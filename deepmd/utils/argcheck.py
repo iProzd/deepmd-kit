@@ -74,6 +74,7 @@ def descrpt_se_a_args():
     doc_seed = 'Random seed for parameter initialization'
     doc_exclude_types = 'The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1.'
     doc_set_davg_zero = 'Set the normalization average to zero. This option should be set when `atom_ener` in the energy fitting is used'
+    doc_attn = 'attn length'
     
     return [
         Argument("sel", [list,str], optional = True, default = "auto", doc = doc_sel),
@@ -88,7 +89,8 @@ def descrpt_se_a_args():
         Argument("trainable", bool, optional = True, default = True, doc = doc_trainable),
         Argument("seed", [int,None], optional = True, doc = doc_seed),
         Argument("exclude_types", list, optional = True, default = [], doc = doc_exclude_types),
-        Argument("set_davg_zero", bool, optional = True, default = False, doc = doc_set_davg_zero)
+        Argument("set_davg_zero", bool, optional = True, default = False, doc = doc_set_davg_zero),
+        Argument("attn", int, optional=True, default=100, doc=doc_attn)
     ]
 
 

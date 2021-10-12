@@ -9,7 +9,7 @@ from deepmd.env import GLOBAL_TF_FLOAT_PRECISION
 from deepmd.env import GLOBAL_NP_FLOAT_PRECISION
 from deepmd.env import op_module
 from deepmd.env import default_tf_session_config
-from deepmd.utils.network import embedding_net, embedding_net_rand_seed_shift
+from deepmd.utils.network import one_layer, embedding_net, embedding_net_rand_seed_shift
 from deepmd.utils.tabulate import DPTabulate
 from deepmd.utils.type_embed import embed_atom_type
 from deepmd.utils.sess import run_sess
@@ -112,7 +112,8 @@ class DescrptSeA (Descriptor):
                   set_davg_zero: bool = False,
                   activation_function: str = 'tanh',
                   precision: str = 'default',
-                  uniform_seed: bool = False
+                  uniform_seed: bool = False,
+                  attn: int = 100
     ) -> None:
         """
         Constructor
@@ -132,6 +133,7 @@ class DescrptSeA (Descriptor):
         self.filter_precision = get_precision(precision)
         self.filter_np_precision = get_np_precision(precision)
         self.exclude_types = set()
+        self.att_n = attn
         for tt in exclude_types:
             assert(len(tt) == 2)
             self.exclude_types.add((tt[0], tt[1]))
@@ -715,13 +717,15 @@ class DescrptSeA (Descriptor):
             stddev = 1.0,
             trainable = True,
             suffix = '',
+            name = 'filter_',
+            reuse = None,
     ):
         """
         input env matrix, returns R.G
         """
         outputs_size = [1] + self.filter_neuron
         # cut-out inputs
-        # with natom x (nei_type_i x 4)  
+        # with natom x (nei_type_i x 4)
         inputs_i = tf.slice (inputs,
                              [ 0, start_index* 4],
                              [-1, incrs_index* 4] )
@@ -744,34 +748,87 @@ class DescrptSeA (Descriptor):
             net = 'filter_-1_net_' + str(type_i)
           else:
             net = 'filter_' + str(type_input) + '_net_' + str(type_i)
-          return op_module.tabulate_fusion(self.table.data[net].astype(self.filter_np_precision), info, xyz_scatter, tf.reshape(inputs_i, [natom, shape_i[1]//4, 4]), last_layer_size = outputs_size[-1])  
+          return op_module.tabulate_fusion(self.table.data[net].astype(self.filter_np_precision), info, xyz_scatter, tf.reshape(inputs_i, [natom, shape_i[1]//4, 4]), last_layer_size = outputs_size[-1])
         else:
-          if (not is_exclude):
-              xyz_scatter = embedding_net(
-                  xyz_scatter, 
-                  self.filter_neuron, 
-                  self.filter_precision, 
-                  activation_fn = activation_fn, 
-                  resnet_dt = self.filter_resnet_dt,
-                  name_suffix = suffix,
-                  stddev = stddev,
-                  bavg = bavg,
-                  seed = self.seed,
-                  trainable = trainable, 
-                  uniform_seed = self.uniform_seed,
-                  initial_variables = self.embedding_net_variables)
-              if (not self.uniform_seed) and (self.seed is not None): self.seed += self.seed_shift
-          else:
-            # we can safely return the final xyz_scatter filled with zero directly
-            return tf.cast(tf.fill((natom, 4, outputs_size[-1]), 0.), GLOBAL_TF_FLOAT_PRECISION)
-          # natom x nei_type_i x out_size
-          xyz_scatter = tf.reshape(xyz_scatter, (-1, shape_i[1]//4, outputs_size[-1]))  
-          # When using tf.reshape(inputs_i, [-1, shape_i[1]//4, 4]) below
-          # [588 24] -> [588 6 4] correct
-          # but if sel is zero
-          # [588 0] -> [147 0 4] incorrect; the correct one is [588 0 4]
-          # So we need to explicitly assign the shape to tf.shape(inputs_i)[0] instead of -1
-          return tf.matmul(tf.reshape(inputs_i, [natom, shape_i[1]//4, 4]), xyz_scatter, transpose_a = True)
+            if (not is_exclude):
+                with tf.variable_scope(name, reuse=reuse):
+                    xyz_scatter = embedding_net(
+                        xyz_scatter,
+                        self.filter_neuron,
+                        self.filter_precision,
+                        activation_fn = activation_fn,
+                        resnet_dt = self.filter_resnet_dt,
+                        name_suffix = suffix,
+                        stddev = stddev,
+                        bavg = bavg,
+                        seed = self.seed,
+                        trainable = trainable,
+                        uniform_seed = self.uniform_seed,
+                        initial_variables = self.embedding_net_variables)
+                    if (not self.uniform_seed) and (self.seed is not None): self.seed += self.seed_shift
+                with tf.variable_scope('attention', reuse=tf.AUTO_REUSE):
+                    Q_c = one_layer(
+                        xyz_scatter,
+                        self.att_n,
+                        name='c_query',
+                        reuse=tf.AUTO_REUSE,
+                        seed = self.seed,
+                        activation_fn = None,
+                        precision = self.filter_precision,
+                        trainable = True,
+                        uniform_seed = self.uniform_seed)
+                    K_c = one_layer(
+                        xyz_scatter,
+                        self.att_n,
+                        name='c_key',
+                        reuse=tf.AUTO_REUSE,
+                        seed = self.seed,
+                        activation_fn = None,
+                        precision = self.filter_precision,
+                        trainable = True,
+                        uniform_seed = self.uniform_seed)
+                    V_c = one_layer(
+                        xyz_scatter,
+                        self.att_n,
+                        name='c_value',
+                        reuse=tf.AUTO_REUSE,
+                        seed = self.seed,
+                        activation_fn = None,
+                        precision = self.filter_precision,
+                        trainable = True,
+                        uniform_seed = self.uniform_seed)
+                    # # natom x nei_type_i x out_size
+                    # xyz_scatter = tf.reshape(xyz_scatter, (-1, shape_i[1] // 4, outputs_size[-1]))
+                    # natom x nei_type_i x att_n
+                    Q_c = tf.reshape(Q_c, (-1, shape_i[1] // 4, self.att_n))
+                    K_c = tf.reshape(K_c, (-1, shape_i[1] // 4, self.att_n))
+                    V_c = tf.reshape(V_c, (-1, shape_i[1] // 4, self.att_n))
+                    A_c = tf.nn.softmax(tf.matmul(Q_c, K_c, transpose_b = True))
+
+                    # (natom x nei_type_i) x att_n
+                    xyz_scatter_att = tf.reshape(tf.matmul(A_c, V_c), (-1, self.att_n))
+                    # (natom x nei_type_i) x out_size
+                    xyz_scatter_att = one_layer(
+                        xyz_scatter_att,
+                        outputs_size[-1],
+                        name='c_out',
+                        reuse=tf.AUTO_REUSE,
+                        seed=self.seed,
+                        activation_fn=None,
+                        precision=self.filter_precision,
+                        trainable=True,
+                        uniform_seed=self.uniform_seed)
+                    # natom x nei_type_i x out_size
+                    xyz_scatter_att = tf.reshape(xyz_scatter_att, (-1, shape_i[1] // 4, outputs_size[-1]))
+            else:
+                # we can safely return the final xyz_scatter filled with zero directly
+                return tf.cast(tf.fill((natom, 4, outputs_size[-1]), 0.), GLOBAL_TF_FLOAT_PRECISION)
+        # When using tf.reshape(inputs_i, [-1, shape_i[1]//4, 4]) below
+        # [588 24] -> [588 6 4] correct
+        # but if sel is zero
+        # [588 0] -> [147 0 4] incorrect; the correct one is [588 0 4]
+        # So we need to explicitly assign the shape to tf.shape(inputs_i)[0] instead of -1
+        return tf.matmul(tf.reshape(inputs_i, [natom, shape_i[1]//4, 4]), xyz_scatter_att, transpose_a = True)
 
 
     def _filter(
@@ -803,62 +860,66 @@ class DescrptSeA (Descriptor):
             qmat = tf.cast(tf.fill((natom, outputs_size[-1], 3), 0.), GLOBAL_TF_FLOAT_PRECISION)
             return result, qmat
             
-        with tf.variable_scope(name, reuse=reuse):
-          start_index = 0
-          type_i = 0
-          # natom x 4 x outputs_size
-          if type_embedding is None:
-              for type_i in range(self.ntypes):
-                  ret = self._filter_lower(
-                      type_i, type_input,
-                      start_index, self.sel_a[type_i],
-                      inputs,
-                      nframes,
-                      natoms,
-                      type_embedding = type_embedding,
-                      is_exclude = (type_input, type_i) in self.exclude_types,
-                      activation_fn = activation_fn,
-                      stddev = stddev,
-                      bavg = bavg,
-                      trainable = trainable,
-                      suffix = "_"+str(type_i))
-                  if type_i == 0:
-                      xyz_scatter_1 = ret
-                  elif (type_input, type_i) not in self.exclude_types:
-                      # add zero is meaningless; skip
-                      xyz_scatter_1+= ret
-                  start_index += self.sel_a[type_i]
-          else :
-              xyz_scatter_1 = self._filter_lower(
-                  type_i, type_input,
-                  start_index, np.cumsum(self.sel_a)[-1],
-                  inputs,
-                  nframes,
-                  natoms,
-                  type_embedding = type_embedding,
-                  is_exclude = False,
-                  activation_fn = activation_fn,
-                  stddev = stddev,
-                  bavg = bavg,
-                  trainable = trainable)
-          # natom x nei x outputs_size
-          # xyz_scatter = tf.concat(xyz_scatter_total, axis=1)
-          # natom x nei x 4
-          # inputs_reshape = tf.reshape(inputs, [-1, shape[1]//4, 4])
-          # natom x 4 x outputs_size
-          # xyz_scatter_1 = tf.matmul(inputs_reshape, xyz_scatter, transpose_a = True)
-          xyz_scatter_1 = xyz_scatter_1 * (4.0 / shape[1])
-          # natom x 4 x outputs_size_2
-          xyz_scatter_2 = tf.slice(xyz_scatter_1, [0,0,0],[-1,-1,outputs_size_2])
-          # # natom x 3 x outputs_size_2
-          # qmat = tf.slice(xyz_scatter_2, [0,1,0], [-1, 3, -1])
-          # natom x 3 x outputs_size_1
-          qmat = tf.slice(xyz_scatter_1, [0,1,0], [-1, 3, -1])
-          # natom x outputs_size_1 x 3
-          qmat = tf.transpose(qmat, perm = [0, 2, 1])
-          # natom x outputs_size x outputs_size_2
-          result = tf.matmul(xyz_scatter_1, xyz_scatter_2, transpose_a = True)
-          # natom x (outputs_size x outputs_size_2)
-          result = tf.reshape(result, [-1, outputs_size_2 * outputs_size[-1]])
+
+        start_index = 0
+        type_i = 0
+        # natom x 4 x outputs_size
+        if type_embedding is None:
+            for type_i in range(self.ntypes):
+                ret = self._filter_lower(
+                    type_i, type_input,
+                    start_index, self.sel_a[type_i],
+                    inputs,
+                    nframes,
+                    natoms,
+                    type_embedding = type_embedding,
+                    is_exclude = (type_input, type_i) in self.exclude_types,
+                    activation_fn = activation_fn,
+                    stddev = stddev,
+                    bavg = bavg,
+                    trainable = trainable,
+                    suffix = "_"+str(type_i),
+                    name = name,
+                    reuse = reuse)
+                if type_i == 0:
+                    xyz_scatter_1 = ret
+                elif (type_input, type_i) not in self.exclude_types:
+                    # add zero is meaningless; skip
+                    xyz_scatter_1+= ret
+                start_index += self.sel_a[type_i]
+        else :
+            xyz_scatter_1 = self._filter_lower(
+                type_i, type_input,
+                start_index, np.cumsum(self.sel_a)[-1],
+                inputs,
+                nframes,
+                natoms,
+                type_embedding = type_embedding,
+                is_exclude = False,
+                activation_fn = activation_fn,
+                stddev = stddev,
+                bavg = bavg,
+                trainable = trainable,
+                name=name,
+                reuse=reuse)
+        # natom x nei x outputs_size
+        # xyz_scatter = tf.concat(xyz_scatter_total, axis=1)
+        # natom x nei x 4
+        # inputs_reshape = tf.reshape(inputs, [-1, shape[1]//4, 4])
+        # natom x 4 x outputs_size
+        # xyz_scatter_1 = tf.matmul(inputs_reshape, xyz_scatter, transpose_a = True)
+        xyz_scatter_1 = xyz_scatter_1 * (4.0 / shape[1])
+        # natom x 4 x outputs_size_2
+        xyz_scatter_2 = tf.slice(xyz_scatter_1, [0,0,0],[-1,-1,outputs_size_2])
+        # # natom x 3 x outputs_size_2
+        # qmat = tf.slice(xyz_scatter_2, [0,1,0], [-1, 3, -1])
+        # natom x 3 x outputs_size_1
+        qmat = tf.slice(xyz_scatter_1, [0,1,0], [-1, 3, -1])
+        # natom x outputs_size_1 x 3
+        qmat = tf.transpose(qmat, perm = [0, 2, 1])
+        # natom x outputs_size x outputs_size_2
+        result = tf.matmul(xyz_scatter_1, xyz_scatter_2, transpose_a = True)
+        # natom x (outputs_size x outputs_size_2)
+        result = tf.reshape(result, [-1, outputs_size_2 * outputs_size[-1]])
 
         return result, qmat
