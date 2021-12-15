@@ -15,6 +15,7 @@ from deepmd.utils.type_embed import embed_atom_type
 from deepmd.utils.sess import run_sess
 from deepmd.utils.graph import load_graph_def, get_tensor_by_name_from_graph, get_embedding_net_variables
 from .descriptor import Descriptor
+from IPython import embed
 
 class DescrptSeA (Descriptor):
     r"""DeepPot-SE constructed from all information (both angular and radial) of
@@ -113,7 +114,9 @@ class DescrptSeA (Descriptor):
                   activation_function: str = 'tanh',
                   precision: str = 'default',
                   uniform_seed: bool = False,
-                  attn: int = 100
+                  attn: int = 100,
+                  attn_layer = 4,
+                  drop_prob = 0.1,
     ) -> None:
         """
         Constructor
@@ -134,6 +137,7 @@ class DescrptSeA (Descriptor):
         self.filter_np_precision = get_np_precision(precision)
         self.exclude_types = set()
         self.att_n = attn
+        self.attn_layer = attn_layer
         for tt in exclude_types:
             assert(len(tt) == 2)
             self.exclude_types.add((tt[0], tt[1]))
@@ -574,8 +578,10 @@ class DescrptSeA (Descriptor):
                      reuse = None,
                      suffix = '', 
                      trainable = True) :
+        drop_prob = 1.0
         if input_dict is not None:
             type_embedding = input_dict.get('type_embedding', None)
+            drop_prob = tf.cast(input_dict.get('drop_prob'), self.filter_precision)
         else:
             type_embedding = None
         start_index = 0
@@ -588,7 +594,7 @@ class DescrptSeA (Descriptor):
                                      [ 0, start_index*      self.ndescrpt],
                                      [-1, natoms[2+type_i]* self.ndescrpt] )
                 inputs_i = tf.reshape(inputs_i, [-1, self.ndescrpt])
-                layer, qmat = self._filter(tf.cast(inputs_i, self.filter_precision), type_i, name='filter_type_'+str(type_i)+suffix, natoms=natoms, reuse=reuse, trainable = trainable, activation_fn = self.filter_activation_fn)
+                layer, qmat = self._filter(tf.cast(inputs_i, self.filter_precision), type_i, name='filter_type_'+str(type_i)+suffix, natoms=natoms, reuse=reuse, trainable = trainable, activation_fn = self.filter_activation_fn, drop_prob = drop_prob)
                 layer = tf.reshape(layer, [tf.shape(inputs)[0], natoms[2+type_i] * self.get_dim_out()])
                 qmat  = tf.reshape(qmat,  [tf.shape(inputs)[0], natoms[2+type_i] * self.get_dim_rot_mat_1() * 3])
                 output.append(layer)
@@ -598,7 +604,7 @@ class DescrptSeA (Descriptor):
             inputs_i = inputs
             inputs_i = tf.reshape(inputs_i, [-1, self.ndescrpt])
             type_i = -1
-            layer, qmat = self._filter(tf.cast(inputs_i, self.filter_precision), type_i, name='filter_type_all'+suffix, natoms=natoms, reuse=reuse, trainable = trainable, activation_fn = self.filter_activation_fn, type_embedding=type_embedding)
+            layer, qmat = self._filter(tf.cast(inputs_i, self.filter_precision), type_i, name='filter_type_all'+suffix, natoms=natoms, reuse=reuse, trainable = trainable, activation_fn = self.filter_activation_fn, type_embedding=type_embedding, drop_prob=drop_prob)
             layer = tf.reshape(layer, [tf.shape(inputs)[0], natoms[0] * self.get_dim_out()])
             qmat  = tf.reshape(qmat,  [tf.shape(inputs)[0], natoms[0] * self.get_dim_rot_mat_1() * 3])
             output.append(layer)
@@ -700,6 +706,108 @@ class DescrptSeA (Descriptor):
             embedding_input = tf.concat([embedding_input,atm_embed],1)  # shape is [nframes*natoms[0]*self.nnei, 1+te_out_dim+te_out_dim]
         return embedding_input
 
+    def _feedforward(self, input_xyz, d_in, d_mid, attn_dropout=0.1):
+        residual = input_xyz
+        input_xyz = tf.nn.relu(one_layer(
+                                input_xyz,
+                                d_mid,
+                                name='c_ffn1',
+                                reuse=tf.AUTO_REUSE,
+                                seed=self.seed,
+                                activation_fn=None,
+                                precision=self.filter_precision,
+                                trainable=True,
+                                uniform_seed=self.uniform_seed))
+        input_xyz = one_layer(
+                                    input_xyz,
+                                    d_in,
+                                    name='c_ffn2',
+                                    reuse=tf.AUTO_REUSE,
+                                    seed=self.seed,
+                                    activation_fn=None,
+                                    precision=self.filter_precision,
+                                    trainable=True,
+                                    uniform_seed=self.uniform_seed)
+        input_xyz += residual
+        input_xyz = tf.keras.layers.LayerNormalization()(input_xyz)
+        return input_xyz
+
+    def _scaled_dot_attn(self, Q, K, V, temperature, attn_dropout=0.1):
+        attn = tf.matmul(Q / temperature, K, transpose_b=True)
+        attn = tf.nn.softmax(attn, axis=-1)
+        output = tf.matmul(attn, V)
+        return output
+
+    def _attention_layers(
+            self,
+            input_xyz,
+            layer_num,
+            shape_i,
+            outputs_size,
+            drop_prob=0.1,
+    ):
+        sd_k = tf.sqrt(tf.cast(self.att_n, dtype=self.filter_precision))
+        for i in range(layer_num):
+            with tf.variable_scope('attention_layer{}_'.format(i), reuse=tf.AUTO_REUSE):
+                Q_c = one_layer(
+                    input_xyz,
+                    self.att_n,
+                    name='c_query',
+                    reuse=tf.AUTO_REUSE,
+                    seed=self.seed,
+                    activation_fn=None,
+                    precision=self.filter_precision,
+                    trainable=True,
+                    uniform_seed=self.uniform_seed)
+                K_c = one_layer(
+                    input_xyz,
+                    self.att_n,
+                    name='c_key',
+                    reuse=tf.AUTO_REUSE,
+                    seed=self.seed,
+                    activation_fn=None,
+                    precision=self.filter_precision,
+                    trainable=True,
+                    uniform_seed=self.uniform_seed)
+                V_c = one_layer(
+                    input_xyz,
+                    self.att_n,
+                    name='c_value',
+                    reuse=tf.AUTO_REUSE,
+                    seed=self.seed,
+                    activation_fn=None,
+                    precision=self.filter_precision,
+                    trainable=True,
+                    uniform_seed=self.uniform_seed)
+                # # natom x nei_type_i x out_size
+                # xyz_scatter = tf.reshape(xyz_scatter, (-1, shape_i[1] // 4, outputs_size[-1]))
+                # natom x nei_type_i x att_n
+                Q_c = tf.reshape(Q_c, (-1, shape_i[1] // 4, self.att_n))
+                K_c = tf.reshape(K_c, (-1, shape_i[1] // 4, self.att_n))
+                V_c = tf.reshape(V_c, (-1, shape_i[1] // 4, self.att_n))
+
+                input_att = self._scaled_dot_attn(Q_c, K_c, V_c, sd_k, attn_dropout=drop_prob)
+                input_att = tf.reshape(input_att, (-1, self.att_n))
+
+                # A_c = tf.nn.softmax(tf.matmul(Q_c, K_c, transpose_b=True)/sd_k)
+                # # (natom x nei_type_i) x att_n
+                # input_att = tf.reshape(tf.matmul(A_c, V_c), (-1, self.att_n))
+
+                # (natom x nei_type_i) x out_size
+                input_xyz += one_layer(
+                                            input_att,
+                                            outputs_size[-1],
+                                            name='c_out',
+                                            reuse=tf.AUTO_REUSE,
+                                            seed=self.seed,
+                                            activation_fn=None,
+                                            precision=self.filter_precision,
+                                            trainable=True,
+                                            uniform_seed=self.uniform_seed)
+                # natom x nei_type_i x out_size
+                input_xyz = tf.keras.layers.LayerNormalization()(input_xyz)
+                self._feedforward(input_xyz, outputs_size[-1], self.att_n, attn_dropout=drop_prob)
+        return input_xyz
 
     def _filter_lower(
             self,
@@ -719,6 +827,7 @@ class DescrptSeA (Descriptor):
             suffix = '',
             name = 'filter_',
             reuse = None,
+            drop_prob = 0.1,
     ):
         """
         input env matrix, returns R.G
@@ -766,60 +875,10 @@ class DescrptSeA (Descriptor):
                         uniform_seed = self.uniform_seed,
                         initial_variables = self.embedding_net_variables)
                     if (not self.uniform_seed) and (self.seed is not None): self.seed += self.seed_shift
-                with tf.variable_scope('attention', reuse=tf.AUTO_REUSE):
-                    Q_c = one_layer(
-                        xyz_scatter,
-                        self.att_n,
-                        name='c_query',
-                        reuse=tf.AUTO_REUSE,
-                        seed = self.seed,
-                        activation_fn = None,
-                        precision = self.filter_precision,
-                        trainable = True,
-                        uniform_seed = self.uniform_seed)
-                    K_c = one_layer(
-                        xyz_scatter,
-                        self.att_n,
-                        name='c_key',
-                        reuse=tf.AUTO_REUSE,
-                        seed = self.seed,
-                        activation_fn = None,
-                        precision = self.filter_precision,
-                        trainable = True,
-                        uniform_seed = self.uniform_seed)
-                    V_c = one_layer(
-                        xyz_scatter,
-                        self.att_n,
-                        name='c_value',
-                        reuse=tf.AUTO_REUSE,
-                        seed = self.seed,
-                        activation_fn = None,
-                        precision = self.filter_precision,
-                        trainable = True,
-                        uniform_seed = self.uniform_seed)
-                    # # natom x nei_type_i x out_size
-                    # xyz_scatter = tf.reshape(xyz_scatter, (-1, shape_i[1] // 4, outputs_size[-1]))
-                    # natom x nei_type_i x att_n
-                    Q_c = tf.reshape(Q_c, (-1, shape_i[1] // 4, self.att_n))
-                    K_c = tf.reshape(K_c, (-1, shape_i[1] // 4, self.att_n))
-                    V_c = tf.reshape(V_c, (-1, shape_i[1] // 4, self.att_n))
-                    A_c = tf.nn.softmax(tf.matmul(Q_c, K_c, transpose_b = True))
-
-                    # (natom x nei_type_i) x att_n
-                    xyz_scatter_att = tf.reshape(tf.matmul(A_c, V_c), (-1, self.att_n))
-                    # (natom x nei_type_i) x out_size
-                    xyz_scatter_att = one_layer(
-                        xyz_scatter_att,
-                        outputs_size[-1],
-                        name='c_out',
-                        reuse=tf.AUTO_REUSE,
-                        seed=self.seed,
-                        activation_fn=None,
-                        precision=self.filter_precision,
-                        trainable=True,
-                        uniform_seed=self.uniform_seed)
-                    # natom x nei_type_i x out_size
-                    xyz_scatter_att = tf.reshape(xyz_scatter_att, (-1, shape_i[1] // 4, outputs_size[-1]))
+                # natom x nei_type_i x out_size
+                xyz_scatter_att = tf.reshape(self._attention_layers(xyz_scatter, self.attn_layer, shape_i, outputs_size, drop_prob=drop_prob),
+                                             (-1, shape_i[1] // 4, outputs_size[-1]))
+                xyz_scatter = tf.reshape(xyz_scatter, (-1, shape_i[1] // 4, outputs_size[-1]))
             else:
                 # we can safely return the final xyz_scatter filled with zero directly
                 return tf.cast(tf.fill((natom, 4, outputs_size[-1]), 0.), GLOBAL_TF_FLOAT_PRECISION)
@@ -842,7 +901,8 @@ class DescrptSeA (Descriptor):
             bavg=0.0,
             name='linear', 
             reuse=None,
-            trainable = True):
+            trainable = True,
+            drop_prob = 0.1):
         nframes = tf.shape(tf.reshape(inputs, [-1, natoms[0], self.ndescrpt]))[0]
         # natom x (nei x 4)
         shape = inputs.get_shape().as_list()
@@ -880,7 +940,8 @@ class DescrptSeA (Descriptor):
                     trainable = trainable,
                     suffix = "_"+str(type_i),
                     name = name,
-                    reuse = reuse)
+                    reuse = reuse,
+                    drop_prob = drop_prob)
                 if type_i == 0:
                     xyz_scatter_1 = ret
                 elif (type_input, type_i) not in self.exclude_types:
@@ -901,7 +962,8 @@ class DescrptSeA (Descriptor):
                 bavg = bavg,
                 trainable = trainable,
                 name=name,
-                reuse=reuse)
+                reuse=reuse,
+                drop_prob=drop_prob)
         # natom x nei x outputs_size
         # xyz_scatter = tf.concat(xyz_scatter_total, axis=1)
         # natom x nei x 4
