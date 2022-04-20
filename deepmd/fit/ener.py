@@ -164,7 +164,8 @@ class EnerFitting ():
         return self.numb_fparam
 
     def compute_output_stats(self, 
-                             all_stat: dict
+                             all_stat: dict,
+                             do_sel: bool = False
     ) -> None:
         """
         Compute the ouput statistics
@@ -176,10 +177,12 @@ class EnerFitting ():
                 all_stat['energy'] of shape n_sys x n_batch x n_frame
                 can be prepared by model.make_stat_input
         """
-        self.bias_atom_e = self._compute_output_stats(all_stat, rcond = self.rcond)
+        self.bias_atom_e = self._compute_output_stats(all_stat, rcond=self.rcond, do_sel=do_sel)
+        # print('bias_atom_e')
+        # embed()
 
     @classmethod
-    def _compute_output_stats(self, all_stat, rcond = 1e-3):
+    def _compute_output_stats(self, all_stat, rcond=1e-3, do_sel=False):
         data = all_stat['energy']
         # data[sys_idx][batch_idx][frame_idx]
         sys_ener = np.array([])
@@ -190,15 +193,31 @@ class EnerFitting ():
                     sys_data.append(data[ss][ii][jj])
             sys_data = np.concatenate(sys_data)
             sys_ener = np.append(sys_ener, np.average(sys_data))
-        data = all_stat['natoms_vec']
-        sys_tynatom = np.array([])
-        nsys = len(data)
-        for ss in range(len(data)):
-            sys_tynatom = np.append(sys_tynatom, data[ss][0].astype(np.float64))
-        sys_tynatom = np.reshape(sys_tynatom, [nsys,-1])
-        sys_tynatom = sys_tynatom[:,2:]
-        energy_shift,resd,rank,s_value \
-            = np.linalg.lstsq(sys_tynatom, sys_ener, rcond = rcond)
+        if do_sel:
+            data = all_stat['real_natoms_vec']
+            sys_tynatom = np.array([])
+            nsys = len(data)
+            for ss in range(len(data)):
+                tmp_tynatom = []
+                for ii in range(len(data[ss])):
+                    for jj in range(len(data[ss][ii])):
+                        tmp_tynatom.append(data[ss][ii][jj].astype(np.float64))
+                tmp_tynatom = np.average(np.array(tmp_tynatom), axis=0)
+                sys_tynatom = np.append(sys_tynatom, tmp_tynatom)
+            sys_tynatom = np.reshape(sys_tynatom, [nsys,-1])
+            sys_tynatom = sys_tynatom[:,2:]
+            energy_shift,resd,rank,s_value \
+                = np.linalg.lstsq(sys_tynatom, sys_ener, rcond = rcond)
+        else:
+            data = all_stat['natoms_vec']
+            sys_tynatom = np.array([])
+            nsys = len(data)
+            for ss in range(len(data)):
+                sys_tynatom = np.append(sys_tynatom, data[ss][0].astype(np.float64))
+            sys_tynatom = np.reshape(sys_tynatom, [nsys,-1])
+            sys_tynatom = sys_tynatom[:,2:]
+            energy_shift,resd,rank,s_value \
+                = np.linalg.lstsq(sys_tynatom, sys_ener, rcond = rcond)
         return energy_shift    
 
     def compute_input_stats(self, 
@@ -245,7 +264,6 @@ class EnerFitting ():
                 if self.aparam_std[ii] < protection:
                     self.aparam_std[ii] = protection
             self.aparam_inv_std = 1./self.aparam_std
-
 
     def _compute_std (self, sumv2, sumv, sumn) :
         return np.sqrt(sumv2/sumn - np.multiply(sumv/sumn, sumv/sumn))
@@ -328,7 +346,9 @@ class EnerFitting ():
     def build (self, 
                inputs : tf.Tensor,
                natoms : tf.Tensor,
+               atype: tf.Tensor,
                input_dict : dict = {},
+               type_embedding: tf.Tensor = None,
                reuse : bool = None,
                suffix : str = '', 
     ) -> tf.Tensor:
@@ -343,6 +363,8 @@ class EnerFitting ():
                 Additional dict for inputs. 
                 if numb_fparam > 0, should have input_dict['fparam']
                 if numb_aparam > 0, should have input_dict['aparam']
+        type_embedding
+                The atomic type embedding.
         natoms
                 The number of atoms. This tensor has the length of Ntypes + 2
                 natoms[0]: number of local atoms
@@ -415,15 +437,16 @@ class EnerFitting ():
             aparam = (aparam - t_aparam_avg) * t_aparam_istd
             aparam = tf.reshape(aparam, [-1, self.numb_aparam * natoms[0]])
             
-        if input_dict is not None:
-            type_embedding = input_dict.get('type_embedding', None)
-        else:
-            type_embedding = None
+        # if input_dict is not None:
+        #     type_embedding = input_dict.get('type_embedding', None)
+        # else:
+        #     type_embedding = None
         if type_embedding is not None:
-            atype_embed = embed_atom_type(self.ntypes, natoms, type_embedding)
-            atype_embed = tf.tile(atype_embed,[tf.shape(inputs)[0],1])
+            atype_embed = tf.nn.embedding_lookup(type_embedding, atype)
         else:
             atype_embed = None
+
+        self.atype_embed = atype_embed
 
         if atype_embed is None:
             start_index = 0
@@ -441,7 +464,7 @@ class EnerFitting ():
                 if type_i < len(self.atom_ener) and self.atom_ener[type_i] is not None:                
                     zero_layer = self._build_lower(
                         start_index, natoms[2+type_i], 
-                        inputs_zero, fparam, aparam, 
+                        inputs_zero, fparam, aparam,
                         bias_atom_e=type_bias_ae, suffix='_type_'+str(type_i)+suffix, reuse=True
                     )
                     final_layer += self.atom_ener[type_i] - zero_layer
@@ -462,6 +485,7 @@ class EnerFitting ():
                 [tf.reshape(inputs,[-1,self.dim_descrpt]),atype_embed],
                 axis=1
             )
+            self.tmp_input = inputs
             self.dim_descrpt = self.dim_descrpt + type_shape[1]
             inputs = tf.cast(tf.reshape(inputs, [-1, self.dim_descrpt * natoms[0]]), self.fitting_precision)
             final_layer = self._build_lower(
@@ -470,6 +494,15 @@ class EnerFitting ():
                 bias_atom_e=0.0, suffix=suffix, reuse=reuse
             )
             outs = tf.reshape(final_layer, [tf.shape(inputs)[0], natoms[0]])
+            # add bias
+            self.atom_ener_before = outs
+            self.add_type = tf.reshape(tf.nn.embedding_lookup(tf.constant(self.bias_atom_e), atype), [tf.shape(inputs)[0], natoms[0]])
+            outs = outs + self.add_type
+            self.atom_ener_after = outs
+            # zd
+            # self.atom_ener_before = outs
+            # self.abias = tf.reshape(tf.nn.embedding_lookup(tf.constant(self.bias_atom_e), atype), [tf.shape(inputs)[0], natoms[0]])
+            # self.atom_ener_after = outs + self.abias
 
         if self.tot_ener_zero:
             force_tot_ener = 0.0

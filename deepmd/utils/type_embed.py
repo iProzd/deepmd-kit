@@ -7,7 +7,7 @@ from deepmd.env import GLOBAL_TF_FLOAT_PRECISION
 from deepmd.env import GLOBAL_NP_FLOAT_PRECISION
 from deepmd.env import op_module
 from deepmd.env import default_tf_session_config
-from deepmd.utils.network import  embedding_net
+from deepmd.utils.network import one_layer, embedding_net
 
 import math
 from deepmd.common import get_activation_func, get_precision, ACTIVATION_FN_DICT, PRECISION_DICT, docstring_parameter, get_np_precision
@@ -126,19 +126,33 @@ class TypeEmbedNet():
         )
         ebd_type = tf.cast(tf.one_hot(tf.cast(types,dtype=tf.int32),int(ntypes)), self.filter_precision)
         ebd_type = tf.reshape(ebd_type, [-1, ntypes])
+
         name = 'type_embed_net' + suffix
-        with tf.variable_scope(name, reuse=reuse):
-            ebd_type = embedding_net(
-                ebd_type,
-                self.neuron,
-                activation_fn = self.filter_activation_fn,
-                precision = self.filter_precision,
-                resnet_dt = self.filter_resnet_dt,
-                seed = self.seed,
-                trainable = self.trainable, 
-                uniform_seed = self.uniform_seed)
-        ebd_type = tf.reshape(ebd_type, [-1, self.neuron[-1]]) # nnei * neuron[-1]
-        self.ebd_type = tf.identity(ebd_type, name ='t_typeebd')
-        return self.ebd_type 
+        # with tf.variable_scope(name, reuse=reuse):
+        #     ebd_type = embedding_net(
+        #         ebd_type,
+        #         self.neuron,
+        #         activation_fn = self.filter_activation_fn,
+        #         precision = self.filter_precision,
+        #         resnet_dt = self.filter_resnet_dt,
+        #         seed = self.seed,
+        #         trainable = self.trainable,
+        #         uniform_seed = self.uniform_seed)
+        ebd_type = one_layer(
+            ebd_type,
+            self.neuron[-1],
+            name=name,
+            reuse=reuse,
+            seed=self.seed,
+            activation_fn=None,
+            precision=self.filter_precision,
+            trainable = self.trainable,
+            uniform_seed=self.uniform_seed)
+        last_type = tf.cast(tf.zeros([1, self.neuron[-1]]), self.filter_precision)
+        ebd_type = tf.reshape(ebd_type, [-1, self.neuron[-1]]) # ntypes * neuron[-1]
+        ebd_type = tf.concat([ebd_type, last_type], 0)
+        self.ebd_type = ebd_type
+        # ebd_type = tf.identity(ebd_type, name ='t_typeebd')
+        return ebd_type
 
 

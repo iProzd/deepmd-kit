@@ -36,6 +36,9 @@ from deepmd.utils.errors import GraphWithoutTensorError
 import deepmd.op
 
 from deepmd.common import j_must_have, ClassArg, data_requirement
+from tensorflow.python import debug as tf_dbg
+# from deepmd.env import wb
+# import matplotlib.pyplot as plt
 
 log = logging.getLogger(__name__)
 
@@ -96,7 +99,7 @@ class DPTrainer (object):
         typeebd_param = model_param.get('type_embedding', None)
         self.model_param    = model_param
         self.descrpt_param  = descrpt_param
-        
+
         # descriptor
         try:
             descrpt_type = descrpt_param['type']
@@ -262,6 +265,11 @@ class DPTrainer (object):
         self.tensorboard = self.run_opt.is_chief and tr_data.get('tensorboard', False)
         self.tensorboard_log_dir = tr_data.get('tensorboard_log_dir', 'log')
         self.tensorboard_freq = tr_data.get('tensorboard_freq', 1)
+        self.wandb_log = tr_data.get('wandb_log', False)
+        # if self.wandb_log:
+        #     name_path = os.path.abspath('.').split('/')
+        #     wb.init(project="attention_models", entity="dp_model_engineering", config=model_param,
+        #             name=name_path[-2] + '/' + name_path[-1])
         # self.sys_probs = tr_data['sys_probs']
         # self.auto_prob_style = tr_data['auto_prob']
         self.useBN = False
@@ -376,10 +384,21 @@ class DPTrainer (object):
             optimizer = self.run_opt._HVD.DistributedOptimizer(optimizer)
         else:
             optimizer = tf.train.AdamOptimizer(learning_rate = self.learning_rate)
-        apply_op = optimizer.minimize(loss=self.l2_l,
-                                      global_step=self.global_step,
-                                      var_list=trainable_variables,
-                                      name='train_step')
+
+        threshold = 10.0
+        check_loss = tf.check_numerics(self.l2_l, "loss non number")
+        # with tf.control_dependencies([check_loss]):
+        #     grads_and_vars = optimizer.compute_gradients(loss=self.l2_l, var_list=trainable_variables)
+        # # capped_gvs = [(tf.clip_by_value(grad, -threshold, threshold), var)
+        # #               for grad, var in grads_and_vars]
+        # grad_check = [tf.check_numerics(grad, "grads non number") for grad, var in grads_and_vars]
+        # with tf.control_dependencies(grad_check):
+        #     apply_op = optimizer.apply_gradients(grads_and_vars, global_step=self.global_step, name='train_step')
+        with tf.control_dependencies([check_loss]):
+            apply_op = optimizer.minimize(loss=self.l2_l,
+                                          global_step=self.global_step,
+                                          var_list=trainable_variables,
+                                          name='train_step')
         train_ops = [apply_op] + self._extra_train_ops
         self.train_op = tf.group(*train_ops)
         log.info("built training")
@@ -431,6 +450,13 @@ class DPTrainer (object):
             else:
                 log.info('receive global variables from task#0')
             run_sess(self.sess, bcast_op)
+
+    # def draw_mat(self, mat, fig_name):
+    #     plt.figure(figsize=[i*5 for i in mat.shape])
+    #     plt.matshow(mat)
+    #     plt.colorbar()
+    #     plt.savefig(fig_name)
+    #     plt.close()
 
     def train (self, train_data = None, valid_data=None) :
 
@@ -486,7 +512,7 @@ class DPTrainer (object):
             tb_valid_writer = None
         
         train_time = 0
-
+        #self.sess = tf_dbg.LocalCLIDebugWrapperSession(self.sess)
         while cur_batch < stop_batch :
 
             # first round validation:
@@ -501,13 +527,73 @@ class DPTrainer (object):
             train_feed_dict = self.get_feed_dict(train_batch, is_training=True)
             # use tensorboard to visualize the training of deepmd-kit
             # it will takes some extra execution time to generate the tensorboard data
-            if self.tensorboard and (cur_batch % self.tensorboard_freq == 0):
-                summary, _ = run_sess(self.sess, [summary_merged_op, self.train_op], feed_dict=train_feed_dict,
-                                           options=prf_options, run_metadata=prf_run_metadata)
-                tb_train_writer.add_summary(summary, cur_batch)
-            else:
-                run_sess(self.sess, [self.train_op], feed_dict=train_feed_dict,
-                              options=prf_options, run_metadata=prf_run_metadata)
+            try :
+                if self.tensorboard and (cur_batch % self.tensorboard_freq == 0):
+                    summary, _ = run_sess(self.sess, [summary_merged_op, self.train_op], feed_dict=train_feed_dict,
+                                               options=prf_options, run_metadata=prf_run_metadata)
+                    tb_train_writer.add_summary(summary, cur_batch)
+                else:
+                    # if cur_batch % 10000 == 0:
+                    # # if cur_batch >= 0:
+                    #     _, l2_l, descrpt_t, descrpt_deriv_t, rij_t, nlist_t, nei_type_vec, \
+                    #     attn_weight_0, angular_weight_0, attn_weight_final_0, attn_weight_1, angular_weight_1, attn_weight_final_1, \
+                    #     nmask, negtive_mask, qs, ks, vs, G, test_nei_embed, test_type_embedding, embedding_input, embedding_input_2, atom_ener,\
+                    #     fit_atebd, fit_input, atom_ener_before, add_type, atom_ener_after = run_sess(
+                    #     # _, l2_l, descrpt_t, descrpt_deriv_t, rij_t, nlist_t, test_nei_embed, nei_type_vec, test_type_embedding, \
+                    #     # nmask= run_sess(
+                    #         self.sess, [self.train_op,
+                    #                     self.l2_l,
+                    #                     self.model.descrpt.descrpt,
+                    #                     self.model.descrpt.descrpt_deriv,
+                    #                     self.model.descrpt.rij,
+                    #                     self.model.descrpt.nlist,
+                    #                     self.model.descrpt.nei_type_vec,
+                    #                     self.model.descrpt.attn_weight[0],
+                    #                     self.model.descrpt.angular_weight[0],
+                    #                     self.model.descrpt.attn_weight_final[0],
+                    #                     self.model.descrpt.attn_weight[1],
+                    #                     self.model.descrpt.angular_weight[1],
+                    #                     self.model.descrpt.attn_weight_final[1],
+                    #                     self.model.descrpt.nmask,
+                    #                     self.model.descrpt.negtive_mask,
+                    #                     self.model.descrpt.qs[0],
+                    #                     self.model.descrpt.ks[0],
+                    #                     self.model.descrpt.vs[0],
+                    #                     self.model.descrpt.G,
+                    #                     self.model.descrpt.test_nei_embed,
+                    #                     self.model.descrpt.test_type_embedding,
+                    #                     self.model.descrpt.embedding_input,
+                    #                     self.model.descrpt.embedding_input_2,
+                    #                     self.model.atom_ener,
+                    #                     self.model.fitting.atype_embed,
+                    #                     self.model.fitting.tmp_input,
+                    #                     self.model.fitting.atom_ener_before,
+                    #                     self.model.fitting.add_type,
+                    #                     self.model.fitting.atom_ener_after], feed_dict=train_feed_dict,
+                    #         options=prf_options, run_metadata=prf_run_metadata)
+                    #     # self.draw_mat(attn_weight_0, 'atten_weight_layer_{}_steps_{}'.format(0, cur_batch))
+                    #     # self.draw_mat(angular_weight_0, 'angular_weight_layer_{}_steps_{}'.format(0, cur_batch))
+                    #     # self.draw_mat(attn_weight_final_0, 'attn_weight_final_layer_{}_steps_{}'.format(0, cur_batch))
+                    #     # self.draw_mat(qs, 'qs_layer_{}_steps_{}'.format(0, cur_batch))
+                    #     # self.draw_mat(ks, 'ks_layer_{}_steps_{}'.format(0, cur_batch))
+                    #     # self.draw_mat(vs, 'vs_layer_{}_steps_{}'.format(0, cur_batch))
+                    #     # self.draw_mat(G, 'G_steps_{}'.format(cur_batch))
+                    #     print('trained one!')
+                    #     embed()
+                    # else:
+                    #     run_sess(self.sess, [self.train_op], feed_dict=train_feed_dict,
+                    #                   options=prf_options, run_metadata=prf_run_metadata)
+                    run_sess(self.sess, [self.train_op], feed_dict=train_feed_dict,
+                             options=prf_options, run_metadata=prf_run_metadata)
+            except Exception as e:
+                log.info(e)
+                log.info('!!!!!! error in cur_batch {} !!!!!!!!'.format(cur_batch))
+                log.info('!!!!!! and the error sys id is {}'.format(train_data.pick_idx))
+                log.info('!!!!!! and the error sys dir is {}'.format(train_data.system_dirs[train_data.pick_idx]))
+                cur_batch = run_sess(self.sess, self.global_step)
+                self.cur_batch = cur_batch
+                continue
+
             if self.timing_in_training: toc = time.time()
             if self.timing_in_training: train_time += toc - tic
             cur_batch = run_sess(self.sess, self.global_step)
@@ -558,7 +644,7 @@ class DPTrainer (object):
     def get_feed_dict(self, batch, is_training):
         feed_dict = {}
         for kk in batch.keys():
-            if kk == 'find_type' or kk == 'type':
+            if kk == 'find_type' or kk == 'type' or kk == 'real_natoms_vec':
                 continue
             if 'find_' in kk:
                 feed_dict[self.place_holders[kk]] = batch[kk]
@@ -569,6 +655,11 @@ class DPTrainer (object):
         for ii in ['natoms_vec', 'default_mesh']:
             feed_dict[self.place_holders[ii]] = batch[ii]
         feed_dict[self.place_holders['is_training']] = is_training
+        feed_dict[self.descrpt.place_holders['fake_natoms_vec']] = \
+            np.array([batch['natoms_vec'][0], batch['natoms_vec'][1], batch['natoms_vec'][1]])
+        feed_dict[self.descrpt.place_holders['fake_type']] = np.zeros_like(feed_dict[self.place_holders['type']])
+        # print('feed_dict')
+        # embed()
         return feed_dict
 
     def get_global_step(self):
@@ -589,7 +680,17 @@ class DPTrainer (object):
                          valid_batches,
                          print_header=False):
         train_results = self.get_evaluation_results(train_batches)
+        train_logs = {}
+        for k, v in train_results.items():
+            train_logs[k+'_train'] = v
+        # if self.wandb_log:
+        #     wb.log(train_logs, step=self.cur_batch)
         valid_results = self.get_evaluation_results(valid_batches)
+        valid_logs = {}
+        for  k, v in valid_results.items():
+            valid_logs[k+'_valid'] = v
+        # if self.wandb_log:
+        #     wb.log(valid_logs, step=self.cur_batch)
 
         cur_batch = self.cur_batch
         current_lr = run_sess(self.sess, self.learning_rate)

@@ -61,6 +61,7 @@ class EnerModel() :
         self.numb_fparam = self.fitting.get_numb_fparam()
         # type embedding
         self.typeebd = typeebd
+        self.type_embedding = None
         # other inputs
         if type_map is None:
             self.type_map = []
@@ -88,23 +89,41 @@ class EnerModel() :
         return self.type_map
 
     def data_stat(self, data):
+        print('start all_stat')
         all_stat = make_stat_input(data, self.data_stat_nbatch, merge_sys = False)
+        print('finish all_stat')
         m_all_stat = merge_sys_stat(all_stat)
-        self._compute_input_stat(m_all_stat, protection = self.data_stat_protect)
-        self._compute_output_stat(all_stat)
+        print('finish m_all_stat')
+        self._compute_input_stat(m_all_stat, protection = self.data_stat_protect, do_sel=data.do_sel)
+        print('finish input_stat')
+        self._compute_output_stat(all_stat, do_sel=data.do_sel)
+        print('finish output_stat')
         # self.bias_atom_e = data.compute_energy_shift(self.rcond)
 
-    def _compute_input_stat (self, all_stat, protection = 1e-2) :
-        self.descrpt.compute_input_stats(all_stat['coord'],
-                                         all_stat['box'],
-                                         all_stat['type'],
-                                         all_stat['natoms_vec'],
-                                         all_stat['default_mesh'], 
-                                         all_stat)
+    def _compute_input_stat (self, all_stat, protection = 1e-2, do_sel=False):
+        if do_sel:
+            self.descrpt.compute_input_stats(all_stat['coord'],
+                                             all_stat['box'],
+                                             all_stat['type'],
+                                             all_stat['natoms_vec'],
+                                             all_stat['default_mesh'],
+                                             all_stat,
+                                             do_sel,
+                                             all_stat['real_natoms_vec'])
+        else:
+            self.descrpt.compute_input_stats(all_stat['coord'],
+                                             all_stat['box'],
+                                             all_stat['type'],
+                                             all_stat['natoms_vec'],
+                                             all_stat['default_mesh'],
+                                             all_stat)
         self.fitting.compute_input_stats(all_stat, protection = protection)
 
-    def _compute_output_stat (self, all_stat) :
-        self.fitting.compute_output_stats(all_stat)
+    def _compute_output_stat (self, all_stat, do_sel=False) :
+        if do_sel:
+            self.fitting.compute_output_stats(all_stat, do_sel=do_sel)
+        else:
+            self.fitting.compute_output_stats(all_stat)
 
     
     def build (self, 
@@ -147,12 +166,11 @@ class EnerModel() :
 
         # type embedding if any
         if self.typeebd is not None:
-            type_embedding = self.typeebd.build(
+            self.type_embedding = self.typeebd.build(
                 self.ntypes,
                 reuse = reuse,
                 suffix = suffix,
             )
-            input_dict['type_embedding'] = type_embedding
 
         if frz_model == None:
             dout \
@@ -162,8 +180,9 @@ class EnerModel() :
                                      box,
                                      mesh,
                                      input_dict,
-                                     suffix = suffix,
-                                     reuse = reuse)
+                                     type_embedding=self.type_embedding,  # only se_a, need todo
+                                     suffix=suffix,
+                                     reuse=reuse)
             dout = tf.identity(dout, name='o_descriptor')
         else:
             tf.constant(self.rcut,
@@ -173,11 +192,10 @@ class EnerModel() :
                 name = 'descrpt_attr/ntypes',
                 dtype = tf.int32)
             feed_dict = self.descrpt.get_feed_dict(coord_, atype_, natoms, box, mesh)
-            return_elements = [*self.descrpt.get_tensor_names(), 'o_descriptor:0']
-            imported_tensors \
+            return_elements = ['o_rmat:0', 'o_rmat_deriv:0', 'o_rij:0', 'o_nlist:0', 'o_descriptor:0']
+            descrpt_reshape, descrpt_deriv, rij, nlist, dout \
                 = self._import_graph_def_from_frz_model(frz_model, feed_dict, return_elements)
-            dout = imported_tensors[-1]
-            self.descrpt.pass_tensors_from_frz_model(*imported_tensors[:-1])
+            self.descrpt.pass_tensors_from_frz_model(descrpt_reshape, descrpt_deriv, rij, nlist)
 
 
         if self.srtab is not None :
@@ -186,10 +204,13 @@ class EnerModel() :
             nnei_r = np.cumsum(sel_r)[-1]
 
         atom_ener = self.fitting.build (dout, 
-                                        natoms, 
-                                        input_dict, 
-                                        reuse = reuse, 
-                                        suffix = suffix)
+                                        natoms,
+                                        atype_,
+                                        input_dict,
+                                        type_embedding=self.type_embedding,  # only ener, need todo
+                                        reuse=reuse,
+                                        suffix=suffix)
+        self.atom_ener = atom_ener
 
         if self.srtab is not None :
             sw_lambda, sw_deriv \

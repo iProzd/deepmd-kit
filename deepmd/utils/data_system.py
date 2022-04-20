@@ -10,6 +10,7 @@ from typing import Tuple, List
 from deepmd.utils import random as dp_random
 from deepmd.utils.data import DataSets
 from deepmd.utils.data import DeepmdData
+from deepmd.utils.threads import para_thread
 
 log = logging.getLogger(__name__)
 
@@ -74,16 +75,45 @@ class DeepmdDataSystem() :
         self.system_dirs = systems
         self.nsystems = len(self.system_dirs)
         self.data_systems = []
-        for ii in self.system_dirs :
-            self.data_systems.append(
-                DeepmdData(
-                    ii, 
-                    set_prefix=set_prefix, 
-                    shuffle_test=shuffle_test, 
-                    type_map = type_map, 
-                    modifier = modifier, 
-                    trn_all_set = trn_all_set
-                ))
+        ntypes = []
+        print('sys init')
+
+        # for ii in tqdm(self.system_dirs) :
+        #     self.data_systems.append(
+        #         DeepmdData(
+        #             ii,
+        #             set_prefix=set_prefix,
+        #             shuffle_test=shuffle_test,
+        #             type_map = type_map,
+        #             modifier = modifier,
+        #             trn_all_set = trn_all_set
+        #         ))
+        def init_data_list(arg_dict):
+            data_systems = []
+            ntypes = []
+            # for ii in tqdm(arg_dict['process_list']):
+            for ii in arg_dict['process_list']:
+                sys = DeepmdData(
+                    ii,
+                    set_prefix=arg_dict['set_prefix'],
+                    shuffle_test=arg_dict['shuffle_test'],
+                    type_map=arg_dict['type_map'],
+                    modifier=arg_dict['modifier'],
+                    trn_all_set=arg_dict['trn_all_set']
+                )
+                data_systems.append(sys)
+                ntypes.append(sys.get_ntypes())
+            result = {'data_systems': data_systems, 'ntypes': ntypes}
+            return result
+
+        init_arg_dict = {'process_list': self.system_dirs, 'set_prefix': set_prefix, 'shuffle_test': shuffle_test,
+                         'type_map': type_map, 'modifier': modifier, 'trn_all_set': trn_all_set}
+        init_arg_dict_flag = {'process_list': True}
+        init_result = para_thread(init_data_list, init_arg_dict, init_arg_dict_flag)
+        self.data_systems = init_result['data_systems']
+        ntypes = init_result['ntypes']
+        self.do_sel = self.data_systems[0].do_sel
+
         # batch size
         self.batch_size = batch_size
         if isinstance(self.batch_size, int):
@@ -100,25 +130,51 @@ class DeepmdDataSystem() :
         elif isinstance(self.batch_size, list):
             pass
         else :
-            raise RuntimeError('invalid batch_size')            
-        assert(isinstance(self.batch_size, (list,np.ndarray)))
+            raise RuntimeError('invalid batch_size')
+        assert(isinstance(self.batch_size, (list, np.ndarray)))
         assert(len(self.batch_size) == self.nsystems)
 
         # natoms, nbatches
-        ntypes = []
-        for ii in self.data_systems :
-            ntypes.append(ii.get_ntypes())
         self.sys_ntypes = max(ntypes)
         self.natoms = []
         self.natoms_vec = []
         self.nbatches = []
         type_map_list = []
-        for ii in range(self.nsystems) :
-            self.natoms.append(self.data_systems[ii].get_natoms())
-            self.natoms_vec.append(self.data_systems[ii].get_natoms_vec(self.sys_ntypes).astype(int))
-            self.nbatches.append(self.data_systems[ii].get_sys_numb_batch(self.batch_size[ii]))
-            type_map_list.append(self.data_systems[ii].get_type_map())
-        self.type_map = self._check_type_map_consistency(type_map_list)
+        print('get_info')
+
+        # for ii in tqdm(range(self.nsystems)) :
+        #     self.natoms.append(self.data_systems[ii].get_natoms())
+        #     self.natoms_vec.append(self.data_systems[ii].get_natoms_vec(self.sys_ntypes).astype(int))
+        #     self.nbatches.append(self.data_systems[ii].get_sys_numb_batch(self.batch_size[ii]))
+        #     type_map_list.append(self.data_systems[ii].get_type_map())
+        def get_info(arg_dict):
+            sys_num = len(arg_dict['data_systems'])
+            natoms = []
+            natoms_vec = []
+            nbatches = []
+            type_map_list_thr = []
+            # for sys_ind in tqdm(range(sys_num)):
+            for sys_ind in range(sys_num):
+                natoms.append(arg_dict['data_systems'][sys_ind].get_natoms())
+                natoms_vec.append(arg_dict['data_systems'][sys_ind].get_natoms_vec(arg_dict['sys_ntypes']).astype(int))
+                nbatches.append(arg_dict['data_systems'][sys_ind].get_sys_numb_batch(arg_dict['batch_size'][sys_ind]))
+                type_map_list_thr.append(arg_dict['data_systems'][sys_ind].get_type_map())
+            result = {'natoms': natoms, 'natoms_vec': natoms_vec, 'nbatches': nbatches,
+                      'type_map_list': type_map_list_thr}
+            return result
+        get_info_arg_dict = {'data_systems': self.data_systems, 'sys_ntypes': self.sys_ntypes,
+                             'batch_size': self.batch_size}
+        get_info_arg_dict_flag = {'data_systems': True, 'batch_size': True}
+        get_info_result = para_thread(get_info, get_info_arg_dict, get_info_arg_dict_flag)
+        self.natoms = get_info_result['natoms']
+        self.natoms_vec = get_info_result['natoms_vec']
+        self.nbatches = get_info_result['nbatches']
+        type_map_list = get_info_result['type_map_list']
+
+        if type_map is None:
+            self.type_map = self._check_type_map_consistency(type_map_list)
+        else:
+            self.type_map = type_map
 
         # ! altered by Marián Rynik
         # test size
@@ -139,12 +195,12 @@ class DeepmdDataSystem() :
         elif isinstance(self.test_size, list):
             pass
         else :
-            raise RuntimeError('invalid test_size')            
+            raise RuntimeError('invalid test_size')
         assert(isinstance(self.test_size, (list,np.ndarray)))
         assert(len(self.test_size) == self.nsystems)
 
         # prob of batch, init pick idx
-        self.prob_nbatches = [ float(i) for i in self.nbatches] / np.sum(self.nbatches)        
+        self.prob_nbatches = [ float(i) for i in self.nbatches] / np.sum(self.nbatches)
         self.pick_idx = 0
 
         # derive system probabilities
@@ -152,16 +208,35 @@ class DeepmdDataSystem() :
         self.set_sys_probs(sys_probs, auto_prob_style)
 
         # check batch and test size
-        for ii in range(self.nsystems) :
-            chk_ret = self.data_systems[ii].check_batch_size(self.batch_size[ii])
-            if chk_ret is not None :
-                warnings.warn("system %s required batch size is larger than the size of the dataset %s (%d > %d)" % \
-                              (self.system_dirs[ii], chk_ret[0], self.batch_size[ii], chk_ret[1]))
-            chk_ret = self.data_systems[ii].check_test_size(self.test_size[ii])
-            if chk_ret is not None :
-                warnings.warn("system %s required test size is larger than the size of the dataset %s (%d > %d)" % \
-                              (self.system_dirs[ii], chk_ret[0], self.test_size[ii], chk_ret[1]))
+        print('check batch and test size')
 
+        # for ii in tqdm(range(self.nsystems)) :
+        #     chk_ret = self.data_systems[ii].check_batch_size(self.batch_size[ii])
+        #     if chk_ret is not None :
+        #         warnings.warn("system %s required batch size is larger than the size of the dataset %s (%d > %d)" % \
+        #                       (self.system_dirs[ii], chk_ret[0], self.batch_size[ii], chk_ret[1]))
+        #     chk_ret = self.data_systems[ii].check_test_size(self.test_size[ii])
+        #     if chk_ret is not None :
+        #         warnings.warn("system %s required test size is larger than the size of the dataset %s (%d > %d)" % \
+        #                       (self.system_dirs[ii], chk_ret[0], self.test_size[ii], chk_ret[1]))
+        def check_batch(arg_dict):
+            sys_num = len(arg_dict['data_systems'])
+            # for sys_ind in tqdm(range(sys_num)):
+            for sys_ind in range(sys_num):
+                chk_ret = arg_dict['data_systems'][sys_ind].check_batch_size(arg_dict['batch_size'][sys_ind])
+                if chk_ret is not None:
+                    warnings.warn("system %s required batch size is larger than the size of the dataset %s (%d > %d)" % \
+                                  (arg_dict['system_dirs'][sys_ind], chk_ret[0], arg_dict['batch_size'][sys_ind], chk_ret[1]))
+                chk_ret = arg_dict['data_systems'][sys_ind].check_test_size(arg_dict['test_size'][sys_ind])
+                if chk_ret is not None:
+                    warnings.warn("system %s required test size is larger than the size of the dataset %s (%d > %d)" % \
+                                  (arg_dict['system_dirs'][sys_ind], chk_ret[0], arg_dict['test_size'][sys_ind], chk_ret[1]))
+            return {}
+
+        check_batch_arg_dict = {'data_systems': self.data_systems, 'batch_size': self.batch_size,
+                                'system_dirs': self.system_dirs, 'test_size': self.test_size}
+        check_batch_arg_dict_flag = {'data_systems': True, 'batch_size': True, 'system_dirs': True, 'test_size': True}
+        para_thread(check_batch, check_batch_arg_dict, check_batch_arg_dict_flag)
 
     def _load_test(self, ntests = -1):
         self.test_data = collections.defaultdict(list)
@@ -169,7 +244,6 @@ class DeepmdDataSystem() :
             test_system_data = self.data_systems[ii].get_test(ntests = ntests)
             for nn in test_system_data:
                 self.test_data[nn].append(test_system_data[nn])
-
 
     def _make_default_mesh(self):
         self.default_mesh = []
@@ -188,7 +262,6 @@ class DeepmdDataSystem() :
                 self.default_mesh.append(default_mesh)
             else:
                 self.default_mesh.append(np.array([], dtype = np.int32))
-
 
     def compute_energy_shift(self, rcond = 1e-3, key = 'energy') :
         sys_ener = np.array([])
@@ -216,19 +289,19 @@ class DeepmdDataSystem() :
         For the explaination of the keys see `add`
         """
         for kk in adict :
-            self.add(kk, 
-                     adict[kk]['ndof'], 
-                     atomic=adict[kk]['atomic'], 
-                     must=adict[kk]['must'], 
-                     high_prec=adict[kk]['high_prec'], 
-                     type_sel=adict[kk]['type_sel'], 
+            self.add(kk,
+                     adict[kk]['ndof'],
+                     atomic=adict[kk]['atomic'],
+                     must=adict[kk]['must'],
+                     high_prec=adict[kk]['high_prec'],
+                     type_sel=adict[kk]['type_sel'],
                      repeat=adict[kk]['repeat'])
 
-    def add(self, 
-            key : str, 
-            ndof : int, 
-            atomic : bool = False, 
-            must : bool = False, 
+    def add(self,
+            key : str,
+            ndof : int,
+            atomic : bool = False,
+            must : bool = False,
             high_prec : bool = False,
             type_sel : List[int] = None,
             repeat : int = 1
@@ -338,7 +411,7 @@ class DeepmdDataSystem() :
         return b_data
 
     # ! altered by Marián Rynik
-    def get_test (self, 
+    def get_test (self,
                   sys_idx : int = None,
                   n_test : int = -1) :  # depreciated
         """
@@ -377,19 +450,19 @@ class DeepmdDataSystem() :
             return self.test_size[sys_idx]
         else :
             return self.test_size[self.pick_idx]
-            
+
     def get_type_map(self) -> List[str]:
         """
         Get the type map
         """
         return self.type_map
 
-    def get_nbatches (self) -> int: 
+    def get_nbatches (self) -> int:
         """
         Get the total number of batches
         """
         return self.nbatches
-    
+
     def get_ntypes (self) -> int:
         """
         Get the number of types
@@ -420,19 +493,22 @@ class DeepmdDataSystem() :
         else :
             name = name[-(width-3):]
             name = '-- ' + name
-            return name 
+            return name
 
     def print_summary(self, name) :
         # width 65
         sys_width = 42
         log.info(f"---Summary of DataSystem: {name:13s}-----------------------------------------------")
         log.info("found %d system(s):" % self.nsystems)
-        log.info(("%s  " % self._format_name_length('system', sys_width)) + 
+        log.info(("%s  " % self._format_name_length('system', sys_width)) +
                  ("%6s  %6s  %6s  %5s  %3s" % ('natoms', 'bch_sz', 'n_bch', 'prob', 'pbc')))
         for ii in range(self.nsystems) :
-            log.info("%s  %6d  %6d  %6d  %5.3f  %3s" % 
+            if ii >= 100:
+                log.info("Only shows pre-100 systems.")
+                break
+            log.info("%s  %6d  %6d  %6d  %5.3f  %3s" %
                      (self._format_name_length(self.system_dirs[ii], sys_width),
-                      self.natoms[ii], 
+                      self.natoms[ii],
                       # TODO batch size * nbatches = number of structures
                       self.batch_size[ii],
                       self.nbatches[ii],
@@ -487,7 +563,7 @@ class DeepmdDataSystem() :
             ret_prob = sys_probs
         assert np.sum(ret_prob) == 1, "sum of probs should be 1"
         return ret_prob
-    
+
     def _prob_sys_size_ext(self, keywords):
         block_str = keywords.split(';')[1:]
         block_stt = []
@@ -524,8 +600,8 @@ class DataSystem (object) :
                   set_prefix,
                   batch_size,
                   test_size,
-                  rcut, 
-                  run_opt = None) : 
+                  rcut,
+                  run_opt = None) :
         self.system_dirs = systems
         self.nsystems = len(self.system_dirs)
         self.batch_size = batch_size
@@ -614,7 +690,7 @@ class DataSystem (object) :
         else :
             name = name[-(width-3):]
             name = '-- ' + name
-            return name 
+            return name
 
     def print_summary(self) :
         tmp_msg = ""
@@ -625,10 +701,10 @@ class DataSystem (object) :
         tmp_msg += "%s  " % self.format_name_length('system', sys_width)
         tmp_msg += "%s  %s  %s\n" % ('natoms', 'bch_sz', 'n_bch')
         for ii in range(self.nsystems) :
-            tmp_msg += ("%s  %6d  %6d  %5d\n" % 
+            tmp_msg += ("%s  %6d  %6d  %5d\n" %
                         (self.format_name_length(self.system_dirs[ii], sys_width),
-                         self.natoms[ii], 
-                         self.batch_size[ii], 
+                         self.natoms[ii],
+                         self.batch_size[ii],
                          self.nbatches[ii]) )
         tmp_msg += "-----------------------------------------------------------------\n"
         log.info(tmp_msg)
@@ -656,7 +732,7 @@ class DataSystem (object) :
         assert np.sum(ret_prob) == 1, "sum of probs should be 1"
         return ret_prob
 
-    def get_batch (self, 
+    def get_batch (self,
                    sys_idx = None,
                    sys_weights = None,
                    style = "prob_sys_size") :
@@ -678,7 +754,7 @@ class DataSystem (object) :
         b_data["default_mesh"] = self.default_mesh[self.pick_idx]
         return b_data
 
-    def get_test (self, 
+    def get_test (self,
                   sys_idx = None) :
         if sys_idx is not None :
             idx = sys_idx
@@ -690,10 +766,10 @@ class DataSystem (object) :
         test_system_data["natoms_vec"] = self.natoms_vec[idx]
         test_system_data["default_mesh"] = self.default_mesh[idx]
         return test_system_data
-            
-    def get_nbatches (self) : 
+
+    def get_nbatches (self) :
         return self.nbatches
-    
+
     def get_ntypes (self) :
         return self.sys_ntypes
 
@@ -710,10 +786,10 @@ class DataSystem (object) :
         return self.has_fparam
 
 def _main () :
-    sys =  ['/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/20', 
-            '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/30', 
-            '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/38', 
-            '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/MoS2', 
+    sys =  ['/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/20',
+            '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/30',
+            '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/38',
+            '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/MoS2',
             '/home/wanghan/study/deep.md/results.01/data/mos2/only_raws/Pt_cluster']
     set_prefix = 'set'
     ds = DataSystem (sys, set_prefix, 4, 6)
@@ -722,4 +798,4 @@ def _main () :
 
 if __name__ == '__main__':
     _main()
-            
+

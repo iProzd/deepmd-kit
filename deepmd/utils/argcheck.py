@@ -75,7 +75,10 @@ def descrpt_se_a_args():
     doc_exclude_types = 'The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1.'
     doc_set_davg_zero = 'Set the normalization average to zero. This option should be set when `atom_ener` in the energy fitting is used'
     doc_attn = 'attn length'
-    
+    doc_attn_layer = 'attn layers'
+    doc_attn_dotr = 'attn dotr'
+    doc_attn_mask = 'attn mask'
+
     return [
         Argument("sel", [list,str], optional = True, default = "auto", doc = doc_sel),
         Argument("rcut", float, optional = True, default = 6.0, doc = doc_rcut),
@@ -90,7 +93,10 @@ def descrpt_se_a_args():
         Argument("seed", [int,None], optional = True, doc = doc_seed),
         Argument("exclude_types", list, optional = True, default = [], doc = doc_exclude_types),
         Argument("set_davg_zero", bool, optional = True, default = False, doc = doc_set_davg_zero),
-        Argument("attn", int, optional=True, default=100, doc=doc_attn)
+        Argument("attn", int, optional=True, default=100, doc=doc_attn),
+        Argument("attn_layer", int, optional=True, default=4, doc=doc_attn_layer),
+        Argument("attn_dotr", bool, optional=True, default=False, doc=doc_attn_dotr),
+        Argument("attn_mask", bool, optional=True, default=False, doc=doc_attn_mask)
     ]
 
 
@@ -574,6 +580,7 @@ def training_args():  # ! modified by Ziyao: data configuration isolated.
     doc_tensorboard = 'Enable tensorboard'
     doc_tensorboard_log_dir = 'The log directory of tensorboard outputs'
     doc_tensorboard_freq = 'The frequency of writing tensorboard events.'
+    doc_wandb_log = 'Log on wandb or not'
 
     arg_training_data = training_data_args()
     arg_validation_data = validation_data_args()
@@ -595,6 +602,7 @@ def training_args():  # ! modified by Ziyao: data configuration isolated.
         Argument("tensorboard", bool, optional=True, default=False, doc=doc_tensorboard),
         Argument("tensorboard_log_dir", str, optional=True, default='log', doc=doc_tensorboard_log_dir),
         Argument("tensorboard_freq", int, optional=True, default=1, doc=doc_tensorboard_freq),
+        Argument("wandb_log", bool, optional=True, default=False, doc=doc_wandb_log),
     ]
 
     doc_training = 'The training options.'

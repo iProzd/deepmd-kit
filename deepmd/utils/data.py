@@ -47,6 +47,7 @@ class DeepmdData() :
         self.dirs = glob.glob (os.path.join(sys_path, set_prefix + ".*"))
         self.dirs.sort()
         # load atom type
+        self.do_sel = self._check_sel(sys_path)
         self.atom_type = self._load_type(sys_path)
         self.natoms = len(self.atom_type)
         # load atom type map
@@ -73,8 +74,8 @@ class DeepmdData() :
                 self.train_dirs = self.dirs[:-1]
         self.data_dict = {}        
         # add box and coord
-        self.add('box', 9, must = self.pbc)
-        self.add('coord', 3, atomic = True, must = True)
+        self.add('box', 9, must=self.pbc)
+        self.add('coord', 3, atomic=True, must=True)
         # set counters
         self.set_count = 0
         self.iterator = 0
@@ -402,8 +403,7 @@ class DeepmdData() :
             if type(data[kk]) == np.ndarray and \
                len(data[kk].shape) == 2 and \
                data[kk].shape[0] == nframes and \
-               not('find_' in kk) and \
-               'type' != kk:
+               not('find_' in kk):
                 ret[kk] = data[kk][idx]
             else :
                 ret[kk] = data[kk]
@@ -422,7 +422,6 @@ class DeepmdData() :
         assert(coord.shape[1] == self.data_dict['coord']['ndof'] * self.natoms)
         # load keys
         data = {}
-        data['type'] = np.tile (self.atom_type[self.idx_map], (nframes, 1))
         for kk in self.data_dict.keys():
             if self.data_dict[kk]['reduce'] is None :
                 data['find_'+kk], data[kk] \
@@ -442,6 +441,17 @@ class DeepmdData() :
                 data['find_'+kk] = data['find_'+k_in]
                 tmp_in = data[k_in].astype(GLOBAL_ENER_FLOAT_PRECISION)
                 data[kk] = np.sum(np.reshape(tmp_in, [nframes, self.natoms, ndof]), axis = 1)
+
+        if self.do_sel:
+            type_path = os.path.join(set_name, "real_atom_types.npy")
+            data['type'] = np.load(type_path).astype(np.int32).reshape([nframes, -1])
+            natoms = data['type'].shape[1]
+            vec_path = os.path.join(set_name, "real_atom_numbs.npy")
+            tmp = np.load(vec_path).astype(np.int32).reshape([nframes, -1])
+            data['real_natoms_vec'] = np.concatenate((np.tile(np.array([natoms, natoms], dtype=np.int32), (nframes, 1)),
+                                                      tmp), axis=-1)
+        else:
+            data['type'] = np.tile(self.atom_type[self.idx_map], (nframes, 1))
 
         return data
 
@@ -514,6 +524,12 @@ class DeepmdData() :
         if os.path.isfile(os.path.join(sys_path, 'nopbc')) :
             pbc = False
         return pbc
+
+    def _check_sel(self, sys_path):
+        sel = False
+        if os.path.isfile(os.path.join(sys_path, 'set.000', 'real_atom_types.npy')):
+            sel = True
+        return sel
 
 
 class DataSets (object):

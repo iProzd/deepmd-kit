@@ -127,11 +127,44 @@ __global__ void fill_nlist(
     }
 }
 
+template<typename FPTYPE>
 __global__ void map_nlist(
-    int *nlist,
-    const int *nlist_map,
+    int * nlist,
+    int * ntype,
+    FPTYPE * nmask,
+    const int * r_type,
+    const int * nlist_map,
     const int nloc,
-    const int nnei
+    const int nnei,
+    const int real_num_types
+)
+{
+    int atom_idx=blockIdx.x;
+    int nei_idx=blockIdx.y*blockDim.y+threadIdx.y;
+    if(nei_idx>=nnei){return;}
+    int nlist_idx=atom_idx*nnei+nei_idx;
+    int nlist_item=nlist[nlist_idx];
+    int temp=0;
+    if(nlist_item!=-1){
+        temp=nlist_map[nlist_item];
+        nlist[nlist_idx]=temp;
+        ntype[nlist_idx]=r_type[temp];
+        nmask[nlist_idx]=1.;
+    }
+    else{
+        ntype[nlist_idx]=real_num_types;
+    }
+}
+
+template<typename FPTYPE>
+__global__ void map_nlist_noconvert(
+    int * nlist,
+    int * ntype,
+    FPTYPE * nmask,
+    const int * r_type,
+    const int nloc,
+    const int nnei,
+    const int real_num_types
 )
 {
     int atom_idx=blockIdx.x;
@@ -140,7 +173,11 @@ __global__ void map_nlist(
     int nlist_idx=atom_idx*nnei+nei_idx;
     int nlist_item=nlist[nlist_idx];
     if(nlist_item!=-1){
-        nlist[nlist_idx]=nlist_map[nlist_item];
+        ntype[nlist_idx]=r_type[nlist_item];
+        nmask[nlist_idx]=1.;
+    }
+    else{
+        ntype[nlist_idx]=real_num_types;
     }
 }
 
@@ -206,20 +243,35 @@ int build_nlist_gpu(
     return 0;
 }
 
+template <typename FPTYPE>
 void use_nlist_map(
-    int * nlist, 
+    int * nlist,
+    int * ntype,
+    FPTYPE * nmask,
+    const int * r_type,
     const int * nlist_map, 
     const int nloc, 
-    const int nnei)
+    const int nnei,
+    const int real_num_types,
+    const bool b_nlist_map)
 {
     int nblock=(nnei+TPB-1)/TPB;
     dim3 block_grid(nloc, nblock);
     dim3 thread_grid(1, TPB);
-    map_nlist<<<block_grid,thread_grid>>>(nlist, nlist_map, nloc, nnei);
+    DPErrcheck(cudaMemset(ntype, 0, sizeof(int) * nloc * nnei));
+    DPErrcheck(cudaMemset(nmask, 0, sizeof(FPTYPE) * nloc * nnei));
+    if (b_nlist_map){
+        map_nlist<<<block_grid,thread_grid>>>(nlist, ntype, nmask, r_type, nlist_map, nloc, nnei, real_num_types);
+    }
+    else{
+        map_nlist_noconvert<<<block_grid,thread_grid>>>(nlist, ntype, nmask, r_type, nloc, nnei, real_num_types);
+    }
     DPErrcheck(cudaGetLastError());
     DPErrcheck(cudaDeviceSynchronize());
 }
 
 template int build_nlist_gpu<float>(InputNlist & nlist, int * max_list_size, int * nlist_data, const float * c_cpy, const int & nloc, const int & nall, const int & mem_size, const float & rcut);
 template int build_nlist_gpu<double>(InputNlist & nlist, int * max_list_size, int * nlist_data, const double * c_cpy, const int & nloc, const int & nall, const int & mem_size, const float & rcut);
+template void use_nlist_map<float>(int * nlist, int * ntype, float * nmask, const int * r_type, const int * nlist_map, const int nloc, const int nnei, const int real_num_types, const bool b_nlist_map);
+template void use_nlist_map<double>(int * nlist, int * ntype, double * nmask, const int * r_type, const int * nlist_map, const int nloc, const int nnei, const int real_num_types, const bool b_nlist_map);
 }

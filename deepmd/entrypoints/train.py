@@ -86,7 +86,9 @@ def train(
 
     jdata = normalize(jdata)
 
+
     if not is_compress:
+        print('update_sel')
         jdata = update_sel(jdata)
 
     with open(output, "w") as fp:
@@ -180,15 +182,15 @@ def get_data(jdata: Dict[str, Any], rcut, type_map, modifier):
         log.fatal(msg)
         raise IOError(msg, help_msg)
     # rougly check all items in systems are valid
-    for ii in systems:
-        if (not os.path.isdir(ii)):
-            msg = f'dir {ii} is not a valid dir'
-            log.fatal(msg)
-            raise IOError(msg, help_msg)
-        if (not os.path.isfile(os.path.join(ii, 'type.raw'))):
-            msg = f'dir {ii} is not a valid data system dir'
-            log.fatal(msg)
-            raise IOError(msg, help_msg)
+    # for ii in tqdm(systems):
+    #     if (not os.path.isdir(ii)):
+    #         msg = f'dir {ii} is not a valid dir'
+    #         log.fatal(msg)
+    #         raise IOError(msg, help_msg)
+    #     if (not os.path.isfile(os.path.join(ii, 'type.raw'))):
+    #         msg = f'dir {ii} is not a valid data system dir'
+    #         log.fatal(msg)
+    #         raise IOError(msg, help_msg)
 
     batch_size = j_must_have(jdata, "batch_size")
     sys_probs = jdata.get("sys_probs", None)
@@ -207,6 +209,8 @@ def get_data(jdata: Dict[str, Any], rcut, type_map, modifier):
         auto_prob_style=auto_prob
     )
     data.add_dict(data_requirement)
+    # print('get data')
+    # embed()
 
     return data
 

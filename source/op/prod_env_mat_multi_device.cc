@@ -15,6 +15,7 @@ REGISTER_OP("ProdEnvMatA")
     .Input("mesh : int32")
     .Input("davg: T")           //average value of data
     .Input("dstd: T")           //standard deviation
+    .Input("r_type: int32")     //real atomic type, original is the same as "type"
     .Attr("rcut_a: float")      //no use
     .Attr("rcut_r: float")
     .Attr("rcut_r_smth: float")
@@ -23,7 +24,9 @@ REGISTER_OP("ProdEnvMatA")
     .Output("descrpt: T")
     .Output("descrpt_deriv: T")
     .Output("rij: T")
-    .Output("nlist: int32");
+    .Output("nlist: int32")
+    .Output("ntype: int32")
+    .Output("nmask: T");
     // only sel_a and rcut_r uesd.
 
 // an alias of ProdEnvMatA -- Compatible with v1.3
@@ -181,12 +184,18 @@ _build_nlist_gpu(
     const int & max_nnei_trial,
     const float & rcut_r);
 
+template <typename FPTYPE>
 static void
 _map_nlist_gpu(
     int * nlist,
+    int * ntype,
+    FPTYPE * nmask,
+    const int * r_type,
     const int * idx_mapping,
     const int & nloc,
-    const int & nnei);
+    const int & nnei,
+    const int & real_num_types,
+    const bool & b_nlist_map);
 
 template <typename FPTYPE>
 static void
@@ -335,6 +344,7 @@ public:
     const Tensor& mesh_tensor   = context->input(context_input_index++);
     const Tensor& avg_tensor	= context->input(context_input_index++);
     const Tensor& std_tensor	= context->input(context_input_index++);
+    const Tensor& r_type_tensor	= context->input(context_input_index++);
     // set size of the sample. assume 't' is [[[1, 1, 1], [2, 2, 2]], [[3, 3, 3], [4, 4, 4]]], then shape(t) ==> [2, 2, 3]
     OP_REQUIRES (context, (coord_tensor.shape().dims() == 2),       errors::InvalidArgument ("Dim of coord should be 2"));
     OP_REQUIRES (context, (type_tensor.shape().dims() == 2),        errors::InvalidArgument ("Dim of type should be 2"));
@@ -343,6 +353,7 @@ public:
     OP_REQUIRES (context, (mesh_tensor.shape().dims() == 1),        errors::InvalidArgument ("Dim of mesh should be 1"));
     OP_REQUIRES (context, (avg_tensor.shape().dims() == 2),         errors::InvalidArgument ("Dim of avg should be 2"));
     OP_REQUIRES (context, (std_tensor.shape().dims() == 2),         errors::InvalidArgument ("Dim of std should be 2"));
+    OP_REQUIRES (context, (r_type_tensor.shape().dims() == 2),        errors::InvalidArgument ("Dim of r_type should be 2"));
     OP_REQUIRES (context, (sec_r.back() == 0),                      errors::InvalidArgument ("Rotational free descriptor only support all-angular information: sel_r should be all zero."));
     OP_REQUIRES (context, (natoms_tensor.shape().dim_size(0) >= 3), errors::InvalidArgument ("number of atoms should be larger than (or equal to) 3"));
     DeviceFunctor() (
@@ -354,17 +365,20 @@ public:
     int nall = natoms[1];
     int ntypes = natoms_tensor.shape().dim_size(0) - 2; //nloc and nall mean something.
     int nsamples = coord_tensor.shape().dim_size(0);
+    int real_num_types = avg_tensor.shape().dim_size(0);
     //// check the sizes
     OP_REQUIRES (context, (nsamples == type_tensor.shape().dim_size(0)),  errors::InvalidArgument ("number of samples should match"));
     OP_REQUIRES (context, (nsamples == box_tensor.shape().dim_size(0)),   errors::InvalidArgument ("number of samples should match"));
-    OP_REQUIRES (context, (ntypes == avg_tensor.shape().dim_size(0)),     errors::InvalidArgument ("number of avg should be ntype"));
-    OP_REQUIRES (context, (ntypes == std_tensor.shape().dim_size(0)),     errors::InvalidArgument ("number of std should be ntype"));
+    OP_REQUIRES (context, (ntypes <= avg_tensor.shape().dim_size(0)),     errors::InvalidArgument ("number of avg should be ntype"));
+    OP_REQUIRES (context, (ntypes <= std_tensor.shape().dim_size(0)),     errors::InvalidArgument ("number of std should be ntype"));
+    OP_REQUIRES (context, (nsamples == r_type_tensor.shape().dim_size(0)),  errors::InvalidArgument ("number of samples should match"));
     
     OP_REQUIRES (context, (nall * 3 == coord_tensor.shape().dim_size(1)), errors::InvalidArgument ("number of atoms should match"));
     OP_REQUIRES (context, (nall == type_tensor.shape().dim_size(1)),      errors::InvalidArgument ("number of atoms should match"));
     OP_REQUIRES (context, (9 == box_tensor.shape().dim_size(1)),          errors::InvalidArgument ("number of box should be 9"));
     OP_REQUIRES (context, (ndescrpt == avg_tensor.shape().dim_size(1)),   errors::InvalidArgument ("number of avg should be ndescrpt"));
-    OP_REQUIRES (context, (ndescrpt == std_tensor.shape().dim_size(1)),   errors::InvalidArgument ("number of std should be ndescrpt"));   
+    OP_REQUIRES (context, (ndescrpt == std_tensor.shape().dim_size(1)),   errors::InvalidArgument ("number of std should be ndescrpt")); 
+    OP_REQUIRES (context, (nall == r_type_tensor.shape().dim_size(1)),      errors::InvalidArgument ("number of atoms should match"));  
     
     OP_REQUIRES (context, (ntypes == int(sel_a.size())),  errors::InvalidArgument ("number of types should match the length of sel array"));
     OP_REQUIRES (context, (ntypes == int(sel_r.size())),  errors::InvalidArgument ("number of types should match the length of sel array"));
@@ -403,12 +417,20 @@ public:
     TensorShape nlist_shape ;
     nlist_shape.AddDim (nsamples);
     nlist_shape.AddDim (nloc * nnei);
+    TensorShape ntype_shape ;
+    ntype_shape.AddDim (nsamples);
+    ntype_shape.AddDim (nloc * nnei);
+    TensorShape nmask_shape ;
+    nmask_shape.AddDim (nsamples);
+    nmask_shape.AddDim (nloc * nnei);
     // define output tensor
     int context_output_index = 0;
     Tensor* descrpt_tensor = NULL;
     Tensor* descrpt_deriv_tensor = NULL;
     Tensor* rij_tensor = NULL;
     Tensor* nlist_tensor = NULL;
+    Tensor* ntype_tensor = NULL;
+    Tensor* nmask_tensor = NULL;
     OP_REQUIRES_OK(context, context->allocate_output(
         context_output_index++,
         descrpt_shape,
@@ -425,16 +447,27 @@ public:
         context_output_index++,
         nlist_shape,
         &nlist_tensor));
+    OP_REQUIRES_OK(context, context->allocate_output(
+        context_output_index++,
+        ntype_shape,
+        &ntype_tensor));
+    OP_REQUIRES_OK(context, context->allocate_output(
+        context_output_index++,
+        nmask_shape,
+        &nmask_tensor));
 
     FPTYPE * p_em = descrpt_tensor->flat<FPTYPE>().data();
     FPTYPE * p_em_deriv = descrpt_deriv_tensor->flat<FPTYPE>().data();
     FPTYPE * p_rij = rij_tensor->flat<FPTYPE>().data();
     int * p_nlist = nlist_tensor->flat<int>().data();
+    int * p_ntype = ntype_tensor->flat<int>().data();
+    FPTYPE * p_nmask = nmask_tensor->flat<FPTYPE>().data();
     const FPTYPE * p_coord = coord_tensor.flat<FPTYPE>().data();
     const FPTYPE * p_box = box_tensor.flat<FPTYPE>().data();
     const FPTYPE * avg = avg_tensor.flat<FPTYPE>().data();
     const FPTYPE * std = std_tensor.flat<FPTYPE>().data();
     const int * p_type = type_tensor.flat<int>().data();
+    const int * p_r_type = r_type_tensor.flat<int>().data();
 
     // loop over samples
     for(int ff = 0; ff < nsamples; ++ff){
@@ -442,9 +475,13 @@ public:
       FPTYPE * em_deriv = p_em_deriv + ff*nloc*ndescrpt*3;
       FPTYPE * rij = p_rij + ff*nloc*nnei*3;
       int * nlist = p_nlist + ff*nloc*nnei;
+      int * ntype = p_ntype + ff*nloc*nnei;
+      FPTYPE * nmask = p_nmask + ff*nloc*nnei;
       const FPTYPE * coord = p_coord + ff*nall*3;
       const FPTYPE * box = p_box + ff*9;
       const int * type = p_type + ff*nall;
+      const int * r_type = p_r_type + ff*nall;
+
 
     if(device == "GPU") {
       #if GOOGLE_CUDA
@@ -480,9 +517,18 @@ public:
       // launch the gpu(nv) compute function
       deepmd::prod_env_mat_a_gpu_cuda(
           em, em_deriv, rij, nlist, 
-          coord, type, gpu_inlist, array_int, array_longlong, max_nbor_size, avg, std, nloc, frame_nall, rcut_r, rcut_r_smth, sec_a);
-      if(b_nlist_map) _map_nlist_gpu(nlist, idx_mapping, nloc, nnei);
+          coord, type, r_type, gpu_inlist, array_int, array_longlong, max_nbor_size, avg, std, nloc, frame_nall, rcut_r, rcut_r_smth, sec_a);
+      _map_nlist_gpu(nlist, ntype, nmask, r_type, idx_mapping, nloc, nnei, real_num_types, b_nlist_map);
       deepmd::delete_device_memory(firstneigh);
+      // int *  ntype_cpu = new int [nloc*nnei];
+      // deepmd::memcpy_device_to_host(ntype, ntype_cpu, nloc*nnei);
+      // for (int ii=0; ii<nloc; ii++){
+      //   std::cout<<"nei "<<ii<<"   :"<<std::endl;
+      //   for (int jj=0; jj<nnei;jj++){
+      //     std::cout<<ntype_cpu[ii*nnei+jj]<<"  ";
+      //   }
+      //   std::cout<<std::endl;
+      // }
       #endif //GOOGLE_CUDA
 
       #if TENSORFLOW_USE_ROCM
@@ -745,7 +791,7 @@ public:
       deepmd::prod_env_mat_r_gpu_cuda(
           em, em_deriv, rij, nlist, 
           coord, type, gpu_inlist, array_int, array_longlong, max_nbor_size, avg, std, nloc, frame_nall, rcut, rcut_smth, sec);
-      if(b_nlist_map) _map_nlist_gpu(nlist, idx_mapping, nloc, nnei);
+      // if(b_nlist_map) _map_nlist_gpu(nlist, idx_mapping, nloc, nnei);
       deepmd::delete_device_memory(firstneigh);
       #endif //GOOGLE_CUDA
 
@@ -1114,14 +1160,20 @@ _build_nlist_gpu(
   return (tt != max_nnei_trial);
 }
 
+template <typename FPTYPE>
 static void
 _map_nlist_gpu(
     int * nlist,
+    int * ntype,
+    FPTYPE * nmask,
+    const int * r_type,
     const int * idx_mapping,
     const int & nloc,
-    const int & nnei)
+    const int & nnei,
+    const int & real_num_types,
+    const bool & b_nlist_map)
 {
-  deepmd::use_nlist_map(nlist, idx_mapping, nloc, nnei);
+  deepmd::use_nlist_map(nlist, ntype, nmask, r_type, idx_mapping, nloc, nnei, real_num_types, b_nlist_map);
 }
 
 template <typename FPTYPE>

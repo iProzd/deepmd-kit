@@ -40,7 +40,7 @@ else:
 
 cmake_args = []
 # get variant option from the environment varibles, available: cpu, cuda, rocm
-dp_variant = os.environ.get("DP_VARIANT", "cpu").lower()
+dp_variant = os.environ.get("DP_VARIANT", "cuda").lower()
 if dp_variant == "cpu" or dp_variant == "":
     pass
 elif dp_variant == "cuda":

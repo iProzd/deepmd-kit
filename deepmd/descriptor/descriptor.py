@@ -280,65 +280,26 @@ class Descriptor(ABC):
         feed_dict : dict[str, tf.Tensor]
             The output feed_dict of current descriptor
         """
-        feed_dict = {
-            't_coord:0'  :coord_,
-            't_type:0'   :atype_,
-            't_natoms:0' :natoms,
-            't_box:0'    :box,
-            't_mesh:0'   :mesh
-        }
-        return feed_dict
+        # TODO: currently only SeA has this method, but I think the method can be
+        # moved here as it doesn't contain anything related to a specific descriptor
+        raise NotImplementedError
 
     def init_variables(self,
-                       model_file: str,
-                       suffix : str = "",
-    ) -> None:
+                       embedding_net_variables: dict
+                       ) -> None:
         """
         Init the embedding net variables with the given dict
 
         Parameters
         ----------
-        model_file : str
-            The input model file
-        suffix : str, optional
-            The suffix of the scope
+        embedding_net_variables
+                The input dict which stores the embedding net variables
         
         Notes
         -----
         This method is called by others when the descriptor supported initialization from the given variables.
         """
+        # TODO: currently only SeA has this method, but I think the method can be
+        # moved here as it doesn't contain anything related to a specific descriptor
         raise NotImplementedError(
             "Descriptor %s doesn't support initialization from the given variables!" % type(self).__name__)
-
-    def get_tensor_names(self, suffix : str = "") -> Tuple[str]:
-        """Get names of tensors.
-        
-        Parameters
-        ----------
-        suffix : str
-            The suffix of the scope
-
-        Returns
-        -------
-        Tuple[str]
-            Names of tensors
-        """
-        raise NotImplementedError("Descriptor %s doesn't support this property!" % type(self).__name__)
-
-    def pass_tensors_from_frz_model(self,
-                                    *tensors : tf.Tensor,
-    ) -> None:
-        """
-        Pass the descrpt_reshape tensor as well as descrpt_deriv tensor from the frz graph_def
-
-        Parameters
-        ----------
-        *tensors : tf.Tensor
-            passed tensors
-        
-        Notes
-        -----
-        The number of parameters in the method must be equal to the numbers of returns in
-        :meth:`get_tensor_names`.
-        """
-        raise NotImplementedError("Descriptor %s doesn't support this method!" % type(self).__name__)

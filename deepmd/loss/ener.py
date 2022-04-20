@@ -4,6 +4,7 @@ from deepmd.common import ClassArg, add_data_requirement
 
 from deepmd.env import global_cvt_2_tf_float
 from deepmd.env import global_cvt_2_ener_float
+# from deepmd.env import wb
 from deepmd.utils.sess import run_sess
 
 class EnerStdLoss () :
@@ -141,12 +142,15 @@ class EnerStdLoss () :
         results = {"natoms": natoms[0], "rmse": np.sqrt(error)}
         if self.has_e:
             results["rmse_e"] = np.sqrt(error_e) / natoms[0]
+            results["l2_e"] = error_e / natoms[0]
         if self.has_ae:
             results["rmse_ae"] = np.sqrt(error_ae)
         if self.has_f:
             results["rmse_f"] = np.sqrt(error_f)
+            results["l2_f"] = error_f
         if self.has_v:
             results["rmse_v"] = np.sqrt(error_v) / natoms[0]
+            results["l2_v"] = error_v / natoms[0]
         if self.has_pf:
             results["rmse_pf"] = np.sqrt(error_pf)
         return results
@@ -202,7 +206,6 @@ class EnerStdLoss () :
 
         error_test, error_e_test, error_f_test, error_v_test, error_ae_test, error_pf_test = test_out
 
-        
         print_str = ""
         prop_fmt = "   %11.2e %11.2e"
         print_str += prop_fmt % (np.sqrt(error_test), np.sqrt(error_train))

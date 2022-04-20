@@ -108,11 +108,17 @@ void convert_nlist_gpu_device(
 void free_nlist_gpu_device(
     InputNlist & gpu_nlist);
 
+template <typename FPTYPE>
 void use_nlist_map(
     int * nlist, 
+    int * ntype,
+    FPTYPE * nmask,
+    const int * r_type,
     const int * nlist_map, 
     const int nloc, 
-    const int nnei);
+    const int nnei,
+    const int real_num_types,
+    const bool b_nlist_map);
 
 #endif //GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 

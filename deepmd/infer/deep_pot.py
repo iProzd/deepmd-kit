@@ -114,6 +114,12 @@ class DeepPot(DeepEval):
             self.t_aparam = None
             self.has_aparam = False
 
+        if 'load/f_type' in operations or 'load/f_natoms' in operations:
+            assert 'load/f_type' in operations and 'load/f_natoms' in operations, 'sel_mode graph error'
+            self.tensors.update({"f_type": "f_type:0"})
+            self.tensors.update({"f_natoms": "f_natoms:0"})
+            self.sel_mode = True
+
         # now load tensors to object attributes
         for attr_name, tensor_name in self.tensors.items():
             self._get_tensor(tensor_name, attr_name)
@@ -137,7 +143,6 @@ class DeepPot(DeepEval):
             t_ewald_h = self._get_tensor("modifier_attr/ewald_h:0")
             t_ewald_beta = self._get_tensor("modifier_attr/ewald_beta:0")
             [mdl_name, mdl_charge_map, sys_charge_map, ewald_h, ewald_beta] = run_sess(self.sess, [t_mdl_name, t_mdl_charge_map, t_sys_charge_map, t_ewald_h, t_ewald_beta])
-            mdl_name = mdl_name.decode("UTF-8")
             mdl_charge_map = [int(ii) for ii in mdl_charge_map.decode("UTF-8").split()]
             sys_charge_map = [int(ii) for ii in sys_charge_map.decode("UTF-8").split()]
             self.dm = DipoleChargeModifier(mdl_name, mdl_charge_map, sys_charge_map, ewald_h = ewald_h, ewald_beta = ewald_beta)
@@ -324,6 +329,10 @@ class DeepPot(DeepEval):
             feed_dict_test[self.t_fparam] = np.reshape(fparam, [-1])
         if self.has_aparam:
             feed_dict_test[self.t_aparam] = np.reshape(aparam, [-1])
+        if self.sel_mode:
+            feed_dict_test[self.f_type] = np.zeros_like(feed_dict_test[self.t_type])
+            feed_dict_test[self.f_natoms] = np.array([natoms_vec[0], natoms_vec[1], natoms_vec[1]])
+
         v_out = self.sess.run (t_out, feed_dict = feed_dict_test)
         energy = v_out[0]
         force = v_out[1]

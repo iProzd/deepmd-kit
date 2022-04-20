@@ -32,9 +32,17 @@ def make_stat_input(data, nbatches, merge_sys = True):
             all_stat[key][batch_idx][frame_idx]
     """
     all_stat = defaultdict(list)
-    for ii in range(data.get_nsystems()) :
+    if data.get_nsystems() > 10000:
+        print('choose random 10000 sys to stat')
+        np.random.seed(100)
+        stat_ind = np.random.choice(range(data.get_nsystems()), size=10000, replace=False)
+        # print(stat_ind)
+    else:
+        stat_ind = range(data.get_nsystems())
+    for ii in stat_ind:
         sys_stat =  defaultdict(list)
         for jj in range(nbatches) :
+        # for jj in range(10):
             stat_data = data.get_batch (sys_idx = ii)
             for dd in stat_data:
                 if dd == "natoms_vec":

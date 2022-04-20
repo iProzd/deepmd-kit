@@ -43,13 +43,14 @@ void prod_env_mat_r_cpu(
 
 #if GOOGLE_CUDA
 template<typename FPTYPE> 
-void prod_env_mat_a_gpu_cuda(    
+void prod_env_mat_a_gpu_cuda(
     FPTYPE * em, 
     FPTYPE * em_deriv, 
     FPTYPE * rij, 
     int * nlist, 
     const FPTYPE * coord, 
     const int * type, 
+    const int * r_type,
     const InputNlist & gpu_inlist,
     int * array_int, 
     unsigned long long * array_longlong,
