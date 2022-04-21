@@ -204,6 +204,7 @@ def test_ener(
         data.add("aparam", dp.get_dim_aparam(), atomic=True, must=True, high_prec=False)
 
     test_data = data.get_test()
+    large_batch_mode = data.do_sel
     natoms = len(test_data["type"][0])
     nframes = test_data["box"].shape[0]
     numb_test = min(nframes, numb_test)
@@ -216,7 +217,10 @@ def test_ener(
         efield = None
     if not data.pbc:
         box = None
-    atype = test_data["type"][0]
+    if large_batch_mode:
+        atype = test_data["type"][:numb_test].reshape([numb_test, -1])
+    else:
+        atype = test_data["type"][0]
     if dp.get_dim_fparam() > 0:
         fparam = test_data["fparam"][:numb_test]
     else:
@@ -234,6 +238,7 @@ def test_ener(
         aparam=aparam,
         atomic=has_atom_ener,
         efield=efield,
+        large_batch_mode=large_batch_mode,
     )
     energy = ret[0]
     force = ret[1]

@@ -150,7 +150,7 @@ class DeepEval:
 
     @staticmethod
     def sort_input(
-        coord : np.ndarray, atom_type : np.ndarray, sel_atoms : List[int] = None
+        coord : np.ndarray, atom_type : np.ndarray, sel_atoms : List[int] = None, large_batch_mode: bool = False
     ):
         """
         Sort atoms in the system according their types.
@@ -182,6 +182,11 @@ class DeepEval:
                 Only output if sel_atoms is not None
                 The index mapping from the selected atoms to sorted selected atoms.
         """
+        ## todo resort the atoms if necessary in large_batch_mode
+        if large_batch_mode:
+            natoms = atom_type[0].size
+            idx_map = np.arange(natoms)
+            return coord, atom_type, idx_map
         if sel_atoms is not None:
             selection = [False] * np.size(atom_type)
             for ii in sel_atoms:
@@ -226,7 +231,7 @@ class DeepEval:
         return ret
 
 
-    def make_natoms_vec(self, atom_types : np.ndarray) -> np.ndarray :
+    def make_natoms_vec(self, atom_types : np.ndarray, large_batch_mode : bool =False) -> np.ndarray :
         """Make the natom vector used by deepmd-kit.
 
         Parameters
@@ -243,10 +248,15 @@ class DeepEval:
                 natoms[i]: 2 <= i < Ntypes+2, number of type i atoms
   
         """
+        if large_batch_mode:
+            atom_types = atom_types[0]
         natoms_vec = np.zeros (self.ntypes+2).astype(int)
         natoms = atom_types.size
         natoms_vec[0] = natoms
         natoms_vec[1] = natoms
+        if large_batch_mode:
+            natoms_vec[2] = natoms
+            return natoms_vec
         for ii in range (self.ntypes) :
             natoms_vec[ii+2] = np.count_nonzero(atom_types == ii)
         return natoms_vec

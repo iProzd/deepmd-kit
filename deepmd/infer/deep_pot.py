@@ -183,7 +183,8 @@ class DeepPot(DeepEval):
         atomic: bool = False,
         fparam: Optional[np.ndarray] = None,
         aparam: Optional[np.ndarray] = None,
-        efield: Optional[np.ndarray] = None
+        efield: Optional[np.ndarray] = None,
+        large_batch_mode: bool = False,
     ) -> Tuple[np.ndarray, ...]:
         """Evaluate the energy, force and virial by using this DP.
 
@@ -232,9 +233,9 @@ class DeepPot(DeepEval):
         if atomic:
             if self.modifier_type is not None:
                 raise RuntimeError('modifier does not support atomic modification')
-            return self._eval_inner(coords, cells, atom_types, fparam = fparam, aparam = aparam, atomic = atomic, efield = efield)
+            return self._eval_inner(coords, cells, atom_types, fparam = fparam, aparam = aparam, atomic = atomic, efield = efield, large_batch_mode=large_batch_mode)
         else :
-            e, f, v = self._eval_inner(coords, cells, atom_types, fparam = fparam, aparam = aparam, atomic = atomic, efield = efield)
+            e, f, v = self._eval_inner(coords, cells, atom_types, fparam = fparam, aparam = aparam, atomic = atomic, efield = efield, large_batch_mode=large_batch_mode)
             if self.modifier_type is not None:
                 me, mf, mv = self.dm.eval(coords, cells, atom_types)
                 e += me.reshape(e.shape)
@@ -250,13 +251,20 @@ class DeepPot(DeepEval):
         fparam=None,
         aparam=None,
         atomic=False,
-        efield=None
+        efield=None,
+        large_batch_mode=False,
     ):
         # standarize the shape of inputs
-        atom_types = np.array(atom_types, dtype = int).reshape([-1])
-        natoms = atom_types.size
-        coords = np.reshape(np.array(coords), [-1, natoms * 3])
-        nframes = coords.shape[0]
+        if not large_batch_mode:
+            atom_types = np.array(atom_types, dtype = int).reshape([-1])
+            natoms = atom_types.size
+            coords = np.reshape(np.array(coords), [-1, natoms * 3])
+            nframes = coords.shape[0]
+        else:
+            natoms = atom_types[0].size
+            atom_types = np.array(atom_types, dtype=int).reshape([-1, natoms])
+            coords = np.reshape(np.array(coords), [-1, natoms * 3])
+            nframes = coords.shape[0]
         if cells is None:
             pbc = False
             # make cells to work around the requirement of pbc
@@ -296,20 +304,23 @@ class DeepPot(DeepEval):
                 raise RuntimeError('got wrong size of frame param, should be either %d x %d x %d or %d x %d or %d' % (nframes, natoms, fdim, natoms, fdim, fdim))
 
         # sort inputs
-        coords, atom_types, imap = self.sort_input(coords, atom_types)
+        coords, atom_types, imap = self.sort_input(coords, atom_types, large_batch_mode=large_batch_mode)
         if self.has_efield:
             efield = np.reshape(efield, [nframes, natoms, 3])
             efield = efield[:,imap,:]
             efield = np.reshape(efield, [nframes, natoms*3])            
 
         # make natoms_vec and default_mesh
-        natoms_vec = self.make_natoms_vec(atom_types)
+        natoms_vec = self.make_natoms_vec(atom_types, large_batch_mode=large_batch_mode)
         assert(natoms_vec[0] == natoms)
 
         # evaluate
         feed_dict_test = {}
         feed_dict_test[self.t_natoms] = natoms_vec
-        feed_dict_test[self.t_type  ] = np.tile(atom_types, [nframes, 1]).reshape([-1])
+        if not large_batch_mode:
+            feed_dict_test[self.t_type  ] = np.tile(atom_types, [nframes, 1]).reshape([-1])
+        else:
+            feed_dict_test[self.t_type] = atom_types.reshape([-1])
         t_out = [self.t_energy, 
                  self.t_force, 
                  self.t_virial]
