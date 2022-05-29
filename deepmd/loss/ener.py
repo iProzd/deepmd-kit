@@ -142,12 +142,15 @@ class EnerStdLoss () :
         results = {"natoms": natoms[0], "rmse": np.sqrt(error)}
         if self.has_e:
             results["rmse_e"] = np.sqrt(error_e) / natoms[0]
+            results["l2_e"] = error_e / natoms[0]
         if self.has_ae:
             results["rmse_ae"] = np.sqrt(error_ae)
         if self.has_f:
             results["rmse_f"] = np.sqrt(error_f)
+            results["l2_f"] = error_f
         if self.has_v:
             results["rmse_v"] = np.sqrt(error_v) / natoms[0]
+            results["l2_v"] = error_v / natoms[0]
         if self.has_pf:
             results["rmse_pf"] = np.sqrt(error_pf)
         return results

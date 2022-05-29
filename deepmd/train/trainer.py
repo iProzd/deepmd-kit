@@ -33,6 +33,8 @@ import deepmd.op
 
 from deepmd.common import j_must_have, ClassArg, data_requirement, get_precision
 
+import wandb as wb
+
 log = logging.getLogger(__name__)
 
 
@@ -62,6 +64,11 @@ class DPTrainer (object):
         typeebd_param = model_param.get('type_embedding', None)
         self.model_param    = model_param
         self.descrpt_param  = descrpt_param
+        name_path = os.path.abspath('.').split('/')
+        self.wb_log = model_param['wb_log']
+        if self.wb_log:
+            wb.init(project="attention_models", entity="dp_model_engineering", config=jdata,
+                    name=name_path[-2] + '/' + name_path[-1])
         
         # descriptor
         try:
@@ -601,8 +608,17 @@ class DPTrainer (object):
                          valid_batches,
                          print_header=False):
         train_results = self.get_evaluation_results(train_batches)
+        train_logs = {}
+        for k, v in train_results.items():
+            train_logs[k + '_train'] = v
+        if self.wb_log:
+            wb.log(train_logs, step=self.cur_batch)
         valid_results = self.get_evaluation_results(valid_batches)
-
+        valid_logs = {}
+        for k, v in valid_results.items():
+            valid_logs[k + '_valid'] = v
+        if self.wb_log:
+            wb.log(valid_logs, step=self.cur_batch)
         cur_batch = self.cur_batch
         current_lr = run_sess(self.sess, self.learning_rate)
         if print_header:
