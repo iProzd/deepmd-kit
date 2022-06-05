@@ -195,8 +195,8 @@ init (const std::string & model, const int & gpu_rank, const std::string & file_
   DPGetDeviceCount(gpu_num); // check current device environment
   if (gpu_num > 0) {
     options.config.set_allow_soft_placement(true);
-    options.config.mutable_gpu_options()->set_per_process_gpu_memory_fraction(0.9);
-    options.config.mutable_gpu_options()->set_allow_growth(true);
+//    options.config.mutable_gpu_options()->set_per_process_gpu_memory_fraction(0.9);
+//    options.config.mutable_gpu_options()->set_allow_growth(true);
     DPErrcheck(DPSetDevice(gpu_rank % gpu_num));
     std::string str = "/gpu:";
     str += std::to_string(gpu_rank % gpu_num);
@@ -527,8 +527,8 @@ init (const std::vector<std::string> & models, const int & gpu_rank, const std::
   #if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
   if (gpu_num > 0) {
       options.config.set_allow_soft_placement(true);
-      options.config.mutable_gpu_options()->set_per_process_gpu_memory_fraction(0.9);
-      options.config.mutable_gpu_options()->set_allow_growth(true);
+//      options.config.mutable_gpu_options()->set_per_process_gpu_memory_fraction(0.9);
+//      options.config.mutable_gpu_options()->set_allow_growth(true);
       DPErrcheck(DPSetDevice(gpu_rank % gpu_num));
   }
   #endif // GOOGLE_CUDA || TENSORFLOW_USE_ROCM

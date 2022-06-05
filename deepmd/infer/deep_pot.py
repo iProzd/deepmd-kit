@@ -114,12 +114,6 @@ class DeepPot(DeepEval):
             self.t_aparam = None
             self.has_aparam = False
 
-        if 'load/f_type' in operations or 'load/f_natoms' in operations:
-            assert 'load/f_type' in operations and 'load/f_natoms' in operations, 'sel_mode graph error'
-            self.tensors.update({"f_type": "f_type:0"})
-            self.tensors.update({"f_natoms": "f_natoms:0"})
-            self.sel_mode = True
-
         # now load tensors to object attributes
         for attr_name, tensor_name in self.tensors.items():
             self._get_tensor(tensor_name, attr_name)
@@ -340,9 +334,6 @@ class DeepPot(DeepEval):
             feed_dict_test[self.t_fparam] = np.reshape(fparam, [-1])
         if self.has_aparam:
             feed_dict_test[self.t_aparam] = np.reshape(aparam, [-1])
-        if self.sel_mode:
-            feed_dict_test[self.f_type] = np.zeros_like(feed_dict_test[self.t_type])
-            feed_dict_test[self.f_natoms] = np.array([natoms_vec[0], natoms_vec[1], natoms_vec[1]])
 
         v_out = self.sess.run (t_out, feed_dict = feed_dict_test)
         energy = v_out[0]

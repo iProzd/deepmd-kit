@@ -381,6 +381,11 @@ class EnerFitting ():
                 The system energy
         """
         bias_atom_e = self.bias_atom_e
+        self.bias_atom_e_t = tf.get_variable('t_bias_atom_e',
+                            self.bias_atom_e.shape,
+                            dtype=GLOBAL_TF_FLOAT_PRECISION,
+                            trainable=False,
+                            initializer=tf.constant_initializer(self.bias_atom_e))
         if self.numb_fparam > 0 and ( self.fparam_avg is None or self.fparam_inv_std is None ):
             raise RuntimeError('No data stat result. one should do data statisitic, before build')
         if self.numb_aparam > 0 and ( self.aparam_avg is None or self.aparam_inv_std is None ):
@@ -442,7 +447,9 @@ class EnerFitting ():
         # else:
         #     type_embedding = None
         if type_embedding is not None:
-            atype_embed = tf.nn.embedding_lookup(type_embedding, atype)
+            atype_nall = tf.reshape(atype, [-1, natoms[1]])
+            self.atype_nloc = tf.reshape(tf.slice(atype_nall, [0, 0], [-1, natoms[0]]), [-1])  ## lammps will make error
+            atype_embed = tf.nn.embedding_lookup(type_embedding, self.atype_nloc)
         else:
             atype_embed = None
 
@@ -496,7 +503,7 @@ class EnerFitting ():
             outs = tf.reshape(final_layer, [tf.shape(inputs)[0], natoms[0]])
             # add bias
             self.atom_ener_before = outs
-            self.add_type = tf.reshape(tf.nn.embedding_lookup(tf.constant(self.bias_atom_e), atype), [tf.shape(inputs)[0], natoms[0]])
+            self.add_type = tf.reshape(tf.nn.embedding_lookup(self.bias_atom_e_t, self.atype_nloc), [tf.shape(inputs)[0], natoms[0]])
             outs = outs + self.add_type
             self.atom_ener_after = outs
             # zd

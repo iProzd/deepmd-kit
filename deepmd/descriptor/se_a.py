@@ -180,8 +180,6 @@ class DescrptSeA(Descriptor):
 
         avg_zero = np.zeros([self.ntypes, self.ndescrpt]).astype(GLOBAL_NP_FLOAT_PRECISION)
         std_ones = np.ones([self.ntypes, self.ndescrpt]).astype(GLOBAL_NP_FLOAT_PRECISION)
-        self.place_holders['fake_type'] = tf.placeholder(tf.int32, [None], name='f_type')  ## modified 1 type vector
-        self.place_holders['fake_natoms_vec'] = tf.placeholder(tf.int32, [3], name='f_natoms')
         sub_graph = tf.Graph()
         with sub_graph.as_default():
             name_pfx = 'd_sea_'
@@ -458,7 +456,8 @@ class DescrptSeA(Descriptor):
         coord = tf.reshape(coord_, [-1, natoms[1] * 3])
         box = tf.reshape(box_, [-1, 9])
         atype = tf.reshape(atype_, [-1, natoms[1]])
-        u_atype = tf.reshape(self.place_holders['fake_type'], [-1, natoms[1]])
+        u_atype = tf.zeros_like(atype)
+        u_natoms = tf.stack([natoms[0], natoms[1], natoms[1]])
         # out todo
         self.attn_weight = [None for i in range(self.attn_layer)]
         self.angular_weight = [None for i in range(self.attn_layer)]
@@ -471,7 +470,7 @@ class DescrptSeA(Descriptor):
         self.descrpt, self.descrpt_deriv, self.rij, self.nlist, self.nei_type_vec, self.nmask \
             = op_module.prod_env_mat_a(coord,
                                        u_atype,
-                                       self.place_holders['fake_natoms_vec'],
+                                       u_natoms,
                                        box,
                                        mesh,
                                        self.t_avg,
@@ -496,9 +495,10 @@ class DescrptSeA(Descriptor):
         self.descrpt_deriv = tf.identity(self.descrpt_deriv, name='o_rmat_deriv' + suffix)
         self.rij = tf.identity(self.rij, name='o_rij' + suffix)
         self.nlist = tf.identity(self.nlist, name='o_nlist' + suffix)
+        self.atype_nloc = tf.reshape(tf.slice(atype, [0, 0], [-1, natoms[0]]), [-1])  ## lammps will make error
 
         self.dout, self.qmat = self._pass_filter(self.descrpt_reshape,
-                                                 atype_,
+                                                 self.atype_nloc,
                                                  natoms,
                                                  input_dict,
                                                  suffix=suffix,

@@ -655,11 +655,6 @@ class DPTrainer (object):
         for ii in ['natoms_vec', 'default_mesh']:
             feed_dict[self.place_holders[ii]] = batch[ii]
         feed_dict[self.place_holders['is_training']] = is_training
-        feed_dict[self.descrpt.place_holders['fake_natoms_vec']] = \
-            np.array([batch['natoms_vec'][0], batch['natoms_vec'][1], batch['natoms_vec'][1]])
-        feed_dict[self.descrpt.place_holders['fake_type']] = np.zeros_like(feed_dict[self.place_holders['type']])
-        # print('feed_dict')
-        # embed()
         return feed_dict
 
     def get_global_step(self):
