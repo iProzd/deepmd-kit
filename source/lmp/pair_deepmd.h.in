@@ -1,3 +1,7 @@
+#ifndef LAMMPS_VERSION_NUMBER
+#error Please define LAMMPS_VERSION_NUMBER to yyyymmdd
+#endif
+
 #ifdef PAIR_CLASS
 
 PairStyle(deepmd,PairDeepMD)
@@ -44,26 +48,26 @@ namespace LAMMPS_NS {
 class PairDeepMD : public Pair {
  public:
   PairDeepMD(class LAMMPS *);
-  virtual ~PairDeepMD();
-  virtual void compute(int, int);
-  virtual void *extract(const char *, int &);
-  void settings(int, char **);
-  virtual void coeff(int, char **);
-  void init_style();
-  virtual void write_restart(FILE *);
-  virtual void read_restart(FILE *);
-  double init_one(int i, int j);
-  int pack_reverse_comm(int, int, double *);
-  void unpack_reverse_comm(int, int *, double *);
+  ~PairDeepMD() override;
+  void compute(int, int) override;
+  void *extract(const char *, int &) override;
+  void settings(int, char **) override;
+  void coeff(int, char **) override;
+  void init_style() override;
+  void write_restart(FILE *) override;
+  void read_restart(FILE *) override;
+  double init_one(int i, int j) override;
+  int pack_reverse_comm(int, int, double *) override;
+  void unpack_reverse_comm(int, int *, double *) override;
   void print_summary(const std::string pre) const;
   int get_node_rank();
   std::string get_file_content(const std::string & model);
   std::vector<std::string> get_file_content(const std::vector<std::string> & models);
- protected:  
+ protected:
   virtual void allocate();
   double **scale;
 
-private:  
+private:
   deepmd::DeepPot deep_pot;
   deepmd::DeepPotModelDevi deep_pot_model_devi;
   unsigned numb_models;
@@ -93,6 +97,25 @@ private:
   float eps;
   float eps_v;
 #endif
+
+  void make_fparam_from_compute(
+#ifdef HIGH_PREC
+      std::vector<double > & fparam
+#else
+      std::vector<float > & fparam
+#endif
+      );
+  bool do_compute;
+  std::string compute_id;
+
+    void make_ttm_fparam(
+#ifdef HIGH_PREC
+      std::vector<double > & fparam
+#else
+      std::vector<float > & fparam
+#endif
+      );
+
   void make_ttm_aparam(
 #ifdef HIGH_PREC
       std::vector<double > & dparam
@@ -105,6 +128,7 @@ private:
   int *counts,*displacements;
   tagint *tagsend, *tagrecv;
   double *stdfsend, *stdfrecv;
+  std::vector<int> type_idx_map;
 };
 
 }

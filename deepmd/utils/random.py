@@ -1,10 +1,13 @@
-import numpy as np
+from typing import (
+    Optional,
+)
 
+import numpy as np
 
 _RANDOM_GENERATOR = np.random.RandomState()
 
 
-def choice(a: np.ndarray, p: np.ndarray = None):
+def choice(a: np.ndarray, p: Optional[np.ndarray] = None):
     """Generates a random sample from a given 1-D array.
 
     Parameters
@@ -38,7 +41,7 @@ def random(size=None):
     return _RANDOM_GENERATOR.random_sample(size)
 
 
-def seed(val: int = None):
+def seed(val: Optional[int] = None):
     """Seed the generator.
 
     Parameters
@@ -60,4 +63,4 @@ def shuffle(x: np.ndarray):
     _RANDOM_GENERATOR.shuffle(x)
 
 
-__all__ = ['choice', 'random', 'seed', 'shuffle']
+__all__ = ["choice", "random", "seed", "shuffle"]

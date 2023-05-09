@@ -1,13 +1,29 @@
 """Unittests for argument parser."""
 
-import unittest
-from argparse import Namespace
-from typing import Any, Dict, List, Tuple, Union, TYPE_CHECKING
 import re
-from io import StringIO
-from contextlib import redirect_stderr
+import unittest
+from argparse import (
+    Namespace,
+)
+from contextlib import (
+    redirect_stderr,
+)
+from io import (
+    StringIO,
+)
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Dict,
+    List,
+    Tuple,
+    Union,
+)
 
-from deepmd.entrypoints.main import parse_args, get_ll
+from deepmd.entrypoints.main import (
+    get_ll,
+    parse_args,
+)
 
 if TYPE_CHECKING:
     try:
@@ -232,16 +248,56 @@ class TestParserOutput(unittest.TestCase):
 
         self.run_test(command="transfer", mapping=ARGS)
 
-    def test_parser_train(self):
-        """Test train subparser."""
+    def test_parser_train_init_model(self):
+        """Test train init-model subparser."""
+        ARGS = {
+            "INPUT": dict(type=str, value="INFILE"),
+            "--init-model": dict(type=(str, type(None)), value="SYSTEM_DIR"),
+            "--output": dict(type=str, value="OUTPUT"),
+        }
+
+        self.run_test(command="train", mapping=ARGS)
+
+    def test_parser_train_restart(self):
+        """Test train restart subparser."""
+        ARGS = {
+            "INPUT": dict(type=str, value="INFILE"),
+            "--restart": dict(type=(str, type(None)), value="RESTART"),
+            "--output": dict(type=str, value="OUTPUT"),
+        }
+
+        self.run_test(command="train", mapping=ARGS)
+
+    def test_parser_train_init_frz_model(self):
+        """Test train init-frz-model subparser."""
+        ARGS = {
+            "INPUT": dict(type=str, value="INFILE"),
+            "--init-frz-model": dict(type=(str, type(None)), value="INIT_FRZ_MODEL"),
+            "--output": dict(type=str, value="OUTPUT"),
+        }
+
+        self.run_test(command="train", mapping=ARGS)
+
+    def test_parser_train_finetune(self):
+        """Test train finetune subparser."""
+        ARGS = {
+            "INPUT": dict(type=str, value="INFILE"),
+            "--finetune": dict(type=(str, type(None)), value="FINETUNE"),
+            "--output": dict(type=str, value="OUTPUT"),
+        }
+
+        self.run_test(command="train", mapping=ARGS)
+
+    def test_parser_train_wrong_subcommand(self):
+        """Test train with multiple subparsers."""
         ARGS = {
             "INPUT": dict(type=str, value="INFILE"),
             "--init-model": dict(type=(str, type(None)), value="SYSTEM_DIR"),
             "--restart": dict(type=(str, type(None)), value="RESTART"),
             "--output": dict(type=str, value="OUTPUT"),
         }
-
-        self.run_test(command="train", mapping=ARGS)
+        with self.assertRaises(SystemExit):
+            self.run_test(command="train", mapping=ARGS)
 
     def test_parser_freeze(self):
         """Test freeze subparser."""
@@ -286,16 +342,19 @@ class TestParserOutput(unittest.TestCase):
         }
 
         self.run_test(command="doc-train-input", mapping=ARGS)
-    
+
     def test_parser_model_devi(self):
-        """Test model-devi subparser"""
+        """Test model-devi subparser."""
         ARGS = {
-            "--models": dict(type=list, value="GRAPH.000.pb GRAPH.001.pb",
-                             expected=["GRAPH.000.pb", "GRAPH.001.pb"]),
+            "--models": dict(
+                type=list,
+                value="GRAPH.000.pb GRAPH.001.pb",
+                expected=["GRAPH.000.pb", "GRAPH.001.pb"],
+            ),
             "--system": dict(type=str, value="SYSTEM_DIR"),
             "--set-prefix": dict(type=str, value="SET_PREFIX"),
             "--output": dict(type=str, value="OUTFILE"),
-            "--frequency": dict(type=int, value=1)
+            "--frequency": dict(type=int, value=1),
         }
 
         self.run_test(command="model-devi", mapping=ARGS)
@@ -317,5 +376,5 @@ class TestParserOutput(unittest.TestCase):
                 get_ll(input_val),
                 expected_result,
                 msg=f"Expected: {expected_result} result for input value: {input_val} "
-                f"but got {get_ll(input_val)}"
+                f"but got {get_ll(input_val)}",
             )

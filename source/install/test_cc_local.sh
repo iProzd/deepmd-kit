@@ -7,26 +7,21 @@ NPROC=$(nproc --all)
 
 #------------------
 
+echo "try to find tensorflow in ${tensorflow_root}"
+INSTALL_PREFIX=${SCRIPT_PATH}/../../dp_test
 BUILD_TMP_DIR=${SCRIPT_PATH}/../build_tests
 mkdir -p ${BUILD_TMP_DIR}
 cd ${BUILD_TMP_DIR}
-cmake ../lib/tests
+cmake -DINSTALL_TENSORFLOW=FALSE -DTENSORFLOW_ROOT=${tensorflow_root} -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} -DBUILD_TESTING:BOOL=TRUE -DLAMMPS_VERSION=stable_23Jun2022_update3 ..
 make -j${NPROC}
+make install
 
 #------------------
-${BUILD_TMP_DIR}/runUnitTests
+# go to a subdirectory...
+# TODO: detect directory of graph files
+mkdir -p ${BUILD_TMP_DIR}/exec_tests
+cd ${BUILD_TMP_DIR}/exec_tests
 
-
-#------------------
-
-echo "try to find tensorflow in ${tensorflow_root}"
-BUILD_TMP_DIR=${SCRIPT_PATH}/../build_cc_tests
-INSTALL_PREFIX=${SCRIPT_PATH}/../../dp
-mkdir -p ${BUILD_TMP_DIR}
-cd ${BUILD_TMP_DIR}
-cmake -DINSTALL_TENSORFLOW=FALSE -DTENSORFLOW_ROOT=${tensorflow_root} ../api_cc/tests
-make -j${NPROC}
-
-#------------------
-cd ${SCRIPT_PATH}/../api_cc/tests
-${BUILD_TMP_DIR}/runUnitTests
+${INSTALL_PREFIX}/bin/runUnitTests_lib
+${INSTALL_PREFIX}/bin/runUnitTests_cc
+${INSTALL_PREFIX}/bin/runUnitTests_c

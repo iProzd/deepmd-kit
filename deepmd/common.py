@@ -2,8 +2,12 @@
 
 import json
 import warnings
-from functools import wraps
-from pathlib import Path
+from functools import (
+    wraps,
+)
+from pathlib import (
+    Path,
+)
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -11,18 +15,26 @@ from typing import (
     Dict,
     List,
     Optional,
-    Tuple,
     TypeVar,
     Union,
 )
 
 import numpy as np
+import tensorflow
 import yaml
+from tensorflow.python.framework import (
+    tensor_util,
+)
 
-from deepmd.env import op_module, tf
-from deepmd.env import GLOBAL_TF_FLOAT_PRECISION, GLOBAL_NP_FLOAT_PRECISION
-from deepmd.utils.sess import run_sess
-from deepmd.utils.errors import GraphWithoutTensorError
+from deepmd.env import (
+    GLOBAL_NP_FLOAT_PRECISION,
+    GLOBAL_TF_FLOAT_PRECISION,
+    op_module,
+    tf,
+)
+from deepmd.utils.path import (
+    DPPath,
+)
 
 if TYPE_CHECKING:
     _DICT_VAL = TypeVar("_DICT_VAL")
@@ -31,7 +43,9 @@ if TYPE_CHECKING:
         from typing import Literal  # python >3.6
     except ImportError:
         from typing_extensions import Literal  # type: ignore
-    _ACTIVATION = Literal["relu", "relu6", "softplus", "sigmoid", "tanh", "gelu"]
+    _ACTIVATION = Literal[
+        "relu", "relu6", "softplus", "sigmoid", "tanh", "gelu", "gelu_tf"
+    ]
     _PRECISION = Literal["default", "float16", "float32", "float64"]
 
 # define constants
@@ -40,13 +54,14 @@ PRECISION_DICT = {
     "float16": tf.float16,
     "float32": tf.float32,
     "float64": tf.float64,
+    "bfloat16": tf.bfloat16,
 }
 
 
 def gelu(x: tf.Tensor) -> tf.Tensor:
     """Gaussian Error Linear Unit.
 
-    This is a smoother version of the RELU.
+    This is a smoother version of the RELU, implemented by custom operator.
 
     Parameters
     ----------
@@ -55,14 +70,48 @@ def gelu(x: tf.Tensor) -> tf.Tensor:
 
     Returns
     -------
-    `x` with the GELU activation applied
+    tf.Tensor
+        `x` with the GELU activation applied
 
     References
     ----------
     Original paper
     https://arxiv.org/abs/1606.08415
     """
-    return op_module.gelu(x)
+    return op_module.gelu_custom(x)
+
+
+def gelu_tf(x: tf.Tensor) -> tf.Tensor:
+    """Gaussian Error Linear Unit.
+
+    This is a smoother version of the RELU, implemented by TF.
+
+    Parameters
+    ----------
+    x : tf.Tensor
+        float Tensor to perform activation
+
+    Returns
+    -------
+    tf.Tensor
+        `x` with the GELU activation applied
+
+    References
+    ----------
+    Original paper
+    https://arxiv.org/abs/1606.08415
+    """
+
+    def gelu_wrapper(x):
+        try:
+            return tensorflow.nn.gelu(x, approximate=True)
+        except AttributeError:
+            warnings.warn(
+                "TensorFlow does not provide an implementation of gelu, please upgrade your TensorFlow version. Fallback to the custom gelu operator."
+            )
+            return op_module.gelu_custom(x)
+
+    return (lambda x: gelu_wrapper(x))(x)
 
 
 # TODO this is not a good way to do things. This is some global variable to which
@@ -76,6 +125,9 @@ ACTIVATION_FN_DICT = {
     "sigmoid": tf.sigmoid,
     "tanh": tf.nn.tanh,
     "gelu": gelu,
+    "gelu_tf": gelu_tf,
+    "None": None,
+    "none": None,
 }
 
 
@@ -85,8 +137,10 @@ def add_data_requirement(
     atomic: bool = False,
     must: bool = False,
     high_prec: bool = False,
-    type_sel: bool = None,
+    type_sel: Optional[bool] = None,
     repeat: int = 1,
+    default: float = 0.0,
+    dtype: Optional[np.dtype] = None,
 ):
     """Specify data requirements for training.
 
@@ -103,11 +157,15 @@ def add_data_requirement(
     must : bool, optional
         specifi if the `*.npy` data file must exist, by default False
     high_prec : bool, optional
-        if tru load data to `np.float64` else `np.float32`, by default False
+        if true load data to `np.float64` else `np.float32`, by default False
     type_sel : bool, optional
         select only certain type of atoms, by default None
     repeat : int, optional
         if specify repaeat data `repeat` times, by default 1
+    default : float, optional, default=0.
+        default value of data
+    dtype : np.dtype, optional
+        the dtype of data, overwrites `high_prec` if provided
     """
     data_requirement[key] = {
         "ndof": ndof,
@@ -116,12 +174,12 @@ def add_data_requirement(
         "high_prec": high_prec,
         "type_sel": type_sel,
         "repeat": repeat,
+        "default": default,
+        "dtype": dtype,
     }
 
 
-def select_idx_map(
-    atom_types: np.ndarray, select_types: np.ndarray
-) -> np.ndarray:
+def select_idx_map(atom_types: np.ndarray, select_types: np.ndarray) -> np.ndarray:
     """Build map of indices for element supplied element types from all atoms list.
 
     Parameters
@@ -141,16 +199,14 @@ def select_idx_map(
     `select_types` array will be sorted before finding indices in `atom_types`
     """
     sort_select_types = np.sort(select_types)
-    idx_map = np.array([], dtype=int)
+    idx_map = []
     for ii in sort_select_types:
-        idx_map = np.append(idx_map, np.where(atom_types == ii))
-    return idx_map
+        idx_map.append(np.where(atom_types == ii)[0])
+    return np.concatenate(idx_map)
 
 
 # TODO not really sure if the docstring is right the purpose of this is a bit unclear
-def make_default_mesh(
-    test_box: np.ndarray, cell_size: float = 3.0
-) -> np.ndarray:
+def make_default_mesh(test_box: np.ndarray, cell_size: float = 3.0) -> np.ndarray:
     """Get number of cells of size=`cell_size` fit into average box.
 
     Parameters
@@ -172,141 +228,6 @@ def make_default_mesh(
     default_mesh = np.zeros(6, dtype=np.int32)
     default_mesh[3:6] = ncell
     return default_mesh
-
-
-# TODO not an ideal approach, every class uses this to parse arguments on its own, json
-# TODO should be parsed once and the parsed result passed to all objects that need it
-class ClassArg:
-    """Class that take care of input json/yaml parsing.
-
-    The rules for parsing are defined by the `add` method, than `parse` is called to
-    process the supplied dict
-
-    Attributes
-    ----------
-    arg_dict: Dict[str, Any]
-        dictionary containing parsing rules
-    alias_map: Dict[str, Any]
-        dictionary with keyword aliases
-    """
-
-    def __init__(self) -> None:
-        self.arg_dict = {}
-        self.alias_map = {}
-
-    def add(
-        self,
-        key: str,
-        types_: Union[type, List[type]],
-        alias: Optional[Union[str, List[str]]] = None,
-        default: Any = None,
-        must: bool = False,
-    ) -> "ClassArg":
-        """Add key to be parsed.
-
-        Parameters
-        ----------
-        key : str
-            key name
-        types_ : Union[type, List[type]]
-            list of allowed key types
-        alias : Optional[Union[str, List[str]]], optional
-            alias for the key, by default None
-        default : Any, optional
-            default value for the key, by default None
-        must : bool, optional
-            if the key is mandatory, by default False
-
-        Returns
-        -------
-        ClassArg
-            instance with added key
-        """
-        if not isinstance(types_, list):
-            types = [types_]
-        else:
-            types = types_
-        if alias is not None:
-            if not isinstance(alias, list):
-                alias_ = [alias]
-            else:
-                alias_ = alias
-        else:
-            alias_ = []
-
-        self.arg_dict[key] = {
-            "types": types,
-            "alias": alias_,
-            "value": default,
-            "must": must,
-        }
-        for ii in alias_:
-            self.alias_map[ii] = key
-
-        return self
-
-    def _add_single(self, key: str, data: Any):
-        vtype = type(data)
-        if data is None:
-            return data
-        if not (vtype in self.arg_dict[key]["types"]):
-            for tp in self.arg_dict[key]["types"]:
-                try:
-                    vv = tp(data)
-                except TypeError:
-                    pass
-                else:
-                    break
-            else:
-                raise TypeError(
-                    f"cannot convert provided key {key} to type(s) "
-                    f'{self.arg_dict[key]["types"]} '
-                )
-        else:
-            vv = data
-        self.arg_dict[key]["value"] = vv
-
-    def _check_must(self):
-        for kk in self.arg_dict:
-            if self.arg_dict[kk]["must"] and self.arg_dict[kk]["value"] is None:
-                raise RuntimeError(f"key {kk} must be provided")
-
-    def parse(self, jdata: Dict[str, Any]) -> Dict[str, Any]:
-        """Parse input dictionary, use the rules defined by add method.
-
-        Parameters
-        ----------
-        jdata : Dict[str, Any]
-            loaded json/yaml data
-
-        Returns
-        -------
-        Dict[str, Any]
-            parsed dictionary
-        """
-        for kk in jdata.keys():
-            if kk in self.arg_dict:
-                key = kk
-                self._add_single(key, jdata[kk])
-            else:
-                if kk in self.alias_map:
-                    key = self.alias_map[kk]
-                    self._add_single(key, jdata[kk])
-        self._check_must()
-        return self.get_dict()
-
-    def get_dict(self) -> Dict[str, Any]:
-        """Get dictionary built from rules defined by add method.
-
-        Returns
-        -------
-        Dict[str, Any]
-            settings dictionary with default values
-        """
-        ret = {}
-        for kk in self.arg_dict.keys():
-            ret[kk] = self.arg_dict[kk]["value"]
-        return ret
 
 
 # TODO maybe rename this to j_deprecated and only warn about deprecated keys,
@@ -368,8 +289,8 @@ def j_loader(filename: Union[str, Path]) -> Dict[str, Any]:
 
 
 def get_activation_func(
-    activation_fn: "_ACTIVATION",
-) -> Callable[[tf.Tensor], tf.Tensor]:
+    activation_fn: Union["_ACTIVATION", None],
+) -> Union[Callable[[tf.Tensor], tf.Tensor], None]:
     """Get activation function callable based on string name.
 
     Parameters
@@ -387,6 +308,8 @@ def get_activation_func(
     RuntimeError
         if unknown activation function is specified
     """
+    if activation_fn is None:
+        return None
     if activation_fn not in ACTIVATION_FN_DICT:
         raise RuntimeError(f"{activation_fn} is not a valid activation function")
     return ACTIVATION_FN_DICT[activation_fn]
@@ -429,32 +352,11 @@ def expand_sys_str(root_dir: Union[str, Path]) -> List[str]:
     List[str]
         list of string pointing to system directories
     """
-    matches = [str(d) for d in Path(root_dir).rglob("*") if (d / "type.raw").is_file()]
-    if (Path(root_dir) / "type.raw").is_file():
-        matches += [root_dir]
+    root_dir = DPPath(root_dir)
+    matches = [str(d) for d in root_dir.rglob("*") if (d / "type.raw").is_file()]
+    if (root_dir / "type.raw").is_file():
+        matches.append(str(root_dir))
     return matches
-
-
-def docstring_parameter(*sub: Tuple[str, ...]):
-    """Add parameters to object docstring.
-
-    Parameters
-    ----------
-    sub: Tuple[str, ...]
-        list of strings that will be inserted into prepared locations in docstring.
-
-    Note
-    ----
-    Can be used on both object and classes.
-    """
-
-    @wraps
-    def dec(obj: "_OBJ") -> "_OBJ":
-        if obj.__doc__ is not None:
-            obj.__doc__ = obj.__doc__.format(*sub)
-        return obj
-
-    return dec
 
 
 def get_np_precision(precision: "_PRECISION") -> np.dtype:
@@ -485,3 +387,99 @@ def get_np_precision(precision: "_PRECISION") -> np.dtype:
         return np.float64
     else:
         raise RuntimeError(f"{precision} is not a valid precision")
+
+
+def safe_cast_tensor(
+    input: tf.Tensor, from_precision: tf.DType, to_precision: tf.DType
+) -> tf.Tensor:
+    """Convert a Tensor from a precision to another precision.
+
+    If input is not a Tensor or without the specific precision, the method will not
+    cast it.
+
+    Parameters
+    ----------
+    input : tf.Tensor
+        input tensor
+    from_precision : tf.DType
+        Tensor data type that is casted from
+    to_precision : tf.DType
+        Tensor data type that casts to
+
+    Returns
+    -------
+    tf.Tensor
+        casted Tensor
+    """
+    if tensor_util.is_tensor(input) and input.dtype == from_precision:
+        return tf.cast(input, to_precision)
+    return input
+
+
+def cast_precision(func: Callable) -> Callable:
+    """A decorator that casts and casts back the input
+    and output tensor of a method.
+
+    The decorator should be used in a classmethod.
+
+    The decorator will do the following thing:
+    (1) It casts input Tensors from `GLOBAL_TF_FLOAT_PRECISION`
+    to precision defined by property `precision`.
+    (2) It casts output Tensors from `precision` to
+    `GLOBAL_TF_FLOAT_PRECISION`.
+    (3) It checks inputs and outputs and only casts when
+    input or output is a Tensor and its dtype matches
+    `GLOBAL_TF_FLOAT_PRECISION` and `precision`, respectively.
+    If it does not match (e.g. it is an integer), the decorator
+    will do nothing on it.
+
+    Returns
+    -------
+    Callable
+        a decorator that casts and casts back the input and
+        output tensor of a method
+
+    Examples
+    --------
+    >>> class A:
+    ...   @property
+    ...   def precision(self):
+    ...     return tf.float32
+    ...
+    ...   @cast_precision
+    ...   def f(x: tf.Tensor, y: tf.Tensor) -> tf.Tensor:
+    ...     return x ** 2 + y
+    """
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        # only convert tensors
+        returned_tensor = func(
+            self,
+            *[
+                safe_cast_tensor(vv, GLOBAL_TF_FLOAT_PRECISION, self.precision)
+                for vv in args
+            ],
+            **{
+                kk: safe_cast_tensor(vv, GLOBAL_TF_FLOAT_PRECISION, self.precision)
+                for kk, vv in kwargs.items()
+            },
+        )
+        if isinstance(returned_tensor, tuple):
+            return tuple(
+                safe_cast_tensor(vv, self.precision, GLOBAL_TF_FLOAT_PRECISION)
+                for vv in returned_tensor
+            )
+        else:
+            return safe_cast_tensor(
+                returned_tensor, self.precision, GLOBAL_TF_FLOAT_PRECISION
+            )
+
+    return wrapper
+
+
+def clear_session():
+    """Reset all state generated by DeePMD-kit."""
+    tf.reset_default_graph()
+    # TODO: remove this line when data_requirement is not a global variable
+    data_requirement.clear()

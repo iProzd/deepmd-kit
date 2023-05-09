@@ -2,13 +2,27 @@
 
 import logging
 import os
-from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from pathlib import (
+    Path,
+)
+from typing import (
+    TYPE_CHECKING,
+    List,
+    Optional,
+)
 
-import numpy as np
-from deepmd.cluster import get_resource
-from deepmd.env import get_tf_default_nthreads, tf, GLOBAL_CONFIG, global_float_prec
-from deepmd.loggers import set_log_handles
+from deepmd.cluster import (
+    get_resource,
+)
+from deepmd.env import (
+    GLOBAL_CONFIG,
+    get_tf_default_nthreads,
+    global_float_prec,
+    tf,
+)
+from deepmd.loggers import (
+    set_log_handles,
+)
 
 if TYPE_CHECKING:
     import horovod.tensorflow as HVD
@@ -26,12 +40,12 @@ log = logging.getLogger(__name__)
 
 # http://patorjk.com/software/taag. Font:Big"
 WELCOME = (  # noqa
-    " _____               _____   __  __  _____           _     _  _   ",
-    "|  __ \             |  __ \ |  \/  ||  __ \         | |   (_)| |  ",
-    "| |  | |  ___   ___ | |__) || \  / || |  | | ______ | | __ _ | |_ ",
-    "| |  | | / _ \ / _ \|  ___/ | |\/| || |  | ||______|| |/ /| || __|",
-    "| |__| ||  __/|  __/| |     | |  | || |__| |        |   < | || |_ ",
-    "|_____/  \___| \___||_|     |_|  |_||_____/         |_|\_\|_| \__|",
+    r" _____               _____   __  __  _____           _     _  _   ",
+    r"|  __ \             |  __ \ |  \/  ||  __ \         | |   (_)| |  ",
+    r"| |  | |  ___   ___ | |__) || \  / || |  | | ______ | | __ _ | |_ ",
+    r"| |  | | / _ \ / _ \|  ___/ | |\/| || |  | ||______|| |/ /| || __|",
+    r"| |__| ||  __/|  __/| |     | |  | || |__| |        |   < | || |_ ",
+    r"|_____/  \___| \___||_|     |_|  |_||_____/         |_|\_\|_| \__|",
 )
 
 CITATION = (
@@ -47,13 +61,14 @@ BUILD = (
     f"source commit:        {GLOBAL_CONFIG['git_hash']}",
     f"source commit at:     {GLOBAL_CONFIG['git_date']}",
     f"build float prec:     {global_float_prec}",
+    f"build variant:        {GLOBAL_CONFIG['dp_variant']}",
     f"build with tf inc:    {GLOBAL_CONFIG['tf_include_dir']}",
-    f"build with tf lib:    {GLOBAL_CONFIG['tf_libs'].replace(';', _sep)}"  # noqa
+    f"build with tf lib:    {GLOBAL_CONFIG['tf_libs'].replace(';', _sep)}",  # noqa
 )
 
 
 class RunOptions:
-    """Class with inf oon how to run training (cluster, MPI and GPU config).
+    """Class with info on how to run training (cluster, MPI and GPU config).
 
     Attributes
     ----------
@@ -88,21 +103,19 @@ class RunOptions:
         self,
         init_model: Optional[str] = None,
         init_frz_model: Optional[str] = None,
+        finetune: Optional[str] = None,
         restart: Optional[str] = None,
         log_path: Optional[str] = None,
         log_level: int = 0,
-        mpi_log: str = "master"
+        mpi_log: str = "master",
     ):
         self._try_init_distrib()
-
-        if all((init_model, restart)):
-            raise RuntimeError(
-                "--init-model and --restart should not be set at the same time"
-            )
 
         # model init options
         self.restart = restart
         self.init_model = init_model
+        self.init_frz_model = init_frz_model
+        self.finetune = finetune
         self.init_mode = "init_from_scratch"
 
         if restart is not None:
@@ -114,6 +127,9 @@ class RunOptions:
         elif init_frz_model is not None:
             self.init_frz_model = os.path.abspath(init_frz_model)
             self.init_mode = "init_from_frz_model"
+        elif finetune is not None:
+            self.finetune = os.path.abspath(finetune)
+            self.init_mode = "finetune"
 
         self._setup_logger(Path(log_path) if log_path else None, log_level, mpi_log)
 
@@ -132,8 +148,12 @@ class RunOptions:
             log.info(f"node list:            {self.nodelist}")
         log.info(f"running on:           {self.nodename}")
         log.info(f"computing device:     {self.my_device}")
-        env_value = os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')
-        log.info(f"CUDA_VISIBLE_DEVICES: {env_value}")
+        if tf.test.is_built_with_cuda():
+            env_value = os.environ.get("CUDA_VISIBLE_DEVICES", "unset")
+            log.info(f"CUDA_VISIBLE_DEVICES: {env_value}")
+        if hasattr(tf.test, "is_built_with_rocm") and tf.test.is_built_with_rocm():
+            env_value = os.environ.get("HIP_VISIBLE_DEVICES", "unset")
+            log.info(f"HIP_VISIBLE_DEVICES:  {env_value}")
         log.info(f"Count of visible GPU: {len(self.gpus or [])}")
         intra, inter = get_tf_default_nthreads()
         log.info(f"num_intra_threads:    {intra:d}")
@@ -150,9 +170,9 @@ class RunOptions:
 
         Parameters
         ----------
-        log_level: int
+        log_level : int
             logging level
-        log_path: Optional[str]
+        log_path : Optional[str]
             path to log file, if None logs will be send only to console. If the parent
             directory does not exist it will be automatically created, by default None
         mpi_log : Optional[str], optional
@@ -177,6 +197,7 @@ class RunOptions:
     def _try_init_distrib(self):
         try:
             import horovod.tensorflow as HVD
+
             HVD.init()
             self.is_distrib = HVD.size() > 1
         except ImportError:
@@ -209,7 +230,9 @@ class RunOptions:
         if gpus is not None:
             gpu_idx = HVD.local_rank()
             if gpu_idx >= len(gpus):
-                raise RuntimeError('Count of local processes is larger than that of available GPUs!')
+                raise RuntimeError(
+                    "Count of local processes is larger than that of available GPUs!"
+                )
             self.my_device = f"gpu:{gpu_idx:d}"
         else:
             self.my_device = "cpu:0"
