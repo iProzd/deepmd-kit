@@ -619,6 +619,7 @@ class DescrptSeAtten(DescrptSeA):
             uu = 1 - self.rcut_r_smth * self.recovered_r
             self.recovered_switch = -uu * uu * uu + 1
             self.recovered_switch = tf.clip_by_value(self.recovered_switch, 0.0, 1.0)
+            self.recovered_switch = tf.cast(self.recovered_switch, self.filter_precision)
 
         self.nei_type_vec = tf.reshape(self.nei_type_vec, [-1])
         self.nmask = tf.cast(
