@@ -133,8 +133,8 @@ class TestModelSmoothSeAttenL0V1(unittest.TestCase):
         jdata['model']['descriptor'] = {
             "type": "se_atten",
             "sel": 120,
-            "rcut_smth": 2.0,
-            "rcut": 9.0,
+            "rcut_smth": 0.5,
+            "rcut": 4.0,
             "neuron": [
                 25,
                 50,
@@ -200,8 +200,8 @@ class TestModelSmoothSeAttenL0V1Stripped(unittest.TestCase):
         jdata['model']['descriptor'] = {
             "type": "se_atten",
             "sel": 120,
-            "rcut_smth": 2.0,
-            "rcut": 9.0,
+            "rcut_smth": 0.5,
+            "rcut": 4.0,
             "neuron": [
                 25,
                 50,
@@ -267,8 +267,8 @@ class TestModelSmoothSeAttenL0V1Shifted(unittest.TestCase):
         jdata['model']['descriptor'] = {
             "type": "se_atten",
             "sel": 120,
-            "rcut_smth": 2.0,
-            "rcut": 9.0,
+            "rcut_smth": 0.5,
+            "rcut": 4.0,
             "neuron": [
                 25,
                 50,
@@ -334,8 +334,8 @@ class TestModelSmoothSeAttenL0V2(unittest.TestCase):
         jdata['model']['descriptor'] = {
             "type": "se_atten_v2",
             "sel": 120,
-            "rcut_smth": 2.0,
-            "rcut": 9.0,
+            "rcut_smth": 0.5,
+            "rcut": 4.0,
             "neuron": [
                 25,
                 50,
@@ -401,8 +401,8 @@ class TestModelSmoothSeAttenL2V1(unittest.TestCase):
         jdata['model']['descriptor'] = {
             "type": "se_atten",
             "sel": 120,
-            "rcut_smth": 2.0,
-            "rcut": 9.0,
+            "rcut_smth": 0.5,
+            "rcut": 4.0,
             "neuron": [
                 25,
                 50,
