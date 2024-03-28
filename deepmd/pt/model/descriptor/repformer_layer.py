@@ -358,6 +358,7 @@ class RepformerLayer(torch.nn.Module):
         self.attn2h_map = None
         self.attn2_ev_apply = None
         self.loc_attn = None
+        self.scale_g2 = self.g1_dim**0.5 * 0.5
 
         if self.update_chnnl_2:
             self.linear2 = SimpleLinear(g2_dim, g2_dim)
@@ -517,6 +518,7 @@ class RepformerLayer(torch.nn.Module):
         sw: torch.Tensor,  # nb x nloc x nnei
     ) -> torch.Tensor:
         ret = g1.unsqueeze(-2) * gg1
+        ret = ret / self.scale_g2
         # nb x nloc x nnei x ng1
         ret = _apply_nlist_mask(ret, nlist_mask)
         if self.smooth:
@@ -631,13 +633,6 @@ class RepformerLayer(torch.nn.Module):
         ng2 = g2.shape[-1]
         nh2 = h2.shape[-1]
 
-        if self.bn1 is not None:
-            g1 = self._apply_bn(1, g1)
-        if self.bn2 is not None:
-            g2 = self._apply_bn(2, g2)
-        if self.update_h2:
-            h2 = _apply_h_norm(h2)
-
         g2_update: List[torch.Tensor] = [g2]
         h2_update: List[torch.Tensor] = [h2]
         g1_update: List[torch.Tensor] = [g1]
@@ -703,6 +698,13 @@ class RepformerLayer(torch.nn.Module):
         else:
             g2_new, h2_new = g2, h2
         g1_new = self.list_update(g1_update)
+
+        if self.bn1 is not None:
+            g1_new = self._apply_bn(1, g1_new)
+        if self.bn2 is not None:
+            g2_new = self._apply_bn(2, g2_new)
+        if self.update_h2:
+            h2_new = _apply_h_norm(h2_new)
         return g1_new, g2_new, h2_new
 
     @torch.jit.export

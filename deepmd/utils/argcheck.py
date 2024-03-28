@@ -1711,6 +1711,20 @@ def loss_ener():
             doc=doc_limit_pref_gf,
         ),
         Argument(
+            "use_huber",
+            [bool],
+            optional=True,
+            default=False,
+            doc=doc_enable_atom_ener_coeff,
+        ),
+        Argument(
+            "huber_delta",
+            float,
+            optional=True,
+            default=1.0,
+            doc=doc_limit_pref_gf,
+        ),
+        Argument(
             "numb_generalized_coord",
             int,
             optional=True,
