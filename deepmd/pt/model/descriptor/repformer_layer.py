@@ -5,6 +5,7 @@ from typing import (
 )
 
 import torch
+import torch.nn as nn
 
 from deepmd.pt.model.network.network import (
     SimpleLinear,
@@ -38,6 +39,19 @@ def _make_nei_g1(
     # gg1  : nb x nloc x nnei x ng1
     gg1 = gg1.view(nb, nloc, nnei, ng1)
     return gg1
+
+
+def get_residual(
+    _dim: int, _scale: float, _mode: str = "norm", trainable: bool = True
+) -> torch.Tensor:
+    residual = nn.Parameter(data=torch.Tensor(_dim), requires_grad=trainable)
+    if _mode == "norm":
+        nn.init.normal_(residual.data, std=_scale)
+    elif _mode == "const":
+        nn.init.constant_(residual.data, val=_scale)
+    else:
+        raise RuntimeError(f"Unsupported initialization mode '{_mode}'!")
+    return residual
 
 
 def _apply_nlist_mask(
@@ -315,6 +329,8 @@ class RepformerLayer(torch.nn.Module):
         attn2_has_gate: bool = False,
         activation_function: str = "tanh",
         update_style: str = "res_avg",
+        update_residual: float = 0.001,
+        update_residual_init: str = "norm",
         set_davg_zero: bool = True,  # TODO
         smooth: bool = True,
     ):
@@ -360,12 +376,39 @@ class RepformerLayer(torch.nn.Module):
         self.loc_attn = None
         self.scale_g2 = self.g1_dim**0.5 * 0.5
 
+        assert update_residual_init in [
+            "norm",
+            "const",
+        ], "'update_residual_init' only support 'norm' or 'const'!"
+        self.update_residual = update_residual
+        self.update_residual_init = update_residual_init
+        self.g1_residual = []
+        self.g2_residual = []
+        self.h2_residual = []
+
+        if self.update_style == "res_residual":
+            self.g1_residual.append(
+                get_residual(g1_dim, self.update_residual, self.update_residual_init)
+            )
+
         if self.update_chnnl_2:
             self.linear2 = SimpleLinear(g2_dim, g2_dim)
+            if self.update_style == "res_residual":
+                self.g2_residual.append(
+                    get_residual(
+                        g2_dim, self.update_residual, self.update_residual_init
+                    )
+                )
         if self.update_g1_has_conv:
             self.proj_g1g2 = SimpleLinear(g1_dim, g2_dim, bias=False)
         if self.update_g2_has_g1g1:
             self.proj_g1g1g2 = SimpleLinear(g1_dim, g2_dim, bias=False)
+            if self.update_style == "res_residual":
+                self.g2_residual.append(
+                    get_residual(
+                        g2_dim, self.update_residual, self.update_residual_init
+                    )
+                )
         if self.update_g2_has_attn:
             self.attn2g_map = Atten2Map(
                 g2_dim, attn2_hidden, attn2_nhead, attn2_has_gate, self.smooth
@@ -377,6 +420,12 @@ class RepformerLayer(torch.nn.Module):
                 device=env.DEVICE,
                 dtype=env.GLOBAL_PT_FLOAT_PRECISION,
             )
+            if self.update_style == "res_residual":
+                self.g2_residual.append(
+                    get_residual(
+                        g2_dim, self.update_residual, self.update_residual_init
+                    )
+                )
         if self.update_h2:
             self.attn2h_map = Atten2Map(
                 g2_dim, attn2_hidden, attn2_nhead, attn2_has_gate, self.smooth
@@ -384,6 +433,16 @@ class RepformerLayer(torch.nn.Module):
             self.attn2_ev_apply = Atten2EquiVarApply(g2_dim, attn2_nhead)
         if self.update_g1_has_attn:
             self.loc_attn = LocalAtten(g1_dim, attn1_hidden, attn1_nhead, self.smooth)
+            if self.update_style == "res_residual":
+                self.g1_residual.append(
+                    get_residual(
+                        g1_dim, self.update_residual, self.update_residual_init
+                    )
+                )
+
+        self.g1_residual = nn.ParameterList(self.g1_residual)
+        self.g2_residual = nn.ParameterList(self.g2_residual)
+        self.h2_residual = nn.ParameterList(self.h2_residual)
 
         if self.do_bn_mode == "uniform":
             self.bn1 = self._bn_layer()
@@ -691,13 +750,28 @@ class RepformerLayer(torch.nn.Module):
             assert self.loc_attn is not None
             g1_update.append(self.loc_attn(g1, gg1, nlist_mask, sw))
 
+        # print("pref: ", self.scale_g2)
+        # print("g1 std: ", g1_update[0].std())
+        # print("mlp(g1) std: ", g1_update[1].std())
+        # print("attn(g1) std: ", g1_update[2].std())
+        # print("g2 std: ", g2_update[0].std())
+        # try:
+        #     print("mlp(g2) std: ", g2_update[1].std())
+        #     print("g1g1(g2) std: ", g2_update[2].std())
+        #     print("attn(g2) std: ", g2_update[3].std())
+        # except:
+        #     pass
+
         # update
         if self.update_chnnl_2:
-            g2_new = self.list_update(g2_update)
-            h2_new = self.list_update(h2_update)
+            # print("list_update g2")
+            g2_new = self.list_update(g2_update, "g2")
+            h2_new = self.list_update(h2_update, "h2")
+            # h2_new TODO
         else:
             g2_new, h2_new = g2, h2
-        g1_new = self.list_update(g1_update)
+        # print("list_update g1")
+        g1_new = self.list_update(g1_update, "g1")
 
         if self.bn1 is not None:
             g1_new = self._apply_bn(1, g1_new)
@@ -728,11 +802,37 @@ class RepformerLayer(torch.nn.Module):
         return uu
 
     @torch.jit.export
-    def list_update(self, update_list: List[torch.Tensor]) -> torch.Tensor:
+    def list_update_res_residual(
+        self, update_list: List[torch.Tensor], update_name: str = "g1"
+    ) -> torch.Tensor:
+        nitem = len(update_list)
+        uu = update_list[0]
+        if update_name == "g1":
+            for ii, vv in enumerate(self.g1_residual):
+                # print("add residual with std: ", residual[ii-1].std())
+                uu = uu + vv * update_list[ii + 1]
+        elif update_name == "g2":
+            for ii, vv in enumerate(self.g2_residual):
+                # print("add residual with std: ", residual[ii-1].std())
+                uu = uu + vv * update_list[ii + 1]
+        elif update_name == "h2":
+            for ii, vv in enumerate(self.h2_residual):
+                # print("add residual with std: ", residual[ii-1].std())
+                uu = uu + vv * update_list[ii + 1]
+        else:
+            raise NotImplementedError
+        return uu
+
+    @torch.jit.export
+    def list_update(
+        self, update_list: List[torch.Tensor], update_name: str = "g1"
+    ) -> torch.Tensor:
         if self.update_style == "res_avg":
             return self.list_update_res_avg(update_list)
         elif self.update_style == "res_incr":
             return self.list_update_res_incr(update_list)
+        elif self.update_style == "res_residual":
+            return self.list_update_res_residual(update_list, update_name=update_name)
         else:
             raise RuntimeError(f"unknown update style {self.update_style}")
 

@@ -84,6 +84,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         attn2_has_gate: bool = False,
         activation_function: str = "tanh",
         update_style: str = "res_avg",
+        update_residual: float = 0.001,
+        update_residual_init: str = "norm",
         set_davg_zero: bool = True,  # TODO
         smooth: bool = True,
         add_type_ebd_to_seq: bool = False,
@@ -153,6 +155,8 @@ class DescrptBlockRepformers(DescriptorBlock):
                     attn2_nhead=attn2_nhead,
                     activation_function=activation_function,
                     update_style=update_style,
+                    update_residual=update_residual,
+                    update_residual_init=update_residual_init,
                     smooth=smooth,
                 )
             )

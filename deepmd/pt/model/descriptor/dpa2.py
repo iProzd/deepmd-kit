@@ -69,6 +69,9 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
         repformer_update_g2_has_g1g1: bool = True,
         repformer_update_g2_has_attn: bool = True,
         repformer_update_h2: bool = False,
+        repformer_update_mode: str = "mean",
+        repformer_update_residual: float = 0.001,
+        repformer_update_residual_init: str = "norm",
         repformer_attn1_hidden: int = 64,
         repformer_attn1_nhead: int = 4,
         repformer_attn2_hidden: int = 16,
@@ -167,11 +170,19 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
             repformers block: the activation function in the MLPs.
         repformer_update_style : str
             repformers block: style of update a rep.
-            can be res_avg or res_incr.
+            can be res_avg, res_incr or res_residual.
             res_avg updates a rep `u` with:
                     u = 1/\sqrt{n+1} (u + u_1 + u_2 + ... + u_n)
             res_incr updates a rep `u` with:
                     u = u + 1/\sqrt{n} (u_1 + u_2 + ... + u_n)
+            res_residual updates a rep `u` with:
+                    u = u + (r1*u_1 + r2*u_2 + ... + r3*u_n)
+                    where `r1`, `r2` ... `r3` are residual weights defined by
+                    repformer_update_residual and repformer_update_residual_init.
+        repformer_update_residual : float
+            repformers block: when update using residual mode, the initial std of residual vector weights.
+        repformer_update_residual_init : str
+            repformers block: when update using residual mode, the initialization mode of residual vector weights.
         repformer_set_davg_zero : bool
             repformers block: set the avg to zero in statistics
         repformer_add_type_ebd_to_seq : bool
@@ -241,6 +252,8 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
             attn2_has_gate=repformer_attn2_has_gate,
             activation_function=repformer_activation,
             update_style=repformer_update_style,
+            update_residual=repformer_update_residual,
+            update_residual_init=repformer_update_residual_init,
             set_davg_zero=repformer_set_davg_zero,
             smooth=True,
             add_type_ebd_to_seq=repformer_add_type_ebd_to_seq,

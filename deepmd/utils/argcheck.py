@@ -667,7 +667,23 @@ def descrpt_dpa2_args():
         "repformers block: has gate in the gated self-attention"
     )
     doc_repformer_activation = "repformers block: the activation function in the MLPs."
-    doc_repformer_update_style = "repformers block: style of update a rep. can be res_avg or res_incr. res_avg updates a rep `u` with: u = 1/\\sqrt{n+1} (u + u_1 + u_2 + ... + u_n) res_incr updates a rep `u` with: u = u + 1/\\sqrt{n} (u_1 + u_2 + ... + u_n)"
+    doc_repformer_update_style = (
+        "repformers block: style of update a rep. can be res_avg, res_incr or res_residual. "
+        "res_avg updates a rep `u` with: u = 1/\\sqrt{n+1} (u + u_1 + u_2 + ... + u_n) "
+        "res_incr updates a rep `u` with: u = u + 1/\\sqrt{n} (u_1 + u_2 + ... + u_n)  "
+        "res_residual updates a rep `u` with: u = u + (r1*u_1 + r2*u_2 + ... + r3*u_n) "
+        "where `r1`, `r2` ... `r3` are residual weights defined by repformer_update_residual "
+        "and repformer_update_residual_init."
+    )
+    doc_repformer_update_residual = (
+        "repformers block: when update using residual mode, "
+        "the initial std of residual vector weights."
+    )
+    doc_repformer_update_residual_init = (
+        "repformers block: when update using residual mode, "
+        "the initialization mode of residual vector weights."
+        "Supported modes are: ['norm', 'const']."
+    )
     doc_repformer_set_davg_zero = "repformers block: set the avg to zero in statistics"
     doc_repformer_add_type_ebd_to_seq = (
         "repformers block: concatenate the type embedding at the output"
@@ -844,6 +860,20 @@ def descrpt_dpa2_args():
             optional=True,
             default="res_avg",
             doc=doc_repformer_update_style,
+        ),
+        Argument(
+            "repformer_update_residual",
+            float,
+            optional=True,
+            default=0.001,
+            doc=doc_repformer_update_residual,
+        ),
+        Argument(
+            "repformer_update_residual_init",
+            str,
+            optional=True,
+            default="norm",
+            doc=doc_repformer_update_residual_init,
         ),
         Argument(
             "repformer_set_davg_zero",
