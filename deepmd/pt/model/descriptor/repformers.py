@@ -74,6 +74,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         attn2_has_gate: bool = False,
         activation_function: str = "tanh",
         update_style: str = "res_avg",
+        update_residual: float = 0.001,
+        update_residual_init: str = "norm",
         set_davg_zero: bool = True,
         smooth: bool = True,
         exclude_types: List[Tuple[int, int]] = [],
@@ -82,6 +84,10 @@ class DescrptBlockRepformers(DescriptorBlock):
         resnet_dt: bool = False,
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
+        ab_g2_gatenorm: bool = False,
+        ab_g2_pre_gate: bool = True,
+        ab_g2_post_gate: bool = True,
+        ab_g2_qkvnorm: bool = False,
         old_impl: bool = False,
     ):
         r"""
@@ -196,6 +202,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.bn_momentum = bn_momentum
         self.activation_function = activation_function
         self.update_style = update_style
+        self.update_residual = update_residual
+        self.update_residual_init = update_residual_init
         self.direct_dist = direct_dist
         self.act = ActivationFn(activation_function)
         self.smooth = smooth
@@ -207,6 +215,11 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.trainable_ln = trainable_ln
         self.ln_eps = ln_eps
         self.old_impl = old_impl
+        self.ab_g2_gatenorm = ab_g2_gatenorm
+        self.ab_g2_pre_gate = ab_g2_pre_gate
+        self.ab_g2_post_gate = ab_g2_post_gate
+        self.ab_g2_qkvnorm = ab_g2_qkvnorm
+        self.epsilon = 1e-4
 
         self.g2_embd = MLPLayer(1, self.g2_dim)
         layers = []
@@ -268,9 +281,15 @@ class DescrptBlockRepformers(DescriptorBlock):
                         attn2_nhead=self.attn2_nhead,
                         activation_function=self.activation_function,
                         update_style=self.update_style,
+                        update_residual=self.update_residual,
+                        update_residual_init=self.update_residual_init,
                         smooth=self.smooth,
                         trainable_ln=self.trainable_ln,
                         ln_eps=self.ln_eps,
+                        ab_g2_gatenorm=self.ab_g2_gatenorm,
+                        ab_g2_pre_gate=self.ab_g2_pre_gate,
+                        ab_g2_post_gate=self.ab_g2_post_gate,
+                        ab_g2_qkvnorm=self.ab_g2_qkvnorm,
                         precision=precision,
                     )
                 )

@@ -695,6 +695,18 @@ def descrpt_dpa2_args():
     doc_ln_eps = "The epsilon value for layer normalization. The default value for TensorFlow is set to 1e-3 to keep consistent with keras while set to 1e-5 in PyTorch and DP implementation."
     doc_type_one_side = r"If true, the embedding network parameters vary by types of neighbor atoms only, so there will be $N_\text{types}$ sets of embedding network parameters. Otherwise, the embedding network parameters vary by types of centric atoms and types of neighbor atoms, so there will be $N_\text{types}^2$ sets of embedding network parameters."
     doc_add_tebd_to_repinit_out = "Add type embedding to the output representation from repinit before inputting it into repformer."
+    doc_ablation = "(Only for ablation and may be removed in future versions.) "
+    doc_ab_g2_gatenorm = f"{doc_ablation}Whether to norm gate in g2 attention."
+    doc_ab_g2_pre_gate = (
+        f"{doc_ablation}Whether to do gate before softmax in g2 attention."
+    )
+    doc_ab_g2_post_gate = (
+        f"{doc_ablation}Whether to do gate after softmax in g2 attention."
+    )
+    doc_ab_g2_qkvnorm = (
+        f"{doc_ablation}Whether to use qk norm instead of d**0.5 scale in g2 attention."
+    )
+    doc_ab_use_econf_tebd = f"{doc_ablation}Whether to use electronic configuration type embedding instead of one-hot type embedding."
     return [
         # repinit args
         Argument("repinit_rcut", float, doc=doc_repinit_rcut),
@@ -891,6 +903,41 @@ def descrpt_dpa2_args():
             optional=True,
             default="res_avg",
             doc=doc_repformer_update_style,
+        ),
+        Argument(
+            "ab_g2_gatenorm",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_ab_g2_gatenorm,
+        ),
+        Argument(
+            "ab_g2_pre_gate",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_ab_g2_pre_gate,
+        ),
+        Argument(
+            "ab_g2_post_gate",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_ab_g2_post_gate,
+        ),
+        Argument(
+            "ab_g2_qkvnorm",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_ab_g2_qkvnorm,
+        ),
+        Argument(
+            "ab_use_econf_tebd",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_ab_use_econf_tebd,
         ),
         Argument(
             "repformer_set_davg_zero",
