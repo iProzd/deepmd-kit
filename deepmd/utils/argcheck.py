@@ -630,16 +630,6 @@ def descrpt_dpa2_args():
     )
     doc_repformer_axis_neuron = f"{doc_repformer}The number of dimension of submatrix in the symmetrization ops."
     doc_repformer_direct_dist = f"{doc_repformer}Whether or not use direct distance as input for the embedding net to get g2 instead of smoothed 1/r."
-    doc_repformer_do_bn_mode = (
-        f"{doc_repformer}The mode to do batch normalization in the repformer layers. "
-        f"Supported options are: "
-        f"-'no': Not do batch normalization."
-        f"-'uniform': Do batch normalization using scalar running momentum and learnable gamma/beta (num_features=1)."
-        f"-'component': Do batch normalization using vector running momentum and learnable gamma/beta (num_features=d)."
-    )
-    doc_repformer_bn_momentum = (
-        f"{doc_repformer}Momentum used in the batch normalization."
-    )
     doc_repformer_update_g1_has_conv = (
         f"{doc_repformer}Update the g1 rep with convolution term."
     )
@@ -670,6 +660,18 @@ def descrpt_dpa2_args():
         f"Supported options are: "
         "-'res_avg': Updates a rep `u` with: u = 1/\\sqrt{n+1} (u + u_1 + u_2 + ... + u_n) "
         "-'res_incr': Updates a rep `u` with: u = u + 1/\\sqrt{n} (u_1 + u_2 + ... + u_n)"
+        "-'res_residual': Updates a rep `u` with: u = u + (r1*u_1 + r2*u_2 + ... + r3*u_n) "
+        "where `r1`, `r2` ... `r3` are residual weights defined by repformer_update_residual "
+        "and repformer_update_residual_init."
+    )
+    doc_repformer_update_residual = (
+        f"{doc_repformer}When update using residual mode, "
+        "the initial std of residual vector weights."
+    )
+    doc_repformer_update_residual_init = (
+        f"{doc_repformer}When update using residual mode, "
+        "the initialization mode of residual vector weights."
+        "Supported modes are: ['norm', 'const']."
     )
     doc_repformer_set_davg_zero = (
         f"{doc_repformer}Set the normalization average to zero. "
@@ -780,20 +782,6 @@ def descrpt_dpa2_args():
             doc=doc_repformer_direct_dist,
         ),
         Argument(
-            "repformer_do_bn_mode",
-            str,
-            optional=True,
-            default="no",
-            doc=doc_repformer_do_bn_mode,
-        ),
-        Argument(
-            "repformer_bn_momentum",
-            float,
-            optional=True,
-            default=0.1,
-            doc=doc_repformer_bn_momentum,
-        ),
-        Argument(
             "repformer_update_g1_has_conv",
             bool,
             optional=True,
@@ -891,6 +879,20 @@ def descrpt_dpa2_args():
             optional=True,
             default="res_avg",
             doc=doc_repformer_update_style,
+        ),
+        Argument(
+            "repformer_update_residual",
+            float,
+            optional=True,
+            default=0.001,
+            doc=doc_repformer_update_residual,
+        ),
+        Argument(
+            "repformer_update_residual_init",
+            str,
+            optional=True,
+            default="norm",
+            doc=doc_repformer_update_residual_init,
         ),
         Argument(
             "repformer_set_davg_zero",

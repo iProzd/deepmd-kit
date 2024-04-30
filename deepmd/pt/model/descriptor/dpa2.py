@@ -75,8 +75,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         repformer_g2_dim: int = 16,
         repformer_axis_neuron: int = 4,
         repformer_direct_dist: bool = False,
-        repformer_do_bn_mode: str = "no",
-        repformer_bn_momentum: float = 0.1,
         repformer_update_g1_has_conv: bool = True,
         repformer_update_g1_has_drrd: bool = True,
         repformer_update_g1_has_grrg: bool = True,
@@ -91,6 +89,8 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         repformer_attn2_has_gate: bool = False,
         repformer_activation_function: str = "tanh",
         repformer_update_style: str = "res_avg",
+        repformer_update_residual: float = 0.001,
+        repformer_update_residual_init: str = "norm",
         repformer_set_davg_zero: bool = True,
         # kwargs for descriptor
         concat_output_tebd: bool = True,
@@ -218,6 +218,15 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             Supported options are:
             -'res_avg': Updates a rep `u` with: u = 1/\\sqrt{n+1} (u + u_1 + u_2 + ... + u_n)
             -'res_incr': Updates a rep `u` with: u = u + 1/\\sqrt{n} (u_1 + u_2 + ... + u_n)
+            -'res_residual': Updates a rep `u` with: u = u + (r1*u_1 + r2*u_2 + ... + r3*u_n)
+            where `r1`, `r2` ... `r3` are residual weights defined by repformer_update_residual
+            and repformer_update_residual_init.
+        repformer_update_residual : float, optional
+            (Used in the repformer block.)
+            When update using residual mode, the initial std of residual vector weights.
+        repformer_update_residual_init : str, optional
+            (Used in the repformer block.)
+            When update using residual mode, the initialization mode of residual vector weights.
         repformer_set_davg_zero : bool, optional
             (Used in the repformer block.)
             Set the normalization average to zero.
@@ -264,6 +273,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
 
         """
         super().__init__()
+        #  to keep consistent with default value in this backends
+        if ln_eps is None:
+            ln_eps = 1e-5
         self.repinit = DescrptBlockSeAtten(
             repinit_rcut,
             repinit_rcut_smth,
@@ -295,8 +307,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             g2_dim=repformer_g2_dim,
             axis_neuron=repformer_axis_neuron,
             direct_dist=repformer_direct_dist,
-            do_bn_mode=repformer_do_bn_mode,
-            bn_momentum=repformer_bn_momentum,
             update_g1_has_conv=repformer_update_g1_has_conv,
             update_g1_has_drrd=repformer_update_g1_has_drrd,
             update_g1_has_grrg=repformer_update_g1_has_grrg,
@@ -311,6 +321,8 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             attn2_has_gate=repformer_attn2_has_gate,
             activation_function=repformer_activation_function,
             update_style=repformer_update_style,
+            update_residual=repformer_update_residual,
+            update_residual_init=repformer_update_residual_init,
             set_davg_zero=repformer_set_davg_zero,
             smooth=smooth,
             exclude_types=exclude_types,
@@ -345,6 +357,14 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
                 bias=False,
                 precision=precision,
                 init="glorot",
+            )
+        self.tebd_transform = None
+        if self.add_tebd_to_repinit_out:
+            self.tebd_transform = MLPLayer(
+                repinit_tebd_dim,
+                self.repformers.dim_in,
+                bias=False,
+                precision=precision,
             )
         assert self.repinit.rcut > self.repformers.rcut
         assert self.repinit.sel[0] > self.repformers.sel[0]
@@ -494,8 +514,6 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             "repformer_g2_dim": repformers.g2_dim,
             "repformer_axis_neuron": repformers.axis_neuron,
             "repformer_direct_dist": repformers.direct_dist,
-            "repformer_do_bn_mode": repformers.do_bn_mode,
-            "repformer_bn_momentum": repformers.bn_momentum,
             "repformer_update_g1_has_conv": repformers.update_g1_has_conv,
             "repformer_update_g1_has_drrd": repformers.update_g1_has_drrd,
             "repformer_update_g1_has_grrg": repformers.update_g1_has_grrg,
@@ -525,6 +543,12 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             "type_embedding": self.type_embedding.embedding.serialize(),
             "g1_shape_tranform": self.g1_shape_tranform.serialize(),
         }
+        if self.add_tebd_to_repinit_out:
+            data.update(
+                {
+                    "tebd_transform": self.tebd_transform.serialize(),
+                }
+            )
         repinit_variable = {
             "embeddings": repinit.filter_layers.serialize(),
             "env_mat": DPEnvMat(repinit.rcut, repinit.rcut_smth).serialize(),
@@ -564,10 +588,15 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         repformers_variable = data.pop("repformers").copy()
         type_embedding = data.pop("type_embedding")
         g1_shape_tranform = data.pop("g1_shape_tranform")
+        tebd_transform = data.pop("tebd_transform", None)
+        add_tebd_to_repinit_out = data["add_tebd_to_repinit_out"]
         obj = cls(**data)
         obj.type_embedding.embedding = TypeEmbedNetConsistent.deserialize(
             type_embedding
         )
+        if add_tebd_to_repinit_out:
+            assert isinstance(tebd_transform, dict)
+            obj.tebd_transform = MLPLayer.deserialize(tebd_transform)
         if obj.repinit.dim_out != obj.repformers.dim_in:
             obj.g1_shape_tranform = MLPLayer.deserialize(g1_shape_tranform)
 
@@ -662,6 +691,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         )
         # linear to change shape
         g1 = self.g1_shape_tranform(g1)
+        if self.add_tebd_to_repinit_out:
+            assert self.tebd_transform is not None
+            g1 = g1 + self.tebd_transform(g1_inp)
         # mapping g1
         assert mapping is not None
         mapping_ext = (
