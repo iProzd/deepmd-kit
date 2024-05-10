@@ -322,6 +322,7 @@ class Trainer:
 
         # Model
         dp_random.seed(training_params["seed"])
+        torch.manual_seed(training_params["seed"])
         if not self.multi_task:
             self.model = get_single_model(
                 model_params,
