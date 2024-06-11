@@ -81,6 +81,8 @@ from torch.utils.data import (
 from deepmd.utils.path import (
     DPH5Path,
 )
+import wandb as wb
+import os
 
 log = logging.getLogger(__name__)
 
@@ -134,6 +136,31 @@ class Trainer:
         self.save_freq = training_params.get("save_freq", 1000)
         self.max_ckpt_keep = training_params.get("max_ckpt_keep", 5)
         self.lcurve_should_print_header = True
+
+        # Init wandb
+        self.wandb_config = training_params.get("wandb_config", {})
+        self.wandb_enabled = self.wandb_config.get("wandb_enabled", False)
+        if self.wandb_enabled:
+            entity = self.wandb_config.get("entity", None)
+            assert (
+                entity is not None
+            ), "The parameter 'entity' of wandb must be specified."
+            project = self.wandb_config.get("project", None)
+            assert (
+                project is not None
+            ), "The parameter 'project' of wandb must be specified."
+            job_name = self.wandb_config.get("job_name", None)
+            if job_name is None:
+                name_path = os.path.abspath(".").split("/")
+                job_name = name_path[-2] + "/" + name_path[-1]
+            if self.rank == 0:
+                wb.init(
+                    project=project,
+                    entity=entity,
+                    config=model_params,
+                    name=job_name,
+                    settings=wb.Settings(start_method="fork"),
+                )
 
         def get_opt_param(params):
             opt_type = params.get("opt_type", "Adam")
@@ -852,6 +879,7 @@ class Trainer:
                                 learning_rate=cur_lr,
                             )
                         )
+                        self.wandb_log(train_results, _step_id, "_train")
                         if valid_results:
                             log.info(
                                 format_training_message_per_task(
@@ -861,11 +889,15 @@ class Trainer:
                                     learning_rate=None,
                                 )
                             )
+                            self.wandb_log(valid_results, _step_id, "_valid")
                 else:
                     train_results = {_key: {} for _key in self.model_keys}
                     valid_results = {_key: {} for _key in self.model_keys}
                     train_results[task_key] = log_loss_train(
                         loss, more_loss, _task_key=task_key
+                    )
+                    self.wandb_log(
+                        train_results[task_key], _step_id, f"_train_{task_key}"
                     )
                     for _key in self.model_keys:
                         if _key != task_key:
@@ -892,6 +924,9 @@ class Trainer:
                                     learning_rate=cur_lr,
                                 )
                             )
+                            self.wandb_log(
+                                train_results[_key], _step_id, f"_train_{_key}"
+                            )
                             if valid_results is not None and valid_results[_key]:
                                 log.info(
                                     format_training_message_per_task(
@@ -900,6 +935,9 @@ class Trainer:
                                         rmse=valid_results[_key],
                                         learning_rate=None,
                                     )
+                                )
+                                self.wandb_log(
+                                    valid_results[_key], _step_id, f"_valid_{_key}"
                                 )
 
                 current_time = time.time()
@@ -912,6 +950,7 @@ class Trainer:
                             wall_time=train_time,
                         )
                     )
+                self.wandb_log({"lr": cur_lr}, step_id)
 
                 if fout:
                     if self.lcurve_should_print_header:
@@ -1087,6 +1126,12 @@ class Trainer:
             log_dict["fid"] = batch_data["fid"]
         log_dict["sid"] = batch_data["sid"]
         return input_dict, label_dict, log_dict
+
+    def wandb_log(self, data: dict, step, type_suffix=""):
+        if not self.wandb_enabled or self.rank != 0:
+            return
+        for k, v in data.items():
+            wb.log({k + type_suffix: v}, step=step)
 
     def print_header(self, fout, train_results, valid_results):
         train_keys = sorted(train_results.keys())

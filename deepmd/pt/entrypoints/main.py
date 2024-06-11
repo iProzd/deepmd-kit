@@ -241,8 +241,11 @@ def train(FLAGS):
 
     # argcheck
     if not multi_task:
+        wandb_config = config["training"].pop("wandb_config", None)
         config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
         config = normalize(config)
+        if wandb_config is not None:
+            config["training"]["wandb_config"] = wandb_config
 
     # do neighbor stat
     if not FLAGS.skip_neighbor_stat:
