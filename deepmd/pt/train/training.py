@@ -399,14 +399,14 @@ class Trainer:
                 self.validation_data,
                 self.valid_numb_batch,
             ) = get_data_loader(training_data, validation_data, training_params)
-            training_data.print_summary(
-                "training", to_numpy_array(self.training_dataloader.sampler.weights)
-            )
-            if validation_data is not None:
-                validation_data.print_summary(
-                    "validation",
-                    to_numpy_array(self.validation_dataloader.sampler.weights),
-                )
+            # training_data.print_summary(
+            #     "training", to_numpy_array(self.training_dataloader.sampler.weights)
+            # )
+            # if validation_data is not None:
+            #     validation_data.print_summary(
+            #         "validation",
+            #         to_numpy_array(self.validation_dataloader.sampler.weights),
+            #     )
         else:
             (
                 self.training_dataloader,
@@ -437,20 +437,20 @@ class Trainer:
                     training_params["data_dict"][model_key],
                 )
 
-                training_data[model_key].print_summary(
-                    f"training in {model_key}",
-                    to_numpy_array(self.training_dataloader[model_key].sampler.weights),
-                )
-                if (
-                    validation_data is not None
-                    and validation_data[model_key] is not None
-                ):
-                    validation_data[model_key].print_summary(
-                        f"validation in {model_key}",
-                        to_numpy_array(
-                            self.validation_dataloader[model_key].sampler.weights
-                        ),
-                    )
+                # training_data[model_key].print_summary(
+                #     f"training in {model_key}",
+                #     to_numpy_array(self.training_dataloader[model_key].sampler.weights),
+                # )
+                # if (
+                #     validation_data is not None
+                #     and validation_data[model_key] is not None
+                # ):
+                #     validation_data[model_key].print_summary(
+                #         f"validation in {model_key}",
+                #         to_numpy_array(
+                #             self.validation_dataloader[model_key].sampler.weights
+                #         ),
+                #     )
 
         # Learning rate
         self.warmup_steps = training_params.get("warmup_steps", 0)
