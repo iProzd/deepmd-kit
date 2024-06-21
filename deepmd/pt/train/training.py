@@ -747,42 +747,54 @@ class Trainer:
             cur_lr = _lr.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
-            input_dict, label_dict, log_dict = self.get_data(
-                is_train=True, task_key=task_key
-            )
-            if SAMPLER_RECORD:
-                print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
-                fout1.write(print_str)
-                fout1.flush()
             if self.opt_type == "Adam":
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
-                loss.backward()
-                if self.gradient_max_norm > 0.0:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.wrapper.parameters(), self.gradient_max_norm
+                for ii in range(self.accumulation_steps):
+                    input_dict, label_dict, log_dict = self.get_data(
+                        is_train=True, task_key=task_key
                     )
-                    if not torch.isfinite(grad_norm).all():
-                        # check local gradnorm single GPU case, trigger NanDetector
-                        if self.skip_bad_points:
-                            logging.warning(
-                                "gradients are Nan/Inf on data points, skipped."
-                            )
-                            self.scheduler.step()
-                            self.optimizer.zero_grad(set_to_none=True)
-                            return
-                        else:
-                            raise FloatingPointError("gradients are Nan/Inf")
+                    if SAMPLER_RECORD:
+                        print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
+                        fout1.write(print_str)
+                        fout1.flush()
+                    model_pred, loss, more_loss = self.wrapper(
+                        **input_dict,
+                        cur_lr=pref_lr,
+                        label=label_dict,
+                        task_key=task_key,
+                    )
+                    loss = loss / float(self.accumulation_steps)
+                    loss.backward()
+                    if self.gradient_max_norm > 0.0:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(
+                            self.wrapper.parameters(), self.gradient_max_norm
+                        )
+                        if not torch.isfinite(grad_norm).all():
+                            # check local gradnorm single GPU case, trigger NanDetector
+                            if self.skip_bad_points:
+                                logging.warning(
+                                    "gradients are Nan/Inf on data points, skipped."
+                                )
+                                self.scheduler.step()
+                                self.optimizer.zero_grad(set_to_none=True)
+                                return
+                            else:
+                                raise FloatingPointError("gradients are Nan/Inf")
                 with torch.device("cpu"):
                     self.optimizer.step()
                 self.scheduler.step()
             elif self.opt_type == "LKF":
+                input_dict, label_dict, log_dict = self.get_data(
+                    is_train=True, task_key=task_key
+                )
+                if SAMPLER_RECORD:
+                    print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
+                    fout1.write(print_str)
+                    fout1.flush()
                 if isinstance(self.loss, EnergyStdLoss):
                     KFOptWrapper = KFOptimizerWrapper(
                         self.wrapper, self.optimizer, 24, 6, dist.is_initialized()
