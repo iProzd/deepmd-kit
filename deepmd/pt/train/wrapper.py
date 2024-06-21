@@ -37,8 +37,10 @@ class ModelWrapper(torch.nn.Module):
         self.multi_task = False
         self.model = torch.nn.ModuleDict()
         # Model
+        self.model_keys = []
         if isinstance(model, torch.nn.Module):
             self.model["Default"] = model
+            self.model_keys.append("Default")
         elif isinstance(model, dict):
             self.multi_task = True
             for task_key in model:
@@ -46,6 +48,7 @@ class ModelWrapper(torch.nn.Module):
                     model[task_key], torch.nn.Module
                 ), f"{task_key} in model_dict is not a torch.nn.Module!"
                 self.model[task_key] = model[task_key]
+                self.model_keys.append(task_key)
         # Loss
         self.loss = None
         if loss is not None:
@@ -181,6 +184,25 @@ class ModelWrapper(torch.nn.Module):
                 natoms=natoms,
                 learning_rate=cur_lr,
             )
+
+            # def get_qt_loss():
+            #     if not self.multi_task:
+            #         return 0.0
+            #     else:
+            #         loss_qt = 0.0
+            #         for ii, model_key in enumerate(self.model_keys):
+            #             coef = cur_lr / self.loss[model_key].starter_learning_rate
+            #             pref_qt = 1 + (0.00001 - 1) * coef
+            #             for param1, param2 in zip(self.model[model_key].atomic_model.fitting_net.named_parameters(),
+            #                                       self.model[self.model_keys[(ii + 1) % len(
+            #                                           self.model_keys)]].atomic_model.fitting_net.named_parameters(),
+            #                                       ):
+            #                 assert param1[0] == param2[0]
+            #                 loss_qt += pref_qt * torch.sum((param1[1] - param2[1]) ** 2)
+            #         loss_qt /= len(self.model_keys)
+            #         return loss_qt
+
+            # loss += get_qt_loss()
             return model_pred, loss, more_loss
 
     def set_extra_state(self, state: Dict):

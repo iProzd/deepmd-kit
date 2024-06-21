@@ -427,10 +427,15 @@ class RepformerLayer(torch.nn.Module):
                     )
                 )
         if self.update_h2:
-            self.attn2h_map = Atten2Map(
-                g2_dim, attn2_hidden, attn2_nhead, attn2_has_gate, self.smooth
-            )
+            if self.update_g2_has_attn:
+                self.attn2h_map = self.attn2g_map
+            else:
+                self.attn2h_map = Atten2Map(
+                    g2_dim, attn2_hidden, attn2_nhead, attn2_has_gate, self.smooth
+                )
             self.attn2_ev_apply = Atten2EquiVarApply(g2_dim, attn2_nhead)
+            if self.update_style == "res_residual":
+                self.h2_residual.append(get_residual(3, 0.0, self.update_residual_init))
         if self.update_g1_has_attn:
             self.loc_attn = LocalAtten(g1_dim, attn1_hidden, attn1_nhead, self.smooth)
             if self.update_style == "res_residual":
@@ -577,7 +582,7 @@ class RepformerLayer(torch.nn.Module):
         sw: torch.Tensor,  # nb x nloc x nnei
     ) -> torch.Tensor:
         ret = g1.unsqueeze(-2) * gg1
-        ret = ret / self.scale_g2
+        # ret = ret / self.scale_g2
         # nb x nloc x nnei x ng1
         ret = _apply_nlist_mask(ret, nlist_mask)
         if self.smooth:
@@ -749,18 +754,7 @@ class RepformerLayer(torch.nn.Module):
             assert gg1 is not None
             assert self.loc_attn is not None
             g1_update.append(self.loc_attn(g1, gg1, nlist_mask, sw))
-
-        # print("pref: ", self.scale_g2)
-        # print("g1 std: ", g1_update[0].std())
-        # print("mlp(g1) std: ", g1_update[1].std())
-        # print("attn(g1) std: ", g1_update[2].std())
-        # print("g2 std: ", g2_update[0].std())
-        # try:
-        #     print("mlp(g2) std: ", g2_update[1].std())
-        #     print("g1g1(g2) std: ", g2_update[2].std())
-        #     print("attn(g2) std: ", g2_update[3].std())
-        # except:
-        #     pass
+        # embed()
 
         # update
         if self.update_chnnl_2:
@@ -773,12 +767,27 @@ class RepformerLayer(torch.nn.Module):
         # print("list_update g1")
         g1_new = self.list_update(g1_update, "g1")
 
+        # print("g1 std: ", g1_update[0].std())
+        # print("mlp(g1) std: ", g1_update[1].std())
+        # print("attn(g1) std: ", g1_update[2].std())
+        # print("g2 std: ", g2_update[0].std())
+        # print("h2 std: ", h2_update[0].std())
+        # print("h2_new std: ", h2_new.std())
+        # try:
+        #     print("attn(h2) std: ", h2_update[1].std())
+        #     print("h2 residual std: ", self.h2_residual[0].std())
+        #     print("mlp(g2) std: ", g2_update[1].std())
+        #     print("g1g1(g2) std: ", g2_update[2].std())
+        #     print("attn(g2) std: ", g2_update[3].std())
+        # except:
+        #     pass
+
         if self.bn1 is not None:
             g1_new = self._apply_bn(1, g1_new)
         if self.bn2 is not None:
             g2_new = self._apply_bn(2, g2_new)
-        if self.update_h2:
-            h2_new = _apply_h_norm(h2_new)
+        # if self.update_h2:
+        #     h2_new = _apply_h_norm(h2_new)
         return g1_new, g2_new, h2_new
 
     @torch.jit.export

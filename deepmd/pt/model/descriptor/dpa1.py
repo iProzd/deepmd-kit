@@ -66,12 +66,14 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         exclude_types: List[Tuple[int, int]] = [],
         stripped_type_embedding: bool = False,
         smooth_type_embdding: bool = False,
+        use_econf_tebd: bool = False,
+        type_map: Optional[List[str]] = None,
     ):
         super().__init__()
         if resnet_dt:
             raise NotImplementedError("resnet_dt is not supported.")
-        if not type_one_side:
-            raise NotImplementedError("type_one_side is not supported.")
+        # if not type_one_side:
+        #     raise NotImplementedError("type_one_side is not supported.")
         if precision != "default" and precision != "float64":
             raise NotImplementedError("precison is not supported.")
         if stripped_type_embedding:
@@ -105,7 +107,9 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             exclude_types=exclude_types,
             env_protection=env_protection,
         )
-        self.type_embedding = TypeEmbedNet(ntypes, tebd_dim)
+        self.type_embedding = TypeEmbedNet(
+            ntypes, tebd_dim, use_econf_tebd=use_econf_tebd, type_map=type_map
+        )
         self.tebd_dim = tebd_dim
         self.concat_output_tebd = concat_output_tebd
         # set trainable

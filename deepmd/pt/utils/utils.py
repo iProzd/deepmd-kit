@@ -22,6 +22,8 @@ def get_activation_fn(activation: str) -> Callable:
     """Returns the activation function corresponding to `activation`."""
     if activation.lower() == "relu":
         return F.relu
+    elif activation.lower() == "silu":
+        return F.silu
     elif activation.lower() == "gelu" or activation.lower() == "gelu_tf":
 
         @torch.jit.script
@@ -54,6 +56,8 @@ class ActivationFn(torch.nn.Module):
 
         if self.activation.lower() == "relu":
             return F.relu(x)
+        elif self.activation.lower() == "silu":
+            return F.silu(x)
         elif self.activation.lower() == "gelu" or self.activation.lower() == "gelu_tf":
             return F.gelu(x, approximate="tanh")
         elif self.activation.lower() == "tanh":

@@ -44,7 +44,7 @@ def make_stat_input(datasets, dataloaders, nbatches):
     """
     lst = []
     log.info(f"Packing data for statistics from {len(datasets)} systems")
-    for i in range(len(datasets)):
+    for i in range(min(len(datasets), 10000)):
         sys_stat = {}
         with torch.device("cpu"):
             iterator = iter(dataloaders[i])

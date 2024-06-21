@@ -51,3 +51,45 @@ class LearningRateExp:
         if step_lr < self.min_lr:
             step_lr = self.min_lr
         return step_lr
+
+
+class LearningRateCosineAnnealingDecay:
+    def __init__(
+        self,
+        start_lr,
+        stop_lr,
+        decay_steps,
+        stop_steps,
+        **kwargs,
+    ):
+        """
+        Construct a cosine annealing decayed learning rate.
+
+        Parameters
+        ----------
+        start_lr
+            The learning rate at the start of the training.
+        stop_lr
+            The desired learning rate at the end of the training.
+        decay_steps
+            The number of training steps in each cycle.
+        stop_steps
+            The total training steps for learning rate scheduler.
+        """
+        self.start_lr = start_lr
+        self.stop_lr = stop_lr
+        default_ds = 100 if stop_steps // 10 > 100 else stop_steps // 100 + 1
+        self.decay_steps = decay_steps
+        if self.decay_steps >= stop_steps:
+            self.decay_steps = default_ds
+        self.stop_steps = stop_steps
+
+    def value(self, step):
+        """Get the learning rate at the given step."""
+        cycle = np.floor(1 + step / (2 * self.decay_steps))
+        x = np.abs(step / self.decay_steps - 2 * cycle + 1)
+        step_lr = (
+            self.stop_lr + (self.start_lr - self.stop_lr) * (1 + np.cos(np.pi * x)) / 2
+        )
+
+        return step_lr

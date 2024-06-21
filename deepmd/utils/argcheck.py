@@ -521,6 +521,12 @@ def descrpt_se_atten_args():
             doc=doc_only_pt_supported + doc_tebd_dim,
         ),
         Argument(
+            "use_econf_tebd",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "tebd_input_mode",
             str,
             optional=True,
@@ -726,6 +732,12 @@ def descrpt_dpa2_args():
             doc=doc_repinit_activation,
         ),
         Argument(
+            "repinit_tebd_input_mode",
+            str,
+            optional=True,
+            default="concat",
+        ),
+        Argument(
             "repformer_nlayers",
             int,
             optional=True,
@@ -888,6 +900,12 @@ def descrpt_dpa2_args():
             optional=True,
             default=False,
             doc=doc_repformer_add_type_ebd_to_seq,
+        ),
+        Argument(
+            "use_econf_tebd",
+            bool,
+            optional=True,
+            default=False,
         ),
     ]
 
@@ -1568,12 +1586,46 @@ def learning_rate_exp():
     return args
 
 
+def learning_rate_cos():
+    doc_start_lr = "The learning rate at the start of the training."
+    doc_stop_lr = "The desired learning rate at the end of the each cycle. "
+    doc_decay_steps = "The number of training steps in each cycle."
+
+    args = [
+        Argument(
+            "start_lr",
+            float,
+            optional=True,
+            default=1e-3,
+            doc=doc_only_pt_supported + doc_start_lr,
+        ),
+        Argument(
+            "stop_lr",
+            float,
+            optional=True,
+            default=2e-4,
+            doc=doc_only_pt_supported + doc_stop_lr,
+        ),
+        Argument(
+            "decay_steps",
+            int,
+            optional=True,
+            default=100000,
+            doc=doc_only_pt_supported + doc_decay_steps,
+        ),
+    ]
+    return args
+
+
 def learning_rate_variant_type_args():
     doc_lr = "The type of the learning rate."
 
     return Variant(
         "type",
-        [Argument("exp", dict, learning_rate_exp())],
+        [
+            Argument("exp", dict, learning_rate_exp()),
+            Argument("cos", dict, learning_rate_cos()),
+        ],
         optional=True,
         default_tag="exp",
         doc=doc_lr,
@@ -1644,6 +1696,7 @@ def loss_ener():
     doc_limit_pref_pf = limit_pref("atomic prefactor force")
     doc_start_pref_gf = start_pref("generalized force", label="drdq", abbr="gf")
     doc_limit_pref_gf = limit_pref("generalized force")
+    doc_huber_delta = "The delta in the huber loss."
     doc_numb_generalized_coord = "The dimension of generalized coordinates. Required when generalized force loss is used."
     doc_relative_f = "If provided, relative force error will be used in the loss. The difference of force will be normalized by the magnitude of the force in the label with a shift given by `relative_f`, i.e. DF_i / ( || F || + relative_f ) with DF denoting the difference between prediction and label and || F || denoting the L2 norm of the label."
     doc_enable_atom_ener_coeff = "If true, the energy will be computed as \\sum_i c_i E_i. c_i should be provided by file atom_ener_coeff.npy in each data system, otherwise it's 1."
@@ -1751,8 +1804,8 @@ def loss_ener():
             "huber_delta",
             float,
             optional=True,
-            default=1.0,
-            doc=doc_limit_pref_gf,
+            default=0.01,
+            doc=doc_huber_delta,
         ),
         Argument(
             "numb_generalized_coord",
@@ -2227,6 +2280,9 @@ def training_args():  # ! modified by Ziyao: data configuration isolated.
     )
     doc_opt_type = "The type of optimizer to use."
     doc_kf_blocksize = "The blocksize for the Kalman filter."
+    doc_adam_beta1 = "Beta1 for the Adam optimizer."
+    doc_adam_beta2 = "Beta2 for the Adam optimizer."
+    doc_accumulation_steps = "Steps for the accumulation of gradient."
 
     arg_training_data = training_data_args()
     arg_validation_data = validation_data_args()
@@ -2249,6 +2305,16 @@ def training_args():  # ! modified by Ziyao: data configuration isolated.
             "save_ckpt", str, optional=True, default="model.ckpt", doc=doc_save_ckpt
         ),
         Argument("max_ckpt_keep", int, optional=True, default=5, doc=doc_max_ckpt_keep),
+        Argument("skip_bad_points", bool, optional=True, default=False),
+        Argument("adam_beta1", float, optional=True, default=0.9, doc=doc_adam_beta1),
+        Argument("adam_beta2", float, optional=True, default=0.999, doc=doc_adam_beta2),
+        Argument(
+            "accumulation_steps",
+            int,
+            optional=True,
+            default=1,
+            doc=doc_accumulation_steps,
+        ),
         Argument(
             "disp_training", bool, optional=True, default=True, doc=doc_disp_training
         ),

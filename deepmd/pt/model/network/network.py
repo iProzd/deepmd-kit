@@ -25,9 +25,13 @@ from functools import (
 
 import torch.utils.checkpoint
 
+from deepmd.pt.model.network.mlp import (
+    EmbeddingNet,
+)
 from deepmd.pt.utils.utils import (
     ActivationFn,
     get_activation_fn,
+    to_torch_tensor,
 )
 
 
@@ -216,6 +220,7 @@ class TypeFilter(nn.Module):
         inputs,
         atype_tebd: Optional[torch.Tensor] = None,
         nlist_tebd: Optional[torch.Tensor] = None,
+        sw: Optional[torch.Tensor] = None,
     ):
         """Calculate decoded embedding for each atom.
 
@@ -250,14 +255,15 @@ class TypeFilter(nn.Module):
             "dot_residual_s",
             "dot_residual_t",
         ]:
-            assert nlist_tebd is not None and atype_tebd is not None
+            assert nlist_tebd is not None and atype_tebd is not None and sw is not None
             nlist_tebd = nlist_tebd.reshape(-1, self.tebd_dim)
             atype_tebd = atype_tebd.reshape(-1, self.tebd_dim)
             # [nframes * nloc * nnei, tebd_dim * 2]
             two_side_tebd = torch.concat([nlist_tebd, atype_tebd], dim=1)
-            for linear in self.deep_layers_t:
-                two_side_tebd = linear(two_side_tebd)
+            for linear_t in self.deep_layers_t:
+                two_side_tebd = linear_t(two_side_tebd)
                 # [nframes * nloc * nnei, out_size]
+            two_side_tebd = two_side_tebd * sw.reshape(-1, 1)
             if self.tebd_mode == "dot":
                 xyz_scatter = xyz_scatter * two_side_tebd
             elif self.tebd_mode == "dot_residual_s":
@@ -549,17 +555,69 @@ class ResidualDeep(nn.Module):
         return outputs
 
 
+def get_econf_tebd(type_map, precision: str = "default"):
+    from deepmd.dpmodel.common import (
+        PRECISION_DICT,
+    )
+    from deepmd.utils.econf_embd import (
+        ECONF_DIM,
+        electronic_configuration_embedding,
+    )
+    from deepmd.utils.econf_embd import type_map as periodic_table
+
+    assert (
+        type_map is not None
+    ), "When using electronic configuration type embedding, type_map must be provided!"
+
+    missing_types = [t for t in type_map if t.split("_")[0] not in periodic_table]
+    assert not missing_types, (
+        "When using electronic configuration type embedding, "
+        "all element in type_map should be in periodic table! "
+        f"Found these invalid elements: {missing_types}"
+    )
+    econf_tebd = np.array(
+        [electronic_configuration_embedding[kk.split("_")[0]] for kk in type_map],
+        dtype=PRECISION_DICT[precision],
+    )
+    embed_input_dim = ECONF_DIM
+    return econf_tebd, embed_input_dim
+
+
 class TypeEmbedNet(nn.Module):
-    def __init__(self, type_nums, embed_dim, bavg=0.0, stddev=1.0):
+    def __init__(
+        self,
+        type_nums,
+        embed_dim,
+        bavg=0.0,
+        stddev=1.0,
+        use_econf_tebd: bool = False,
+        type_map=None,
+    ):
         """Construct a type embedding net."""
         super().__init__()
-        self.embedding = nn.Embedding(
-            type_nums + 1,
-            embed_dim,
-            padding_idx=type_nums,
-            dtype=env.GLOBAL_PT_FLOAT_PRECISION,
-            device=env.DEVICE,
-        )
+        self.use_econf_tebd = use_econf_tebd
+        self.econf_tebd = None
+        self.embedding_net = None
+        self.embedding = None
+        if self.use_econf_tebd:
+            self.type_map = type_map
+            econf_tebd, embed_input_dim = get_econf_tebd(
+                self.type_map,
+            )
+            self.econf_tebd = to_torch_tensor(econf_tebd)
+            self.embedding_net = EmbeddingNet(
+                embed_input_dim,
+                [embed_dim],
+                "Linear",
+            )
+        else:
+            self.embedding = nn.Embedding(
+                type_nums + 1,
+                embed_dim,
+                padding_idx=type_nums,
+                dtype=env.GLOBAL_PT_FLOAT_PRECISION,
+                device=env.DEVICE,
+            )
         # nn.init.normal_(self.embedding.weight[:-1], mean=bavg, std=stddev)
 
     def forward(self, atype):
@@ -572,7 +630,25 @@ class TypeEmbedNet(nn.Module):
         type_embedding:
 
         """
-        return self.embedding(atype)
+        if not self.use_econf_tebd:
+            assert self.embedding is not None
+            return self.embedding(atype)
+        else:
+            assert self.econf_tebd is not None
+            assert self.embedding_net is not None
+            embed_atype = self.embedding_net(self.econf_tebd)
+            embed_atype = torch.cat(
+                [
+                    embed_atype,
+                    torch.zeros(
+                        1,
+                        embed_atype.shape[1],
+                        dtype=self.econf_tebd.dtype,
+                        device=self.econf_tebd.device,
+                    ),
+                ]
+            )
+            return embed_atype[atype]
 
     def share_params(self, base_class, shared_level, resume=False):
         """

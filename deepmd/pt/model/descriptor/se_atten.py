@@ -325,6 +325,7 @@ class DescrptBlockSeAtten(DescriptorBlock):
             dmatrix,
             atype_tebd=atype_tebd_nnei,
             nlist_tebd=atype_tebd_nlist,
+            sw=sw,
         )  # shape is [nframes*nall, self.neei, out_size]
         input_r = torch.nn.functional.normalize(
             dmatrix.reshape(-1, self.nnei, 4)[:, :, 1:4], dim=-1

@@ -54,6 +54,7 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
         repinit_axis_neuron: int = 16,
         repinit_set_davg_zero: bool = True,  # TODO
         repinit_activation="tanh",
+        repinit_tebd_input_mode="concat",
         # repinit still unclear:
         # ffn, ffn_embed_dim, scaling_factor, normalize,
         repformer_nlayers: int = 3,
@@ -84,6 +85,8 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
         env_protection: float = 0.0,
         trainable: bool = True,
         exclude_types: List[Tuple[int, int]] = [],
+        use_econf_tebd: bool = False,
+        type_map: Optional[List[str]] = None,
         type: Optional[
             str
         ] = None,  # work around the bad design in get_trainer and DpLoaderSet!
@@ -219,7 +222,7 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
             neuron=repinit_neuron,
             axis_neuron=repinit_axis_neuron,
             tebd_dim=tebd_dim,
-            tebd_input_mode="concat",
+            tebd_input_mode=repinit_tebd_input_mode,
             # tebd_input_mode='dot_residual_s',
             set_davg_zero=repinit_set_davg_zero,
             exclude_types=exclude_types,
@@ -260,7 +263,9 @@ class DescrptDPA2(torch.nn.Module, BaseDescriptor):
             exclude_types=exclude_types,
             env_protection=env_protection,
         )
-        self.type_embedding = TypeEmbedNet(ntypes, tebd_dim)
+        self.type_embedding = TypeEmbedNet(
+            ntypes, tebd_dim, use_econf_tebd=use_econf_tebd, type_map=type_map
+        )
         if self.repinit.dim_out == self.repformers.dim_in:
             self.g1_shape_tranform = Identity()
         else:

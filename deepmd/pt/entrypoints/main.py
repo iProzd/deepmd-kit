@@ -79,6 +79,7 @@ def get_trainer(
     force_load=False,
     init_frz_model=None,
     shared_links=None,
+    out_config=None,
 ):
     multi_task = "model_dict" in config.get("model", {})
 
@@ -97,6 +98,10 @@ def get_trainer(
             config["model"],
             model_branch=model_branch,
         )
+    if out_config is not None:
+        with open(out_config, "w") as fp:
+            json.dump(config, fp, indent=4)
+
     config["model"]["resuming"] = (finetune_model is not None) or (ckpt is not None)
 
     def prepare_trainer_input_single(
@@ -240,9 +245,12 @@ def train(FLAGS):
         config["model"], shared_links = preprocess_shared_params(config["model"])
 
     # argcheck
-    if not multi_task:
+    if not multi_task and FLAGS.finetune is None:
+        wandb_config = config["training"].pop("wandb_config", None)
         config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
         config = normalize(config)
+        if wandb_config is not None:
+            config["training"]["wandb_config"] = wandb_config
 
     # do neighbor stat
     if not FLAGS.skip_neighbor_stat:
@@ -265,9 +273,6 @@ def train(FLAGS):
                     fake_global_jdata, config["model"]["model_dict"][model_item]
                 )
 
-    with open(FLAGS.output, "w") as fp:
-        json.dump(config, fp, indent=4)
-
     trainer = get_trainer(
         config,
         FLAGS.init_model,
@@ -277,6 +282,7 @@ def train(FLAGS):
         FLAGS.force_load,
         FLAGS.init_frz_model,
         shared_links=shared_links,
+        out_config=FLAGS.output,
     )
     trainer.run()
 
@@ -299,7 +305,7 @@ def main(args: Optional[Union[List[str], argparse.Namespace]] = None):
 
     set_log_handles(FLAGS.log_level, FLAGS.log_path, mpi_log=None)
     log.debug("Log handles were successfully set")
-    log.info("DeepMD version: %s", __version__)
+    log.info("DeePMD version: %s", __version__)
 
     if FLAGS.command == "train":
         train(FLAGS)
