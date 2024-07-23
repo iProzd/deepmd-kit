@@ -2479,6 +2479,24 @@ def loss_ener():
             default=0,
             doc=doc_numb_generalized_coord,
         ),
+        Argument(
+            "use_huber",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "huber_delta",
+            float,
+            optional=True,
+            default=0.01,
+        ),
+        Argument(
+            "torch_huber",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
