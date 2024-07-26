@@ -81,6 +81,7 @@ class EnergyStdLoss(TaskLoss):
         inference=False,
         use_huber=False,
         huber_delta=0.01,
+        torch_huber=False,
         **kwargs,
     ):
         r"""Construct a layer to compute loss on energy, force and virial.
@@ -160,6 +161,8 @@ class EnergyStdLoss(TaskLoss):
         self.inference = inference
         self.huber = use_huber
         self.huber_delta = huber_delta
+        self.torch_huber = torch_huber
+        self.huber_loss = torch.nn.HuberLoss(reduction="mean", delta=huber_delta)
 
     def forward(self, input_dict, model, label, natoms, learning_rate, mae=False):
         """Return loss on energy and force.
@@ -225,11 +228,17 @@ class EnergyStdLoss(TaskLoss):
                 if not self.huber:
                     loss += atom_norm * (pref_e * l2_ener_loss)
                 else:
-                    l_huber_loss = custom_huber_loss(
-                        atom_norm * model_pred["energy"],
-                        atom_norm * label["energy"],
-                        delta=self.huber_delta,
-                    )
+                    if self.torch_huber:
+                        l_huber_loss = self.huber_loss(
+                            atom_norm * model_pred["energy"],
+                            atom_norm * label["energy"],
+                        )
+                    else:
+                        l_huber_loss = custom_huber_loss(
+                            atom_norm * model_pred["energy"],
+                            atom_norm * label["energy"],
+                            delta=self.huber_delta,
+                        )
                     loss += pref_e * l_huber_loss
                 rmse_e = l2_ener_loss.sqrt() * atom_norm
                 more_loss["rmse_e"] = self.display_if_exist(
@@ -288,11 +297,16 @@ class EnergyStdLoss(TaskLoss):
                     if not self.huber:
                         loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
                     else:
-                        l_huber_loss = custom_step_huber_loss(
-                            force_pred.reshape(-1),
-                            force_label.reshape(-1),
-                            delta=self.huber_delta,
-                        )
+                        if self.torch_huber:
+                            l_huber_loss = self.huber_loss(
+                                model_pred["force"], label["force"]
+                            )
+                        else:
+                            l_huber_loss = custom_step_huber_loss(
+                                force_pred.reshape(-1),
+                                force_label.reshape(-1),
+                                delta=self.huber_delta,
+                            )
                         loss += pref_f * l_huber_loss
                     rmse_f = l2_force_loss.sqrt()
                     more_loss["rmse_f"] = self.display_if_exist(
@@ -364,11 +378,17 @@ class EnergyStdLoss(TaskLoss):
             if not self.huber:
                 loss += atom_norm * (pref_v * l2_virial_loss)
             else:
-                l_huber_loss = custom_huber_loss(
-                    model_pred["virial"].reshape(-1),
-                    label["virial"].reshape(-1),
-                    delta=self.huber_delta,
-                )
+                if self.torch_huber:
+                    l_huber_loss = self.huber_loss(
+                        atom_norm * model_pred["virial"],
+                        atom_norm * label["virial"],
+                    )
+                else:
+                    l_huber_loss = custom_huber_loss(
+                        model_pred["virial"].reshape(-1),
+                        label["virial"].reshape(-1),
+                        delta=self.huber_delta,
+                    )
                 loss += pref_v * l_huber_loss
             rmse_v = l2_virial_loss.sqrt() * atom_norm
             more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)

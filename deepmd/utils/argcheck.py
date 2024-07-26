@@ -1931,6 +1931,12 @@ def loss_ener():
             optional=True,
             default=0.01,
         ),
+        Argument(
+            "torch_huber",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
