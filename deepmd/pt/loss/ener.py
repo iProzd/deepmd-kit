@@ -302,7 +302,7 @@ class EnergyStdLoss(TaskLoss):
                                 model_pred["force"], label["force"]
                             )
                         else:
-                            l_huber_loss = custom_step_huber_loss(
+                            l_huber_loss = custom_huber_loss(
                                 force_pred.reshape(-1),
                                 force_label.reshape(-1),
                                 delta=self.huber_delta,
@@ -385,8 +385,8 @@ class EnergyStdLoss(TaskLoss):
                     )
                 else:
                     l_huber_loss = custom_huber_loss(
-                        model_pred["virial"].reshape(-1),
-                        label["virial"].reshape(-1),
+                        atom_norm * model_pred["virial"].reshape(-1),
+                        atom_norm * label["virial"].reshape(-1),
                         delta=self.huber_delta,
                     )
                 loss += pref_v * l_huber_loss

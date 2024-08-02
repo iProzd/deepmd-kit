@@ -215,14 +215,14 @@ def get_econf_tebd(type_map, precision: str = "default"):
         type_map is not None
     ), "When using electronic configuration type embedding, type_map must be provided!"
 
-    missing_types = [t for t in type_map if t not in periodic_table]
+    missing_types = [t for t in type_map if t.split("_")[0] not in periodic_table]
     assert not missing_types, (
         "When using electronic configuration type embedding, "
         "all element in type_map should be in periodic table! "
         f"Found these invalid elements: {missing_types}"
     )
     econf_tebd = np.array(
-        [electronic_configuration_embedding[kk] for kk in type_map],
+        [electronic_configuration_embedding[kk.split("_")[0]] for kk in type_map],
         dtype=PRECISION_DICT[precision],
     )
     embed_input_dim = ECONF_DIM

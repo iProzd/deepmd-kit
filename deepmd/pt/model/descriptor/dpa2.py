@@ -91,6 +91,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         add_tebd_to_repinit_out: bool = False,
         use_econf_tebd: bool = False,
         type_map: Optional[List[str]] = None,
+        use_tebd_bias=True,
         old_impl: bool = False,
     ):
         r"""The DPA-2 descriptor. see https://arxiv.org/abs/2312.15492.
@@ -219,6 +220,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             seed=child_seed(seed, 2),
             use_econf_tebd=self.use_econf_tebd,
             type_map=type_map,
+            bias=use_tebd_bias,
         )
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision

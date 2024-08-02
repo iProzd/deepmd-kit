@@ -597,6 +597,12 @@ def descrpt_se_atten_args():
             doc=doc_only_pt_supported + doc_use_econf_tebd,
         ),
         Argument(
+            "use_tebd_bias",
+            bool,
+            optional=True,
+            default=True,
+        ),
+        Argument(
             "tebd_input_mode",
             str,
             optional=True,
@@ -774,6 +780,12 @@ def descrpt_dpa2_args():
             optional=True,
             default=False,
             doc=doc_only_pt_supported + doc_use_econf_tebd,
+        ),
+        Argument(
+            "use_tebd_bias",
+            bool,
+            optional=True,
+            default=True,
         ),
     ]
 
