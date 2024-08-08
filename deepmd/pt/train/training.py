@@ -277,9 +277,18 @@ class Trainer:
             return get_sample
 
         def get_lr(lr_params):
-            assert (
-                lr_params.get("type", "exp") == "exp"
-            ), "Only learning rate `exp` is supported!"
+            if lr_params.get("type", "exp") == "exp":
+                self.use_auto_reduce = False
+            elif lr_params.get("type", "exp") == "reduce_on_plateau":
+                self.use_auto_reduce = True
+                self.lr_patience = lr_params.get("patience", 100000)
+                self.lr_factor = lr_params.get("factor", 0.5)
+                self.lr_min = lr_params.get("stop_lr", 3.51e-08)
+                self.lr_start = lr_params.get("start_lr", 2e-04)
+                self.lr_threshold = lr_params.get("threshold", 1e-4)
+                self.lr_threshold_mode = lr_params.get("threshold_mode", "rel")
+            else:
+                raise ValueError(lr_params.get("type", "exp"))
             lr_params["stop_steps"] = self.num_steps - self.warmup_steps
             lr_exp = LearningRateExp(**lr_params)
             return lr_exp
@@ -619,15 +628,32 @@ class Trainer:
         # TODO add optimizers for multitask
         # author: iProzd
         if self.opt_type == "Adam":
-            self.optimizer = torch.optim.Adam(
-                self.wrapper.parameters(), lr=self.lr_exp.start_lr
-            )
+            if not self.use_auto_reduce:
+                self.optimizer = torch.optim.Adam(
+                    self.wrapper.parameters(), lr=self.lr_exp.start_lr
+                )
+            else:
+                self.optimizer = torch.optim.Adam(
+                    self.wrapper.parameters(), lr=self.lr_start
+                )
             if optimizer_state_dict is not None and self.restart_training:
                 self.optimizer.load_state_dict(optimizer_state_dict)
-            self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self.optimizer,
-                lambda step: warm_up_linear(step + self.start_step, self.warmup_steps),
-            )
+            if not self.use_auto_reduce:
+                self.scheduler = torch.optim.lr_scheduler.LambdaLR(
+                    self.optimizer,
+                    lambda step: warm_up_linear(
+                        step + self.start_step, self.warmup_steps
+                    ),
+                )
+            else:
+                self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.optimizer,
+                    patience=self.lr_patience,
+                    factor=self.lr_factor,
+                    min_lr=self.lr_min,
+                    threshold=self.lr_threshold,
+                    threshold_mode=self.lr_threshold_mode,
+                )
         elif self.opt_type == "LKF":
             self.optimizer = LKFOptimizer(
                 self.wrapper.parameters(), 0.98, 0.99870, self.opt_param["kf_blocksize"]
@@ -709,7 +735,10 @@ class Trainer:
                 fout1.write(print_str)
                 fout1.flush()
             if self.opt_type == "Adam":
-                cur_lr = self.scheduler.get_last_lr()[0]
+                if not self.use_auto_reduce:
+                    cur_lr = self.scheduler.get_last_lr()[0]
+                else:
+                    cur_lr = self.optimizer.param_groups[-1]["lr"]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr
                 else:
@@ -717,6 +746,7 @@ class Trainer:
                 model_pred, loss, more_loss = self.wrapper(
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                 )
+                ax_loss = more_loss.pop("ax_loss")
                 loss.backward()
                 if self.gradient_max_norm > 0.0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -727,7 +757,10 @@ class Trainer:
                         raise FloatingPointError("gradients are Nan/Inf")
                 with torch.device("cpu"):
                     self.optimizer.step()
-                self.scheduler.step()
+                if self.use_auto_reduce:
+                    self.scheduler.step(ax_loss)
+                else:
+                    self.scheduler.step()
             elif self.opt_type == "LKF":
                 if isinstance(self.loss, EnergyStdLoss):
                     KFOptWrapper = KFOptimizerWrapper(
@@ -834,6 +867,7 @@ class Trainer:
                             label=label_dict,
                             task_key=_task_key,
                         )
+                        more_loss.pop("ax_loss", None)
                         # more_loss.update({"rmse": math.sqrt(loss)})
                         natoms = int(input_dict["atype"].shape[-1])
                         sum_natoms += natoms
@@ -889,6 +923,7 @@ class Trainer:
                                 label=label_dict,
                                 task_key=_key,
                             )
+                            more_loss.pop("ax_loss", None)
                             train_results[_key] = log_loss_train(
                                 loss, more_loss, _task_key=_key
                             )
@@ -1004,7 +1039,10 @@ class Trainer:
                         _bias_adjust_mode="change-by-statistic",
                     )
             self.latest_model = Path(self.save_ckpt + f"-{self.num_steps}.pt")
-            cur_lr = self.lr_exp.value(self.num_steps - 1)
+            if not self.use_auto_reduce:
+                cur_lr = self.lr_exp.value(self.num_steps - 1)
+            else:
+                cur_lr = self.optimizer.param_groups[-1]["lr"]
             self.save_model(self.latest_model, lr=cur_lr, step=self.num_steps - 1)
             log.info(f"Saved model to {self.latest_model}")
             symlink_prefix_files(self.latest_model.stem, self.save_ckpt)

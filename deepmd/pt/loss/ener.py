@@ -197,7 +197,7 @@ class EnergyStdLoss(TaskLoss):
         pref_gf = self.limit_pref_gf + (self.start_pref_gf - self.limit_pref_gf) * coef
 
         loss = torch.zeros(1, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=env.DEVICE)[0]
-        more_loss = {}
+        more_loss = {"ax_loss": 0.0}  # for stop prefactor loss
         # more_loss['log_keys'] = []  # showed when validation on the fly
         # more_loss['test_keys'] = []  # showed when doing dp test
         atom_norm = 1.0 / natoms
@@ -227,6 +227,9 @@ class EnergyStdLoss(TaskLoss):
                     )
                 if not self.huber:
                     loss += atom_norm * (pref_e * l2_ener_loss)
+                    more_loss["ax_loss"] += atom_norm * (
+                        self.limit_pref_e * find_energy * l2_ener_loss
+                    )
                 else:
                     if self.torch_huber:
                         l_huber_loss = self.huber_loss(
@@ -240,6 +243,9 @@ class EnergyStdLoss(TaskLoss):
                             delta=self.huber_delta,
                         )
                     loss += pref_e * l_huber_loss
+                    more_loss["ax_loss"] += (
+                        self.limit_pref_e * find_energy * l_huber_loss
+                    )
                 rmse_e = l2_ener_loss.sqrt() * atom_norm
                 more_loss["rmse_e"] = self.display_if_exist(
                     rmse_e.detach(), find_energy
@@ -296,6 +302,9 @@ class EnergyStdLoss(TaskLoss):
                         )
                     if not self.huber:
                         loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                        more_loss["ax_loss"] += (
+                            self.limit_pref_f * find_force * l2_force_loss
+                        ).to(GLOBAL_PT_FLOAT_PRECISION)
                     else:
                         if self.torch_huber:
                             l_huber_loss = self.huber_loss(
@@ -307,7 +316,8 @@ class EnergyStdLoss(TaskLoss):
                                 force_label.reshape(-1),
                                 delta=self.huber_delta,
                             )
-                        loss += pref_f * l_huber_loss
+                        loss += self.limit_pref_f * find_force * l_huber_loss
+                        more_loss["ax_loss"] += pref_f * l_huber_loss
                     rmse_f = l2_force_loss.sqrt()
                     more_loss["rmse_f"] = self.display_if_exist(
                         rmse_f.detach(), find_force
@@ -377,6 +387,9 @@ class EnergyStdLoss(TaskLoss):
                 )
             if not self.huber:
                 loss += atom_norm * (pref_v * l2_virial_loss)
+                more_loss["ax_loss"] += atom_norm * (
+                    self.limit_pref_v * find_virial * l2_virial_loss
+                )
             else:
                 if self.torch_huber:
                     l_huber_loss = self.huber_loss(
@@ -390,6 +403,7 @@ class EnergyStdLoss(TaskLoss):
                         delta=self.huber_delta,
                     )
                 loss += pref_v * l_huber_loss
+                more_loss["ax_loss"] += self.limit_pref_v * find_virial * l_huber_loss
             rmse_v = l2_virial_loss.sqrt() * atom_norm
             more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
             if mae:

@@ -1759,6 +1759,34 @@ def learning_rate_exp():
             default=None,
             doc=doc_only_pt_supported + doc_decay_rate,
         ),
+        Argument(
+            "factor",
+            float,
+            optional=True,
+            default=0.5,
+            doc="factor to minimize lr once.",
+        ),
+        Argument(
+            "patience",
+            int,
+            optional=True,
+            default=100000,
+            doc="steps to wait before minimize.",
+        ),
+        Argument(
+            "threshold",
+            float,
+            optional=True,
+            default=1e-4,
+            doc="Threshold for measuring the new optimum, to only focus on significant changes. Default: 1e-4.",
+        ),
+        Argument(
+            "threshold_mode",
+            str,
+            optional=True,
+            default="rel",
+            doc="One of rel, abs.",
+        ),
     ]
     return args
 
@@ -1768,7 +1796,10 @@ def learning_rate_variant_type_args():
 
     return Variant(
         "type",
-        [Argument("exp", dict, learning_rate_exp())],
+        [
+            Argument("exp", dict, learning_rate_exp()),
+            Argument("reduce_on_plateau", dict, learning_rate_exp()),
+        ],
         optional=True,
         default_tag="exp",
         doc=doc_lr,
