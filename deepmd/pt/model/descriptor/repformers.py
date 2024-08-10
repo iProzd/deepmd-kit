@@ -9,6 +9,9 @@ from typing import (
 )
 
 import torch
+from IPython import (
+    embed,
+)
 
 from deepmd.dpmodel.utils.seed import (
     child_seed,
@@ -104,6 +107,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         precision: str = "float64",
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
+        use_g1_act=True,
+        log_sub_distribution=False,
         seed: Optional[Union[int, List[int]]] = None,
         old_impl: bool = False,
     ):
@@ -221,6 +226,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.update_residual_init = update_residual_init
         self.direct_dist = direct_dist
         self.act = ActivationFn(activation_function)
+        self.use_g1_act = use_g1_act
+        self.log_sub_distribution = log_sub_distribution
         self.smooth = smooth
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
@@ -296,6 +303,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                         trainable_ln=self.trainable_ln,
                         ln_eps=self.ln_eps,
                         precision=precision,
+                        log_sub_distribution=log_sub_distribution,
                         seed=child_seed(child_seed(seed, 1), ii),
                     )
                 )
@@ -440,7 +448,10 @@ class DescrptBlockRepformers(DescriptorBlock):
         else:
             atype_embd = extended_atype_embd
         assert isinstance(atype_embd, torch.Tensor)  # for jit
-        g1 = self.act(atype_embd)
+        if self.use_g1_act:
+            g1 = self.act(atype_embd)
+        else:
+            g1 = atype_embd
         # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
         if not self.direct_dist:
             g2, h2 = torch.split(dmatrix, [1, 3], dim=-1)
@@ -489,14 +500,25 @@ class DescrptBlockRepformers(DescriptorBlock):
                     torch.tensor(nall - nloc),
                 )
                 g1_ext = ret[0].unsqueeze(0)
-            g1, g2, h2 = ll.forward(
-                g1_ext,
-                g2,
-                h2,
-                nlist,
-                nlist_mask,
-                sw,
-            )
+            if not self.log_sub_distribution:
+                g1, g2, h2 = ll.forward(
+                    g1_ext,
+                    g2,
+                    h2,
+                    nlist,
+                    nlist_mask,
+                    sw,
+                )
+            else:
+                g1, g2, h2, log_result = ll.forward(
+                    g1_ext,
+                    g2,
+                    h2,
+                    nlist,
+                    nlist_mask,
+                    sw,
+                )
+                embed()
 
         # nb x nloc x 3 x ng2
         h2g2 = RepformerLayer._cal_hg(

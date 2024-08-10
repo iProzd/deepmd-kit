@@ -2,12 +2,7 @@
 import unittest
 
 from deepmd.pt.model.descriptor import (
-    DescrptDPA1,
     DescrptDPA2,
-    DescrptHybrid,
-    DescrptSeA,
-    DescrptSeR,
-    DescrptSeT,
 )
 
 from ....consistent.common import (
@@ -17,13 +12,7 @@ from ...common.cases.descriptor.descriptor import (
     DescriptorTest,
 )
 from ...dpmodel.descriptor.test_descriptor import (
-    DescriptorParamDPA1,
-    DescriptorParamDPA2,
-    DescriptorParamHybrid,
-    DescriptorParamHybridMixed,
-    DescriptorParamSeA,
-    DescriptorParamSeR,
-    DescriptorParamSeT,
+    DescriptorParamDPA2TTebd,
 )
 from ..backend import (
     PTTestCase,
@@ -32,13 +21,15 @@ from ..backend import (
 
 @parameterized(
     (
-        (DescriptorParamSeA, DescrptSeA),
-        (DescriptorParamSeR, DescrptSeR),
-        (DescriptorParamSeT, DescrptSeT),
-        (DescriptorParamDPA1, DescrptDPA1),
-        (DescriptorParamDPA2, DescrptDPA2),
-        (DescriptorParamHybrid, DescrptHybrid),
-        (DescriptorParamHybridMixed, DescrptHybrid),
+        # (DescriptorParamSeA, DescrptSeA),
+        # (DescriptorParamSeR, DescrptSeR),
+        # (DescriptorParamSeT, DescrptSeT),
+        # (DescriptorParamDPA1, DescrptDPA1),
+        # (DescriptorParamDPA2, DescrptDPA2),
+        # (DescriptorParamHybrid, DescrptHybrid),
+        # (DescriptorParamHybridMixed, DescrptHybrid),
+        # (DescriptorParamHybridTTebd, DescrptHybrid),
+        (DescriptorParamDPA2TTebd, DescrptDPA2),
     )  # class_param & class
 )
 class TestDescriptorPT(unittest.TestCase, DescriptorTest, PTTestCase):

@@ -599,6 +599,7 @@ class RepformerLayer(torch.nn.Module):
         precision: str = "float64",
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
+        log_sub_distribution=False,
         seed: Optional[Union[int, List[int]]] = None,
     ):
         super().__init__()
@@ -638,6 +639,7 @@ class RepformerLayer(torch.nn.Module):
         self.ln_eps = ln_eps
         self.precision = precision
         self.seed = seed
+        self.log_sub_distribution = log_sub_distribution
 
         assert update_residual_init in [
             "norm",
@@ -1047,6 +1049,8 @@ class RepformerLayer(torch.nn.Module):
         g2:     nf x nloc x nnei x ng2  updated pair-atom channel, invariant
         h2:     nf x nloc x nnei x 3    updated pair-atom channel, equivariant
         """
+        if self.log_sub_distribution:
+            sub_distribution = {}
         cal_gg1 = (
             self.update_g1_has_drrd
             or self.update_g1_has_conv
@@ -1064,6 +1068,11 @@ class RepformerLayer(torch.nn.Module):
         h2_update: List[torch.Tensor] = [h2]
         g1_update: List[torch.Tensor] = [g1]
         g1_mlp: List[torch.Tensor] = [g1]
+        if self.log_sub_distribution:
+            sub_distribution["g2_std"] = g2.std()
+            sub_distribution["g2_mean"] = g2.mean()
+            sub_distribution["g1_std"] = g1.std()
+            sub_distribution["g1_mean"] = g1.mean()
 
         if cal_gg1:
             gg1 = _make_nei_g1(g1_ext, nlist)
@@ -1076,6 +1085,9 @@ class RepformerLayer(torch.nn.Module):
             # nb x nloc x nnei x ng2
             g2_1 = self.act(self.linear2(g2))
             g2_update.append(g2_1)
+            if self.log_sub_distribution:
+                sub_distribution["g2_mlp_std"] = g2_1.std()
+                sub_distribution["g2_mlp_mean"] = g2_1.mean()
 
             if self.update_g2_has_g1g1:
                 # linear(g1_i * g1_j)
@@ -1098,6 +1110,9 @@ class RepformerLayer(torch.nn.Module):
                     g2_2 = self.attn2_mh_apply(AAg, g2)
                     g2_2 = self.attn2_lm(g2_2)
                     g2_update.append(g2_2)
+                    if self.log_sub_distribution:
+                        sub_distribution["g2_attn_std"] = g2_2.std()
+                        sub_distribution["g2_attn_mean"] = g2_2.mean()
 
                 if self.update_h2:
                     # linear_head(attention_weights * h2)
@@ -1105,44 +1120,59 @@ class RepformerLayer(torch.nn.Module):
 
         if self.update_g1_has_conv:
             assert gg1 is not None
-            g1_mlp.append(self._update_g1_conv(gg1, g2, nlist_mask, sw))
+            g1_conv = self._update_g1_conv(gg1, g2, nlist_mask, sw)
+            g1_mlp.append(g1_conv)
+            if self.log_sub_distribution:
+                sub_distribution["g1_conv_std"] = g1_conv.std()
+                sub_distribution["g1_conv_mean"] = g1_conv.mean()
 
         if self.update_g1_has_grrg:
-            g1_mlp.append(
-                self.symmetrization_op(
-                    g2,
-                    h2,
-                    nlist_mask,
-                    sw,
-                    self.axis_neuron,
-                    smooth=self.smooth,
-                    epsilon=self.epsilon,
-                )
+            g1_grrg = self.symmetrization_op(
+                g2,
+                h2,
+                nlist_mask,
+                sw,
+                self.axis_neuron,
+                smooth=self.smooth,
+                epsilon=self.epsilon,
             )
+            g1_mlp.append(g1_grrg)
+            if self.log_sub_distribution:
+                sub_distribution["g1_grrg_std"] = g1_grrg.std()
+                sub_distribution["g1_grrg_mean"] = g1_grrg.mean()
 
         if self.update_g1_has_drrd:
             assert gg1 is not None
-            g1_mlp.append(
-                self.symmetrization_op(
-                    gg1,
-                    h2,
-                    nlist_mask,
-                    sw,
-                    self.axis_neuron,
-                    smooth=self.smooth,
-                    epsilon=self.epsilon,
-                )
+            g1_drrd = self.symmetrization_op(
+                gg1,
+                h2,
+                nlist_mask,
+                sw,
+                self.axis_neuron,
+                smooth=self.smooth,
+                epsilon=self.epsilon,
             )
+            g1_mlp.append(g1_drrd)
+            if self.log_sub_distribution:
+                sub_distribution["g1_drrd_std"] = g1_drrd.std()
+                sub_distribution["g1_drrd_mean"] = g1_drrd.mean()
 
         # nb x nloc x [ng1+ng2+(axisxng2)+(axisxng1)]
         #                  conv   grrg      drrd
         g1_1 = self.act(self.linear1(torch.cat(g1_mlp, dim=-1)))
+        if self.log_sub_distribution:
+            sub_distribution["g1_update_mlp_std"] = g1_1.std()
+            sub_distribution["g1_update_mlp_mean"] = g1_1.mean()
         g1_update.append(g1_1)
 
         if self.update_g1_has_attn:
             assert gg1 is not None
             assert self.loc_attn is not None
-            g1_update.append(self.loc_attn(g1, gg1, nlist_mask, sw))
+            g1_attn = self.loc_attn(g1, gg1, nlist_mask, sw)
+            g1_update.append(g1_attn)
+            if self.log_sub_distribution:
+                sub_distribution["g1_attn_std"] = g1_attn.std()
+                sub_distribution["g1_attn_mean"] = g1_attn.mean()
 
         # update
         if self.update_chnnl_2:
@@ -1151,7 +1181,10 @@ class RepformerLayer(torch.nn.Module):
         else:
             g2_new, h2_new = g2, h2
         g1_new = self.list_update(g1_update, "g1")
-        return g1_new, g2_new, h2_new
+        if not self.log_sub_distribution:
+            return g1_new, g2_new, h2_new
+        else:
+            return g1_new, g2_new, h2_new, sub_distribution
 
     @torch.jit.export
     def list_update_res_avg(
