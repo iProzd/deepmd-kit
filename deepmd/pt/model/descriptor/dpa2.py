@@ -674,7 +674,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         )
         if use_three_body:
             assert self.repinit_three_body is not None
-            g1_three_body, _, _, _, _ = self.repinit_three_body(
+            g1_three_body, __, __, __, __ = self.repinit_three_body(
                 nlist_dict[
                     get_multiple_nlist_key(
                         self.repinit_three_body.get_rcut(),
