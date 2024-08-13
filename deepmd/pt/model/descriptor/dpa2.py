@@ -69,6 +69,9 @@ from .repformers import (
 from .se_atten import (
     DescrptBlockSeAtten,
 )
+from .se_t_tebd import (
+    DescrptBlockSeTTebd,
+)
 
 
 @BaseDescriptor.register("dpa2")
@@ -175,6 +178,27 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             type_one_side=self.repinit_args.type_one_side,
             seed=child_seed(seed, 0),
         )
+        self.use_three_body = self.repinit_args.use_three_body
+        if self.repinit_args.use_three_body:
+            self.repinit_three_body = DescrptBlockSeTTebd(
+                self.repinit_args.three_body_rcut,
+                self.repinit_args.three_body_rcut_smth,
+                self.repinit_args.three_body_sel,
+                ntypes,
+                neuron=self.repinit_args.three_body_neuron,
+                tebd_dim=self.repinit_args.tebd_dim,
+                tebd_input_mode=self.repinit_args.tebd_input_mode,
+                set_davg_zero=self.repinit_args.set_davg_zero,
+                exclude_types=exclude_types,
+                env_protection=env_protection,
+                activation_function=self.repinit_args.activation_function,
+                precision=precision,
+                resnet_dt=self.repinit_args.resnet_dt,
+                smooth=smooth,
+                seed=child_seed(seed, 5),
+            )
+        else:
+            self.repinit_three_body = None
         self.repformers = DescrptBlockRepformers(
             self.repformer_args.rcut,
             self.repformer_args.rcut_smth,
@@ -230,11 +254,16 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         self.trainable = trainable
         self.add_tebd_to_repinit_out = add_tebd_to_repinit_out
 
-        if self.repinit.dim_out == self.repformers.dim_in:
+        self.repinit_out_dim = self.repinit.dim_out
+        if self.repinit_args.use_three_body:
+            assert self.repinit_three_body is not None
+            self.repinit_out_dim += self.repinit_three_body.dim_out
+
+        if self.repinit_out_dim == self.repformers.dim_in:
             self.g1_shape_tranform = Identity()
         else:
             self.g1_shape_tranform = MLPLayer(
-                self.repinit.dim_out,
+                self.repinit_out_dim,
                 self.repformers.dim_in,
                 bias=False,
                 precision=precision,
@@ -603,15 +632,34 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             The smooth switch function. shape: nf x nloc x nnei
 
         """
+        use_three_body = self.use_three_body
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
-        # nlists
-        nlist_dict = build_multiple_neighbor_list(
-            extended_coord,
-            nlist,
-            [self.repformers.get_rcut(), self.repinit.get_rcut()],
-            [self.repformers.get_nsel(), self.repinit.get_nsel()],
-        )
+
+        if not use_three_body:
+            # nlists
+            nlist_dict = build_multiple_neighbor_list(
+                extended_coord,
+                nlist,
+                [self.repformers.get_rcut(), self.repinit.get_rcut()],
+                [self.repformers.get_nsel(), self.repinit.get_nsel()],
+            )
+        else:
+            assert self.repinit_three_body is not None
+            nlist_dict = build_multiple_neighbor_list(
+                extended_coord,
+                nlist,
+                [
+                    self.repformers.get_rcut(),
+                    self.repinit_three_body.get_rcut(),
+                    self.repinit.get_rcut(),
+                ],
+                [
+                    self.repformers.get_nsel(),
+                    self.repinit_three_body.get_nsel(),
+                    self.repinit.get_nsel(),
+                ],
+            )
         # repinit
         g1_ext = self.type_embedding(extended_atype)
         g1_inp = g1_ext[:, :nloc, :]
@@ -624,6 +672,21 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             g1_ext,
             mapping,
         )
+        if use_three_body:
+            assert self.repinit_three_body is not None
+            g1_three_body, _, _, _, _ = self.repinit_three_body(
+                nlist_dict[
+                    get_multiple_nlist_key(
+                        self.repinit_three_body.get_rcut(),
+                        self.repinit_three_body.get_nsel(),
+                    )
+                ],
+                extended_coord,
+                extended_atype,
+                g1_ext,
+                mapping,
+            )
+            g1 = torch.cat([g1, g1_three_body], dim=-1)
         # linear to change shape
         g1 = self.g1_shape_tranform(g1)
         if self.add_tebd_to_repinit_out:

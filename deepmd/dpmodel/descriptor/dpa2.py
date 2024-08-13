@@ -75,6 +75,11 @@ class RepinitArgs:
         activation_function="tanh",
         resnet_dt: bool = False,
         type_one_side: bool = False,
+        use_three_body: bool = False,
+        three_body_neuron: List[int] = [2, 4, 8],
+        three_body_sel: int = 40,
+        three_body_rcut: float = 4.0,
+        three_body_rcut_smth: float = 0.5,
     ):
         r"""The constructor for the RepinitArgs class which defines the parameters of the repinit block in DPA2 descriptor.
 
@@ -116,6 +121,11 @@ class RepinitArgs:
         self.activation_function = activation_function
         self.resnet_dt = resnet_dt
         self.type_one_side = type_one_side
+        self.use_three_body = use_three_body
+        self.three_body_neuron = three_body_neuron
+        self.three_body_sel = three_body_sel
+        self.three_body_rcut = three_body_rcut
+        self.three_body_rcut_smth = three_body_rcut_smth
 
     def __getitem__(self, key):
         if hasattr(self, key):
@@ -136,6 +146,11 @@ class RepinitArgs:
             "activation_function": self.activation_function,
             "resnet_dt": self.resnet_dt,
             "type_one_side": self.type_one_side,
+            "use_three_body": self.use_three_body,
+            "three_body_neuron": self.three_body_neuron,
+            "three_body_sel": self.three_body_sel,
+            "three_body_rcut": self.three_body_rcut,
+            "three_body_rcut_smth": self.three_body_rcut_smth,
         }
 
     @classmethod
