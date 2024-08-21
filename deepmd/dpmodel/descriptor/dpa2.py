@@ -187,6 +187,10 @@ class RepformerArgs:
         update_residual_init: str = "norm",
         set_davg_zero: bool = True,
         trainable_ln: bool = True,
+        use_sqrt_nnei: bool = False,
+        g1_out_conv: bool = False,
+        g1_out_mlp: bool = False,
+        g1_linear_trans: bool = False,
         ln_eps: Optional[float] = 1e-5,
     ):
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
@@ -280,6 +284,10 @@ class RepformerArgs:
         self.update_residual_init = update_residual_init
         self.set_davg_zero = set_davg_zero
         self.trainable_ln = trainable_ln
+        self.use_sqrt_nnei = use_sqrt_nnei
+        self.g1_out_conv = g1_out_conv
+        self.g1_out_mlp = g1_out_mlp
+        self.g1_linear_trans = g1_linear_trans
         #  to keep consistent with default value in this backends
         if ln_eps is None:
             ln_eps = 1e-5

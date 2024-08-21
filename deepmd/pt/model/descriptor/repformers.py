@@ -9,9 +9,6 @@ from typing import (
 )
 
 import torch
-from IPython import (
-    embed,
-)
 
 from deepmd.dpmodel.utils.seed import (
     child_seed,
@@ -110,6 +107,10 @@ class DescrptBlockRepformers(DescriptorBlock):
         use_g1_act=True,
         log_sub_distribution=False,
         seed: Optional[Union[int, List[int]]] = None,
+        use_sqrt_nnei: bool = False,
+        g1_out_conv: bool = False,
+        g1_out_mlp: bool = False,
+        g1_linear_trans: bool = False,
         old_impl: bool = False,
     ):
         r"""
@@ -228,7 +229,14 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.act = ActivationFn(activation_function)
         self.use_g1_act = use_g1_act
         self.log_sub_distribution = log_sub_distribution
+        if self.log_sub_distribution:
+            self.std_f = open("std.txt", "w")
+            self.mean_f = open("mean.txt", "w")
         self.smooth = smooth
+        self.use_sqrt_nnei = use_sqrt_nnei
+        self.g1_out_conv = g1_out_conv
+        self.g1_out_mlp = g1_out_mlp
+        self.g1_linear_trans = g1_linear_trans
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
         self.env_protection = env_protection
@@ -304,6 +312,10 @@ class DescrptBlockRepformers(DescriptorBlock):
                         ln_eps=self.ln_eps,
                         precision=precision,
                         log_sub_distribution=log_sub_distribution,
+                        use_sqrt_nnei=self.use_sqrt_nnei,
+                        g1_out_conv=self.g1_out_conv,
+                        g1_out_mlp=self.g1_out_mlp,
+                        g1_linear_trans=self.g1_linear_trans,
                         seed=child_seed(child_seed(seed, 1), ii),
                     )
                 )
@@ -500,29 +512,46 @@ class DescrptBlockRepformers(DescriptorBlock):
                     torch.tensor(nall - nloc),
                 )
                 g1_ext = ret[0].unsqueeze(0)
-            if not self.log_sub_distribution:
-                g1, g2, h2 = ll.forward(
-                    g1_ext,
-                    g2,
-                    h2,
-                    nlist,
-                    nlist_mask,
-                    sw,
-                )
-            else:
-                g1, g2, h2, log_result = ll.forward(
-                    g1_ext,
-                    g2,
-                    h2,
-                    nlist,
-                    nlist_mask,
-                    sw,
-                )
-                embed()
+            # if not self.log_sub_distribution:
+            g1, g2, h2 = ll.forward(
+                g1_ext,
+                g2,
+                h2,
+                nlist,
+                nlist_mask,
+                sw,
+            )
+            # else:
+            #     g1, g2, h2, log_result = ll.forward(
+            #         g1_ext,
+            #         g2,
+            #         h2,
+            #         nlist,
+            #         nlist_mask,
+            #         sw,
+            #     )
+            #     std_values = []
+            #     mean_values = []
+            #     kk = sorted(list(log_result.keys()))
+            #     for key in kk:
+            #         if "std" in key:
+            #             std_values.append(f"{key}: {log_result[key]:.10f}\n")
+            #         elif "mean" in key:
+            #             mean_values.append(f"{key}: {log_result[key]:.10f}\n")
+            #     self.std_f.write(f"Layer: {idx}:\n")
+            #     self.std_f.writelines(std_values)
+            #     self.mean_f.write(f"Layer: {idx}:\n")
+            #     self.mean_f.writelines(mean_values)
 
         # nb x nloc x 3 x ng2
         h2g2 = RepformerLayer._cal_hg(
-            g2, h2, nlist_mask, sw, smooth=self.smooth, epsilon=self.epsilon
+            g2,
+            h2,
+            nlist_mask,
+            sw,
+            smooth=self.smooth,
+            epsilon=self.epsilon,
+            use_sqrt_nnei=self.use_sqrt_nnei,
         )
         # (nb x nloc) x ng2 x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))

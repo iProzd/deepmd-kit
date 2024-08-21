@@ -234,6 +234,10 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             precision=precision,
             trainable_ln=self.repformer_args.trainable_ln,
             ln_eps=self.repformer_args.ln_eps,
+            use_sqrt_nnei=self.repformer_args.use_sqrt_nnei,
+            g1_out_conv=self.repformer_args.g1_out_conv,
+            g1_out_mlp=self.repformer_args.g1_out_mlp,
+            g1_linear_trans=self.repformer_args.g1_linear_trans,
             seed=child_seed(seed, 1),
             use_g1_act=use_g1_act,
             log_sub_distribution=log_sub_distribution,
@@ -678,7 +682,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         )
         if use_three_body:
             assert self.repinit_three_body is not None
-            g1_three_body, _, _, _, _ = self.repinit_three_body(
+            g1_three_body, __, __, __, __ = self.repinit_three_body(
                 nlist_dict[
                     get_multiple_nlist_key(
                         self.repinit_three_body.get_rcut(),

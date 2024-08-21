@@ -600,6 +600,10 @@ class RepformerLayer(torch.nn.Module):
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
         log_sub_distribution=False,
+        use_sqrt_nnei=False,
+        g1_out_conv=False,
+        g1_out_mlp=False,
+        g1_linear_trans=False,
         seed: Optional[Union[int, List[int]]] = None,
     ):
         super().__init__()
@@ -640,6 +644,10 @@ class RepformerLayer(torch.nn.Module):
         self.precision = precision
         self.seed = seed
         self.log_sub_distribution = log_sub_distribution
+        self.use_sqrt_nnei = use_sqrt_nnei
+        self.g1_out_conv = g1_out_conv
+        self.g1_out_mlp = g1_out_mlp
+        self.g1_linear_trans = g1_linear_trans
 
         assert update_residual_init in [
             "norm",
@@ -666,6 +674,7 @@ class RepformerLayer(torch.nn.Module):
         self.linear1 = MLPLayer(
             g1_in_dim,
             g1_dim,
+            bias=not self.g1_linear_trans,
             precision=precision,
             seed=child_seed(seed, 1),
         )
@@ -695,14 +704,52 @@ class RepformerLayer(torch.nn.Module):
                         seed=child_seed(seed, 3),
                     )
                 )
-        if self.update_g1_has_conv:
-            self.proj_g1g2 = MLPLayer(
+        if self.g1_out_mlp:
+            self.g1_self_mlp = MLPLayer(
                 g1_dim,
-                g2_dim,
-                bias=False,
+                g1_dim,
                 precision=precision,
-                seed=child_seed(seed, 4),
+                seed=child_seed(seed, 16),
             )
+            if self.update_style == "res_residual":
+                self.g1_residual.append(
+                    get_residual(
+                        g1_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 17),
+                    )
+                )
+        else:
+            self.g1_self_mlp = None
+        if self.update_g1_has_conv:
+            if not self.g1_out_conv:
+                self.proj_g1g2 = MLPLayer(
+                    g1_dim,
+                    g2_dim,
+                    bias=False,
+                    precision=precision,
+                    seed=child_seed(seed, 4),
+                )
+            else:
+                self.proj_g1g2 = MLPLayer(
+                    g2_dim,
+                    g1_dim,
+                    bias=False,
+                    precision=precision,
+                    seed=child_seed(seed, 4),
+                )
+                if self.update_style == "res_residual":
+                    self.g1_residual.append(
+                        get_residual(
+                            g1_dim,
+                            self.update_residual,
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 15),
+                        )
+                    )
         if self.update_g2_has_g1g1:
             self.proj_g1g1g2 = MLPLayer(
                 g1_dim,
@@ -792,12 +839,12 @@ class RepformerLayer(torch.nn.Module):
         self.h2_residual = nn.ParameterList(self.h2_residual)
 
     def cal_1_dim(self, g1d: int, g2d: int, ax: int) -> int:
-        ret = g1d
+        ret = g1d if not self.g1_out_mlp else 0
         if self.update_g1_has_grrg:
             ret += g2d * ax
         if self.update_g1_has_drrd:
             ret += g1d * ax
-        if self.update_g1_has_conv:
+        if self.update_g1_has_conv and not self.g1_out_conv:
             ret += g2d
         return ret
 
@@ -847,9 +894,12 @@ class RepformerLayer(torch.nn.Module):
         nb, nloc, nnei, _ = g2.shape
         ng1 = gg1.shape[-1]
         ng2 = g2.shape[-1]
-        # gg1  : nb x nloc x nnei x ng2
-        gg1 = self.proj_g1g2(gg1).view(nb, nloc, nnei, ng2)
-        # nb x nloc x nnei x ng2
+        if not self.g1_out_conv:
+            # gg1  : nb x nloc x nnei x ng2
+            gg1 = self.proj_g1g2(gg1).view(nb, nloc, nnei, ng2)
+        else:
+            gg1 = gg1.view(nb, nloc, nnei, ng1)
+        # nb x nloc x nnei x ng2/ng1
         gg1 = _apply_nlist_mask(gg1, nlist_mask)
         if not self.smooth:
             # normalized by number of neighbors, not smooth
@@ -863,8 +913,13 @@ class RepformerLayer(torch.nn.Module):
             invnnei = (1.0 / float(nnei)) * torch.ones(
                 (nb, nloc, 1), dtype=gg1.dtype, device=gg1.device
             )
-        # nb x nloc x ng2
-        g1_11 = torch.sum(g2 * gg1, dim=2) * invnnei
+        if not self.g1_out_conv:
+            # nb x nloc x ng2
+            g1_11 = torch.sum(g2 * gg1, dim=2) * invnnei
+        else:
+            g2 = self.proj_g1g2(g2).view(nb, nloc, nnei, ng1)
+            # nb x nloc x ng1
+            g1_11 = torch.sum(g2 * gg1, dim=2) * invnnei
         return g1_11
 
     @staticmethod
@@ -875,6 +930,7 @@ class RepformerLayer(torch.nn.Module):
         sw: torch.Tensor,
         smooth: bool = True,
         epsilon: float = 1e-4,
+        use_sqrt_nnei: bool = False,
     ) -> torch.Tensor:
         """
         Calculate the transposed rotation matrix.
@@ -914,12 +970,21 @@ class RepformerLayer(torch.nn.Module):
             # nb x nloc x 1 x 1
             invnnei = invnnei.unsqueeze(-1).unsqueeze(-1)
         else:
+            # print(919)
+            # embed()
             g2 = _apply_switch(g2, sw)
-            invnnei = (1.0 / float(nnei)) * torch.ones(
-                (nb, nloc, 1, 1), dtype=g2.dtype, device=g2.device
-            )
+            if not use_sqrt_nnei:
+                invnnei = (1.0 / float(nnei)) * torch.ones(
+                    (nb, nloc, 1, 1), dtype=g2.dtype, device=g2.device
+                )
+            else:
+                invnnei = (1.0 / (float(nnei) ** 0.5)) * torch.ones(
+                    (nb, nloc, 1, 1), dtype=g2.dtype, device=g2.device
+                )
         # nb x nloc x 3 x ng2
         h2g2 = torch.matmul(torch.transpose(h2, -1, -2), g2) * invnnei
+        # print(926)
+        # embed()
         return h2g2
 
     @staticmethod
@@ -990,9 +1055,18 @@ class RepformerLayer(torch.nn.Module):
         # msk: nb x nloc x nnei
         nb, nloc, nnei, _ = g2.shape
         # nb x nloc x 3 x ng2
-        h2g2 = self._cal_hg(g2, h2, nlist_mask, sw, smooth=smooth, epsilon=epsilon)
+        h2g2 = self._cal_hg(
+            g2,
+            h2,
+            nlist_mask,
+            sw,
+            smooth=smooth,
+            epsilon=epsilon,
+            use_sqrt_nnei=self.use_sqrt_nnei,
+        )
         # nb x nloc x (axisxng2)
         g1_13 = self._cal_grrg(h2g2, axis_neuron)
+        # embed()
         return g1_13
 
     def _update_g2_g1g1(
@@ -1049,8 +1123,8 @@ class RepformerLayer(torch.nn.Module):
         g2:     nf x nloc x nnei x ng2  updated pair-atom channel, invariant
         h2:     nf x nloc x nnei x 3    updated pair-atom channel, equivariant
         """
-        if self.log_sub_distribution:
-            sub_distribution = {}
+        # if self.log_sub_distribution:
+        #     sub_distribution = {}
         cal_gg1 = (
             self.update_g1_has_drrd
             or self.update_g1_has_conv
@@ -1067,12 +1141,17 @@ class RepformerLayer(torch.nn.Module):
         g2_update: List[torch.Tensor] = [g2]
         h2_update: List[torch.Tensor] = [h2]
         g1_update: List[torch.Tensor] = [g1]
-        g1_mlp: List[torch.Tensor] = [g1]
-        if self.log_sub_distribution:
-            sub_distribution["g2_std"] = g2.std()
-            sub_distribution["g2_mean"] = g2.mean()
-            sub_distribution["g1_std"] = g1.std()
-            sub_distribution["g1_mean"] = g1.mean()
+        g1_mlp: List[torch.Tensor] = [g1] if not self.g1_out_mlp else []
+        if self.g1_out_mlp:
+            assert self.g1_self_mlp is not None
+            g1_self_mlp = self.act(self.g1_self_mlp(g1))
+            g1_update.append(g1_self_mlp)
+
+        # if self.log_sub_distribution:
+        #     sub_distribution["g2_std"] = g2.std().detach().cpu().numpy().item()
+        #     sub_distribution["g2_mean"] = g2.mean().detach().cpu().numpy().item()
+        #     sub_distribution["g1_std"] = g1.std().detach().cpu().numpy().item()
+        #     sub_distribution["g1_mean"] = g1.mean().detach().cpu().numpy().item()
 
         if cal_gg1:
             gg1 = _make_nei_g1(g1_ext, nlist)
@@ -1085,9 +1164,9 @@ class RepformerLayer(torch.nn.Module):
             # nb x nloc x nnei x ng2
             g2_1 = self.act(self.linear2(g2))
             g2_update.append(g2_1)
-            if self.log_sub_distribution:
-                sub_distribution["g2_mlp_std"] = g2_1.std()
-                sub_distribution["g2_mlp_mean"] = g2_1.mean()
+            # if self.log_sub_distribution:
+            #     sub_distribution["g2_mlp_std"] = g2_1.std().detach().cpu().numpy().item()
+            #     sub_distribution["g2_mlp_mean"] = g2_1.mean().detach().cpu().numpy().item()
 
             if self.update_g2_has_g1g1:
                 # linear(g1_i * g1_j)
@@ -1110,9 +1189,9 @@ class RepformerLayer(torch.nn.Module):
                     g2_2 = self.attn2_mh_apply(AAg, g2)
                     g2_2 = self.attn2_lm(g2_2)
                     g2_update.append(g2_2)
-                    if self.log_sub_distribution:
-                        sub_distribution["g2_attn_std"] = g2_2.std()
-                        sub_distribution["g2_attn_mean"] = g2_2.mean()
+                    # if self.log_sub_distribution:
+                    #     sub_distribution["g2_attn_std"] = g2_2.std().detach().cpu().numpy().item()
+                    #     sub_distribution["g2_attn_mean"] = g2_2.mean().detach().cpu().numpy().item()
 
                 if self.update_h2:
                     # linear_head(attention_weights * h2)
@@ -1121,12 +1200,16 @@ class RepformerLayer(torch.nn.Module):
         if self.update_g1_has_conv:
             assert gg1 is not None
             g1_conv = self._update_g1_conv(gg1, g2, nlist_mask, sw)
-            g1_mlp.append(g1_conv)
-            if self.log_sub_distribution:
-                sub_distribution["g1_conv_std"] = g1_conv.std()
-                sub_distribution["g1_conv_mean"] = g1_conv.mean()
+            if not self.g1_out_conv:
+                g1_mlp.append(g1_conv)
+            else:
+                g1_update.append(g1_conv)
+            # if self.log_sub_distribution:
+            #     sub_distribution["g1_conv_std"] = g1_conv.std().detach().cpu().numpy().item()
+            #     sub_distribution["g1_conv_mean"] = g1_conv.mean().detach().cpu().numpy().item()
 
         if self.update_g1_has_grrg:
+            # print("grrg")
             g1_grrg = self.symmetrization_op(
                 g2,
                 h2,
@@ -1137,12 +1220,13 @@ class RepformerLayer(torch.nn.Module):
                 epsilon=self.epsilon,
             )
             g1_mlp.append(g1_grrg)
-            if self.log_sub_distribution:
-                sub_distribution["g1_grrg_std"] = g1_grrg.std()
-                sub_distribution["g1_grrg_mean"] = g1_grrg.mean()
+            # if self.log_sub_distribution:
+            #     sub_distribution["g1_grrg_std"] = g1_grrg.std().detach().cpu().numpy().item()
+            #     sub_distribution["g1_grrg_mean"] = g1_grrg.mean().detach().cpu().numpy().item()
 
         if self.update_g1_has_drrd:
             assert gg1 is not None
+            # print("drrd")
             g1_drrd = self.symmetrization_op(
                 gg1,
                 h2,
@@ -1153,16 +1237,19 @@ class RepformerLayer(torch.nn.Module):
                 epsilon=self.epsilon,
             )
             g1_mlp.append(g1_drrd)
-            if self.log_sub_distribution:
-                sub_distribution["g1_drrd_std"] = g1_drrd.std()
-                sub_distribution["g1_drrd_mean"] = g1_drrd.mean()
+            # if self.log_sub_distribution:
+            #     sub_distribution["g1_drrd_std"] = g1_drrd.std().detach().cpu().numpy().item()
+            #     sub_distribution["g1_drrd_mean"] = g1_drrd.mean().detach().cpu().numpy().item()
 
         # nb x nloc x [ng1+ng2+(axisxng2)+(axisxng1)]
         #                  conv   grrg      drrd
-        g1_1 = self.act(self.linear1(torch.cat(g1_mlp, dim=-1)))
-        if self.log_sub_distribution:
-            sub_distribution["g1_update_mlp_std"] = g1_1.std()
-            sub_distribution["g1_update_mlp_mean"] = g1_1.mean()
+        if not self.g1_linear_trans:
+            g1_1 = self.act(self.linear1(torch.cat(g1_mlp, dim=-1)))
+        else:
+            g1_1 = self.linear1(torch.cat(g1_mlp, dim=-1))
+        # if self.log_sub_distribution:
+        #     sub_distribution["g1_update_mlp_std"] = g1_1.std().detach().cpu().numpy().item()
+        #     sub_distribution["g1_update_mlp_mean"] = g1_1.mean().detach().cpu().numpy().item()
         g1_update.append(g1_1)
 
         if self.update_g1_has_attn:
@@ -1170,9 +1257,9 @@ class RepformerLayer(torch.nn.Module):
             assert self.loc_attn is not None
             g1_attn = self.loc_attn(g1, gg1, nlist_mask, sw)
             g1_update.append(g1_attn)
-            if self.log_sub_distribution:
-                sub_distribution["g1_attn_std"] = g1_attn.std()
-                sub_distribution["g1_attn_mean"] = g1_attn.mean()
+            # if self.log_sub_distribution:
+            #     sub_distribution["g1_attn_std"] = g1_attn.std().detach().cpu().numpy().item()
+            #     sub_distribution["g1_attn_mean"] = g1_attn.mean().detach().cpu().numpy().item()
 
         # update
         if self.update_chnnl_2:
@@ -1181,10 +1268,15 @@ class RepformerLayer(torch.nn.Module):
         else:
             g2_new, h2_new = g2, h2
         g1_new = self.list_update(g1_update, "g1")
-        if not self.log_sub_distribution:
-            return g1_new, g2_new, h2_new
-        else:
-            return g1_new, g2_new, h2_new, sub_distribution
+        # if self.log_sub_distribution:
+        #     sub_distribution["g1_new_std"] = g1_new.std().detach().cpu().numpy().item()
+        #     sub_distribution["g1_new_mean"] = g1_new.mean().detach().cpu().numpy().item()
+        #     sub_distribution["h2_new_std"] = h2_new.std().detach().cpu().numpy().item()
+        #     sub_distribution["h2_new_mean"] = h2_new.mean().detach().cpu().numpy().item()
+        # if not self.log_sub_distribution:
+        return g1_new, g2_new, h2_new
+        # else:
+        #     return g1_new, g2_new, h2_new, sub_distribution
 
     @torch.jit.export
     def list_update_res_avg(

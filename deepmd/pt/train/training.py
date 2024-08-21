@@ -551,9 +551,7 @@ class Trainer:
                             target_state_dict,
                         )
                     state_dict = new_state_dict
-                    state_dict["_extra_state"] = self.wrapper.state_dict()[
-                        "_extra_state"
-                    ]
+                state_dict["_extra_state"] = self.wrapper.state_dict()["_extra_state"]
 
                 self.wrapper.load_state_dict(state_dict)
 
@@ -686,7 +684,13 @@ class Trainer:
 
     def run(self):
         fout = (
-            open(self.disp_file, mode="w", buffering=1) if self.rank == 0 else None
+            open(
+                self.disp_file,
+                mode="w" if not self.restart_training else "a",
+                buffering=1,
+            )
+            if self.rank == 0
+            else None
         )  # line buffered
         if SAMPLER_RECORD:
             record_file = f"Sample_rank_{self.rank}.txt"
