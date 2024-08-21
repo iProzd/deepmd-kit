@@ -1154,6 +1154,18 @@ def dpa2_repformer_args():
             doc=doc_update_g2_has_attn,
         ),
         Argument(
+            "g1_out_conv",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "g1_out_mlp",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "update_h2",
             bool,
             optional=True,
@@ -1243,6 +1255,12 @@ def dpa2_repformer_args():
             optional=True,
             default=None,
             doc=doc_ln_eps,
+        ),
+        Argument(
+            "use_sqrt_nnei",
+            bool,
+            optional=True,
+            default=False,
         ),
     ]
 

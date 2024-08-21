@@ -105,6 +105,9 @@ class DescrptBlockRepformers(DescriptorBlock):
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
         seed: Optional[Union[int, List[int]]] = None,
+        use_sqrt_nnei: bool = False,
+        g1_out_conv: bool = False,
+        g1_out_mlp: bool = False,
         old_impl: bool = False,
     ):
         r"""
@@ -222,6 +225,9 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.direct_dist = direct_dist
         self.act = ActivationFn(activation_function)
         self.smooth = smooth
+        self.use_sqrt_nnei = use_sqrt_nnei
+        self.g1_out_conv = g1_out_conv
+        self.g1_out_mlp = g1_out_mlp
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
         self.env_protection = env_protection
@@ -296,6 +302,9 @@ class DescrptBlockRepformers(DescriptorBlock):
                         trainable_ln=self.trainable_ln,
                         ln_eps=self.ln_eps,
                         precision=precision,
+                        use_sqrt_nnei=self.use_sqrt_nnei,
+                        g1_out_conv=self.g1_out_conv,
+                        g1_out_mlp=self.g1_out_mlp,
                         seed=child_seed(child_seed(seed, 1), ii),
                     )
                 )
@@ -500,7 +509,13 @@ class DescrptBlockRepformers(DescriptorBlock):
 
         # nb x nloc x 3 x ng2
         h2g2 = RepformerLayer._cal_hg(
-            g2, h2, nlist_mask, sw, smooth=self.smooth, epsilon=self.epsilon
+            g2,
+            h2,
+            nlist_mask,
+            sw,
+            smooth=self.smooth,
+            epsilon=self.epsilon,
+            use_sqrt_nnei=self.use_sqrt_nnei,
         )
         # (nb x nloc) x ng2 x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
