@@ -27,6 +27,7 @@ from deepmd.pt.loss import (
     DenoiseLoss,
     DOSLoss,
     EnergySpinLoss,
+    EnergyStdBindLoss,
     EnergyStdLoss,
     TensorLoss,
 )
@@ -684,9 +685,20 @@ class Trainer:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
+                if "complex" not in input_dict:
+                    model_pred, loss, more_loss = self.wrapper(
+                        **input_dict,
+                        cur_lr=pref_lr,
+                        label=label_dict,
+                        task_key=task_key,
+                    )
+                else:
+                    model_pred, loss, more_loss = self.wrapper(
+                        input_dict_bind=input_dict,
+                        cur_lr=pref_lr,
+                        label=label_dict,
+                        task_key=task_key,
+                    )
                 loss.backward()
                 if self.gradient_max_norm > 0.0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -798,14 +810,24 @@ class Trainer:
                         if input_dict == {}:
                             # no validation data
                             return {}
-                        _, loss, more_loss = self.wrapper(
-                            **input_dict,
-                            cur_lr=pref_lr,
-                            label=label_dict,
-                            task_key=_task_key,
-                        )
-                        # more_loss.update({"rmse": math.sqrt(loss)})
-                        natoms = int(input_dict["atype"].shape[-1])
+                        if "complex" not in input_dict:
+                            _, loss, more_loss = self.wrapper(
+                                **input_dict,
+                                cur_lr=pref_lr,
+                                label=label_dict,
+                                task_key=_task_key,
+                            )
+                            # more_loss.update({"rmse": math.sqrt(loss)})
+                            natoms = int(input_dict["atype"].shape[-1])
+                        else:
+                            _, loss, more_loss = self.wrapper(
+                                input_dict_bind=input_dict,
+                                cur_lr=pref_lr,
+                                label=label_dict,
+                                task_key=_task_key,
+                            )
+                            # more_loss.update({"rmse": math.sqrt(loss)})
+                            natoms = int(input_dict["complex"]["atype"].shape[-1])
                         sum_natoms += natoms
                         for k, v in more_loss.items():
                             if "l2_" not in k:
@@ -848,12 +870,20 @@ class Trainer:
                             input_dict, label_dict, _ = self.get_data(
                                 is_train=True, task_key=_key
                             )
-                            _, loss, more_loss = self.wrapper(
-                                **input_dict,
-                                cur_lr=pref_lr,
-                                label=label_dict,
-                                task_key=_key,
-                            )
+                            if "complex" not in input_dict:
+                                _, loss, more_loss = self.wrapper(
+                                    **input_dict,
+                                    cur_lr=pref_lr,
+                                    label=label_dict,
+                                    task_key=_key,
+                                )
+                            else:
+                                _, loss, more_loss = self.wrapper(
+                                    input_dict_bind=input_dict,
+                                    cur_lr=pref_lr,
+                                    label=label_dict,
+                                    task_key=_key,
+                                )
                             train_results[_key] = log_loss_train(
                                 loss, more_loss, _task_key=_key
                             )
@@ -1088,39 +1118,63 @@ class Trainer:
                     )
                     batch_data = next(iter(self.validation_data[task_key]))
 
-        for key in batch_data.keys():
-            if key == "sid" or key == "fid" or key == "box" or "find_" in key:
-                continue
-            elif not isinstance(batch_data[key], list):
-                if batch_data[key] is not None:
-                    batch_data[key] = batch_data[key].to(DEVICE, non_blocking=True)
-            else:
-                batch_data[key] = [
-                    item.to(DEVICE, non_blocking=True) for item in batch_data[key]
-                ]
-        # we may need a better way to classify which are inputs and which are labels
-        # now wrapper only supports the following inputs:
-        input_keys = [
-            "coord",
-            "atype",
-            "spin",
-            "box",
-            "fparam",
-            "aparam",
-        ]
-        input_dict = {item_key: None for item_key in input_keys}
-        label_dict = {}
-        for item_key in batch_data:
-            if item_key in input_keys:
-                input_dict[item_key] = batch_data[item_key]
-            else:
-                if item_key not in ["sid", "fid"]:
-                    label_dict[item_key] = batch_data[item_key]
-        log_dict = {}
-        if "fid" in batch_data:
-            log_dict["fid"] = batch_data["fid"]
-        log_dict["sid"] = batch_data["sid"]
-        return input_dict, label_dict, log_dict
+        def get_batch_data(batch_data_):
+            for key in batch_data_.keys():
+                if key == "sid" or key == "fid" or key == "box" or "find_" in key:
+                    continue
+                elif not isinstance(batch_data_[key], list):
+                    if batch_data_[key] is not None:
+                        batch_data_[key] = batch_data_[key].to(
+                            DEVICE, non_blocking=True
+                        )
+                else:
+                    batch_data_[key] = [
+                        item.to(DEVICE, non_blocking=True) for item in batch_data_[key]
+                    ]
+            # we may need a better way to classify which are inputs and which are labels
+            # now wrapper only supports the following inputs:
+            input_keys = [
+                "coord",
+                "atype",
+                "spin",
+                "box",
+                "fparam",
+                "aparam",
+            ]
+            input_dict = {item_key: None for item_key in input_keys}
+            label_dict = {}
+            for item_key in batch_data_:
+                if item_key in input_keys:
+                    input_dict[item_key] = batch_data_[item_key]
+                else:
+                    if item_key not in ["sid", "fid"]:
+                        label_dict[item_key] = batch_data_[item_key]
+            log_dict = {}
+            if "fid" in batch_data_:
+                log_dict["fid"] = batch_data_["fid"]
+            log_dict["sid"] = batch_data_["sid"]
+            return input_dict, label_dict, log_dict
+
+        if "complex" not in batch_data:
+            return get_batch_data(batch_data)
+        else:
+            input_dict = {}
+            label_dict = {}
+            log_dict = {}
+            fid = None
+            if "sid" in batch_data:
+                sid = batch_data.pop("sid")
+                for kk in batch_data:
+                    batch_data[kk]["sid"] = sid
+            for kk in batch_data:
+                if fid is None:
+                    fid = batch_data[kk]["fid"]
+                else:
+                    assert fid == batch_data[kk]["fid"]
+                input_dict[kk], label_dict[kk], log_dict[kk] = get_batch_data(
+                    batch_data[kk]
+                )
+            return input_dict, label_dict, log_dict
 
     def print_header(self, fout, train_results, valid_results):
         train_keys = sorted(train_results.keys())
@@ -1216,6 +1270,9 @@ def get_loss(loss_params, start_lr, _ntypes, _model):
     if loss_type == "ener":
         loss_params["starter_learning_rate"] = start_lr
         return EnergyStdLoss(**loss_params)
+    elif loss_type == "ener_bind":
+        loss_params["starter_learning_rate"] = start_lr
+        return EnergyStdBindLoss(**loss_params)
     elif loss_type == "dos":
         loss_params["starter_learning_rate"] = start_lr
         loss_params["numb_dos"] = _model.model_output_def()["dos"].output_size

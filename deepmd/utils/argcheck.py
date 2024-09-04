@@ -2094,6 +2094,140 @@ def loss_ener():
     ]
 
 
+@loss_args_plugin.register("ener_bind")
+def loss_ener_bind():
+    doc_start_pref_e = start_pref("energy", abbr="e")
+    doc_limit_pref_e = limit_pref("energy")
+    doc_start_pref_f = start_pref("force", abbr="f")
+    doc_limit_pref_f = limit_pref("force")
+    doc_start_pref_v = start_pref("virial", abbr="v")
+    doc_limit_pref_v = limit_pref("virial")
+    doc_start_pref_ae = start_pref("atomic energy", label="atom_ener", abbr="ae")
+    doc_limit_pref_ae = limit_pref("atomic energy")
+    doc_start_pref_pf = start_pref(
+        "atomic prefactor force", label="atom_pref", abbr="pf"
+    )
+    doc_limit_pref_pf = limit_pref("atomic prefactor force")
+    doc_start_pref_gf = start_pref("generalized force", label="drdq", abbr="gf")
+    doc_limit_pref_gf = limit_pref("generalized force")
+    doc_numb_generalized_coord = "The dimension of generalized coordinates. Required when generalized force loss is used."
+    doc_relative_f = "If provided, relative force error will be used in the loss. The difference of force will be normalized by the magnitude of the force in the label with a shift given by `relative_f`, i.e. DF_i / ( || F || + relative_f ) with DF denoting the difference between prediction and label and || F || denoting the L2 norm of the label."
+    doc_enable_atom_ener_coeff = "If true, the energy will be computed as \\sum_i c_i E_i. c_i should be provided by file atom_ener_coeff.npy in each data system, otherwise it's 1."
+    return [
+        Argument(
+            "start_pref_e",
+            [float, int],
+            optional=True,
+            default=0.02,
+            doc=doc_start_pref_e,
+        ),
+        Argument(
+            "limit_pref_e",
+            [float, int],
+            optional=True,
+            default=1.00,
+            doc=doc_limit_pref_e,
+        ),
+        Argument(
+            "start_pref_bind",
+            [float, int],
+            optional=True,
+            default=1.00,
+        ),
+        Argument(
+            "limit_pref_bind",
+            [float, int],
+            optional=True,
+            default=1.00,
+        ),
+        Argument(
+            "start_pref_f",
+            [float, int],
+            optional=True,
+            default=1000,
+            doc=doc_start_pref_f,
+        ),
+        Argument(
+            "limit_pref_f",
+            [float, int],
+            optional=True,
+            default=1.00,
+            doc=doc_limit_pref_f,
+        ),
+        Argument(
+            "start_pref_v",
+            [float, int],
+            optional=True,
+            default=0.00,
+            doc=doc_start_pref_v,
+        ),
+        Argument(
+            "limit_pref_v",
+            [float, int],
+            optional=True,
+            default=0.00,
+            doc=doc_limit_pref_v,
+        ),
+        Argument(
+            "start_pref_ae",
+            [float, int],
+            optional=True,
+            default=0.00,
+            doc=doc_start_pref_ae,
+        ),
+        Argument(
+            "limit_pref_ae",
+            [float, int],
+            optional=True,
+            default=0.00,
+            doc=doc_limit_pref_ae,
+        ),
+        Argument(
+            "start_pref_pf",
+            [float, int],
+            optional=True,
+            default=0.00,
+            doc=doc_start_pref_pf,
+        ),
+        Argument(
+            "limit_pref_pf",
+            [float, int],
+            optional=True,
+            default=0.00,
+            doc=doc_limit_pref_pf,
+        ),
+        Argument("relative_f", [float, None], optional=True, doc=doc_relative_f),
+        Argument(
+            "enable_atom_ener_coeff",
+            [bool],
+            optional=True,
+            default=False,
+            doc=doc_enable_atom_ener_coeff,
+        ),
+        Argument(
+            "start_pref_gf",
+            float,
+            optional=True,
+            default=0.0,
+            doc=doc_start_pref_gf,
+        ),
+        Argument(
+            "limit_pref_gf",
+            float,
+            optional=True,
+            default=0.0,
+            doc=doc_limit_pref_gf,
+        ),
+        Argument(
+            "numb_generalized_coord",
+            int,
+            optional=True,
+            default=0,
+            doc=doc_numb_generalized_coord,
+        ),
+    ]
+
+
 @loss_args_plugin.register("ener_spin")
 def loss_ener_spin():
     doc_start_pref_e = start_pref("energy")
@@ -2358,6 +2492,12 @@ If MPI is used, the value should be considered as the batch size per task.'
             doc=doc_batch_size,
         ),
         Argument(
+            "binding_dataset",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "auto_prob",
             str,
             optional=True,
@@ -2422,6 +2562,12 @@ def validation_data_args():  # ! added by Ziyao: new specification style for dat
             optional=True,
             default="auto",
             doc=doc_batch_size,
+        ),
+        Argument(
+            "binding_dataset",
+            bool,
+            optional=True,
+            default=False,
         ),
         Argument(
             "auto_prob",

@@ -8,6 +8,9 @@ from .dos import (
 from .ener import (
     EnergyStdLoss,
 )
+from .ener_bind import (
+    EnergyStdBindLoss,
+)
 from .ener_spin import (
     EnergySpinLoss,
 )
@@ -25,4 +28,5 @@ __all__ = [
     "TensorLoss",
     "TaskLoss",
     "DOSLoss",
+    "EnergyStdBindLoss",
 ]

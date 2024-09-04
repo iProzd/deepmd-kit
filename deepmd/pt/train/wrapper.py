@@ -137,8 +137,8 @@ class ModelWrapper(torch.nn.Module):
 
     def forward(
         self,
-        coord,
-        atype,
+        coord: Optional[torch.Tensor] = None,
+        atype: Optional[torch.Tensor] = None,
         spin: Optional[torch.Tensor] = None,
         box: Optional[torch.Tensor] = None,
         cur_lr: Optional[torch.Tensor] = None,
@@ -148,6 +148,7 @@ class ModelWrapper(torch.nn.Module):
         do_atomic_virial=False,
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
+        input_dict_bind=None,
     ):
         if not self.multi_task:
             task_key = "Default"
@@ -155,33 +156,60 @@ class ModelWrapper(torch.nn.Module):
             assert (
                 task_key is not None
             ), f"Multitask model must specify the inference task! Supported tasks are {list(self.model.keys())}."
-        input_dict = {
-            "coord": coord,
-            "atype": atype,
-            "box": box,
-            "do_atomic_virial": do_atomic_virial,
-            "fparam": fparam,
-            "aparam": aparam,
-        }
         has_spin = getattr(self.model[task_key], "has_spin", False)
         if callable(has_spin):
             has_spin = has_spin()
-        if has_spin:
-            input_dict["spin"] = spin
-
-        if self.inference_only or inference_only:
-            model_pred = self.model[task_key](**input_dict)
-            return model_pred, None, None
+        if input_dict_bind is None:
+            input_dict = {
+                "coord": coord,
+                "atype": atype,
+                "box": box,
+                "do_atomic_virial": do_atomic_virial,
+                "fparam": fparam,
+                "aparam": aparam,
+            }
+            if has_spin:
+                input_dict["spin"] = spin
+            if self.inference_only or inference_only:
+                model_pred = self.model[task_key](**input_dict)
+                return model_pred, None, None
+            else:
+                natoms = atype.shape[-1]
+                model_pred, loss, more_loss = self.loss[task_key](
+                    input_dict,
+                    self.model[task_key],
+                    label,
+                    natoms=natoms,
+                    learning_rate=cur_lr,
+                )
+                return model_pred, loss, more_loss
         else:
-            natoms = atype.shape[-1]
-            model_pred, loss, more_loss = self.loss[task_key](
-                input_dict,
-                self.model[task_key],
-                label,
-                natoms=natoms,
-                learning_rate=cur_lr,
-            )
-            return model_pred, loss, more_loss
+            input_dict = {}
+            for kk in input_dict_bind.keys():
+                input_dict[kk] = {
+                    "coord": input_dict_bind[kk]["coord"],
+                    "atype": input_dict_bind[kk]["atype"],
+                    "box": input_dict_bind[kk]["box"],
+                    "do_atomic_virial": do_atomic_virial,
+                    "fparam": input_dict_bind[kk]["fparam"],
+                    "aparam": input_dict_bind[kk]["aparam"],
+                }
+                if has_spin:
+                    input_dict[kk]["spin"] = input_dict_bind[kk]["spin"]
+            if self.inference_only or inference_only:
+                model_pred = {}
+                for kk in input_dict_bind.keys():
+                    model_pred[kk] = self.model[task_key](**input_dict[kk])
+                return model_pred, None, None
+            else:
+                model_pred, loss, more_loss = self.loss[task_key](
+                    input_dict,
+                    self.model[task_key],
+                    label,
+                    natoms=0,
+                    learning_rate=cur_lr,
+                )
+                return model_pred, loss, more_loss
 
     def set_extra_state(self, state: Dict):
         self.model_params = state["model_params"]

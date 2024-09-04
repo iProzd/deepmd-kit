@@ -48,17 +48,27 @@ def make_stat_input(datasets, dataloaders, nbatches):
     - a list of dicts, each of which contains data from a system
     """
     lst = []
-    log.info(f"Packing data for statistics from {len(datasets)} systems")
-    for i in range(len(datasets)):
+    if isinstance(datasets, dict):
+        merged_datasets = []
+        merged_dataloaders = []
+        for kk in datasets:
+            merged_datasets += datasets[kk]
+            merged_dataloaders += dataloaders[kk]
+    else:
+        merged_datasets = datasets
+        merged_dataloaders = dataloaders
+
+    log.info(f"Packing data for statistics from {len(merged_datasets)} systems")
+    for i in range(len(merged_datasets)):
         sys_stat = {}
         with torch.device("cpu"):
-            iterator = iter(dataloaders[i])
-            numb_batches = min(nbatches, len(dataloaders[i]))
+            iterator = iter(merged_dataloaders[i])
+            numb_batches = min(nbatches, len(merged_dataloaders[i]))
             for _ in range(numb_batches):
                 try:
                     stat_data = next(iterator)
                 except StopIteration:
-                    iterator = iter(dataloaders[i])
+                    iterator = iter(merged_dataloaders[i])
                     stat_data = next(iterator)
                 for dd in stat_data:
                     if stat_data[dd] is None:

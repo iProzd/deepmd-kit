@@ -113,14 +113,42 @@ def get_trainer(
         model_params_single, data_dict_single, rank=0, seed=None
     ):
         training_dataset_params = data_dict_single["training_data"]
+        binding_dataset = training_dataset_params.get("binding_dataset", False)
         validation_dataset_params = data_dict_single.get("validation_data", None)
         validation_systems = (
             validation_dataset_params["systems"] if validation_dataset_params else None
         )
         training_systems = training_dataset_params["systems"]
-        training_systems = process_systems(training_systems)
-        if validation_systems is not None:
-            validation_systems = process_systems(validation_systems)
+        if not binding_dataset:
+            training_systems = process_systems(training_systems)
+            if validation_systems is not None:
+                validation_systems = process_systems(validation_systems)
+        else:
+            training_systems_dict = {
+                "ligand": process_systems(
+                    [os.path.join(sys, "ligand") for sys in training_systems]
+                ),
+                "pocket": process_systems(
+                    [os.path.join(sys, "pocket") for sys in training_systems]
+                ),
+                "complex": process_systems(
+                    [os.path.join(sys, "complex") for sys in training_systems]
+                ),
+            }
+            training_systems = training_systems_dict
+            if validation_systems is not None:
+                validation_systems_dict = {
+                    "ligand": process_systems(
+                        [os.path.join(sys, "ligand") for sys in validation_systems]
+                    ),
+                    "pocket": process_systems(
+                        [os.path.join(sys, "pocket") for sys in validation_systems]
+                    ),
+                    "complex": process_systems(
+                        [os.path.join(sys, "complex") for sys in validation_systems]
+                    ),
+                }
+                validation_systems = validation_systems_dict
 
         # stat files
         stat_file_path_single = data_dict_single.get("stat_file", None)
@@ -144,6 +172,7 @@ def get_trainer(
                 validation_dataset_params["batch_size"],
                 model_params_single["type_map"],
                 seed=rank_seed,
+                binding_dataset=validation_dataset_params.get("binding_dataset", False),
             )
             if validation_systems
             else None
@@ -153,6 +182,7 @@ def get_trainer(
             training_dataset_params["batch_size"],
             model_params_single["type_map"],
             seed=rank_seed,
+            binding_dataset=training_dataset_params.get("binding_dataset", False),
         )
         return (
             train_data_single,
