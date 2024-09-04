@@ -404,7 +404,7 @@ class EnergyStdBindLoss(TaskLoss):
                 )
             loss_all += atom_norm * (pref_bind * l2_bind_loss)
             rmse_e = l2_bind_loss.sqrt() * atom_norm
-            more_loss_dict["rmse_bind"] = self.display_if_exist(
+            more_loss_dict["rmse_e_bind"] = self.display_if_exist(
                 rmse_e.detach(), find_bind
             )
         return model_pred_dict, loss_all, more_loss_dict
