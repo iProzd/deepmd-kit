@@ -80,12 +80,23 @@ class DpLoaderSet(Dataset):
         type_map,
         seed=None,
         shuffle=True,
+        binding_dataset=False,
     ) -> None:
+        self.binding_dataset = binding_dataset
         if seed is not None:
             setup_seed(seed)
         if isinstance(systems, str):
             with h5py.File(systems) as file:
                 systems = [os.path.join(systems, item) for item in file.keys()]
+        if binding_dataset:
+            assert isinstance(systems, dict)
+            self.part_key = list(systems.keys())
+            self.systems: dict[str, list[DeepmdDataSetForLoader]] = {
+                kk: [] for kk in self.part_key
+            }
+        else:
+            self.part_key = []
+            self.systems: list[DeepmdDataSetForLoader] = []
 
         def construct_dataset(system):
             return DeepmdDataSetForLoader(
@@ -93,22 +104,36 @@ class DpLoaderSet(Dataset):
                 type_map=type_map,
             )
 
-        self.systems: list[DeepmdDataSetForLoader] = []
         global_rank = dist.get_rank() if dist.is_initialized() else 0
-        if global_rank == 0:
-            log.info(f"Constructing DataLoaders from {len(systems)} systems")
-            with Pool(max(1, env.NUM_WORKERS)) as pool:
-                self.systems = pool.map(construct_dataset, systems)
+        if not binding_dataset:
+            if global_rank == 0:
+                log.info(f"Constructing DataLoaders from {len(systems)} systems")
+                with Pool(max(1, env.NUM_WORKERS)) as pool:
+                    self.systems = pool.map(construct_dataset, systems)
+            else:
+                self.systems = [None] * len(systems)  # type: ignore
+            if dist.is_initialized():
+                dist.broadcast_object_list(self.systems)
+                assert self.systems[-1] is not None
         else:
-            self.systems = [None] * len(systems)  # type: ignore
-        if dist.is_initialized():
-            dist.broadcast_object_list(self.systems)
-            assert self.systems[-1] is not None
+            if global_rank == 0:
+                log.info(
+                    f"Constructing DataLoaders from {len(systems[self.part_key[0]])} systems"
+                )
+                with Pool(max(1, env.NUM_WORKERS)) as pool:
+                    for kk in self.part_key:
+                        self.systems[kk] = pool.map(construct_dataset, systems[kk])
+            else:
+                for kk in self.part_key:
+                    self.systems[kk] = [None] * len(systems[self.part_key[0]])  # type: ignore
+            if dist.is_initialized():
+                for kk in self.part_key:
+                    dist.broadcast_object_list(self.systems[kk])
+                    assert self.systems[kk][-1] is not None
         self.sampler_list: list[DistributedSampler] = []
         self.index = []
         self.total_batch = 0
 
-        self.dataloaders = []
         self.batch_sizes = []
         if isinstance(batch_size, str):
             if batch_size == "auto":
@@ -118,7 +143,7 @@ class DpLoaderSet(Dataset):
             else:
                 rule = None
                 log.error("Unsupported batch size type")
-            for ii in self.systems:
+            for ii in self.systems if not binding_dataset else self.systems["complex"]:
                 ni = ii._natoms
                 bsi = rule // ni
                 if bsi * ni < rule:
@@ -127,31 +152,67 @@ class DpLoaderSet(Dataset):
         elif isinstance(batch_size, list):
             self.batch_sizes = batch_size
         else:
-            self.batch_sizes = batch_size * np.ones(len(systems), dtype=int)
-        assert len(self.systems) == len(self.batch_sizes)
-        for system, batch_size in zip(self.systems, self.batch_sizes):
-            if dist.is_available() and dist.is_initialized():
-                system_sampler = DistributedSampler(system)
-                self.sampler_list.append(system_sampler)
-            else:
-                system_sampler = None
-            system_dataloader = DataLoader(
-                dataset=system,
-                batch_size=int(batch_size),
-                num_workers=0,  # Should be 0 to avoid too many threads forked
-                sampler=system_sampler,
-                collate_fn=collate_batch,
-                shuffle=(not (dist.is_available() and dist.is_initialized()))
-                and shuffle,
+            self.batch_sizes = batch_size * np.ones(
+                len(systems if not binding_dataset else systems[self.part_key[0]]),
+                dtype=int,
             )
-            self.dataloaders.append(system_dataloader)
-            self.index.append(len(system_dataloader))
-            self.total_batch += len(system_dataloader)
-        # Initialize iterator instances for DataLoader
-        self.iters = []
-        with torch.device("cpu"):
-            for item in self.dataloaders:
-                self.iters.append(iter(item))
+        assert len(
+            self.systems if not binding_dataset else self.systems[self.part_key[0]]
+        ) == len(self.batch_sizes)
+        if not binding_dataset:
+            self.dataloaders = []
+            for system, batch_size in zip(self.systems, self.batch_sizes):
+                if dist.is_available() and dist.is_initialized():
+                    system_sampler = DistributedSampler(system)
+                    self.sampler_list.append(system_sampler)
+                else:
+                    system_sampler = None
+                system_dataloader = DataLoader(
+                    dataset=system,
+                    batch_size=int(batch_size),
+                    num_workers=0,  # Should be 0 to avoid too many threads forked
+                    sampler=system_sampler,
+                    collate_fn=collate_batch,
+                    shuffle=(not (dist.is_available() and dist.is_initialized()))
+                    and shuffle,
+                )
+                self.dataloaders.append(system_dataloader)
+                self.index.append(len(system_dataloader))
+                self.total_batch += len(system_dataloader)
+            # Initialize iterator instances for DataLoader
+            self.iters = []
+            with torch.device("cpu"):
+                for item in self.dataloaders:
+                    self.iters.append(iter(item))
+        else:
+            self.dataloaders = {kk: [] for kk in self.part_key}
+            for kk in self.part_key:
+                for system, batch_size in zip(self.systems[kk], self.batch_sizes):
+                    if dist.is_available() and dist.is_initialized():
+                        system_sampler = DistributedSampler(system)
+                        if kk == self.part_key[0]:
+                            self.sampler_list.append(system_sampler)
+                    else:
+                        system_sampler = None
+                    system_dataloader = DataLoader(
+                        dataset=system,
+                        batch_size=int(batch_size),
+                        num_workers=0,  # Should be 0 to avoid too many threads forked
+                        sampler=system_sampler,
+                        collate_fn=collate_batch,
+                        shuffle=(not (dist.is_available() and dist.is_initialized()))
+                        and shuffle,
+                    )
+                    self.dataloaders[kk].append(system_dataloader)
+                    if kk == self.part_key[0]:
+                        self.index.append(len(system_dataloader))
+                        self.total_batch += len(system_dataloader)
+            # Initialize iterator instances for DataLoader
+            self.iters = {kk: [] for kk in self.part_key}
+            with torch.device("cpu"):
+                for kk in self.part_key:
+                    for item in self.dataloaders[kk]:
+                        self.iters[kk].append(iter(item))
 
     def set_noise(self, noise_settings) -> None:
         # noise_settings['noise_type'] # "trunc_normal", "normal", "uniform"
@@ -163,23 +224,44 @@ class DpLoaderSet(Dataset):
         for system in self.systems:
             system.set_noise(noise_settings)
 
-    def __len__(self) -> int:
-        return len(self.dataloaders)
+    def __len__(self):
+        return len(
+            self.dataloaders
+            if not self.binding_dataset
+            else self.dataloaders[self.part_key[0]]
+        )
 
     def __getitem__(self, idx):
         # log.warning(str(torch.distributed.get_rank())+" idx: "+str(idx)+" index: "+str(self.index[idx]))
-        try:
-            batch = next(self.iters[idx])
-        except StopIteration:
-            self.iters[idx] = iter(self.dataloaders[idx])
-            batch = next(self.iters[idx])
+        if not self.binding_dataset:
+            try:
+                batch = next(self.iters[idx])
+            except StopIteration:
+                self.iters[idx] = iter(self.dataloaders[idx])
+                batch = next(self.iters[idx])
+        else:
+            try:
+                batch = {}
+                for kk in self.part_key:
+                    batch[kk] = next(self.iters[kk][idx])
+            except StopIteration:
+                for kk in self.part_key:
+                    self.iters[kk][idx] = iter(self.dataloaders[kk][idx])
+                batch = {}
+                for kk in self.part_key:
+                    batch[kk] = next(self.iters[kk][idx])
         batch["sid"] = idx
         return batch
 
     def add_data_requirement(self, data_requirement: list[DataRequirementItem]) -> None:
         """Add data requirement for each system in multiple systems."""
-        for system in self.systems:
-            system.add_data_requirement(data_requirement)
+        if not self.binding_dataset:
+            for system in self.systems:
+                system.add_data_requirement(data_requirement)
+        else:
+            for kk in self.part_key:
+                for system in self.systems[kk]:
+                    system.add_data_requirement(data_requirement)
 
     def print_summary(
         self,
@@ -188,19 +270,26 @@ class DpLoaderSet(Dataset):
     ) -> None:
         rank = dist.get_rank() if dist.is_initialized() else 0
         if rank == 0:
-            print_summary(
-                name,
-                len(self.systems),
-                [ss.system for ss in self.systems],
-                [ss._natoms for ss in self.systems],
-                self.batch_sizes,
-                [
-                    ss._data_system.get_sys_numb_batch(self.batch_sizes[ii])
-                    for ii, ss in enumerate(self.systems)
-                ],
-                prob,
-                [ss._data_system.pbc for ss in self.systems],
+            sys_list = (
+                [self.systems]
+                if not self.binding_dataset
+                else [self.systems[kk] for kk in self.part_key]
             )
+            bs = self.batch_sizes
+            for sys in sys_list:
+                print_summary(
+                    name,
+                    len(sys),
+                    [ss.system for ss in sys],
+                    [ss._natoms for ss in sys],
+                    bs,
+                    [
+                        ss._data_system.get_sys_numb_batch(bs[ii])
+                        for ii, ss in enumerate(sys)
+                    ],
+                    prob,
+                    [ss._data_system.pbc for ss in sys],
+                )
 
 
 class BackgroundConsumer(Thread):
