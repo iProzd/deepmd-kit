@@ -5,7 +5,6 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 
 from deepmd.pt.loss.loss import (
     TaskLoss,
@@ -219,54 +218,44 @@ class EnergyStdLoss(TaskLoss):
                 energy_pred = torch.sum(atom_ener_coeff * atom_ener_pred, dim=1)
             find_energy = label.get("find_energy", 0.0)
             pref_e = pref_e * find_energy
-            if not self.use_l1_all:
-                l2_ener_loss = torch.mean(torch.square(energy_pred - energy_label))
+
+            l2_ener_loss = torch.mean(torch.square(energy_pred - energy_label))
+            if not self.inference:
+                more_loss["l2_ener_loss"] = self.display_if_exist(
+                    l2_ener_loss.detach(), find_energy
+                )
+            rmse_e = l2_ener_loss.sqrt() * atom_norm
+            more_loss["rmse_e"] = self.display_if_exist(rmse_e.detach(), find_energy)
+            l_ener_loss = l2_ener_loss
+            if self.use_l1_all:
+                l1_ener_loss = torch.mean(torch.abs(energy_pred - energy_label))
                 if not self.inference:
-                    more_loss["l2_ener_loss"] = self.display_if_exist(
-                        l2_ener_loss.detach(), find_energy
+                    more_loss["l1_ener_loss"] = self.display_if_exist(
+                        l1_ener_loss.detach(), find_energy
                     )
-                if not self.huber:
-                    loss += atom_norm * (pref_e * l2_ener_loss)
-                    more_loss["ax_loss"] += atom_norm * (
-                        self.limit_pref_e * find_energy * l2_ener_loss
+                mae_e = l1_ener_loss * atom_norm
+                more_loss["mae_e"] = self.display_if_exist(mae_e.detach(), find_energy)
+                l_ener_loss = l1_ener_loss
+
+            if not self.huber:
+                loss += atom_norm * (pref_e * l_ener_loss)
+                more_loss["ax_loss"] += atom_norm * (
+                    self.limit_pref_e * find_energy * l_ener_loss
+                )
+            else:
+                if self.torch_huber:
+                    l_huber_loss = self.huber_loss(
+                        atom_norm * model_pred["energy"],
+                        atom_norm * label["energy"],
                     )
                 else:
-                    if self.torch_huber:
-                        l_huber_loss = self.huber_loss(
-                            atom_norm * model_pred["energy"],
-                            atom_norm * label["energy"],
-                        )
-                    else:
-                        l_huber_loss = custom_huber_loss(
-                            atom_norm * model_pred["energy"],
-                            atom_norm * label["energy"],
-                            delta=self.huber_delta,
-                        )
-                    loss += pref_e * l_huber_loss
-                    more_loss["ax_loss"] += (
-                        self.limit_pref_e * find_energy * l_huber_loss
+                    l_huber_loss = custom_huber_loss(
+                        atom_norm * model_pred["energy"],
+                        atom_norm * label["energy"],
+                        delta=self.huber_delta,
                     )
-                rmse_e = l2_ener_loss.sqrt() * atom_norm
-                more_loss["rmse_e"] = self.display_if_exist(
-                    rmse_e.detach(), find_energy
-                )
-                # more_loss['log_keys'].append('rmse_e')
-            else:  # use l1 and for all atoms
-                l1_ener_loss = F.l1_loss(
-                    energy_pred.reshape(-1),
-                    energy_label.reshape(-1),
-                    reduction="sum",
-                )
-                loss += pref_e * l1_ener_loss
-                more_loss["mae_e"] = self.display_if_exist(
-                    F.l1_loss(
-                        energy_pred.reshape(-1),
-                        energy_label.reshape(-1),
-                        reduction="mean",
-                    ).detach(),
-                    find_energy,
-                )
-                # more_loss['log_keys'].append('rmse_e')
+                loss += pref_e * l_huber_loss
+                more_loss["ax_loss"] += self.limit_pref_e * find_energy * l_huber_loss
             if mae:
                 mae_e = torch.mean(torch.abs(energy_pred - energy_label)) * atom_norm
                 more_loss["mae_e"] = self.display_if_exist(mae_e.detach(), find_energy)
@@ -294,41 +283,43 @@ class EnergyStdLoss(TaskLoss):
                 diff_f = diff_f_3.reshape(-1)
 
             if self.has_f:
-                if not self.use_l1_all:
-                    l2_force_loss = torch.mean(torch.square(diff_f))
+                l2_force_loss = torch.mean(torch.square(diff_f))
+                if not self.inference:
+                    more_loss["l2_force_loss"] = self.display_if_exist(
+                        l2_force_loss.detach(), find_force
+                    )
+                rmse_f = l2_force_loss.sqrt()
+                more_loss["rmse_f"] = self.display_if_exist(rmse_f.detach(), find_force)
+                l_force_loss = l2_force_loss
+                if self.use_l1_all:
+                    l1_force_loss = torch.mean(torch.abs(diff_f))
                     if not self.inference:
-                        more_loss["l2_force_loss"] = self.display_if_exist(
-                            l2_force_loss.detach(), find_force
+                        more_loss["l1_force_loss"] = self.display_if_exist(
+                            l1_force_loss.detach(), find_force
                         )
-                    if not self.huber:
-                        loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
-                        more_loss["ax_loss"] += (
-                            self.limit_pref_f * find_force * l2_force_loss
-                        ).to(GLOBAL_PT_FLOAT_PRECISION)
-                    else:
-                        if self.torch_huber:
-                            l_huber_loss = self.huber_loss(
-                                model_pred["force"], label["force"]
-                            )
-                        else:
-                            l_huber_loss = custom_huber_loss(
-                                force_pred.reshape(-1),
-                                force_label.reshape(-1),
-                                delta=self.huber_delta,
-                            )
-                        loss += self.limit_pref_f * find_force * l_huber_loss
-                        more_loss["ax_loss"] += pref_f * l_huber_loss
-                    rmse_f = l2_force_loss.sqrt()
-                    more_loss["rmse_f"] = self.display_if_exist(
-                        rmse_f.detach(), find_force
-                    )
-                else:
-                    l1_force_loss = F.l1_loss(force_label, force_pred, reduction="none")
+                    mae_f = l1_force_loss
                     more_loss["mae_f"] = self.display_if_exist(
-                        l1_force_loss.mean().detach(), find_force
+                        mae_f.detach(), find_force
                     )
-                    l1_force_loss = l1_force_loss.sum(-1).mean(-1).sum()
-                    loss += (pref_f * l1_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                    l_force_loss = l1_force_loss
+                if not self.huber:
+                    loss += (pref_f * l_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                    more_loss["ax_loss"] += (
+                        self.limit_pref_f * find_force * l_force_loss
+                    ).to(GLOBAL_PT_FLOAT_PRECISION)
+                else:
+                    if self.torch_huber:
+                        l_huber_loss = self.huber_loss(
+                            model_pred["force"], label["force"]
+                        )
+                    else:
+                        l_huber_loss = custom_huber_loss(
+                            force_pred.reshape(-1),
+                            force_label.reshape(-1),
+                            delta=self.huber_delta,
+                        )
+                    loss += self.limit_pref_f * find_force * l_huber_loss
+                    more_loss["ax_loss"] += pref_f * l_huber_loss
                 if mae:
                     mae_f = torch.mean(torch.abs(diff_f))
                     more_loss["mae_f"] = self.display_if_exist(
@@ -385,10 +376,23 @@ class EnergyStdLoss(TaskLoss):
                 more_loss["l2_virial_loss"] = self.display_if_exist(
                     l2_virial_loss.detach(), find_virial
                 )
+            rmse_v = l2_virial_loss.sqrt() * atom_norm
+            more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
+            l_virial_loss = l2_virial_loss
+            if self.use_l1_all:
+                l1_virial_loss = torch.mean(torch.abs(diff_v))
+                if not self.inference:
+                    more_loss["l1_virial_loss"] = self.display_if_exist(
+                        l1_virial_loss.detach(), find_virial
+                    )
+                mae_v = l1_virial_loss * atom_norm
+                more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)
+                l_virial_loss = l1_virial_loss
+
             if not self.huber:
-                loss += atom_norm * (pref_v * l2_virial_loss)
+                loss += atom_norm * (pref_v * l_virial_loss)
                 more_loss["ax_loss"] += atom_norm * (
-                    self.limit_pref_v * find_virial * l2_virial_loss
+                    self.limit_pref_v * find_virial * l_virial_loss
                 )
             else:
                 if self.torch_huber:
@@ -404,8 +408,6 @@ class EnergyStdLoss(TaskLoss):
                     )
                 loss += pref_v * l_huber_loss
                 more_loss["ax_loss"] += self.limit_pref_v * find_virial * l_huber_loss
-            rmse_v = l2_virial_loss.sqrt() * atom_norm
-            more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
             if mae:
                 mae_v = torch.mean(torch.abs(diff_v)) * atom_norm
                 more_loss["mae_v"] = self.display_if_exist(mae_v.detach(), find_virial)

@@ -846,7 +846,7 @@ class Trainer:
                     rmse_val = {
                         item: _more_loss[item]
                         for item in _more_loss
-                        if "l2_" not in item
+                        if ("l2_" not in item and "l1_" not in item)
                     }
                     for item in sorted(rmse_val.keys()):
                         results[item] = rmse_val[item]
@@ -878,7 +878,7 @@ class Trainer:
                         natoms = int(input_dict["atype"].shape[-1])
                         sum_natoms += natoms
                         for k, v in more_loss.items():
-                            if "l2_" not in k:
+                            if "l2_" not in k and "l1_" not in k:
                                 single_results[k] = (
                                     single_results.get(k, 0.0) + v * natoms
                                 )
