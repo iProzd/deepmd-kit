@@ -286,8 +286,8 @@ def train(FLAGS):
             "Calculate neighbor statistics... (add --skip-neighbor-stat to skip this step)"
         )
 
-        type_map = config["model"].get("type_map")
         if not multi_task:
+            type_map = config["model"].get("type_map")
             train_data = get_data(
                 config["training"]["training_data"], 0, type_map, None
             )
@@ -297,6 +297,7 @@ def train(FLAGS):
         else:
             min_nbor_dist = {}
             for model_item in config["model"]["model_dict"]:
+                type_map = config["model"]["model_dict"][model_item].get("type_map")
                 train_data = get_data(
                     config["training"]["data_dict"][model_item]["training_data"],
                     0,
