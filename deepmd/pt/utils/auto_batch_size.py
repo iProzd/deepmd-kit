@@ -115,6 +115,8 @@ class AutoBatchSize(AutoBatchSizeBase):
         returned_dict = None
         while index < total_size:
             n_batch, result = self.execute(execute_with_batch_size, index, natoms)
+            if not n_batch:
+                continue
             returned_dict = (
                 isinstance(result, dict) if returned_dict is None else returned_dict
             )

@@ -551,9 +551,7 @@ class Trainer:
                             target_state_dict,
                         )
                     state_dict = new_state_dict
-                    state_dict["_extra_state"] = self.wrapper.state_dict()[
-                        "_extra_state"
-                    ]
+                state_dict["_extra_state"] = self.wrapper.state_dict()["_extra_state"]
 
                 self.wrapper.load_state_dict(state_dict)
 

@@ -133,6 +133,7 @@ class EnergyFittingNetDirect(Fitting):
             assert self.ntypes == len(bias_atom_e), "Element count mismatches!"
         bias_atom_e = torch.tensor(bias_atom_e, device=env.DEVICE)
         self.register_buffer("bias_atom_e", bias_atom_e)
+        self.exclude_types = []
 
         filter_layers_dipole = []
         for type_i in range(self.ntypes):
@@ -178,6 +179,14 @@ class EnergyFittingNetDirect(Fitting):
             ]
         )
 
+    def get_dim_fparam(self) -> int:
+        """Get the number (dimension) of frame parameters of this atomic model."""
+        return 0
+
+    def get_dim_aparam(self) -> int:
+        """Get the number (dimension) of atomic parameters of this atomic model."""
+        return 0
+
     def serialize(self) -> dict:
         raise NotImplementedError
 
@@ -191,6 +200,23 @@ class EnergyFittingNetDirect(Fitting):
 
     def get_type_map(self) -> List[str]:
         raise NotImplementedError
+
+    # make jit happy
+    exclude_types: List[int]
+
+    def get_sel_type(self) -> List[int]:
+        """Get the selected atom types of this model.
+
+        Only atoms with selected atom types have atomic contribution
+        to the result of the model.
+        If returning an empty list, all atom types are selected.
+        """
+        # make jit happy
+        sel_type: List[int] = []
+        for ii in range(self.ntypes):
+            if ii not in self.exclude_types:
+                sel_type.append(ii)
+        return sel_type
 
     def forward(
         self,
