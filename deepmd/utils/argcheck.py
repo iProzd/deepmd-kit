@@ -1233,6 +1233,18 @@ def dpa2_repformer_args():
             doc=doc_g1_out_mlp,
         ),
         Argument(
+            "output_g1_ln",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "output_g2_ln",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "update_h2",
             bool,
             optional=True,
