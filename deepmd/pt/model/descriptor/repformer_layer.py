@@ -602,6 +602,8 @@ class RepformerLayer(torch.nn.Module):
         use_sqrt_nnei=False,
         g1_out_conv=False,
         g1_out_mlp=False,
+        output_g1_ln=False,
+        output_g2_ln=False,
         seed: Optional[Union[int, List[int]]] = None,
     ):
         super().__init__()
@@ -644,6 +646,8 @@ class RepformerLayer(torch.nn.Module):
         self.use_sqrt_nnei = use_sqrt_nnei
         self.g1_out_conv = g1_out_conv
         self.g1_out_mlp = g1_out_mlp
+        self.output_g1_ln = output_g1_ln
+        self.output_g2_ln = output_g2_ln
 
         assert update_residual_init in [
             "norm",
@@ -681,6 +685,8 @@ class RepformerLayer(torch.nn.Module):
         self.attn2_lm = None
         self.attn2_ev_apply = None
         self.loc_attn = None
+        self.g1_ln = None
+        self.g2_ln = None
 
         if self.update_chnnl_2:
             self.linear2 = MLPLayer(
@@ -832,6 +838,22 @@ class RepformerLayer(torch.nn.Module):
         self.g1_residual = nn.ParameterList(self.g1_residual)
         self.g2_residual = nn.ParameterList(self.g2_residual)
         self.h2_residual = nn.ParameterList(self.h2_residual)
+        if self.output_g1_ln:
+            self.g1_ln = LayerNorm(
+                g1_dim,
+                eps=ln_eps,
+                trainable=trainable_ln,
+                precision=precision,
+                seed=child_seed(seed, 18),
+            )
+        if self.output_g2_ln:
+            self.g2_ln = LayerNorm(
+                g2_dim,
+                eps=ln_eps,
+                trainable=trainable_ln,
+                precision=precision,
+                seed=child_seed(seed, 19),
+            )
 
     def cal_1_dim(self, g1d: int, g2d: int, ax: int) -> int:
         ret = g1d if not self.g1_out_mlp else 0
@@ -1225,6 +1247,12 @@ class RepformerLayer(torch.nn.Module):
         else:
             g2_new, h2_new = g2, h2
         g1_new = self.list_update(g1_update, "g1")
+        if self.output_g1_ln:
+            assert self.g1_ln is not None
+            g1_new = self.g1_ln(g1_new)
+        if self.output_g2_ln:
+            assert self.g2_ln is not None
+            g2_new = self.g2_ln(g2_new)
         return g1_new, g2_new, h2_new
 
     @torch.jit.export

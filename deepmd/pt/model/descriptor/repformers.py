@@ -108,6 +108,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         use_sqrt_nnei: bool = False,
         g1_out_conv: bool = False,
         g1_out_mlp: bool = False,
+        output_g1_ln: bool = False,
+        output_g2_ln: bool = False,
         old_impl: bool = False,
     ):
         r"""
@@ -228,6 +230,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.use_sqrt_nnei = use_sqrt_nnei
         self.g1_out_conv = g1_out_conv
         self.g1_out_mlp = g1_out_mlp
+        self.output_g1_ln = output_g1_ln
+        self.output_g2_ln = output_g2_ln
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
         self.env_protection = env_protection
@@ -305,6 +309,8 @@ class DescrptBlockRepformers(DescriptorBlock):
                         use_sqrt_nnei=self.use_sqrt_nnei,
                         g1_out_conv=self.g1_out_conv,
                         g1_out_mlp=self.g1_out_mlp,
+                        output_g1_ln=self.output_g1_ln,
+                        output_g2_ln=self.output_g2_ln,
                         seed=child_seed(child_seed(seed, 1), ii),
                     )
                 )
