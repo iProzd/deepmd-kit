@@ -19,6 +19,10 @@ from deepmd.pt.model.descriptor.descriptor import (
 from deepmd.pt.model.descriptor.env_mat import (
     prod_env_mat,
 )
+from deepmd.pt.model.network.edge_embedding import (
+    BesselBasis,
+    PolynomialCutoff,
+)
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
@@ -110,6 +114,9 @@ class DescrptBlockRepformers(DescriptorBlock):
         g1_out_mlp: bool = False,
         output_g1_ln: bool = False,
         output_g2_ln: bool = False,
+        radial_func=None,
+        basis_num=None,
+        cutoff_func=None,
         old_impl: bool = False,
     ):
         r"""
@@ -240,10 +247,35 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.ln_eps = ln_eps
         self.epsilon = 1e-4
         self.seed = seed
+        self.radial_func = radial_func
+        self.cutoff_func = cutoff_func
+        self.basis_num = basis_num
+        self.custom_radial = False
+        self.radial_module = None
+        self.cutoff_module = None
+        if (
+            self.radial_func is not None
+            and self.cutoff_func is not None
+            and self.basis_num is not None
+        ):
+            self.custom_radial = True
+            if self.radial_func == "bessel":
+                self.radial_module = BesselBasis(
+                    cutoff_length=self.rcut, bessel_basis_num=self.basis_num
+                )
+            else:
+                raise NotImplementedError
+            if self.cutoff_func == "poly":
+                self.cutoff_module = PolynomialCutoff(cutoff_length=self.rcut)
+            else:
+                raise NotImplementedError
         self.old_impl = old_impl
 
         self.g2_embd = MLPLayer(
-            1, self.g2_dim, precision=precision, seed=child_seed(seed, 0)
+            1 if not self.custom_radial else self.basis_num,
+            self.g2_dim,
+            precision=precision,
+            seed=child_seed(seed, 0),
         )
         layers = []
         for ii in range(nlayers):
@@ -459,6 +491,10 @@ class DescrptBlockRepformers(DescriptorBlock):
         # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
         if not self.direct_dist:
             g2, h2 = torch.split(dmatrix, [1, 3], dim=-1)
+            if self.custom_radial:
+                rr = torch.linalg.norm(diff, dim=-1)
+                g2 = self.radial_module(rr) * self.cutoff_module(rr).unsqueeze(-1)
+                g2 = g2.view(nframes, nloc, nnei, -1)
         else:
             g2, h2 = torch.linalg.norm(diff, dim=-1, keepdim=True), diff
             g2 = g2 / self.rcut

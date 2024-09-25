@@ -176,6 +176,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             resnet_dt=self.repinit_args.resnet_dt,
             smooth=smooth,
             type_one_side=self.repinit_args.type_one_side,
+            radial_func=self.repinit_args.radial_func,
+            basis_num=self.repinit_args.basis_num,
+            cutoff_func=self.repinit_args.cutoff_func,
             seed=child_seed(seed, 0),
         )
         self.use_three_body = self.repinit_args.use_three_body
@@ -238,6 +241,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             output_g1_ln=self.repformer_args.output_g1_ln,
             output_g2_ln=self.repformer_args.output_g2_ln,
             seed=child_seed(seed, 1),
+            radial_func=self.repformer_args.radial_func,
+            basis_num=self.repformer_args.basis_num,
+            cutoff_func=self.repformer_args.cutoff_func,
             old_impl=old_impl,
         )
         self.use_econf_tebd = use_econf_tebd
