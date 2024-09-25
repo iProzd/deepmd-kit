@@ -492,6 +492,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         if not self.direct_dist:
             g2, h2 = torch.split(dmatrix, [1, 3], dim=-1)
             if self.custom_radial:
+                assert self.radial_module is not None
+                assert self.cutoff_module is not None
                 rr = torch.linalg.norm(diff, dim=-1)
                 g2 = self.radial_module(rr) * self.cutoff_module(rr).unsqueeze(-1)
                 g2 = g2.view(nframes, nloc, nnei, -1)

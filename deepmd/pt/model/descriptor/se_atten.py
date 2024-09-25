@@ -566,6 +566,8 @@ class DescrptBlockSeAtten(DescriptorBlock):
             if not self.custom_radial:
                 ss = rr[:, :, :1]
             else:
+                assert self.radial_module is not None
+                assert self.cutoff_module is not None
                 dist = torch.linalg.norm(diff, dim=-1)
                 ss = self.radial_module(dist) * self.cutoff_module(dist).unsqueeze(-1)
                 ss = ss.view(nframes * nloc, nnei, -1)
