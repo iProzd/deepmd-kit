@@ -633,6 +633,24 @@ def descrpt_se_atten_args():
             doc=doc_tebd_input_mode,
         ),
         Argument(
+            "radial_func",
+            str,
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "basis_num",
+            int,
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "cutoff_func",
+            str,
+            optional=True,
+            default=None,
+        ),
+        Argument(
             "scaling_factor",
             float,
             optional=True,
@@ -1070,6 +1088,24 @@ def dpa2_repinit_args():
         Argument(
             "three_body_sel", int, optional=True, default=40, doc=doc_three_body_sel
         ),
+        Argument(
+            "radial_func",
+            str,
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "basis_num",
+            int,
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "cutoff_func",
+            str,
+            optional=True,
+            default=None,
+        ),
     ]
 
 
@@ -1324,6 +1360,24 @@ def dpa2_repformer_args():
             optional=True,
             default=None,
             doc=doc_ln_eps,
+        ),
+        Argument(
+            "radial_func",
+            str,
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "basis_num",
+            int,
+            optional=True,
+            default=None,
+        ),
+        Argument(
+            "cutoff_func",
+            str,
+            optional=True,
+            default=None,
         ),
     ]
 

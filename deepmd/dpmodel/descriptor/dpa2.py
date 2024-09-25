@@ -83,6 +83,9 @@ class RepinitArgs:
         three_body_sel: int = 40,
         three_body_rcut: float = 4.0,
         three_body_rcut_smth: float = 0.5,
+        radial_func=None,
+        basis_num=None,
+        cutoff_func=None,
     ):
         r"""The constructor for the RepinitArgs class which defines the parameters of the repinit block in DPA2 descriptor.
 
@@ -142,6 +145,9 @@ class RepinitArgs:
         self.three_body_sel = three_body_sel
         self.three_body_rcut = three_body_rcut
         self.three_body_rcut_smth = three_body_rcut_smth
+        self.radial_func = radial_func
+        self.basis_num = basis_num
+        self.cutoff_func = cutoff_func
 
     def __getitem__(self, key):
         if hasattr(self, key):
@@ -207,6 +213,9 @@ class RepformerArgs:
         g1_out_conv: bool = True,
         g1_out_mlp: bool = True,
         ln_eps: Optional[float] = 1e-5,
+        radial_func=None,
+        basis_num=None,
+        cutoff_func=None,
     ):
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -312,6 +321,9 @@ class RepformerArgs:
         if ln_eps is None:
             ln_eps = 1e-5
         self.ln_eps = ln_eps
+        self.radial_func = radial_func
+        self.basis_num = basis_num
+        self.cutoff_func = cutoff_func
 
     def __getitem__(self, key):
         if hasattr(self, key):

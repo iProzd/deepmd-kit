@@ -21,6 +21,10 @@ from deepmd.pt.model.descriptor.descriptor import (
 from deepmd.pt.model.descriptor.env_mat import (
     prod_env_mat,
 )
+from deepmd.pt.model.network.edge_embedding import (
+    BesselBasis,
+    PolynomialCutoff,
+)
 from deepmd.pt.model.network.layernorm import (
     LayerNorm,
 )
@@ -87,6 +91,9 @@ class DescrptBlockSeAtten(DescriptorBlock):
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
         seed: Optional[Union[int, List[int]]] = None,
+        radial_func=None,
+        basis_num=None,
+        cutoff_func=None,
         type: Optional[str] = None,
         old_impl: bool = False,
     ):
@@ -181,6 +188,28 @@ class DescrptBlockSeAtten(DescriptorBlock):
         self.env_protection = env_protection
         self.trainable_ln = trainable_ln
         self.seed = seed
+        self.radial_func = radial_func
+        self.cutoff_func = cutoff_func
+        self.basis_num = basis_num
+        self.custom_radial = False
+        self.radial_module = None
+        self.cutoff_module = None
+        if (
+            self.radial_func is not None
+            and self.cutoff_func is not None
+            and self.basis_num is not None
+        ):
+            self.custom_radial = True
+            if self.radial_func == "bessel":
+                self.radial_module = BesselBasis(
+                    cutoff_length=self.rcut, bessel_basis_num=self.basis_num
+                )
+            else:
+                raise NotImplementedError
+            if self.cutoff_func == "poly":
+                self.cutoff_module = PolynomialCutoff(cutoff_length=self.rcut)
+            else:
+                raise NotImplementedError
         #  to keep consistent with default value in this backends
         if ln_eps is None:
             ln_eps = 1e-5
@@ -243,10 +272,11 @@ class DescrptBlockSeAtten(DescriptorBlock):
         self.register_buffer("mean", mean)
         self.register_buffer("stddev", stddev)
         self.tebd_dim_input = self.tebd_dim if self.type_one_side else self.tebd_dim * 2
+        original_input = 1 if not self.custom_radial else self.basis_num
         if self.tebd_input_mode in ["concat"]:
-            self.embd_input_dim = 1 + self.tebd_dim_input
+            self.embd_input_dim = original_input + self.tebd_dim_input
         else:
-            self.embd_input_dim = 1
+            self.embd_input_dim = original_input
 
         self.filter_layers_old = None
         self.filter_layers = None
@@ -533,7 +563,12 @@ class DescrptBlockSeAtten(DescriptorBlock):
             # nfnl x nnei x 4
             rr = dmatrix
             rr = rr * exclude_mask[:, :, None]
-            ss = rr[:, :, :1]
+            if not self.custom_radial:
+                ss = rr[:, :, :1]
+            else:
+                dist = torch.linalg.norm(diff, dim=-1)
+                ss = self.radial_module(dist) * self.cutoff_module(dist).unsqueeze(-1)
+                ss = ss.view(nframes * nloc, nnei, -1)
             nlist_tebd = atype_tebd_nlist.reshape(nfnl, nnei, self.tebd_dim)
             atype_tebd = atype_tebd_nnei.reshape(nfnl, nnei, self.tebd_dim)
             if self.tebd_input_mode in ["concat"]:

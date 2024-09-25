@@ -245,6 +245,9 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
         type_map: Optional[List[str]] = None,
+        radial_func=None,
+        basis_num=None,
+        cutoff_func=None,
         # not implemented
         spin=None,
         type: Optional[str] = None,
@@ -266,6 +269,9 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             ln_eps = 1e-5
 
         del type, spin, attn_mask
+        self.radial_func = radial_func
+        self.basis_num = basis_num
+        self.cutoff_func = cutoff_func
         self.se_atten = DescrptBlockSeAtten(
             rcut,
             rcut_smth,
@@ -293,6 +299,9 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             trainable_ln=trainable_ln,
             ln_eps=ln_eps,
             seed=child_seed(seed, 1),
+            radial_func=radial_func,
+            basis_num=basis_num,
+            cutoff_func=cutoff_func,
             old_impl=old_impl,
         )
         self.use_econf_tebd = use_econf_tebd
