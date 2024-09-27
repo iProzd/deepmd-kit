@@ -36,9 +36,6 @@ import torch.utils.checkpoint
 from deepmd.dpmodel.utils.type_embed import (
     get_econf_tebd,
 )
-from deepmd.pt.model.network.layernorm import (
-    LayerNorm,
-)
 from deepmd.pt.utils.utils import (
     ActivationFn,
     to_torch_tensor,
@@ -694,15 +691,11 @@ class TypeEmbedNetConsistent(nn.Module):
         self.type_map = type_map
         self.econf_tebd = None
         embed_input_dim = ntypes
-        self.econf_norm = None
         if self.use_econf_tebd:
             econf_tebd, embed_input_dim = get_econf_tebd(
                 self.type_map, precision=self.precision
             )
             self.econf_tebd = to_torch_tensor(econf_tebd)
-            self.econf_norm = LayerNorm(
-                self.neuron[-1], trainable=False, precision=precision, seed=seed
-            )
         self.embedding_net = EmbeddingNet(
             embed_input_dim,
             self.neuron,
@@ -729,9 +722,7 @@ class TypeEmbedNetConsistent(nn.Module):
             )
         else:
             assert self.econf_tebd is not None
-            assert self.econf_norm is not None
             embed = self.embedding_net(self.econf_tebd.to(device))
-            embed = self.econf_norm(embed)
         if self.padding:
             embed = torch.cat(
                 [embed, torch.zeros(1, embed.shape[1], dtype=self.prec, device=device)]
