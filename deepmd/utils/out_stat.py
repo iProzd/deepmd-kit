@@ -7,7 +7,9 @@ from typing import (
 )
 
 import numpy as np
+import logging
 
+log = logging.getLogger(__name__)
 
 def compute_stats_from_redu(
     output_redu: np.ndarray,
@@ -72,6 +74,9 @@ def compute_stats_from_redu(
 
     # computed_output_bias: ntypes, ndim
     computed_output_bias, _, _, _ = np.linalg.lstsq(natoms, output_redu, rcond=rcond)
+    ntypes = natoms.shape[1]
+    log.info("Computed atom biases: {}".format(list(computed_output_bias.reshape(ntypes))))
+    log.info("Sampled atom numbers: {}".format(list(natoms.sum(0).reshape(ntypes))))
     if assigned_bias is not None:
         # add back assigned atom; this might not be required
         computed_output_bias[assigned_bias_atom_mask] = assigned_bias_masked
