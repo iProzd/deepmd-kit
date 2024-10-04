@@ -137,12 +137,12 @@ def _post_process_stat(
     """Post process the statistics.
 
     For global statistics, we do not have the std for each type of atoms,
-    thus fake the output std by ones for all the types.
+    thus use the same output std for all the types.
 
     """
     new_std = {}
     for kk, vv in out_bias.items():
-        new_std[kk] = np.ones_like(vv)
+        new_std[kk] = np.ones_like(vv) * out_std[kk]
     return out_bias, new_std
 
 

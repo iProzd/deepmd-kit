@@ -1761,6 +1761,7 @@ def model_args(exclude_hybrid=False):
     doc_data_stat_nbatch = "The model determines the normalization from the statistics of the data. This key specifies the number of `frames` in each `system` used for statistics."
     doc_data_stat_protect = "Protect parameter for atomic energy regression."
     doc_data_bias_nsample = "The number of training samples in a system to compute and change the energy bias."
+    doc_use_stat_std = "Whether to use the statistical standard deviation of the data in model outputs."
     doc_type_embedding = "The type embedding."
     doc_modifier = "The modifier of model output."
     doc_use_srtab = "The table for the short-range pairwise interaction added on top of DP. The table is a text data file with (N_t + 1) * N_t / 2 + 1 columes. The first colume is the distance between atoms. The second to the last columes are energies for pairs of certain types. For example we have two atom types, 0 and 1. The columes from 2nd to 4th are for 0-0, 0-1 and 1-1 correspondingly."
@@ -1812,6 +1813,13 @@ def model_args(exclude_hybrid=False):
                 str,
                 optional=True,
                 doc=doc_use_srtab,
+            ),
+            Argument(
+                "use_stat_std",
+                str,
+                optional=True,
+                default=False,
+                doc=doc_only_pt_supported + doc_use_stat_std,
             ),
             Argument(
                 "smin_alpha",

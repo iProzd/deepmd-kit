@@ -72,6 +72,8 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         The value is a list specifying the bias. the elements can be None or np.ndarray of output shape.
         For example: [None, [2.]] means type 0 is not set, type 1 is set to [2.]
         The `set_davg_zero` key in the descrptor should be set.
+    use_stat_std : bool, optional
+        Whether to use the statistical standard deviation of the data in model outputs.
 
     """
 
@@ -82,6 +84,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         pair_exclude_types: List[Tuple[int, int]] = [],
         rcond: Optional[float] = None,
         preset_out_bias: Optional[Dict[str, np.ndarray]] = None,
+        use_stat_std: bool = False,
     ):
         torch.nn.Module.__init__(self)
         BaseAtomicModel_.__init__(self)
@@ -90,6 +93,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         self.reinit_pair_exclude(pair_exclude_types)
         self.rcond = rcond
         self.preset_out_bias = preset_out_bias
+        self.use_stat_std = use_stat_std
 
     def init_out_stat(self):
         """Initialize the output bias."""
@@ -325,6 +329,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             "atom_exclude_types": self.atom_exclude_types,
             "pair_exclude_types": self.pair_exclude_types,
             "rcond": self.rcond,
+            "use_stat_std": self.use_stat_std,
             "preset_out_bias": self.preset_out_bias,
             "@variables": {
                 "out_bias": to_numpy_array(self.out_bias),
@@ -421,8 +426,8 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         """
         out_bias, out_std = self._fetch_out_stat(self.bias_keys)
         for kk in self.bias_keys:
-            # nf x nloc x odims, out_bias: ntypes x odims
-            ret[kk] = ret[kk] + out_bias[kk][atype]
+            # nf x nloc x odims, out_std/out_bias: ntypes x odims
+            ret[kk] = (ret[kk] * out_std[kk][atype] if self.use_stat_std else ret[kk]) + out_bias[kk][atype]
         return ret
 
     def change_out_bias(

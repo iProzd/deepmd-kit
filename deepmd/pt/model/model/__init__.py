@@ -212,6 +212,7 @@ def get_standard_model(model_params):
     preset_out_bias = _convert_preset_out_bias_to_array(
         preset_out_bias, model_params["type_map"]
     )
+    use_stat_std = model_params.get("use_stat_std", False)
 
     if fitting_net["type"] == "dipole":
         modelcls = DipoleModel
@@ -233,6 +234,7 @@ def get_standard_model(model_params):
         atom_exclude_types=atom_exclude_types,
         pair_exclude_types=pair_exclude_types,
         preset_out_bias=preset_out_bias,
+        use_stat_std=use_stat_std,
     )
     model.model_def_script = json.dumps(model_params_old)
     return model
