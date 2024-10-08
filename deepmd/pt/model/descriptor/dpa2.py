@@ -239,6 +239,8 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             g1_out_mlp=self.repformer_args.g1_out_mlp,
             update_h1_has_g1=self.repformer_args.update_h1_has_g1,
             update_h2_has_g2=self.repformer_args.update_h2_has_g2,
+            update_h1_has_si=self.repformer_args.update_h1_has_si,
+            update_h2_has_si=self.repformer_args.update_h2_has_si,
             output_g1_ln=self.repformer_args.output_g1_ln,
             output_g2_ln=self.repformer_args.output_g2_ln,
             output_h1_ln=self.repformer_args.output_h1_ln,

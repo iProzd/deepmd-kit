@@ -114,6 +114,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         output_h2_ln: bool = False,
         update_h1_has_g1: bool = False,
         update_h2_has_g2: bool = False,
+        update_h1_has_si: bool = False,
+        update_h2_has_si: bool = False,
         old_impl: bool = False,
     ):
         r"""
@@ -242,6 +244,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.g1_out_mlp = g1_out_mlp
         self.update_h1_has_g1 = update_h1_has_g1
         self.update_h2_has_g2 = update_h2_has_g2
+        self.update_h1_has_si = update_h1_has_si
+        self.update_h2_has_si = update_h2_has_si
         self.output_g1_ln = output_g1_ln
         self.output_g2_ln = output_g2_ln
         self.output_h1_ln = output_h1_ln
@@ -339,6 +343,8 @@ class DescrptBlockRepformers(DescriptorBlock):
                         g1_out_mlp=self.g1_out_mlp,
                         update_h1_has_g1=self.update_h1_has_g1,
                         update_h2_has_g2=self.update_h2_has_g2,
+                        update_h1_has_si=self.update_h1_has_si,
+                        update_h2_has_si=self.update_h2_has_si,
                         output_g1_ln=self.output_g1_ln,
                         output_g2_ln=self.output_g2_ln,
                         output_h1_ln=self.output_h1_ln,

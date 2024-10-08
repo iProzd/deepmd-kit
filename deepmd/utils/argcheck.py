@@ -1247,6 +1247,18 @@ def dpa2_repformer_args():
             default=False,
         ),
         Argument(
+            "update_h1_has_si",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "update_h2_has_si",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "output_g1_ln",
             bool,
             optional=True,

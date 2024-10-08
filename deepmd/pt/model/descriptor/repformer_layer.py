@@ -590,6 +590,8 @@ class RepformerLayer(torch.nn.Module):
         update_h2: bool = False,
         update_h1_has_g1: bool = False,
         update_h2_has_g2: bool = False,
+        update_h1_has_si: bool = False,
+        update_h2_has_si: bool = False,
         attn1_hidden: int = 64,
         attn1_nhead: int = 4,
         attn2_hidden: int = 16,
@@ -635,6 +637,8 @@ class RepformerLayer(torch.nn.Module):
         self.update_h2 = update_h2 if self.update_chnnl_2 else False
         self.update_h2_has_g2 = update_h2_has_g2
         self.update_h1_has_g1 = update_h1_has_g1
+        self.update_h2_has_si = update_h2_has_si
+        self.update_h1_has_si = update_h1_has_si
         # delete unused variables
         del (
             update_g2_has_g1g1,
@@ -696,6 +700,8 @@ class RepformerLayer(torch.nn.Module):
             seed=child_seed(seed, 1),
         )
         self.linear2 = None
+        self.proj_h1si = None
+        self.proj_h2si = None
         self.proj_g1g2 = None
         self.proj_h1h2 = None
         self.proj_g1g1g2 = None
@@ -745,6 +751,45 @@ class RepformerLayer(torch.nn.Module):
                 )
         else:
             self.g1_self_mlp = None
+
+        if self.update_h2_has_si:
+            self.proj_h2si = MLPLayer(
+                g2_dim,
+                g2_dim,
+                bias=False,
+                precision=precision,
+                seed=child_seed(child_seed(seed, 22), 0),
+            )
+            if self.update_style == "res_residual":
+                self.h2_residual.append(
+                    get_residual(
+                        g2_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(child_seed(seed, 22), 1),
+                    )
+                )
+
+        if self.update_h1_has_si:
+            self.proj_h1si = MLPLayer(
+                g1_dim,
+                g1_dim,
+                bias=False,
+                precision=precision,
+                seed=child_seed(child_seed(seed, 22), 0),
+            )
+            if self.update_style == "res_residual":
+                self.h1_residual.append(
+                    get_residual(
+                        g1_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(child_seed(seed, 23), 1),
+                    )
+                )
+
         if self.update_g1_has_conv:
             if not self.g1_out_conv:
                 self.proj_g1g2 = MLPLayer(
@@ -1394,6 +1439,14 @@ class RepformerLayer(torch.nn.Module):
             assert self.g1_self_mlp is not None
             g1_self_mlp = self.act(self.g1_self_mlp(g1))
             g1_update.append(g1_self_mlp)
+
+        if self.update_h1_has_si:
+            assert self.proj_h1si is not None
+            h1_update.append(self.proj_h1si(h1))
+
+        if self.update_h2_has_si:
+            assert self.proj_h2si is not None
+            h2_update.append(self.proj_h2si(h2))
 
         if cal_gg1:
             gg1 = _make_nei_g1(g1_ext, nlist)
