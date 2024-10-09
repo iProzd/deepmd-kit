@@ -179,6 +179,7 @@ class Trainer:
         def get_opt_param(params):
             opt_type = params.get("opt_type", "Adam")
             opt_param = {
+                "adam_amsgrad": params.get("adam_amsgrad", False),
                 "kf_blocksize": params.get("kf_blocksize", 5120),
                 "kf_start_pref_e": params.get("kf_start_pref_e", 1),
                 "kf_limit_pref_e": params.get("kf_limit_pref_e", 1),
@@ -625,14 +626,16 @@ class Trainer:
 
         # TODO add optimizers for multitask
         # author: iProzd
-        if self.opt_type == "Adam":
+        if self.opt_type in ["Adam", "AdamW"]:
+            adam_amsgrad = self.opt_param["adam_amsgrad"]
+            adam = torch.optim.Adam if self.opt_type == "Adam" else torch.optim.AdamW
             if not self.use_auto_reduce:
-                self.optimizer = torch.optim.Adam(
-                    self.wrapper.parameters(), lr=self.lr_exp.start_lr
+                self.optimizer = adam(
+                    self.wrapper.parameters(), lr=self.lr_exp.start_lr, amsgrad=adam_amsgrad,
                 )
             else:
-                self.optimizer = torch.optim.Adam(
-                    self.wrapper.parameters(), lr=self.lr_start
+                self.optimizer = adam(
+                    self.wrapper.parameters(), lr=self.lr_start, amsgrad=adam_amsgrad,
                 )
             if optimizer_state_dict is not None and self.restart_training:
                 self.optimizer.load_state_dict(optimizer_state_dict)
@@ -738,7 +741,7 @@ class Trainer:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
                 fout1.flush()
-            if self.opt_type == "Adam":
+            if self.opt_type in ["Adam", "AdamW"]:
                 if not self.use_auto_reduce:
                     cur_lr = self.scheduler.get_last_lr()[0]
                 else:

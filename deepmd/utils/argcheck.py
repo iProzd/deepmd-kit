@@ -2833,7 +2833,22 @@ def training_args(
         Variant(
             "opt_type",
             choices=[
-                Argument("Adam", dict, [], [], optional=True),
+                Argument("Adam", dict, [
+                    Argument(
+                        "adam_amsgrad",
+                        bool,
+                        optional=True,
+                        default=False,
+                    ),
+                ], [], optional=True),
+                Argument("AdamW", dict, [
+                    Argument(
+                        "adam_amsgrad",
+                        bool,
+                        optional=True,
+                        default=False,
+                    ),
+                ], [], optional=True),
                 Argument(
                     "LKF",
                     dict,
