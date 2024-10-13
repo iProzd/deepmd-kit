@@ -2,8 +2,8 @@
 from typing import (
     List,
     Optional,
-    Union,
     Tuple,
+    Union,
 )
 
 import torch
@@ -162,6 +162,7 @@ class Atten2Map(torch.nn.Module):
         attnw_shift: float = 20.0,
         precision: str = "float64",
         seed: Optional[Union[int, List[int]]] = None,
+        gate_mode: str = "first-element-multi",
     ):
         """Return neighbor-wise multi-head self-attention maps, with gate mechanism."""
         super().__init__()
@@ -179,6 +180,7 @@ class Atten2Map(torch.nn.Module):
         self.smooth = smooth
         self.attnw_shift = attnw_shift
         self.precision = precision
+        self.gate_mode = gate_mode
 
     def forward(
         self,
@@ -194,17 +196,26 @@ class Atten2Map(torch.nn.Module):
             _,
         ) = g2.shape
         nd, nh = self.hidden_dim, self.head_num
-        # nb x nloc x nnei x nd x (nh x 2)
-        g2qk = self.mapqk(g2).view(nb, nloc, nnei, nd, nh * 2)
-        # nb x nloc x (nh x 2) x nnei x nd
-        g2qk = torch.permute(g2qk, (0, 1, 4, 2, 3))
+        g2_exdim = 1
+        if self.has_gate and self.gate_mode == "concat-to-g":
+            g2 = torch.concat([g2.unsqueeze(-2), h2], dim=-2)
+            g2_exdim = 4
+        elif self.has_gate and self.gate_mode == "first-element-multi":
+            h2 = h2[..., 0]
+            g2_exdim = 1
+        elif self.has_gate:
+            raise ValueError(f"unknown gate mode {self.gate_mode}")
+        # nb x nloc x nnei x 4/1 x nd x (nh x 2)
+        g2qk = self.mapqk(g2).view(nb, nloc, nnei, g2_exdim, nd, nh * 2)
+        # nb x nloc x (nh x 2) x nnei x (4/1 x nd)
+        g2qk = torch.permute(g2qk, (0, 1, 5, 2, 3, 4)).view(
+            nb, nloc, nh * 2, nnei, g2_exdim * nd
+        )
         # nb x nloc x nh x nnei x nd
         g2q, g2k = torch.split(g2qk, nh, dim=2)
-        # g2q = torch.nn.functional.normalize(g2q, dim=-1)
-        # g2k = torch.nn.functional.normalize(g2k, dim=-1)
         # nb x nloc x nh x nnei x nnei
-        attnw = torch.matmul(g2q, torch.transpose(g2k, -1, -2)) / nd**0.5
-        if self.has_gate:
+        attnw = torch.matmul(g2q, torch.transpose(g2k, -1, -2)) / (g2_exdim * nd) ** 0.5
+        if self.has_gate and self.gate_mode == "first-element-multi":
             gate = torch.matmul(h2, torch.transpose(h2, -1, -2)).unsqueeze(-3)
             attnw = attnw * gate
         # mask the attenmap, nb x nloc x 1 x 1 x nnei
@@ -232,13 +243,14 @@ class Atten2Map(torch.nn.Module):
         )
         if self.smooth:
             attnw = attnw * sw[:, :, None, :, None] * sw[:, :, None, None, :]
-        # nb x nloc x nnei x nnei
-        h2h2t = torch.matmul(h2, torch.transpose(h2, -1, -2)) / 3.0**0.5
-        # nb x nloc x nh x nnei x nnei
-        ret = attnw * h2h2t[:, :, None, :, :]
+        if self.has_gate and self.gate_mode == "first-element-multi":
+            # nb x nloc x nnei x nnei
+            h2h2t = torch.matmul(h2, torch.transpose(h2, -1, -2)) / 3.0**0.5
+            # nb x nloc x nh x nnei x nnei
+            attnw = attnw * h2h2t[:, :, None, :, :]
         # ret = torch.softmax(g2qk, dim=-1)
         # nb x nloc x nnei x nnei x nh
-        ret = torch.permute(ret, (0, 1, 3, 4, 2))
+        ret = torch.permute(attnw, (0, 1, 3, 4, 2))
         return ret
 
     def serialize(self) -> dict:
@@ -597,6 +609,7 @@ class RepformerLayer(torch.nn.Module):
         attn2_hidden: int = 16,
         attn2_nhead: int = 4,
         attn2_has_gate: bool = False,
+        attn2_gate_mode: str = "first-element-multi",
         activation_function: str = "tanh",
         update_style: str = "res_avg",
         update_residual: float = 0.001,
@@ -652,6 +665,7 @@ class RepformerLayer(torch.nn.Module):
         self.attn2_hidden = attn2_hidden
         self.attn2_nhead = attn2_nhead
         self.attn2_has_gate = attn2_has_gate
+        self.attn2_gate_mode = attn2_gate_mode
         self.update_style = update_style
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
@@ -891,6 +905,7 @@ class RepformerLayer(torch.nn.Module):
                 attn2_has_gate,
                 self.smooth,
                 precision=precision,
+                gate_mode=self.attn2_gate_mode,
                 seed=child_seed(seed, 7),
             )
             if self.update_g2_has_attn:
@@ -1476,7 +1491,7 @@ class RepformerLayer(torch.nn.Module):
                 # gated_attention(g2, h2)
                 assert self.attn2g_map is not None
                 # nb x nloc x nnei x nnei x nh
-                AAg = self.attn2g_map(g2, h2[..., 0], nlist_mask, sw)
+                AAg = self.attn2g_map(g2, h2, nlist_mask, sw)
 
                 if self.update_g2_has_attn:
                     assert self.attn2_mh_apply is not None

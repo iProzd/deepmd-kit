@@ -1325,6 +1325,12 @@ def dpa2_repformer_args():
             doc=doc_attn2_has_gate,
         ),
         Argument(
+            "attn2_gate_mode",
+            str,
+            optional=True,
+            default="first-element-multi",
+        ),
+        Argument(
             "activation_function",
             str,
             optional=True,

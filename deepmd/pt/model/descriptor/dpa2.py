@@ -223,6 +223,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             attn2_hidden=self.repformer_args.attn2_hidden,
             attn2_nhead=self.repformer_args.attn2_nhead,
             attn2_has_gate=self.repformer_args.attn2_has_gate,
+            attn2_gate_mode=self.repformer_args.attn2_gate_mode,
             activation_function=self.repformer_args.activation_function,
             update_style=self.repformer_args.update_style,
             update_residual=self.repformer_args.update_residual,

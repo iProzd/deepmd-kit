@@ -197,6 +197,7 @@ class RepformerArgs:
         attn2_hidden: int = 16,
         attn2_nhead: int = 4,
         attn2_has_gate: bool = False,
+        attn2_gate_mode: str = "first-element-multi",
         activation_function: str = "tanh",
         update_style: str = "res_avg",
         update_residual: float = 0.001,
@@ -307,6 +308,7 @@ class RepformerArgs:
         self.attn2_hidden = attn2_hidden
         self.attn2_nhead = attn2_nhead
         self.attn2_has_gate = attn2_has_gate
+        self.attn2_gate_mode = attn2_gate_mode
         self.activation_function = activation_function
         self.update_style = update_style
         self.update_residual = update_residual
