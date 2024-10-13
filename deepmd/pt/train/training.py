@@ -63,6 +63,7 @@ from deepmd.pt.utils.stat import (
 )
 from deepmd.pt.utils.utils import (
     to_numpy_array,
+    to_torch_tensor,
 )
 from deepmd.utils.data import (
     DataRequirementItem,
@@ -134,6 +135,11 @@ class Trainer:
             else 1
         )
         self.num_model = len(self.model_keys)
+
+        # add dataid
+        self.dataid = None
+        if self.multi_task:
+            self.dataid = np.eye(self.num_model, dtype=float)
 
         # Iteration config
         self.num_steps = training_params["numb_steps"]
@@ -1157,6 +1163,10 @@ class Trainer:
         ]
         input_dict = {item_key: None for item_key in input_keys}
         label_dict = {}
+        nframes = batch_data['coord'].shape[0]
+        data_id_onehot = self.dataid[self.model_keys.index(task_key)]
+        batch_data["fparam"] = torch.tile(to_torch_tensor(data_id_onehot).unsqueeze(0), (nframes, 1))
+
         for item_key in batch_data:
             if item_key in input_keys:
                 input_dict[item_key] = batch_data[item_key]
@@ -1239,13 +1249,13 @@ class Trainer:
 
 def get_additional_data_requirement(_model):
     additional_data_requirement = []
-    if _model.get_dim_fparam() > 0:
-        fparam_requirement_items = [
-            DataRequirementItem(
-                "fparam", _model.get_dim_fparam(), atomic=False, must=True
-            )
-        ]
-        additional_data_requirement += fparam_requirement_items
+    # if _model.get_dim_fparam() > 0:
+    #     fparam_requirement_items = [
+    #         DataRequirementItem(
+    #             "fparam", _model.get_dim_fparam(), atomic=False, must=True
+    #         )
+    #     ]
+    #     additional_data_requirement += fparam_requirement_items
     if _model.get_dim_aparam() > 0:
         aparam_requirement_items = [
             DataRequirementItem(
