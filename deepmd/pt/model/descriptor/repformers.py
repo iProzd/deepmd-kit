@@ -535,7 +535,6 @@ class DescrptBlockRepformers(DescriptorBlock):
                 assert mapping is not None
                 assert mapping3 is not None
                 g1_ext = torch.gather(g1, 1, mapping)
-                h1_ext = torch.gather(h1, 1, mapping3)
             else:
                 n_padding = nall - nloc
                 g1 = torch.nn.functional.pad(
@@ -559,12 +558,10 @@ class DescrptBlockRepformers(DescriptorBlock):
                     torch.tensor(nall - nloc),  # pylint: disable=no-explicit-dtype,no-explicit-device
                 )
                 g1_ext = ret[0].unsqueeze(0)
-                h1_ext = ret[0].unsqueeze(0)  # place holder
-            assert h1_ext is not None
             g1, g2, h1, h2 = ll.forward(
                 g1_ext,
                 g2,
-                h1_ext,
+                h1,
                 h2,
                 nlist,
                 nlist_mask,
