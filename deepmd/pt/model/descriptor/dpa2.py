@@ -757,32 +757,33 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         # repinit
         g1_ext = self.type_embedding(extended_atype)
         g1_inp = g1_ext[:, :nloc, :]
-        g1, _, _, _, _ = self.repinit(
-            nlist_dict[
-                get_multiple_nlist_key(self.repinit.get_rcut(), self.repinit.get_nsel())
-            ],
-            extended_coord,
-            extended_atype,
-            g1_ext,
-            mapping,
-        )
-        if use_three_body:
-            assert self.repinit_three_body is not None
-            g1_three_body, __, __, __, __ = self.repinit_three_body(
-                nlist_dict[
-                    get_multiple_nlist_key(
-                        self.repinit_three_body.get_rcut(),
-                        self.repinit_three_body.get_nsel(),
-                    )
-                ],
-                extended_coord,
-                extended_atype,
-                g1_ext,
-                mapping,
-            )
-            g1 = torch.cat([g1, g1_three_body], dim=-1)
+        # g1, _, _, _, _ = self.repinit(
+        #     nlist_dict[
+        #         get_multiple_nlist_key(self.repinit.get_rcut(), self.repinit.get_nsel())
+        #     ],
+        #     extended_coord,
+        #     extended_atype,
+        #     g1_ext,
+        #     mapping,
+        # )
+        # if use_three_body:
+        #     assert self.repinit_three_body is not None
+        #     g1_three_body, __, __, __, __ = self.repinit_three_body(
+        #         nlist_dict[
+        #             get_multiple_nlist_key(
+        #                 self.repinit_three_body.get_rcut(),
+        #                 self.repinit_three_body.get_nsel(),
+        #             )
+        #         ],
+        #         extended_coord,
+        #         extended_atype,
+        #         g1_ext,
+        #         mapping,
+        #     )
+        #     g1 = torch.cat([g1, g1_three_body], dim=-1)
         # linear to change shape
-        g1 = self.g1_shape_tranform(g1)
+        # g1 = self.g1_shape_tranform(g1)
+        g1 = g1_inp
         if self.add_tebd_to_repinit_out:
             assert self.tebd_transform is not None
             g1 = g1 + self.tebd_transform(g1_inp)

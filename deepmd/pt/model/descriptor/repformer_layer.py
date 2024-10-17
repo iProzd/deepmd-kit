@@ -2,7 +2,6 @@
 from typing import (
     Optional,
     Union,
-    List,
 )
 
 import torch
@@ -604,7 +603,7 @@ class RepformerLayer(torch.nn.Module):
         g1_out_mlp: bool = True,
         output_g1_ln=False,
         output_g2_ln=False,
-        seed: Optional[Union[int, List[int]]] = None,
+        seed: Optional[Union[int, list[int]]] = None,
     ):
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
