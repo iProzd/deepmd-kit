@@ -15,7 +15,6 @@ from pathlib import (
     Path,
 )
 from typing import (
-    List,
     Optional,
     Union,
 )
@@ -80,7 +79,7 @@ def _make_node_names(
     modifier_type: Optional[str] = None,
     out_suffix: str = "",
     node_names: Optional[Union[str, list]] = None,
-) -> List[str]:
+) -> list[str]:
     """Get node names based on model type.
 
     Parameters
@@ -96,7 +95,7 @@ def _make_node_names(
 
     Returns
     -------
-    List[str]
+    list[str]
         list with all node names to freeze
 
     Raises
@@ -124,6 +123,8 @@ def _make_node_names(
             "o_atom_energy",
             "o_atom_virial",
             "spin_attr/ntypes_spin",
+            "spin_attr/virtual_len",
+            "spin_attr/spin_norm",
             "fitting_attr/dfparam",
             "fitting_attr/daparam",
             "fitting_attr/aparam_nall",
@@ -238,7 +239,7 @@ def freeze_graph(
         The default session.
     input_graph : tf.GraphDef
         The input graph_def stored from the checkpoint.
-    input_node : List[str]
+    input_node : list[str]
         The expected nodes to freeze.
     freeze_type : str
         The model type to freeze.
@@ -259,6 +260,8 @@ def freeze_graph(
         "train_attr/min_nbor_dist",
         "fitting_attr/aparam_nall",
         "spin_attr/ntypes_spin",
+        "spin_attr/virtual_len",
+        "spin_attr/spin_norm",
     ]
     different_set = set(output_node) - set(input_node)
     if different_set:

@@ -1,10 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 from typing import (
     Callable,
-    Dict,
-    List,
     Optional,
-    Tuple,
     Union,
 )
 
@@ -31,6 +28,9 @@ from deepmd.pt.utils.env_mat_stat import (
 from deepmd.pt.utils.exclude_mask import (
     PairExcludeMask,
 )
+from deepmd.pt.utils.spin import (
+    concat_switch_virtual,
+)
 from deepmd.pt.utils.utils import (
     ActivationFn,
 )
@@ -44,7 +44,6 @@ from deepmd.utils.path import (
 from .repformer_layer import (
     RepformerLayer,
 )
-from .repformer_layer_old_impl import RepformerLayer as RepformerLayerOld
 
 if not hasattr(torch.ops.deepmd, "border_op"):
 
@@ -60,7 +59,8 @@ if not hasattr(torch.ops.deepmd, "border_op"):
         argument8,
     ) -> torch.Tensor:
         raise NotImplementedError(
-            "border_op is not available since customized PyTorch OP library is not built when freezing the model."
+            "border_op is not available since customized PyTorch OP library is not built when freezing the model. "
+            "See documentation for DPA-2 for details."
         )
 
     # Note: this hack cannot actually save a model that can be runned using LAMMPS.
@@ -99,16 +99,15 @@ class DescrptBlockRepformers(DescriptorBlock):
         update_residual_init: str = "norm",
         set_davg_zero: bool = True,
         smooth: bool = True,
-        exclude_types: List[Tuple[int, int]] = [],
+        exclude_types: list[tuple[int, int]] = [],
         env_protection: float = 0.0,
         precision: str = "float64",
         trainable_ln: bool = True,
         ln_eps: Optional[float] = 1e-5,
-        seed: Optional[Union[int, List[int]]] = None,
+        seed: Optional[Union[int, list[int]]] = None,
         use_sqrt_nnei: bool = True,
         g1_out_conv: bool = True,
         g1_out_mlp: bool = True,
-        old_impl: bool = False,
     ):
         r"""
         The repformer descriptor block.
@@ -177,7 +176,7 @@ class DescrptBlockRepformers(DescriptorBlock):
             The precision of the embedding net parameters.
         smooth : bool, optional
             Whether to use smoothness in processes such as attention weights calculation.
-        exclude_types : List[List[int]], optional
+        exclude_types : list[list[int]], optional
             The excluded pairs of types which have no interaction with each other.
             For example, `[[0, 1]]` means no interaction between type 0 and type 1.
         env_protection : float, optional
@@ -242,78 +241,48 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.ln_eps = ln_eps
         self.epsilon = 1e-4
         self.seed = seed
-        self.old_impl = old_impl
 
         self.g2_embd = MLPLayer(
             1, self.g2_dim, precision=precision, seed=child_seed(seed, 0)
         )
         layers = []
         for ii in range(nlayers):
-            if self.old_impl:
-                layers.append(
-                    RepformerLayerOld(
-                        self.rcut,
-                        self.rcut_smth,
-                        self.sel,
-                        self.ntypes,
-                        self.g1_dim,
-                        self.g2_dim,
-                        axis_neuron=self.axis_neuron,
-                        update_chnnl_2=(ii != nlayers - 1),
-                        update_g1_has_conv=self.update_g1_has_conv,
-                        update_g1_has_drrd=self.update_g1_has_drrd,
-                        update_g1_has_grrg=self.update_g1_has_grrg,
-                        update_g1_has_attn=self.update_g1_has_attn,
-                        update_g2_has_g1g1=self.update_g2_has_g1g1,
-                        update_g2_has_attn=self.update_g2_has_attn,
-                        update_h2=self.update_h2,
-                        attn1_hidden=self.attn1_hidden,
-                        attn1_nhead=self.attn1_nhead,
-                        attn2_has_gate=self.attn2_has_gate,
-                        attn2_hidden=self.attn2_hidden,
-                        attn2_nhead=self.attn2_nhead,
-                        activation_function=self.activation_function,
-                        update_style=self.update_style,
-                        smooth=self.smooth,
-                    )
+            layers.append(
+                RepformerLayer(
+                    self.rcut,
+                    self.rcut_smth,
+                    self.sel,
+                    self.ntypes,
+                    self.g1_dim,
+                    self.g2_dim,
+                    axis_neuron=self.axis_neuron,
+                    update_chnnl_2=(ii != nlayers - 1),
+                    update_g1_has_conv=self.update_g1_has_conv,
+                    update_g1_has_drrd=self.update_g1_has_drrd,
+                    update_g1_has_grrg=self.update_g1_has_grrg,
+                    update_g1_has_attn=self.update_g1_has_attn,
+                    update_g2_has_g1g1=self.update_g2_has_g1g1,
+                    update_g2_has_attn=self.update_g2_has_attn,
+                    update_h2=self.update_h2,
+                    attn1_hidden=self.attn1_hidden,
+                    attn1_nhead=self.attn1_nhead,
+                    attn2_has_gate=self.attn2_has_gate,
+                    attn2_hidden=self.attn2_hidden,
+                    attn2_nhead=self.attn2_nhead,
+                    activation_function=self.activation_function,
+                    update_style=self.update_style,
+                    update_residual=self.update_residual,
+                    update_residual_init=self.update_residual_init,
+                    smooth=self.smooth,
+                    trainable_ln=self.trainable_ln,
+                    ln_eps=self.ln_eps,
+                    precision=precision,
+                    use_sqrt_nnei=self.use_sqrt_nnei,
+                    g1_out_conv=self.g1_out_conv,
+                    g1_out_mlp=self.g1_out_mlp,
+                    seed=child_seed(child_seed(seed, 1), ii),
                 )
-            else:
-                layers.append(
-                    RepformerLayer(
-                        self.rcut,
-                        self.rcut_smth,
-                        self.sel,
-                        self.ntypes,
-                        self.g1_dim,
-                        self.g2_dim,
-                        axis_neuron=self.axis_neuron,
-                        update_chnnl_2=(ii != nlayers - 1),
-                        update_g1_has_conv=self.update_g1_has_conv,
-                        update_g1_has_drrd=self.update_g1_has_drrd,
-                        update_g1_has_grrg=self.update_g1_has_grrg,
-                        update_g1_has_attn=self.update_g1_has_attn,
-                        update_g2_has_g1g1=self.update_g2_has_g1g1,
-                        update_g2_has_attn=self.update_g2_has_attn,
-                        update_h2=self.update_h2,
-                        attn1_hidden=self.attn1_hidden,
-                        attn1_nhead=self.attn1_nhead,
-                        attn2_has_gate=self.attn2_has_gate,
-                        attn2_hidden=self.attn2_hidden,
-                        attn2_nhead=self.attn2_nhead,
-                        activation_function=self.activation_function,
-                        update_style=self.update_style,
-                        update_residual=self.update_residual,
-                        update_residual_init=self.update_residual_init,
-                        smooth=self.smooth,
-                        trainable_ln=self.trainable_ln,
-                        ln_eps=self.ln_eps,
-                        precision=precision,
-                        use_sqrt_nnei=self.use_sqrt_nnei,
-                        g1_out_conv=self.g1_out_conv,
-                        g1_out_mlp=self.g1_out_mlp,
-                        seed=child_seed(child_seed(seed, 1), ii),
-                    )
-                )
+            )
         self.layers = torch.nn.ModuleList(layers)
 
         wanted_shape = (self.ntypes, self.nnei, 4)
@@ -339,7 +308,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         """Returns the number of selected atoms in the cut-off radius."""
         return sum(self.sel)
 
-    def get_sel(self) -> List[int]:
+    def get_sel(self) -> list[int]:
         """Returns the number of selected atoms for each type."""
         return self.sel
 
@@ -408,7 +377,7 @@ class DescrptBlockRepformers(DescriptorBlock):
 
     def reinit_exclude(
         self,
-        exclude_types: List[Tuple[int, int]] = [],
+        exclude_types: list[tuple[int, int]] = [],
     ):
         self.exclude_types = exclude_types
         self.emask = PairExcludeMask(self.ntypes, exclude_types=exclude_types)
@@ -420,7 +389,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         extended_atype: torch.Tensor,
         extended_atype_embd: Optional[torch.Tensor] = None,
         mapping: Optional[torch.Tensor] = None,
-        comm_dict: Optional[Dict[str, torch.Tensor]] = None,
+        comm_dict: Optional[dict[str, torch.Tensor]] = None,
     ):
         if comm_dict is None:
             assert mapping is not None
@@ -456,6 +425,7 @@ class DescrptBlockRepformers(DescriptorBlock):
             atype_embd = extended_atype_embd
         assert isinstance(atype_embd, torch.Tensor)  # for jit
         g1 = self.act(atype_embd)
+        ng1 = g1.shape[-1]
         # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
         if not self.direct_dist:
             g2, h2 = torch.split(dmatrix, [1, 3], dim=-1)
@@ -482,10 +452,27 @@ class DescrptBlockRepformers(DescriptorBlock):
                 assert mapping is not None
                 g1_ext = torch.gather(g1, 1, mapping)
             else:
-                n_padding = nall - nloc
-                g1 = torch.nn.functional.pad(
-                    g1.squeeze(0), (0, 0, 0, n_padding), value=0.0
-                )
+                has_spin = "has_spin" in comm_dict
+                if not has_spin:
+                    n_padding = nall - nloc
+                    g1 = torch.nn.functional.pad(
+                        g1.squeeze(0), (0, 0, 0, n_padding), value=0.0
+                    )
+                    real_nloc = nloc
+                    real_nall = nall
+                else:
+                    # for spin
+                    real_nloc = nloc // 2
+                    real_nall = nall // 2
+                    real_n_padding = real_nall - real_nloc
+                    g1_real, g1_virtual = torch.split(g1, [real_nloc, real_nloc], dim=1)
+                    # mix_g1: nb x real_nloc x (ng1 * 2)
+                    mix_g1 = torch.cat([g1_real, g1_virtual], dim=2)
+                    # nb x real_nall x (ng1 * 2)
+                    g1 = torch.nn.functional.pad(
+                        mix_g1.squeeze(0), (0, 0, 0, real_n_padding), value=0.0
+                    )
+
                 assert "send_list" in comm_dict
                 assert "send_proc" in comm_dict
                 assert "recv_proc" in comm_dict
@@ -500,10 +487,15 @@ class DescrptBlockRepformers(DescriptorBlock):
                     comm_dict["recv_num"],
                     g1,
                     comm_dict["communicator"],
-                    torch.tensor(nloc),  # pylint: disable=no-explicit-dtype,no-explicit-device
-                    torch.tensor(nall - nloc),  # pylint: disable=no-explicit-dtype,no-explicit-device
+                    torch.tensor(real_nloc),  # pylint: disable=no-explicit-dtype,no-explicit-device
+                    torch.tensor(real_nall - real_nloc),  # pylint: disable=no-explicit-dtype,no-explicit-device
                 )
                 g1_ext = ret[0].unsqueeze(0)
+                if has_spin:
+                    g1_real_ext, g1_virtual_ext = torch.split(g1_ext, [ng1, ng1], dim=2)
+                    g1_ext = concat_switch_virtual(
+                        g1_real_ext, g1_virtual_ext, real_nloc
+                    )
             g1, g2, h2 = ll.forward(
                 g1_ext,
                 g2,
@@ -530,7 +522,7 @@ class DescrptBlockRepformers(DescriptorBlock):
 
     def compute_input_stats(
         self,
-        merged: Union[Callable[[], List[dict]], List[dict]],
+        merged: Union[Callable[[], list[dict]], list[dict]],
         path: Optional[DPPath] = None,
     ):
         """
@@ -538,11 +530,11 @@ class DescrptBlockRepformers(DescriptorBlock):
 
         Parameters
         ----------
-        merged : Union[Callable[[], List[dict]], List[dict]]
-            - List[dict]: A list of data samples from various data systems.
+        merged : Union[Callable[[], list[dict]], list[dict]]
+            - list[dict]: A list of data samples from various data systems.
                 Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
                 originating from the `i`-th data system.
-            - Callable[[], List[dict]]: A lazy function that returns data samples in the above format
+            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
                 only when needed. Since the sampling process can be slow and memory-intensive,
                 the lazy function helps by only sampling once.
         path : Optional[DPPath]
@@ -567,7 +559,7 @@ class DescrptBlockRepformers(DescriptorBlock):
             self.mean.copy_(torch.tensor(mean, device=env.DEVICE))  # pylint: disable=no-explicit-dtype
         self.stddev.copy_(torch.tensor(stddev, device=env.DEVICE))  # pylint: disable=no-explicit-dtype
 
-    def get_stats(self) -> Dict[str, StatItem]:
+    def get_stats(self) -> dict[str, StatItem]:
         """Get the statistics of the descriptor."""
         if self.stats is None:
             raise RuntimeError(
