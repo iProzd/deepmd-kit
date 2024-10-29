@@ -223,7 +223,7 @@ def test_pair_deepmd_mpi(balance_args: list):
                 "-n",
                 "2",
                 sys.executable,
-                Path(__file__).parent / "run_mpi_pair_deepmd.py",
+                Path(__file__).parent / "run_mpi_pair_deepmd_spin.py",
                 data_file,
                 pb_file,
                 pb_file2,
@@ -240,9 +240,14 @@ def test_pair_deepmd_mpi(balance_args: list):
     # load model devi
     md = np.loadtxt(md_file.resolve())
     norm = np.linalg.norm(np.mean([expected_f, expected_f2], axis=0), axis=1)
+    norm_spin = np.linalg.norm(np.mean([expected_fm, expected_fm2], axis=0), axis=1)
     expected_md_f = np.linalg.norm(np.std([expected_f, expected_f2], axis=0), axis=1)
     expected_md_f /= norm + relative
-    assert md[7:] == pytest.approx(expected_md_f)
+    expected_md_fm = np.linalg.norm(np.std([expected_fm, expected_fm2], axis=0), axis=1)
+    expected_md_fm /= norm_spin + relative
     assert md[4] == pytest.approx(np.max(expected_md_f))
     assert md[5] == pytest.approx(np.min(expected_md_f))
     assert md[6] == pytest.approx(np.mean(expected_md_f))
+    assert md[7] == pytest.approx(np.max(expected_md_fm))
+    assert md[8] == pytest.approx(np.min(expected_md_fm))
+    assert md[9] == pytest.approx(np.mean(expected_md_fm))
