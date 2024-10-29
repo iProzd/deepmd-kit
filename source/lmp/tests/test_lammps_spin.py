@@ -19,9 +19,9 @@ from write_lmp_data import (
     write_lmp_data_spin,
 )
 
-pbtxt_file = Path(__file__).parent.parent.parent / "tests" / "infer" / "deeppot.pbtxt"
+pbtxt_file = Path(__file__).parent.parent.parent / "tests" / "infer" / "deepspin_nlist.pbtxt"
 pbtxt_file2 = (
-    Path(__file__).parent.parent.parent / "tests" / "infer" / "deeppot-1.pbtxt"
+    Path(__file__).parent.parent.parent / "tests" / "infer" / "deepspin_nlist-2.pbtxt"
 )
 pb_file = Path(__file__).parent / "graph.pb"
 pb_file2 = Path(__file__).parent / "graph2.pb"
@@ -31,7 +31,6 @@ data_file_si = Path(__file__).parent / "data.si"
 data_type_map_file = Path(__file__).parent / "data_type_map.lmp"
 md_file = Path(__file__).parent / "md.out"
 
-# this is as the same as python and c++ tests, test_deeppot_a.py
 expected_ae = np.array(
     [
         -7.314365618560289 ,
@@ -60,19 +59,19 @@ expected_fm = np.array(
 
 expected_f2 = np.array(
     [
-        [-0.6454949, 1.72457783, 0.18897958],
-        [1.68936514, -0.36995299, -1.36044464],
-        [-1.09902692, -1.35487928, 1.17416702],
-        [1.68426111, -0.50835585, 0.98340415]
+        [-0.0009939342103254,  0.0009450997605637, -0.0002710189976979],
+        [0.0040364645780618, -0.0008326705633617, -0.000208982833015],
+        [0.0007716358981262,  0.0018705501216939, -0.002687696295354],
+        [-0.0038141662658625, -0.0019829793188958,  0.0031676981260669]
     ]
 )
 
 expected_fm2 = np.array(
     [
-        [-0.6454949, 1.72457783, 0.18897958],
-        [1.68936514, -0.36995299, -1.36044464],
-        [-1.09902692, -1.35487928, 1.17416702],
-        [1.68426111, -0.50835585, 0.98340415]
+        [0.0021649674715341, -0.0008507073771461,  0.0270620372234819],
+        [-0.0026523551738949,  0.0013308033074224,  0.0294569107929189],
+        [0.0000000000000000, 0.00000000000000000, 0.00000000000000000],
+        [0.0000000000000000, 0.00000000000000000, 0.00000000000000000]
     ]
 )
 
@@ -148,7 +147,7 @@ def test_pair_deepmd(lammps):
     lammps.pair_coeff("* *")
     lammps.run(0)
     assert lammps.eval("pe") == pytest.approx(expected_e)
-    for ii in range(6):
+    for ii in range(4):
         assert lammps.atoms[ii].force == pytest.approx(
             expected_f[lammps.atoms[ii].id - 1]
         )
@@ -162,7 +161,7 @@ def test_pair_deepmd_model_devi(lammps):
     lammps.pair_coeff("* *")
     lammps.run(0)
     assert lammps.eval("pe") == pytest.approx(expected_e)
-    for ii in range(6):
+    for ii in range(4):
         assert lammps.atoms[ii].force == pytest.approx(
             expected_f[lammps.atoms[ii].id - 1]
         )
@@ -186,7 +185,7 @@ def test_pair_deepmd_model_devi_atomic_relative(lammps):
     lammps.pair_coeff("* *")
     lammps.run(0)
     assert lammps.eval("pe") == pytest.approx(expected_e)
-    for ii in range(6):
+    for ii in range(4):
         assert lammps.atoms[ii].force == pytest.approx(
             expected_f[lammps.atoms[ii].id - 1]
         )

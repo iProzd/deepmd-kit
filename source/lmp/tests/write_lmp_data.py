@@ -71,7 +71,7 @@ def write_lmp_data_full(
         f.write("\n")
 
 
-def write_lmp_data(box, coord, spin, type_list, file_name):
+def write_lmp_data_spin(box, coord, spin, type_list, file_name):
     natom = coord.shape[0]
     ntype = np.unique(type_list).shape[0]
     sp_norm = np.linalg.norm(spin, axis=1, keepdims=True)
