@@ -7,10 +7,7 @@ from abc import (
 )
 from typing import (
     Any,
-    List,
     Optional,
-    Tuple,
-    Type,
 )
 
 from deepmd.utils.data_system import (
@@ -22,7 +19,7 @@ from deepmd.utils.plugin import (
 )
 
 
-def make_base_model() -> Type[object]:
+def make_base_model() -> type[object]:
     class BaseBaseModel(ABC, PluginVariant, make_plugin_registry("model")):
         """Base class for final exported model that will be directly used for inference.
 
@@ -67,7 +64,7 @@ def make_base_model() -> Type[object]:
             pass
 
         @abstractmethod
-        def get_type_map(self) -> List[str]:
+        def get_type_map(self) -> list[str]:
             """Get the type map."""
 
         @abstractmethod
@@ -83,7 +80,7 @@ def make_base_model() -> Type[object]:
             """Get the number (dimension) of atomic parameters of this atomic model."""
 
         @abstractmethod
-        def get_sel_type(self) -> List[int]:
+        def get_sel_type(self) -> list[int]:
             """Get the selected atom types of this model.
 
             Only atoms with selected atom types have atomic contribution
@@ -99,7 +96,7 @@ def make_base_model() -> Type[object]:
             """
 
         @abstractmethod
-        def model_output_type(self) -> List[str]:
+        def model_output_type(self) -> list[str]:
             """Get the output type for the model."""
 
         @abstractmethod
@@ -166,15 +163,15 @@ def make_base_model() -> Type[object]:
         def update_sel(
             cls,
             train_data: DeepmdDataSystem,
-            type_map: Optional[List[str]],
+            type_map: Optional[list[str]],
             local_jdata: dict,
-        ) -> Tuple[dict, Optional[float]]:
+        ) -> tuple[dict, Optional[float]]:
             """Update the selection and perform neighbor statistics.
 
             Parameters
             ----------
             train_data : DeepmdDataSystem
-                data used to do neighbor statictics
+                data used to do neighbor statistics
             type_map : list[str], optional
                 The name of each type of atoms
             local_jdata : dict
@@ -193,6 +190,28 @@ def make_base_model() -> Type[object]:
                 model_type = local_jdata.get("fitting", {}).get("type", "ener")
             cls = cls.get_class_by_type(model_type)
             return cls.update_sel(train_data, type_map, local_jdata)
+
+        def enable_compression(
+            self,
+            table_extrapolate: float = 5,
+            table_stride_1: float = 0.01,
+            table_stride_2: float = 0.1,
+            check_frequency: int = -1,
+        ) -> None:
+            """Enable model compression by tabulation.
+
+            Parameters
+            ----------
+            table_extrapolate
+                The scale of model extrapolation
+            table_stride_1
+                The uniform stride of the first table
+            table_stride_2
+                The uniform stride of the second table
+            check_frequency
+                The overflow check frequency
+            """
+            raise NotImplementedError("This atomic model doesn't support compression!")
 
         @classmethod
         def get_model(cls, model_params: dict) -> "BaseBaseModel":

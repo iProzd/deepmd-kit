@@ -447,8 +447,11 @@ void DeepPotTF::init(const std::string& model,
         0.9);
     options.config.mutable_gpu_options()->set_allow_growth(true);
     DPErrcheck(DPSetDevice(gpu_rank % gpu_num));
-    std::string str = "/gpu:";
-    str += std::to_string(gpu_rank % gpu_num);
+    std::string str = "/gpu:0";
+    // See
+    // https://github.com/tensorflow/tensorflow/blame/8fac27b486939f40bc8e362b94a16a4a8bb51869/tensorflow/core/protobuf/config.proto#L80
+    options.config.mutable_gpu_options()->set_visible_device_list(
+        std::to_string(gpu_rank % gpu_num));
     graph::SetDefaultDevice(str, graph_def);
   }
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
@@ -462,10 +465,10 @@ void DeepPotTF::init(const std::string& model,
   }
   if (!model_compatable(model_version)) {
     throw deepmd::deepmd_exception(
-        "incompatable model: version " + model_version +
+        "incompatible model: version " + model_version +
         " in graph, but version " + global_model_version +
         " supported "
-        "See https://deepmd.rtfd.io/compatability/ for details.");
+        "See https://deepmd.rtfd.io/compatibility/ for details.");
   }
   dtype = session_get_dtype(session, "descrpt_attr/rcut");
   if (dtype == tensorflow::DT_DOUBLE) {
@@ -475,11 +478,7 @@ void DeepPotTF::init(const std::string& model,
   }
   cell_size = rcut;
   ntypes = get_scalar<int>("descrpt_attr/ntypes");
-  try {
-    ntypes_spin = get_scalar<int>("spin_attr/ntypes_spin");
-  } catch (const deepmd::deepmd_exception&) {
-    ntypes_spin = 0;
-  }
+  ntypes_spin = 0;
   dfparam = get_scalar<int>("fitting_attr/dfparam");
   daparam = get_scalar<int>("fitting_attr/daparam");
   if (dfparam < 0) {

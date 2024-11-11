@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import copy
 from typing import (
-    Dict,
-    List,
     Optional,
-    Tuple,
     Union,
 )
 
+import array_api_compat
 import numpy as np
 
 from deepmd.dpmodel.utils.nlist import (
     build_multiple_neighbor_list,
     get_multiple_nlist_key,
     nlist_distinguish_types,
+)
+from deepmd.env import (
+    GLOBAL_NP_FLOAT_PRECISION,
 )
 from deepmd.utils.version import (
     check_version_compatibility,
@@ -34,6 +35,7 @@ from .pairtab_atomic_model import (
 )
 
 
+@BaseAtomicModel.register("linear")
 class LinearEnergyAtomicModel(BaseAtomicModel):
     """Linear model make linear combinations of several existing models.
 
@@ -48,8 +50,8 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
 
     def __init__(
         self,
-        models: List[BaseAtomicModel],
-        type_map: List[str],
+        models: list[BaseAtomicModel],
+        type_map: list[str],
         **kwargs,
     ):
         super().__init__(type_map, **kwargs)
@@ -68,7 +70,7 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         self.models = models
         sub_model_type_maps = [md.get_type_map() for md in models]
         err_msg = []
-        self.mapping_list = []
+        mapping_list = []
         common_type_map = set(type_map)
         self.type_map = type_map
         for tpmp in sub_model_type_maps:
@@ -76,7 +78,8 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
                 err_msg.append(
                     f"type_map {tpmp} is not a subset of type_map {type_map}"
                 )
-            self.mapping_list.append(self.remap_atype(tpmp, self.type_map))
+            mapping_list.append(self.remap_atype(tpmp, self.type_map))
+        self.mapping_list = mapping_list
         assert len(err_msg) == 0, "\n".join(err_msg)
         self.mixed_types_list = [model.mixed_types() for model in self.models]
 
@@ -104,12 +107,12 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         """Get the cut-off radius."""
         return max(self.get_model_rcuts())
 
-    def get_type_map(self) -> List[str]:
+    def get_type_map(self) -> list[str]:
         """Get the type map."""
         return self.type_map
 
     def change_type_map(
-        self, type_map: List[str], model_with_new_type_stat=None
+        self, type_map: list[str], model_with_new_type_stat=None
     ) -> None:
         """Change the type related params to new ones, according to `type_map` and the original one in the model.
         If there are new types in `type_map`, statistics will be updated accordingly to `model_with_new_type_stat` for these new types.
@@ -125,28 +128,60 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
                 else None,
             )
 
-    def get_model_rcuts(self) -> List[float]:
+    def get_model_rcuts(self) -> list[float]:
         """Get the cut-off radius for each individual models."""
         return [model.get_rcut() for model in self.models]
 
-    def get_sel(self) -> List[int]:
+    def get_sel(self) -> list[int]:
         return [max([model.get_nsel() for model in self.models])]
 
-    def get_model_nsels(self) -> List[int]:
+    def get_model_nsels(self) -> list[int]:
         """Get the processed sels for each individual models. Not distinguishing types."""
         return [model.get_nsel() for model in self.models]
 
-    def get_model_sels(self) -> List[Union[int, List[int]]]:
+    def get_model_sels(self) -> list[Union[int, list[int]]]:
         """Get the sels for each individual models."""
         return [model.get_sel() for model in self.models]
 
-    def _sort_rcuts_sels(self) -> Tuple[List[float], List[int]]:
+    def _sort_rcuts_sels(self) -> tuple[list[float], list[int]]:
         # sort the pair of rcut and sels in ascending order, first based on sel, then on rcut.
         zipped = sorted(
             zip(self.get_model_rcuts(), self.get_model_nsels()),
             key=lambda x: (x[1], x[0]),
         )
         return [p[0] for p in zipped], [p[1] for p in zipped]
+
+    def enable_compression(
+        self,
+        min_nbor_dist: float,
+        table_extrapolate: float = 5,
+        table_stride_1: float = 0.01,
+        table_stride_2: float = 0.1,
+        check_frequency: int = -1,
+    ) -> None:
+        """Compress model.
+
+        Parameters
+        ----------
+        min_nbor_dist
+            The nearest distance between atoms
+        table_extrapolate
+            The scale of model extrapolation
+        table_stride_1
+            The uniform stride of the first table
+        table_stride_2
+            The uniform stride of the second table
+        check_frequency
+            The overflow check frequency
+        """
+        for model in self.models:
+            model.enable_compression(
+                min_nbor_dist,
+                table_extrapolate,
+                table_stride_1,
+                table_stride_2,
+                check_frequency,
+            )
 
     def forward_atomic(
         self,
@@ -156,13 +191,13 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         mapping: Optional[np.ndarray] = None,
         fparam: Optional[np.ndarray] = None,
         aparam: Optional[np.ndarray] = None,
-    ) -> Dict[str, np.ndarray]:
+    ) -> dict[str, np.ndarray]:
         """Return atomic prediction.
 
         Parameters
         ----------
         extended_coord
-            coodinates in extended region, (nframes, nall * 3)
+            coordinates in extended region, (nframes, nall * 3)
         extended_atype
             atomic type in extended region, (nframes, nall)
         nlist
@@ -179,8 +214,9 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         result_dict
             the result dict, defined by the fitting net output def.
         """
+        xp = array_api_compat.array_namespace(extended_coord, extended_atype, nlist)
         nframes, nloc, nnei = nlist.shape
-        extended_coord = extended_coord.reshape(nframes, -1, 3)
+        extended_coord = xp.reshape(extended_coord, (nframes, -1, 3))
         sorted_rcuts, sorted_sels = self._sort_rcuts_sels()
         nlists = build_multiple_neighbor_list(
             extended_coord,
@@ -211,24 +247,24 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
                     aparam,
                 )["energy"]
             )
-        self.weights = self._compute_weight(extended_coord, extended_atype, nlists_)
+        weights = self._compute_weight(extended_coord, extended_atype, nlists_)
 
         fit_ret = {
-            "energy": np.sum(np.stack(ener_list) * np.stack(self.weights), axis=0),
+            "energy": xp.sum(xp.stack(ener_list) * xp.stack(weights), axis=0),
         }  # (nframes, nloc, 1)
         return fit_ret
 
     @staticmethod
-    def remap_atype(ori_map: List[str], new_map: List[str]) -> np.ndarray:
+    def remap_atype(ori_map: list[str], new_map: list[str]) -> np.ndarray:
         """
         This method is used to map the atype from the common type_map to the original type_map of
         indivial AtomicModels.
 
         Parameters
         ----------
-        ori_map : List[str]
+        ori_map : list[str]
             The original type map of an AtomicModel.
-        new_map : List[str]
+        new_map : list[str]
             The common type map of the DPZBLLinearEnergyAtomicModel, created by the `get_type_map` method,
             must be a subset of the ori_map.
 
@@ -284,12 +320,17 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         self,
         extended_coord: np.ndarray,
         extended_atype: np.ndarray,
-        nlists_: List[np.ndarray],
-    ) -> List[np.ndarray]:
+        nlists_: list[np.ndarray],
+    ) -> list[np.ndarray]:
         """This should be a list of user defined weights that matches the number of models to be combined."""
+        xp = array_api_compat.array_namespace(extended_coord, extended_atype, nlists_)
         nmodels = len(self.models)
         nframes, nloc, _ = nlists_[0].shape
-        return [np.ones((nframes, nloc, 1)) / nmodels for _ in range(nmodels)]  # pylint: disable=no-explicit-dtype
+        # the dtype of weights is the interface data type.
+        return [
+            xp.ones((nframes, nloc, 1), dtype=GLOBAL_NP_FLOAT_PRECISION) / nmodels
+            for _ in range(nmodels)
+        ]
 
     def get_dim_fparam(self) -> int:
         """Get the number (dimension) of frame parameters of this atomic model."""
@@ -300,7 +341,7 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         """Get the number (dimension) of atomic parameters of this atomic model."""
         return max([model.get_dim_aparam() for model in self.models])
 
-    def get_sel_type(self) -> List[int]:
+    def get_sel_type(self) -> list[int]:
         """Get the selected atom types of this model.
 
         Only atoms with selected atom types have atomic contribution
@@ -320,6 +361,7 @@ class LinearEnergyAtomicModel(BaseAtomicModel):
         return False
 
 
+@BaseAtomicModel.register("zbl")
 class DPZBLLinearEnergyAtomicModel(LinearEnergyAtomicModel):
     """Model linearly combine a list of AtomicModels.
 
@@ -337,7 +379,7 @@ class DPZBLLinearEnergyAtomicModel(LinearEnergyAtomicModel):
         Mapping atom type to the name (str) of the type.
         For example `type_map[1]` gives the name of the type 1.
     smin_alpha
-        The short-range tabulated interaction will be swithed according to the distance of the nearest neighbor.
+        The short-range tabulated interaction will be switched according to the distance of the nearest neighbor.
         This distance is calculated by softmin.
     """
 
@@ -347,7 +389,7 @@ class DPZBLLinearEnergyAtomicModel(LinearEnergyAtomicModel):
         zbl_model: PairTabAtomicModel,
         sw_rmin: float,
         sw_rmax: float,
-        type_map: List[str],
+        type_map: list[str],
         smin_alpha: Optional[float] = 0.1,
         **kwargs,
     ):
@@ -391,19 +433,20 @@ class DPZBLLinearEnergyAtomicModel(LinearEnergyAtomicModel):
         self,
         extended_coord: np.ndarray,
         extended_atype: np.ndarray,
-        nlists_: List[np.ndarray],
-    ) -> List[np.ndarray]:
+        nlists_: list[np.ndarray],
+    ) -> list[np.ndarray]:
         """ZBL weight.
 
         Returns
         -------
-        List[np.ndarray]
+        list[np.ndarray]
             the atomic ZBL weight for interpolation. (nframes, nloc, 1)
         """
         assert (
             self.sw_rmax > self.sw_rmin
         ), "The upper boundary `sw_rmax` must be greater than the lower boundary `sw_rmin`."
 
+        xp = array_api_compat.array_namespace(extended_coord, extended_atype)
         dp_nlist = nlists_[0]
         zbl_nlist = nlists_[1]
 
@@ -412,40 +455,40 @@ class DPZBLLinearEnergyAtomicModel(LinearEnergyAtomicModel):
 
         # use the larger rr based on nlist
         nlist_larger = zbl_nlist if zbl_nnei >= dp_nnei else dp_nlist
-        masked_nlist = np.clip(nlist_larger, 0, None)
+        masked_nlist = xp.clip(nlist_larger, 0, None)
         pairwise_rr = PairTabAtomicModel._get_pairwise_dist(
             extended_coord, masked_nlist
         )
 
-        numerator = np.sum(
-            np.where(
+        numerator = xp.sum(
+            xp.where(
                 nlist_larger != -1,
-                pairwise_rr * np.exp(-pairwise_rr / self.smin_alpha),
-                np.zeros_like(nlist_larger),
+                pairwise_rr * xp.exp(-pairwise_rr / self.smin_alpha),
+                xp.zeros_like(nlist_larger),
             ),
             axis=-1,
         )  # masked nnei will be zero, no need to handle
-        denominator = np.sum(
-            np.where(
+        denominator = xp.sum(
+            xp.where(
                 nlist_larger != -1,
-                np.exp(-pairwise_rr / self.smin_alpha),
-                np.zeros_like(nlist_larger),
+                xp.exp(-pairwise_rr / self.smin_alpha),
+                xp.zeros_like(nlist_larger),
             ),
             axis=-1,
         )  # handle masked nnei.
         with np.errstate(divide="ignore", invalid="ignore"):
             sigma = numerator / denominator
         u = (sigma - self.sw_rmin) / (self.sw_rmax - self.sw_rmin)
-        coef = np.zeros_like(u)
+        coef = xp.zeros_like(u)
         left_mask = sigma < self.sw_rmin
         mid_mask = (self.sw_rmin <= sigma) & (sigma < self.sw_rmax)
         right_mask = sigma >= self.sw_rmax
-        coef[left_mask] = 1
+        coef = xp.where(left_mask, xp.ones_like(coef), coef)
         with np.errstate(invalid="ignore"):
             smooth = -6 * u**5 + 15 * u**4 - 10 * u**3 + 1
-        coef[mid_mask] = smooth[mid_mask]
-        coef[right_mask] = 0
+        coef = xp.where(mid_mask, smooth, coef)
+        coef = xp.where(right_mask, xp.zeros_like(coef), coef)
         # to handle masked atoms
-        coef = np.where(sigma != 0, coef, np.zeros_like(coef))
+        coef = xp.where(sigma != 0, coef, xp.zeros_like(coef))
         self.zbl_weight = coef
-        return [1 - np.expand_dims(coef, -1), np.expand_dims(coef, -1)]
+        return [1 - xp.expand_dims(coef, -1), xp.expand_dims(coef, -1)]

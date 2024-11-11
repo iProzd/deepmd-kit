@@ -5,9 +5,6 @@ import os
 from functools import (
     lru_cache,
 )
-from typing import (
-    Tuple,
-)
 
 from packaging.version import (
     Version,
@@ -24,7 +21,7 @@ from .find_tensorflow import (
 
 
 @lru_cache
-def get_argument_from_env() -> Tuple[str, list, list, dict, str, str]:
+def get_argument_from_env() -> tuple[str, list, list, dict, str, str]:
     """Get the arguments from environment variables.
 
     The environment variables are assumed to be not changed during the build.
@@ -46,7 +43,7 @@ def get_argument_from_env() -> Tuple[str, list, list, dict, str, str]:
     """
     cmake_args = []
     extra_scripts = {}
-    # get variant option from the environment varibles, available: cpu, cuda, rocm
+    # get variant option from the environment variables, available: cpu, cuda, rocm
     dp_variant = os.environ.get("DP_VARIANT", "cpu").lower()
     if dp_variant == "cpu" or dp_variant == "":
         cmake_minimum_required_version = "3.16"
