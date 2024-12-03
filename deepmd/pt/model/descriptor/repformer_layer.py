@@ -478,6 +478,7 @@ class RepformerLayer(torch.nn.Module):
         a_rcut: float = 4.0,
         a_sel: int = 40,
         angle_use_self_g2_padding: bool = True,
+        use_undirect_g2: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -532,6 +533,7 @@ class RepformerLayer(torch.nn.Module):
         self.a_rcut = a_rcut
         self.a_sel = a_sel
         self.angle_use_self_g2_padding = angle_use_self_g2_padding
+        self.use_undirect_g2 = use_undirect_g2
 
         assert update_residual_init in [
             "norm",
@@ -1110,6 +1112,14 @@ class RepformerLayer(torch.nn.Module):
             # g2 edge update
             assert edge_info is not None
             g2_edge_info = self.act(self.linear2(edge_info))
+            if self.use_undirect_g2:
+                assert gg1 is not None
+                edge_info_2 = torch.cat(
+                    [gg1, torch.tile(g1.unsqueeze(-2), [1, 1, self.nnei, 1]), g2],
+                    dim=-1,
+                )
+                g2_edge_info_2 = self.act(self.linear2(edge_info_2))
+                g2_edge_info = (g2_edge_info + g2_edge_info_2) / 2
             g2_update.append(g2_edge_info)
 
         # g2 attn

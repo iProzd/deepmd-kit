@@ -128,6 +128,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         scale_dist: bool = True,
         multiscale_mode: str = "None",
         angle_only_cos: bool = False,
+        use_undirect_g2: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -269,6 +270,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.multiscale_mode = multiscale_mode
         self.prec = PRECISION_DICT[precision]
         self.angle_only_cos = angle_only_cos
+        self.use_undirect_g2 = use_undirect_g2
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -358,6 +360,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     use_sqrt_nnei=self.use_sqrt_nnei,
                     g1_out_conv=self.g1_out_conv,
                     g1_out_mlp=self.g1_out_mlp,
+                    use_undirect_g2=self.use_undirect_g2,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -366,6 +369,8 @@ class DescrptBlockRepformers(DescriptorBlock):
         wanted_shape = (self.ntypes, self.nnei, 4)
         mean = torch.zeros(wanted_shape, dtype=self.prec, device=env.DEVICE)
         stddev = torch.ones(wanted_shape, dtype=self.prec, device=env.DEVICE)
+        if self.use_undirect_g2:
+            stddev = stddev * 0.3
         self.register_buffer("mean", mean)
         self.register_buffer("stddev", stddev)
         self.stats = None
@@ -693,13 +698,14 @@ class DescrptBlockRepformers(DescriptorBlock):
         env_mat_stat.load_or_compute_stats(sampled, path)
         self.stats = env_mat_stat.stats
         mean, stddev = env_mat_stat()
-        if not self.set_davg_zero:
-            self.mean.copy_(
-                torch.tensor(mean, device=env.DEVICE, dtype=self.mean.dtype)
+        if not self.use_undirect_g2:
+            if not self.set_davg_zero:
+                self.mean.copy_(
+                    torch.tensor(mean, device=env.DEVICE, dtype=self.mean.dtype)
+                )
+            self.stddev.copy_(
+                torch.tensor(stddev, device=env.DEVICE, dtype=self.stddev.dtype)
             )
-        self.stddev.copy_(
-            torch.tensor(stddev, device=env.DEVICE, dtype=self.stddev.dtype)
-        )
 
     def get_stats(self) -> dict[str, StatItem]:
         """Get the statistics of the descriptor."""
