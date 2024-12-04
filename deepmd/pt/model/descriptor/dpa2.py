@@ -256,6 +256,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             angle_only_cos=self.repformer_args.angle_only_cos,
             use_undirect_g2=self.repformer_args.use_undirect_g2,
             use_undirect_a=self.repformer_args.use_undirect_a,
+            update_g1_bidirect=self.repformer_args.update_g1_bidirect,
             seed=child_seed(seed, 1),
         )
         self.rcsl_list = [

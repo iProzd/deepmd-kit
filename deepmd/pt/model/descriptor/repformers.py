@@ -130,6 +130,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         angle_only_cos: bool = False,
         use_undirect_g2: bool = False,
         use_undirect_a: bool = False,
+        update_g1_bidirect: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -273,6 +274,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.angle_only_cos = angle_only_cos
         self.use_undirect_g2 = use_undirect_g2
         self.use_undirect_a = use_undirect_a
+        self.update_g1_bidirect = update_g1_bidirect
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -364,6 +366,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     g1_out_mlp=self.g1_out_mlp,
                     use_undirect_g2=self.use_undirect_g2,
                     use_undirect_a=self.use_undirect_a,
+                    update_g1_bidirect=self.update_g1_bidirect,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -576,9 +579,15 @@ class DescrptBlockRepformers(DescriptorBlock):
         # nb x nall x ng1
         if comm_dict is None:
             assert mapping is not None
+            nlist_loc = torch.gather(
+                mapping, index=nlist.reshape(nframes, -1), dim=1
+            ).reshape(nframes, nloc, self.nnei)
+            nlist_loc = torch.where(nlist_mask, nlist_loc, nloc)
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.g1_dim)
             )
+        else:
+            nlist_loc = None
         for idx, ll in enumerate(self.layers):
             # g1:     nb x nloc x ng1
             # g1_ext: nb x nall x ng1
@@ -649,6 +658,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                 angle_nlist,
                 angle_nlist_mask,
                 angle_sw,
+                nlist_loc=nlist_loc,
             )
 
         # nb x nloc x 3 x ng2

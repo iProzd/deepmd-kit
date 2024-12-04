@@ -480,6 +480,7 @@ class RepformerLayer(torch.nn.Module):
         angle_use_self_g2_padding: bool = True,
         use_undirect_g2: bool = False,
         use_undirect_a: bool = False,
+        update_g1_bidirect: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -536,6 +537,7 @@ class RepformerLayer(torch.nn.Module):
         self.angle_use_self_g2_padding = angle_use_self_g2_padding
         self.use_undirect_g2 = use_undirect_g2
         self.use_undirect_a = use_undirect_a
+        self.update_g1_bidirect = update_g1_bidirect
 
         assert update_residual_init in [
             "norm",
@@ -626,13 +628,22 @@ class RepformerLayer(torch.nn.Module):
                 g1_dim,
                 precision=precision,
                 seed=child_seed(seed, 11),
-            )  # need act
+            )  # need act # receive
             self.g1_edge_linear2 = MLPLayer(
                 g1_dim,
                 g1_dim,
                 precision=precision,
                 seed=child_seed(seed, 12),
             )  # need act
+            if self.update_g1_bidirect:
+                self.g1_edge_linear_send = MLPLayer(
+                    self.edge_info_dim,
+                    g1_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 20),
+                )  # need act # send
+            else:
+                self.g1_edge_linear_send = None
             if self.update_style == "res_residual":
                 self.g1_residual.append(
                     get_residual(
@@ -643,6 +654,16 @@ class RepformerLayer(torch.nn.Module):
                         seed=child_seed(seed, 13),
                     )
                 )
+                if self.update_g1_bidirect:
+                    self.g1_residual.append(
+                        get_residual(
+                            g1_dim,
+                            self.update_residual,
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 21),
+                        )
+                    )
 
         if not self.update_g2_has_edge:
             # g2 self mlp
@@ -996,6 +1017,7 @@ class RepformerLayer(torch.nn.Module):
         angle_nlist: torch.Tensor,  # nf x nloc x a_nnei
         angle_nlist_mask: torch.Tensor,  # nf x nloc x a_nnei
         angle_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
+        nlist_loc: Optional[torch.Tensor] = None,
     ):
         """
         Parameters
@@ -1100,9 +1122,37 @@ class RepformerLayer(torch.nn.Module):
             assert self.g1_edge_linear1 is not None
             assert self.g1_edge_linear2 is not None
             # nb x nloc x nnei x ng1
+            # receive
             g1_edge_info = self.act(self.g1_edge_linear1(edge_info)) * sw.unsqueeze(-1)
             g1_edge_update = torch.sum(g1_edge_info, dim=-2) / self.nnei
             g1_update.append(g1_edge_update)
+            if self.update_g1_bidirect:
+                # send message
+                assert self.g1_edge_linear_send is not None
+                # nb x nloc x nnei x ng1
+                g1_edge_info_send = self.act(
+                    self.g1_edge_linear_send(edge_info)
+                ) * sw.unsqueeze(-1)
+                assert nlist_loc is not None
+                # nb x (nloc+1) x nnei x ng1
+                scattered_message = torch.zeros(
+                    size=[nb, nloc + 1, nnei, self.g1_dim],
+                    device=g1_edge_info_send.device,
+                    dtype=g1_edge_info_send.dtype,
+                )
+                # nb x nloc x nnei x ng1
+                scatter_index = nlist_loc.unsqueeze(-1).expand(-1, -1, -1, self.g1_dim)
+                # nb x nloc x nnei x ng1
+                scattered_message = torch.scatter_reduce(
+                    scattered_message,
+                    dim=1,
+                    index=scatter_index,
+                    src=g1_edge_info_send,
+                    reduce="sum",
+                )[:, :-1, :, :]
+                # nb x nloc x ng1
+                g1_edge_update_send = torch.sum(scattered_message, dim=-2) / self.nnei
+                g1_update.append(g1_edge_update_send)
 
         assert self.linear2 is not None
         if not self.update_g2_has_edge:
