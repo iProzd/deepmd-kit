@@ -1247,6 +1247,12 @@ def dpa2_repformer_args():
             default=False,
         ),
         Argument(
+            "use_undirect_a",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "update_g2_has_a",
             bool,
             optional=True,

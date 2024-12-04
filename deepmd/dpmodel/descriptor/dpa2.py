@@ -229,6 +229,7 @@ class RepformerArgs:
         angle_only_cos: bool = False,
         ln_eps: Optional[float] = 1e-5,
         use_undirect_g2: bool = False,
+        use_undirect_a: bool = False,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -349,6 +350,7 @@ class RepformerArgs:
             ln_eps = 1e-5
         self.ln_eps = ln_eps
         self.use_undirect_g2 = use_undirect_g2
+        self.use_undirect_a = use_undirect_a
 
     def __getitem__(self, key):
         if hasattr(self, key):

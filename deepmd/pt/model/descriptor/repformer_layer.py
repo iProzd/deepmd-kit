@@ -479,6 +479,7 @@ class RepformerLayer(torch.nn.Module):
         a_sel: int = 40,
         angle_use_self_g2_padding: bool = True,
         use_undirect_g2: bool = False,
+        use_undirect_a: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -534,6 +535,7 @@ class RepformerLayer(torch.nn.Module):
         self.a_sel = a_sel
         self.angle_use_self_g2_padding = angle_use_self_g2_padding
         self.use_undirect_g2 = use_undirect_g2
+        self.use_undirect_a = use_undirect_a
 
         assert update_residual_init in [
             "norm",
@@ -1139,6 +1141,9 @@ class RepformerLayer(torch.nn.Module):
             assert self.angle_linear is not None
             assert self.g2_angle_linear1 is not None
             assert self.g2_angle_linear2 is not None
+            assert (
+                not self.use_undirect_g2
+            ), "use angle update can not use undirect g2 yet"
             # nb x nloc x a_nnei x a_nnei x g1
             g1_angle_embed = torch.tile(
                 g1.unsqueeze(2).unsqueeze(2), (1, 1, self.a_sel, self.a_sel, 1)
@@ -1161,8 +1166,14 @@ class RepformerLayer(torch.nn.Module):
                 updated_angle_list.append(g2_angle_embed)
             # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2)
             updated_angle = torch.cat(updated_angle_list, dim=-1)
+            # nb x nloc x a_nnei x a_nnei x dim_a
+            angle_message = self.act(self.angle_linear(updated_angle))
+            if self.use_undirect_a:
+                angle_message = (
+                    angle_message + angle_message.permute(0, 1, 3, 2, 4)
+                ) / 2
             # angle update
-            a_update.append(self.act(self.angle_linear(updated_angle)))
+            a_update.append(angle_message)
 
             if self.g2_angle_dim == self.angle_dim:
                 # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2)

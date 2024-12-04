@@ -129,6 +129,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         multiscale_mode: str = "None",
         angle_only_cos: bool = False,
         use_undirect_g2: bool = False,
+        use_undirect_a: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -271,6 +272,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.prec = PRECISION_DICT[precision]
         self.angle_only_cos = angle_only_cos
         self.use_undirect_g2 = use_undirect_g2
+        self.use_undirect_a = use_undirect_a
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -361,6 +363,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     g1_out_conv=self.g1_out_conv,
                     g1_out_mlp=self.g1_out_mlp,
                     use_undirect_g2=self.use_undirect_g2,
+                    use_undirect_a=self.use_undirect_a,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
