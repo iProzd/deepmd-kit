@@ -540,11 +540,24 @@ class RepformerLayer(torch.nn.Module):
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
         self.pipeline_update = pipeline_update
+        self.prec = PRECISION_DICT[precision]
+        self.g1_layernorm = None
+        self.g2_layernorm = None
+        self.angle_layernorm = None
 
         assert update_residual_init in [
             "norm",
             "const",
         ], "'update_residual_init' only support 'norm' or 'const'!"
+
+        if self.update_style == "res_layer":
+            self.g1_layernorm = nn.LayerNorm(
+                self.g1_dim, device=env.DEVICE, dtype=self.prec
+            )
+            self.g2_layernorm = nn.LayerNorm(
+                self.g2_dim, device=env.DEVICE, dtype=self.prec
+            )
+
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
         self.g1_residual = []
@@ -727,6 +740,10 @@ class RepformerLayer(torch.nn.Module):
                 )
 
         if self.has_angle:
+            if self.update_style == "res_layer":
+                self.angle_layernorm = nn.LayerNorm(
+                    self.a_dim, device=env.DEVICE, dtype=self.prec
+                )
             angle_seed = 20
             self.angle_dim = self.a_dim
             self.angle_dim += self.g1_dim if self.update_a_has_g1 else 0
@@ -1341,6 +1358,29 @@ class RepformerLayer(torch.nn.Module):
         return uu
 
     @torch.jit.export
+    def list_update_res_layer(
+        self, update_list: list[torch.Tensor], update_name: str = "g1"
+    ) -> torch.Tensor:
+        nitem = len(update_list)
+        uu = update_list[0]
+        for ii in range(1, nitem):
+            uu = uu + update_list[ii]
+        if update_name == "g1":
+            assert self.g1_layernorm is not None
+            return self.g1_layernorm(uu)
+        elif update_name == "g2":
+            assert self.g2_layernorm is not None
+            return self.g2_layernorm(uu)
+        elif update_name == "h2":
+            # not update h2
+            return uu
+        elif update_name == "a":
+            assert self.angle_layernorm is not None
+            return self.angle_layernorm(uu)
+        else:
+            raise NotImplementedError
+
+    @torch.jit.export
     def list_update_res_residual(
         self, update_list: list[torch.Tensor], update_name: str = "g1"
     ) -> torch.Tensor:
@@ -1373,6 +1413,8 @@ class RepformerLayer(torch.nn.Module):
             return self.list_update_res_incr(update_list)
         elif self.update_style == "res_residual":
             return self.list_update_res_residual(update_list, update_name=update_name)
+        elif self.update_style == "res_layer":
+            return self.list_update_res_layer(update_list, update_name=update_name)
         else:
             raise RuntimeError(f"unknown update style {self.update_style}")
 
