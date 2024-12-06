@@ -131,6 +131,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         use_undirect_g2: bool = False,
         use_undirect_a: bool = False,
         update_g1_bidirect: bool = False,
+        pipeline_update: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -275,6 +276,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.use_undirect_g2 = use_undirect_g2
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
+        self.pipeline_update = pipeline_update
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -367,6 +369,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     use_undirect_g2=self.use_undirect_g2,
                     use_undirect_a=self.use_undirect_a,
                     update_g1_bidirect=self.update_g1_bidirect,
+                    pipeline_update=self.pipeline_update,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

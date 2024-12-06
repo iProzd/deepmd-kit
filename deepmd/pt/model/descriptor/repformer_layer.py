@@ -481,6 +481,7 @@ class RepformerLayer(torch.nn.Module):
         use_undirect_g2: bool = False,
         use_undirect_a: bool = False,
         update_g1_bidirect: bool = False,
+        pipeline_update: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -538,6 +539,7 @@ class RepformerLayer(torch.nn.Module):
         self.use_undirect_g2 = use_undirect_g2
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
+        self.pipeline_update = pipeline_update
 
         assert update_residual_init in [
             "norm",
@@ -1154,6 +1156,17 @@ class RepformerLayer(torch.nn.Module):
                 g1_edge_update_send = torch.sum(scattered_message, dim=-2) / self.nnei
                 g1_update.append(g1_edge_update_send)
 
+        # update g1 for pipeline_update
+        g1_new = self.list_update(g1_update, "g1")
+        if self.pipeline_update:
+            # update all g1 related tensor
+            assert gg1 is not None
+            assert nlist_loc is not None
+            # new gg1
+            gg1 = _make_nei_g1(g1_new, torch.where(nlist_mask, nlist_loc, 0))
+            # g1
+            g1 = g1_new
+
         assert self.linear2 is not None
         if not self.update_g2_has_edge:
             # g2 self mlp
@@ -1209,30 +1222,11 @@ class RepformerLayer(torch.nn.Module):
             # nb x nloc x a_nnei x a_nnei x (g2 + g2)
             g2_angle_embed = torch.cat([g2_angle_i, g2_angle_j], dim=-1)
 
-            updated_angle_list = [angle_embed]
-            if self.update_a_has_g1:
-                updated_angle_list.append(g1_angle_embed)
-            if self.update_a_has_g2:
-                updated_angle_list.append(g2_angle_embed)
+            # angle for g2:
+            updated_g2_angle_list = [angle_embed] if self.update_g2_has_a else []
             # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2)
-            updated_angle = torch.cat(updated_angle_list, dim=-1)
-            # nb x nloc x a_nnei x a_nnei x dim_a
-            angle_message = self.act(self.angle_linear(updated_angle))
-            if self.use_undirect_a:
-                angle_message = (
-                    angle_message + angle_message.permute(0, 1, 3, 2, 4)
-                ) / 2
-            # angle update
-            a_update.append(angle_message)
-
-            if self.g2_angle_dim == self.angle_dim:
-                # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2)
-                updated_g2_angle = updated_angle
-            else:
-                updated_g2_angle_list = [angle_embed] if self.update_g2_has_a else []
-                # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2)
-                updated_g2_angle_list += [g1_angle_embed, g2_angle_embed]
-                updated_g2_angle = torch.cat(updated_g2_angle_list, dim=-1)
+            updated_g2_angle_list += [g1_angle_embed, g2_angle_embed]
+            updated_g2_angle = torch.cat(updated_g2_angle_list, dim=-1)
             # nb x nloc x a_nnei x a_nnei x g2
             updated_angle_g2 = self.act(self.g2_angle_linear1(updated_g2_angle))
             # nb x nloc x a_nnei x a_nnei x g2
@@ -1274,10 +1268,55 @@ class RepformerLayer(torch.nn.Module):
                 )
             g2_update.append(self.act(self.g2_angle_linear2(padding_updated_angle_g2)))
 
+            # update g2 for pipeline_update
+            g2_new = self.list_update(g2_update, "g2")
+            if self.pipeline_update:
+                g2 = g2_new
+
+            # angle for angle
+            if not self.pipeline_update and self.g2_angle_dim == self.angle_dim:
+                updated_angle = updated_g2_angle
+            else:
+                # copy from above
+                # use new g2
+                if self.pipeline_update:
+                    # nb x nloc x a_nnei x g2
+                    g2_angle = g2[:, :, : self.a_sel, :]
+                    # nb x nloc x a_nnei x g2
+                    g2_angle = torch.where(
+                        angle_nlist_mask.unsqueeze(-1), g2_angle, 0.0
+                    )
+                    # nb x nloc x (a_nnei) x a_nnei x g2
+                    g2_angle_i = torch.tile(
+                        g2_angle.unsqueeze(2), (1, 1, self.a_sel, 1, 1)
+                    )
+                    # nb x nloc x a_nnei x (a_nnei) x g2
+                    g2_angle_j = torch.tile(
+                        g2_angle.unsqueeze(3), (1, 1, 1, self.a_sel, 1)
+                    )
+                    # nb x nloc x a_nnei x a_nnei x (g2 + g2)
+                    g2_angle_embed = torch.cat([g2_angle_i, g2_angle_j], dim=-1)
+                updated_angle_list = [angle_embed]
+                if self.update_a_has_g1:
+                    updated_angle_list.append(g1_angle_embed)
+                if self.update_a_has_g2:
+                    updated_angle_list.append(g2_angle_embed)
+                # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2)
+                updated_angle = torch.cat(updated_angle_list, dim=-1)
+
+            # nb x nloc x a_nnei x a_nnei x dim_a
+            angle_message = self.act(self.angle_linear(updated_angle))
+            if self.use_undirect_a:
+                angle_message = (
+                    angle_message + angle_message.permute(0, 1, 3, 2, 4)
+                ) / 2
+            # angle update
+            a_update.append(angle_message)
+        else:
+            g2_new = self.list_update(g2_update, "g2")
+
         # update
-        g2_new = self.list_update(g2_update, "g2")
         h2_new = self.list_update(h2_update, "h2")
-        g1_new = self.list_update(g1_update, "g1")
         a_new = self.list_update(a_update, "a")
         return g1_new, g2_new, h2_new, a_new
 

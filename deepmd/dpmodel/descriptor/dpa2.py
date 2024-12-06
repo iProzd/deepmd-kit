@@ -231,6 +231,7 @@ class RepformerArgs:
         use_undirect_g2: bool = False,
         use_undirect_a: bool = False,
         update_g1_bidirect: bool = False,
+        pipeline_update: bool = False,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -353,6 +354,7 @@ class RepformerArgs:
         self.use_undirect_g2 = use_undirect_g2
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
+        self.pipeline_update = pipeline_update
 
     def __getitem__(self, key):
         if hasattr(self, key):
