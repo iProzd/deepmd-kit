@@ -552,10 +552,16 @@ class RepformerLayer(torch.nn.Module):
 
         if self.update_style == "res_layer":
             self.g1_layernorm = nn.LayerNorm(
-                self.g1_dim, device=env.DEVICE, dtype=self.prec
+                self.g1_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=trainable_ln,
             )
             self.g2_layernorm = nn.LayerNorm(
-                self.g2_dim, device=env.DEVICE, dtype=self.prec
+                self.g2_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=trainable_ln,
             )
 
         self.update_residual = update_residual
@@ -742,7 +748,10 @@ class RepformerLayer(torch.nn.Module):
         if self.has_angle:
             if self.update_style == "res_layer":
                 self.angle_layernorm = nn.LayerNorm(
-                    self.a_dim, device=env.DEVICE, dtype=self.prec
+                    self.a_dim,
+                    device=env.DEVICE,
+                    dtype=self.prec,
+                    elementwise_affine=trainable_ln,
                 )
             angle_seed = 20
             self.angle_dim = self.a_dim
