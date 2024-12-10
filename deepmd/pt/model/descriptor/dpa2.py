@@ -258,6 +258,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             use_undirect_a=self.repformer_args.use_undirect_a,
             update_g1_bidirect=self.repformer_args.update_g1_bidirect,
             pipeline_update=self.repformer_args.pipeline_update,
+            pre_ln=self.repformer_args.pre_ln,
             seed=child_seed(seed, 1),
         )
         self.rcsl_list = [

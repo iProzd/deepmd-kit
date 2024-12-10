@@ -232,6 +232,7 @@ class RepformerArgs:
         use_undirect_a: bool = False,
         update_g1_bidirect: bool = False,
         pipeline_update: bool = False,
+        pre_ln: bool = False,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -347,6 +348,7 @@ class RepformerArgs:
         self.scale_dist = scale_dist
         self.multiscale_mode = multiscale_mode
         self.angle_only_cos = angle_only_cos
+        self.pre_ln = pre_ln
         #  to keep consistent with default value in this backends
         if ln_eps is None:
             ln_eps = 1e-5

@@ -132,6 +132,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         use_undirect_a: bool = False,
         update_g1_bidirect: bool = False,
         pipeline_update: bool = False,
+        pre_ln: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -277,6 +278,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
         self.pipeline_update = pipeline_update
+        self.pre_ln = pre_ln
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -295,6 +297,14 @@ class DescrptBlockRepformers(DescriptorBlock):
             bias=False,
             dtype=self.prec,
         )
+        self.out_ln = None
+        if self.pre_ln:
+            self.out_ln = torch.nn.LayerNorm(
+                self.g1_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=trainable_ln,
+            )
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
         self.env_protection = env_protection
@@ -370,6 +380,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     use_undirect_a=self.use_undirect_a,
                     update_g1_bidirect=self.update_g1_bidirect,
                     pipeline_update=self.pipeline_update,
+                    pre_ln=self.pre_ln,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -676,6 +687,10 @@ class DescrptBlockRepformers(DescriptorBlock):
         )
         # (nb x nloc) x ng2 x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
+
+        if self.pre_ln:
+            assert self.out_ln is not None
+            g1 = self.out_ln(g1)
 
         return g1, g2, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
 

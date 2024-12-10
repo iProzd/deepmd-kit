@@ -482,6 +482,7 @@ class RepformerLayer(torch.nn.Module):
         use_undirect_a: bool = False,
         update_g1_bidirect: bool = False,
         pipeline_update: bool = False,
+        pre_ln: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -519,6 +520,7 @@ class RepformerLayer(torch.nn.Module):
         self.g2_dim = g2_dim
         self.trainable_ln = trainable_ln
         self.ln_eps = ln_eps
+        self.pre_ln = pre_ln
         self.precision = precision
         self.seed = seed
         self.use_sqrt_nnei = use_sqrt_nnei
@@ -549,6 +551,9 @@ class RepformerLayer(torch.nn.Module):
             "norm",
             "const",
         ], "'update_residual_init' only support 'norm' or 'const'!"
+
+        if self.pre_ln:
+            assert self.update_style == "res_layer"
 
         if self.update_style == "res_layer":
             self.g1_layernorm = nn.LayerNorm(
@@ -1086,6 +1091,12 @@ class RepformerLayer(torch.nn.Module):
         # angle
         a_update: list[torch.Tensor] = [angle_embed]
 
+        if self.pre_ln:
+            assert self.g1_layernorm is not None
+            assert self.g2_layernorm is not None
+            g1 = self.g1_layernorm(g1)
+            g2 = self.g2_layernorm(g2)
+
         # g1 self mlp
         g1_self_mlp = self.act(self.g1_self_mlp(g1))
         g1_update.append(g1_self_mlp)
@@ -1227,6 +1238,9 @@ class RepformerLayer(torch.nn.Module):
             g2_update.append(g2_2)
 
         if self.has_angle:
+            if self.pre_ln:
+                assert self.angle_layernorm is not None
+                angle_embed = self.angle_layernorm(angle_embed)
             assert self.angle_linear is not None
             assert self.g2_angle_linear1 is not None
             assert self.g2_angle_linear2 is not None
@@ -1374,20 +1388,24 @@ class RepformerLayer(torch.nn.Module):
         uu = update_list[0]
         for ii in range(1, nitem):
             uu = uu + update_list[ii]
-        if update_name == "g1":
-            assert self.g1_layernorm is not None
-            return self.g1_layernorm(uu)
-        elif update_name == "g2":
-            assert self.g2_layernorm is not None
-            return self.g2_layernorm(uu)
-        elif update_name == "h2":
-            # not update h2
-            return uu
-        elif update_name == "a":
-            assert self.angle_layernorm is not None
-            return self.angle_layernorm(uu)
+        if not self.pre_ln:
+            if update_name == "g1":
+                assert self.g1_layernorm is not None
+                out = self.g1_layernorm(uu)
+            elif update_name == "g2":
+                assert self.g2_layernorm is not None
+                out = self.g2_layernorm(uu)
+            elif update_name == "h2":
+                # not update h2
+                out = uu
+            elif update_name == "a":
+                assert self.angle_layernorm is not None
+                out = self.angle_layernorm(uu)
+            else:
+                raise NotImplementedError
         else:
-            raise NotImplementedError
+            out = uu
+        return out
 
     @torch.jit.export
     def list_update_res_residual(

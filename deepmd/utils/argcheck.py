@@ -1295,6 +1295,12 @@ def dpa2_repformer_args():
             default=True,
         ),
         Argument(
+            "pre_ln",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "angle_only_cos",
             bool,
             optional=True,
