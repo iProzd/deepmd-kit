@@ -1205,6 +1205,12 @@ def dpa2_repformer_args():
             default=True,
         ),
         Argument(
+            "no_repinit",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "a_dim",
             int,
             optional=True,
