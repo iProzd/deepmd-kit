@@ -1271,6 +1271,24 @@ def dpa2_repformer_args():
             default=False,
         ),
         Argument(
+            "update_g2_has_ar",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "update_g1_has_ar",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "update_g2_has_arra",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "pipeline_update",
             bool,
             optional=True,

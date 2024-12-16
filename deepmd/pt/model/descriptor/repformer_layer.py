@@ -484,6 +484,9 @@ class RepformerLayer(torch.nn.Module):
         pipeline_update: bool = False,
         pre_ln: bool = False,
         g1_mess_mulmlp: bool = False,
+        update_g2_has_ar: bool = False,
+        update_g1_has_ar: bool = False,
+        update_g2_has_arra: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -544,6 +547,9 @@ class RepformerLayer(torch.nn.Module):
         self.update_g1_bidirect = update_g1_bidirect
         self.pipeline_update = pipeline_update
         self.g1_mess_mulmlp = g1_mess_mulmlp
+        self.update_g2_has_ar = update_g2_has_ar
+        self.update_g1_has_ar = update_g1_has_ar
+        self.update_g2_has_arra = update_g2_has_arra
         self.prec = PRECISION_DICT[precision]
         self.g1_layernorm = None
         self.g2_layernorm = None
@@ -693,6 +699,27 @@ class RepformerLayer(torch.nn.Module):
                         )
                     )
 
+        # angle for g1
+        if self.has_angle and self.update_g1_has_ar:
+            self.g1_angle_linear = MLPLayer(
+                self.a_dim,
+                g1_dim,
+                precision=precision,
+                seed=child_seed(seed, 13),
+            )  # need act
+            if self.update_style == "res_residual":
+                self.g1_residual.append(
+                    get_residual(
+                        g1_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 14),
+                    )
+                )
+        else:
+            self.g1_angle_linear = None
+
         if not self.update_g2_has_edge:
             # g2 self mlp
             self.linear2 = MLPLayer(
@@ -751,6 +778,27 @@ class RepformerLayer(torch.nn.Module):
                         seed=child_seed(seed, 10),
                     )
                 )
+
+        # angle for g2
+        if self.has_angle and self.update_g2_has_ar:
+            self.g2_angle_linear_ar = MLPLayer(
+                self.a_dim,
+                g2_dim,
+                precision=precision,
+                seed=child_seed(seed, 21),
+            )  # need act
+            if self.update_style == "res_residual":
+                self.g2_residual.append(
+                    get_residual(
+                        g2_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 22),
+                    )
+                )
+        else:
+            self.g2_angle_linear_ar = None
 
         if self.has_angle:
             if self.update_style == "res_layer":
@@ -1053,6 +1101,7 @@ class RepformerLayer(torch.nn.Module):
         angle_nlist_mask: torch.Tensor,  # nf x nloc x a_nnei
         angle_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         nlist_loc: Optional[torch.Tensor] = None,
+        cosine_ij: Optional[torch.Tensor] = None,
     ):
         """
         Parameters
@@ -1198,6 +1247,24 @@ class RepformerLayer(torch.nn.Module):
                 g1_edge_update_send = torch.sum(scattered_message, dim=-2) / self.nnei
                 g1_update.append(g1_edge_update_send)
 
+        if self.has_angle and (self.update_g1_has_ar or self.update_g2_has_ar):
+            assert cosine_ij is not None
+            assert angle_embed is not None
+            # nb x nloc x a_nnei x a_nnei x a
+            angle_ar = cosine_ij.unsqueeze(-1) * angle_embed
+        else:
+            angle_ar = None
+
+        # angle for g1
+        if self.has_angle and self.update_g1_has_ar:
+            assert self.g1_angle_linear is not None
+            assert angle_ar is not None
+            # nb x nloc x g1_dim
+            g1_ar = self.act(self.g1_angle_linear(angle_ar)).sum(-2).sum(-2) / (
+                float(self.a_sel) * float(self.a_sel)
+            )
+            g1_update.append(g1_ar)
+
         # update g1 for pipeline_update
         g1_new = self.list_update(g1_update, "g1")
         if self.pipeline_update:
@@ -1241,6 +1308,41 @@ class RepformerLayer(torch.nn.Module):
             g2_2 = self.attn2_mh_apply(AAg, g2)
             g2_2 = self.attn2_lm(g2_2)
             g2_update.append(g2_2)
+
+        # angle for g2
+        if self.has_angle and self.update_g2_has_ar:
+            assert self.g2_angle_linear_ar is not None
+            assert angle_ar is not None
+            # nb x nloc x a_nnei x g2_dim
+            g2_ar = self.act(self.g2_angle_linear_ar(angle_ar)).sum(-2) / float(
+                self.a_sel
+            )
+            # nb x nloc x nnei x g2
+            padding_g2_ar = torch.concat(
+                [
+                    g2_ar,
+                    torch.zeros(
+                        [nb, nloc, self.nnei - self.a_sel, self.g2_dim],
+                        dtype=g2.dtype,
+                        device=g2.device,
+                    ),
+                ],
+                dim=2,
+            )
+            if self.angle_use_self_g2_padding:
+                full_mask = torch.concat(
+                    [
+                        angle_nlist_mask,
+                        torch.zeros(
+                            [nb, nloc, self.nnei - self.a_sel],
+                            dtype=angle_nlist_mask.dtype,
+                            device=angle_nlist_mask.device,
+                        ),
+                    ],
+                    dim=-1,
+                )
+                padding_g2_ar = torch.where(full_mask.unsqueeze(-1), padding_g2_ar, g2)
+            g2_update.append(padding_g2_ar)
 
         if self.has_angle:
             if self.pre_ln:

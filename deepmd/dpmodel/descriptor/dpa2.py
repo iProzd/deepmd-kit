@@ -235,6 +235,9 @@ class RepformerArgs:
         pre_ln: bool = False,
         no_repinit: bool = False,
         g1_mess_mulmlp: bool = False,
+        update_g2_has_ar: bool = False,
+        update_g1_has_ar: bool = False,
+        update_g2_has_arra: bool = False,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -352,6 +355,9 @@ class RepformerArgs:
         self.angle_only_cos = angle_only_cos
         self.pre_ln = pre_ln
         self.no_repinit = no_repinit
+        self.update_g2_has_ar = update_g2_has_ar
+        self.update_g1_has_ar = update_g1_has_ar
+        self.update_g2_has_arra = update_g2_has_arra
         #  to keep consistent with default value in this backends
         if ln_eps is None:
             ln_eps = 1e-5

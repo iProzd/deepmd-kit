@@ -134,6 +134,9 @@ class DescrptBlockRepformers(DescriptorBlock):
         pipeline_update: bool = False,
         pre_ln: bool = False,
         g1_mess_mulmlp: bool = False,
+        update_g2_has_ar: bool = False,
+        update_g1_has_ar: bool = False,
+        update_g2_has_arra: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -281,6 +284,9 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.pipeline_update = pipeline_update
         self.pre_ln = pre_ln
         self.g1_mess_mulmlp = g1_mess_mulmlp
+        self.update_g2_has_ar = update_g2_has_ar
+        self.update_g1_has_ar = update_g1_has_ar
+        self.update_g2_has_arra = update_g2_has_arra
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -384,6 +390,9 @@ class DescrptBlockRepformers(DescriptorBlock):
                     pipeline_update=self.pipeline_update,
                     pre_ln=self.pre_ln,
                     g1_mess_mulmlp=self.g1_mess_mulmlp,
+                    update_g2_has_ar=self.update_g2_has_ar,
+                    update_g1_has_ar=self.update_g1_has_ar,
+                    update_g2_has_arra=self.update_g2_has_arra,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -556,7 +565,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         ]
         angle_nlist = nlist[:, :, : self.a_sel]
         angle_nlist = torch.where(a_dist_mask, angle_nlist, -1)
-        _, angle_diff, angle_sw = prod_env_mat(
+        amatrix, angle_diff, angle_sw = prod_env_mat(
             extended_coord,
             angle_nlist,
             atype,
@@ -676,6 +685,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                 angle_nlist_mask,
                 angle_sw,
                 nlist_loc=nlist_loc,
+                cosine_ij=cosine_ij,
             )
 
         # nb x nloc x 3 x ng2
