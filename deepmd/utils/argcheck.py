@@ -1265,6 +1265,12 @@ def dpa2_repformer_args():
             default=False,
         ),
         Argument(
+            "g1_mess_mulmlp",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "pipeline_update",
             bool,
             optional=True,

@@ -234,6 +234,7 @@ class RepformerArgs:
         pipeline_update: bool = False,
         pre_ln: bool = False,
         no_repinit: bool = False,
+        g1_mess_mulmlp: bool = False,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -359,6 +360,7 @@ class RepformerArgs:
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
         self.pipeline_update = pipeline_update
+        self.g1_mess_mulmlp = g1_mess_mulmlp
 
     def __getitem__(self, key):
         if hasattr(self, key):

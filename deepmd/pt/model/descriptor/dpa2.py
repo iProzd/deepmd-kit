@@ -259,6 +259,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             update_g1_bidirect=self.repformer_args.update_g1_bidirect,
             pipeline_update=self.repformer_args.pipeline_update,
             pre_ln=self.repformer_args.pre_ln,
+            g1_mess_mulmlp=self.repformer_args.g1_mess_mulmlp,
             seed=child_seed(seed, 1),
         )
         self.no_repinit = self.repformer_args.no_repinit

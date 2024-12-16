@@ -133,6 +133,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         update_g1_bidirect: bool = False,
         pipeline_update: bool = False,
         pre_ln: bool = False,
+        g1_mess_mulmlp: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -279,6 +280,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.update_g1_bidirect = update_g1_bidirect
         self.pipeline_update = pipeline_update
         self.pre_ln = pre_ln
+        self.g1_mess_mulmlp = g1_mess_mulmlp
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -381,6 +383,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     update_g1_bidirect=self.update_g1_bidirect,
                     pipeline_update=self.pipeline_update,
                     pre_ln=self.pre_ln,
+                    g1_mess_mulmlp=self.g1_mess_mulmlp,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

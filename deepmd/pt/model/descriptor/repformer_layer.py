@@ -483,6 +483,7 @@ class RepformerLayer(torch.nn.Module):
         update_g1_bidirect: bool = False,
         pipeline_update: bool = False,
         pre_ln: bool = False,
+        g1_mess_mulmlp: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -542,6 +543,7 @@ class RepformerLayer(torch.nn.Module):
         self.use_undirect_a = use_undirect_a
         self.update_g1_bidirect = update_g1_bidirect
         self.pipeline_update = pipeline_update
+        self.g1_mess_mulmlp = g1_mess_mulmlp
         self.prec = PRECISION_DICT[precision]
         self.g1_layernorm = None
         self.g2_layernorm = None
@@ -1162,7 +1164,10 @@ class RepformerLayer(torch.nn.Module):
             assert self.g1_edge_linear2 is not None
             # nb x nloc x nnei x ng1
             # receive
-            g1_edge_info = self.act(self.g1_edge_linear1(edge_info)) * sw.unsqueeze(-1)
+            g1_edge_info = self.act(self.g1_edge_linear1(edge_info))
+            if self.g1_mess_mulmlp:
+                g1_edge_info = self.act(self.g1_edge_linear2(g1_edge_info))
+            g1_edge_info = g1_edge_info * sw.unsqueeze(-1)
             g1_edge_update = torch.sum(g1_edge_info, dim=-2) / self.nnei
             g1_update.append(g1_edge_update)
             if self.update_g1_bidirect:
