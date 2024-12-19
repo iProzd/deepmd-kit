@@ -137,6 +137,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         update_g2_has_ar: bool = False,
         update_g1_has_ar: bool = False,
         update_g2_has_arra: bool = False,
+        compress_a: bool = False,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -287,6 +288,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.update_g2_has_ar = update_g2_has_ar
         self.update_g1_has_ar = update_g1_has_ar
         self.update_g2_has_arra = update_g2_has_arra
+        self.compress_a = compress_a
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -393,6 +395,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     update_g2_has_ar=self.update_g2_has_ar,
                     update_g1_has_ar=self.update_g1_has_ar,
                     update_g2_has_arra=self.update_g2_has_arra,
+                    compress_a=self.compress_a,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

@@ -263,6 +263,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             update_g2_has_ar=self.repformer_args.update_g2_has_ar,
             update_g1_has_ar=self.repformer_args.update_g1_has_ar,
             update_g2_has_arra=self.repformer_args.update_g2_has_arra,
+            compress_a=self.repformer_args.compress_a,
             seed=child_seed(seed, 1),
         )
         self.no_repinit = self.repformer_args.no_repinit
