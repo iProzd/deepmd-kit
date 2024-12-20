@@ -488,6 +488,7 @@ class RepformerLayer(torch.nn.Module):
         update_g1_has_ar: bool = False,
         update_g2_has_arra: bool = False,
         compress_a: bool = False,
+        g1_bi_message: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         super().__init__()
@@ -552,6 +553,7 @@ class RepformerLayer(torch.nn.Module):
         self.update_g1_has_ar = update_g1_has_ar
         self.update_g2_has_arra = update_g2_has_arra
         self.compress_a = compress_a
+        self.g1_bi_message = g1_bi_message
         self.prec = PRECISION_DICT[precision]
         self.g1_layernorm = None
         self.g2_layernorm = None
@@ -680,6 +682,17 @@ class RepformerLayer(torch.nn.Module):
                 )  # need act # send
             else:
                 self.g1_edge_linear_send = None
+
+            if self.g1_bi_message:
+                self.g1_edge_linear_receive_head2 = MLPLayer(
+                    self.edge_info_dim,
+                    g1_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 22),
+                )  # need act # receive 2
+            else:
+                self.g1_edge_linear_receive_head2 = None
+
             if self.update_style == "res_residual":
                 self.g1_residual.append(
                     get_residual(
@@ -698,6 +711,16 @@ class RepformerLayer(torch.nn.Module):
                             self.update_residual_init,
                             precision=precision,
                             seed=child_seed(seed, 21),
+                        )
+                    )
+                if self.g1_bi_message:
+                    self.g1_residual.append(
+                        get_residual(
+                            g1_dim,
+                            self.update_residual,
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 23),
                         )
                     )
 
@@ -1241,6 +1264,19 @@ class RepformerLayer(torch.nn.Module):
             g1_edge_info = g1_edge_info * sw.unsqueeze(-1)
             g1_edge_update = torch.sum(g1_edge_info, dim=-2) / self.nnei
             g1_update.append(g1_edge_update)
+
+            if self.g1_bi_message:
+                # reveive multihead
+                assert self.g1_edge_linear_receive_head2 is not None
+                g1_edge_info_reveive2 = self.act(
+                    self.g1_edge_linear_receive_head2(edge_info)
+                )
+                g1_edge_info_reveive2 = g1_edge_info_reveive2 * sw.unsqueeze(-1)
+                g1_edge_update_reveive2 = (
+                    torch.sum(g1_edge_info_reveive2, dim=-2) / self.nnei
+                )
+                g1_update.append(g1_edge_update_reveive2)
+
             if self.update_g1_bidirect:
                 # send message
                 assert self.g1_edge_linear_send is not None

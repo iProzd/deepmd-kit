@@ -1211,6 +1211,12 @@ def dpa2_repformer_args():
             default=False,
         ),
         Argument(
+            "g1_bi_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "a_dim",
             int,
             optional=True,
