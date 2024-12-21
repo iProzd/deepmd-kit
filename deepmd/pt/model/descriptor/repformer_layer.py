@@ -834,14 +834,13 @@ class RepformerLayer(torch.nn.Module):
                     elementwise_affine=trainable_ln,
                 )
             angle_seed = 20
+            self.angle_dim = self.a_dim
             if self.compress_a == 0:
-                self.angle_dim = self.a_dim
                 self.angle_dim += self.g1_dim if self.update_a_has_g1 else 0
                 self.angle_dim += 2 * self.g2_dim if self.update_a_has_g2 else 0
                 self.compress_n_linear = None
                 self.compress_e_linear = None
             else:
-                self.angle_dim = self.a_dim // self.compress_a
                 self.angle_dim += (
                     self.a_dim // self.compress_a if self.update_a_has_g1 else 0
                 )
@@ -862,16 +861,6 @@ class RepformerLayer(torch.nn.Module):
                     bias=False,
                     seed=child_seed(seed, angle_seed + 2),
                 )
-                if self.compress_a > 1:
-                    self.compress_a_linear = MLPLayer(
-                        self.a_dim,
-                        self.a_dim // self.compress_a,
-                        precision=precision,
-                        bias=False,
-                        seed=child_seed(seed, angle_seed + 4),
-                    )
-                else:
-                    self.compress_a_linear = None
 
             self.g2_angle_dim = self.angle_dim
             self.angle_linear = MLPLayer(
@@ -1434,9 +1423,6 @@ class RepformerLayer(torch.nn.Module):
                 g1_for_angle = self.compress_n_linear(g1)
                 # nb x nloc x nnei x a/2c
                 g2_for_angle = self.compress_e_linear(g2)
-                if self.compress_a > 1:
-                    assert self.compress_a_linear is not None
-                    angle_embed = self.compress_a_linear(angle_embed)
             else:
                 g1_for_angle = g1
                 g2_for_angle = g2
