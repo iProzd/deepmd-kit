@@ -238,7 +238,7 @@ class RepformerArgs:
         update_g2_has_ar: bool = False,
         update_g1_has_ar: bool = False,
         update_g2_has_arra: bool = False,
-        compress_a: bool = False,
+        compress_a: int = 0,
         g1_bi_message: bool = False,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.

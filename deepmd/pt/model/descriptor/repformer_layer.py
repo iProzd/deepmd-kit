@@ -487,7 +487,7 @@ class RepformerLayer(torch.nn.Module):
         update_g2_has_ar: bool = False,
         update_g1_has_ar: bool = False,
         update_g2_has_arra: bool = False,
-        compress_a: bool = False,
+        compress_a: int = 0,
         g1_bi_message: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -834,29 +834,44 @@ class RepformerLayer(torch.nn.Module):
                     elementwise_affine=trainable_ln,
                 )
             angle_seed = 20
-            self.angle_dim = self.a_dim
-            if not self.compress_a:
+            if self.compress_a == 0:
+                self.angle_dim = self.a_dim
                 self.angle_dim += self.g1_dim if self.update_a_has_g1 else 0
                 self.angle_dim += 2 * self.g2_dim if self.update_a_has_g2 else 0
                 self.compress_n_linear = None
                 self.compress_e_linear = None
             else:
-                self.angle_dim += self.a_dim if self.update_a_has_g1 else 0
-                self.angle_dim += self.a_dim if self.update_a_has_g2 else 0
+                self.angle_dim = self.a_dim // self.compress_a
+                self.angle_dim += (
+                    self.a_dim // self.compress_a if self.update_a_has_g1 else 0
+                )
+                self.angle_dim += (
+                    self.a_dim // self.compress_a if self.update_a_has_g2 else 0
+                )
                 self.compress_n_linear = MLPLayer(
                     self.g1_dim,
-                    self.a_dim,
+                    self.a_dim // self.compress_a,
                     precision=precision,
                     bias=False,
                     seed=child_seed(seed, angle_seed + 3),
                 )
                 self.compress_e_linear = MLPLayer(
-                    self.g2_dim * 2,
-                    self.a_dim,
+                    self.g2_dim,
+                    self.a_dim // (2 * self.compress_a),
                     precision=precision,
                     bias=False,
                     seed=child_seed(seed, angle_seed + 2),
                 )
+                if self.compress_a > 1:
+                    self.compress_a_linear = MLPLayer(
+                        self.a_dim,
+                        self.a_dim // self.compress_a,
+                        precision=precision,
+                        bias=False,
+                        seed=child_seed(seed, angle_seed + 4),
+                    )
+                else:
+                    self.compress_a_linear = None
 
             self.g2_angle_dim = self.angle_dim
             self.angle_linear = MLPLayer(
@@ -1412,31 +1427,39 @@ class RepformerLayer(torch.nn.Module):
             assert (
                 not self.use_undirect_g2
             ), "use angle update can not use undirect g2 yet"
-            # nb x nloc x a_nnei x a_nnei x g1
-            g1_angle_embed = torch.tile(
-                g1.unsqueeze(2).unsqueeze(2), (1, 1, self.a_sel, self.a_sel, 1)
-            )
-            # nb x nloc x a_nnei x g2
-            g2_angle = g2[:, :, : self.a_sel, :]
-            # nb x nloc x a_nnei x g2
-            g2_angle = torch.where(angle_nlist_mask.unsqueeze(-1), g2_angle, 0.0)
-            # nb x nloc x (a_nnei) x a_nnei x g2
-            g2_angle_i = torch.tile(g2_angle.unsqueeze(2), (1, 1, self.a_sel, 1, 1))
-            # nb x nloc x a_nnei x (a_nnei) x g2
-            g2_angle_j = torch.tile(g2_angle.unsqueeze(3), (1, 1, 1, self.a_sel, 1))
-            # nb x nloc x a_nnei x a_nnei x (g2 + g2)
-            g2_angle_embed = torch.cat([g2_angle_i, g2_angle_j], dim=-1)
-            if self.compress_a:
+            if self.compress_a != 0:
                 assert self.compress_n_linear is not None
                 assert self.compress_e_linear is not None
-                # nb x nloc x a_nnei x a_nnei x a_dim
-                g1_angle_embed = self.compress_n_linear(g1_angle_embed)
-                # nb x nloc x a_nnei x a_nnei x a_dim
-                g2_angle_embed = self.compress_e_linear(g2_angle_embed)
+                # nb x nloc x a/c
+                g1_for_angle = self.compress_n_linear(g1)
+                # nb x nloc x nnei x a/2c
+                g2_for_angle = self.compress_e_linear(g2)
+                if self.compress_a > 1:
+                    assert self.compress_a_linear is not None
+                    angle_embed = self.compress_a_linear(angle_embed)
+            else:
+                g1_for_angle = g1
+                g2_for_angle = g2
+
+            # nb x nloc x a_nnei x a_nnei x (g1 or a/c)
+            g1_angle_embed = torch.tile(
+                g1_for_angle.unsqueeze(2).unsqueeze(2),
+                (1, 1, self.a_sel, self.a_sel, 1),
+            )
+            # nb x nloc x a_nnei x (g2 or a/2c)
+            g2_angle = g2_for_angle[:, :, : self.a_sel, :]
+            # nb x nloc x a_nnei x (g2 or a/2c)
+            g2_angle = torch.where(angle_nlist_mask.unsqueeze(-1), g2_angle, 0.0)
+            # nb x nloc x (a_nnei) x a_nnei x (g2 or a/2c)
+            g2_angle_i = torch.tile(g2_angle.unsqueeze(2), (1, 1, self.a_sel, 1, 1))
+            # nb x nloc x a_nnei x (a_nnei) x (g2 or a/2c)
+            g2_angle_j = torch.tile(g2_angle.unsqueeze(3), (1, 1, 1, self.a_sel, 1))
+            # nb x nloc x a_nnei x a_nnei x (g2 + g2 or a/c)
+            g2_angle_embed = torch.cat([g2_angle_i, g2_angle_j], dim=-1)
 
             # angle for g2:
             updated_g2_angle_list = [angle_embed] if self.update_g2_has_a else []
-            # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2) or (a + a + a)
+            # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2) or (a + a/c + a/c)
             updated_g2_angle_list += [g1_angle_embed, g2_angle_embed]
             updated_g2_angle = torch.cat(updated_g2_angle_list, dim=-1)
             # nb x nloc x a_nnei x a_nnei x g2

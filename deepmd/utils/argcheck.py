@@ -1248,9 +1248,9 @@ def dpa2_repformer_args():
         ),
         Argument(
             "compress_a",
-            bool,
+            int,
             optional=True,
-            default=False,
+            default=0,
         ),
         Argument(
             "update_a_has_g2",
