@@ -1444,9 +1444,12 @@ class RepformerLayer(torch.nn.Module):
             g2_angle_embed = torch.cat([g2_angle_i, g2_angle_j], dim=-1)
 
             # angle for g2:
-            updated_g2_angle_list = [angle_embed] if self.update_g2_has_a else []
+            updated_g2_angle_list = [angle_embed]
             # nb x nloc x a_nnei x a_nnei x (a + g1 + g2*2) or (a + a/c + a/c)
-            updated_g2_angle_list += [g1_angle_embed, g2_angle_embed]
+            if self.update_a_has_g1:
+                updated_g2_angle_list += [g1_angle_embed]
+            if self.update_a_has_g2:
+                updated_g2_angle_list += [g2_angle_embed]
             updated_g2_angle = torch.cat(updated_g2_angle_list, dim=-1)
             # nb x nloc x a_nnei x a_nnei x g2
             updated_angle_g2 = self.act(self.g2_angle_linear1(updated_g2_angle))
