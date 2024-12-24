@@ -139,6 +139,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         update_g2_has_arra: bool = False,
         compress_a: int = 0,
         g1_bi_message: bool = False,
+        g1_message_head: int = 1,
     ) -> None:
         r"""
         The repformer descriptor block.
@@ -291,6 +292,7 @@ class DescrptBlockRepformers(DescriptorBlock):
         self.update_g2_has_arra = update_g2_has_arra
         self.compress_a = compress_a
         self.g1_bi_message = g1_bi_message
+        self.g1_message_head = g1_message_head
         if num_a % 2 != 1:
             raise ValueError(f"{num_a=} must be an odd integer")
         circular_harmonics_order = (num_a - 1) // 2
@@ -399,6 +401,7 @@ class DescrptBlockRepformers(DescriptorBlock):
                     update_g2_has_arra=self.update_g2_has_arra,
                     compress_a=self.compress_a,
                     g1_bi_message=self.g1_bi_message,
+                    g1_message_head=self.g1_message_head,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

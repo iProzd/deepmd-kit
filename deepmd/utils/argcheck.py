@@ -1283,6 +1283,12 @@ def dpa2_repformer_args():
             default=False,
         ),
         Argument(
+            "g1_message_head",
+            int,
+            optional=True,
+            default=1,
+        ),
+        Argument(
             "update_g2_has_ar",
             bool,
             optional=True,

@@ -240,6 +240,7 @@ class RepformerArgs:
         update_g2_has_arra: bool = False,
         compress_a: int = 0,
         g1_bi_message: bool = False,
+        g1_message_head: int = 1,
     ) -> None:
         r"""The constructor for the RepformerArgs class which defines the parameters of the repformer block in DPA2 descriptor.
 
@@ -371,6 +372,7 @@ class RepformerArgs:
         self.g1_mess_mulmlp = g1_mess_mulmlp
         self.compress_a = compress_a
         self.g1_bi_message = g1_bi_message
+        self.g1_message_head = g1_message_head
 
     def __getitem__(self, key):
         if hasattr(self, key):
