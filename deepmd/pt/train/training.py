@@ -577,10 +577,15 @@ class Trainer:
 
         # TODO add optimizers for multitask
         # author: iProzd
-        if self.opt_type == "Adam":
-            self.optimizer = torch.optim.Adam(
-                self.wrapper.parameters(), lr=self.lr_exp.start_lr, fused=True
-            )
+        if self.opt_type in ["Adam", "AdamW"]:
+            if self.opt_type == "Adam":
+                self.optimizer = torch.optim.Adam(
+                    self.wrapper.parameters(), lr=self.lr_exp.start_lr, fused=True
+                )
+            else:
+                self.optimizer = torch.optim.AdamW(
+                    self.wrapper.parameters(), lr=self.lr_exp.start_lr, fused=True
+                )
             if optimizer_state_dict is not None and self.restart_training:
                 self.optimizer.load_state_dict(optimizer_state_dict)
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -676,7 +681,7 @@ class Trainer:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
                 fout1.flush()
-            if self.opt_type == "Adam":
+            if self.opt_type in ["Adam", "AdamW"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr

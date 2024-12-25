@@ -3072,6 +3072,7 @@ def training_args(
             "opt_type",
             choices=[
                 Argument("Adam", dict, [], [], optional=True),
+                Argument("AdamW", dict, [], [], optional=True),
                 Argument(
                     "LKF",
                     dict,
