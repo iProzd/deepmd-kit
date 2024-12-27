@@ -1535,6 +1535,18 @@ def dpa3_repflow_args():
             default="const",
             doc=doc_update_residual_init,
         ),
+        Argument(
+            "a_mess_has_n",
+            bool,
+            optional=True,
+            default=True,
+        ),
+        Argument(
+            "a_compress_e_rate",
+            int,
+            optional=True,
+            default=1,
+        ),
     ]
 
 

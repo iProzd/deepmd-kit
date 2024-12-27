@@ -15,6 +15,8 @@ class RepFlowArgs:
         a_rcut_smth: float = 3.5,
         a_sel: int = 20,
         a_compress_rate: int = 0,
+        a_mess_has_n: bool = True,
+        a_compress_e_rate: int = 1,
         n_multi_edge_message: int = 1,
         axis_neuron: int = 4,
         update_angle: bool = True,
@@ -89,6 +91,8 @@ class RepFlowArgs:
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
         self.skip_stat = skip_stat
+        self.a_mess_has_n = a_mess_has_n
+        self.a_compress_e_rate = a_compress_e_rate
 
     def __getitem__(self, key):
         if hasattr(self, key):

@@ -46,6 +46,8 @@ class RepFlowLayer(torch.nn.Module):
         e_dim: int = 16,
         a_dim: int = 64,
         a_compress_rate: int = 0,
+        a_mess_has_n: bool = True,
+        a_compress_e_rate: int = 1,
         n_multi_edge_message: int = 1,
         axis_neuron: int = 4,
         update_angle: bool = True,  # angle
@@ -87,6 +89,8 @@ class RepFlowLayer(torch.nn.Module):
         self.update_style = update_style
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
+        self.a_mess_has_n = a_mess_has_n
+        self.a_compress_e_rate = a_compress_e_rate
         self.precision = precision
         self.seed = seed
         self.prec = PRECISION_DICT[precision]
@@ -181,12 +185,20 @@ class RepFlowLayer(torch.nn.Module):
             self.angle_dim = self.a_dim
             if self.a_compress_rate == 0:
                 # angle + node + edge * 2
-                self.angle_dim += self.n_dim + 2 * self.e_dim
+                self.angle_dim += self.n_dim if self.a_mess_has_n else 0
+                self.angle_dim += 2 * self.e_dim
                 self.a_compress_n_linear = None
                 self.a_compress_e_linear = None
             else:
                 # angle + node/c + edge/2c * 2
-                self.angle_dim += 2 * (self.a_dim // self.a_compress_rate)
+                # node : node/c or 0
+                self.angle_dim += (
+                    self.a_dim // self.a_compress_rate if self.a_mess_has_n else 0
+                )
+                # edge : edge/2c * 2 * e_rate
+                self.angle_dim += (
+                    self.a_dim // self.a_compress_rate
+                ) * self.a_compress_e_rate
                 self.a_compress_n_linear = MLPLayer(
                     self.n_dim,
                     self.a_dim // self.a_compress_rate,
@@ -196,7 +208,7 @@ class RepFlowLayer(torch.nn.Module):
                 )
                 self.a_compress_e_linear = MLPLayer(
                     self.e_dim,
-                    self.a_dim // (2 * self.a_compress_rate),
+                    self.a_dim // (2 * self.a_compress_rate) * self.a_compress_e_rate,
                     precision=precision,
                     bias=False,
                     seed=child_seed(seed, 9),
@@ -523,7 +535,10 @@ class RepFlowLayer(torch.nn.Module):
             edge_for_angle_info = torch.cat(
                 [edge_for_angle_i, edge_for_angle_j], dim=-1
             )
-            angle_info_list = [angle_ebd, node_for_angle_info, edge_for_angle_info]
+            angle_info_list = [angle_ebd]
+            if self.a_mess_has_n:
+                angle_info_list.append(node_for_angle_info)
+            angle_info_list.append(edge_for_angle_info)
             # nb x nloc x a_nnei x a_nnei x (a + n_dim + e_dim*2) or (a + a/c + a/c)
             angle_info = torch.cat(angle_info_list, dim=-1)
 
