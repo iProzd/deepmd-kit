@@ -47,6 +47,7 @@ class RepFlowLayer(torch.nn.Module):
         a_dim: int = 64,
         a_compress_rate: int = 0,
         a_mess_has_n: bool = True,
+        a_use_e_mess: bool = False,
         a_compress_e_rate: int = 1,
         n_multi_edge_message: int = 1,
         axis_neuron: int = 4,
@@ -75,6 +76,7 @@ class RepFlowLayer(torch.nn.Module):
         self.e_dim = e_dim
         self.a_dim = a_dim
         self.a_compress_rate = a_compress_rate
+        self.a_use_e_mess = a_use_e_mess
         if a_compress_rate != 0:
             assert a_dim % (2 * a_compress_rate) == 0, (
                 f"For a_compress_rate of {a_compress_rate}, a_dim must be divisible by {2 * a_compress_rate}. "
@@ -502,15 +504,19 @@ class RepFlowLayer(torch.nn.Module):
             assert self.angle_self_linear is not None
             assert self.edge_angle_linear1 is not None
             assert self.edge_angle_linear2 is not None
+            if self.a_use_e_mess:
+                edge_ebd_for_a_before_cp = edge_self_update
+            else:
+                edge_ebd_for_a_before_cp = edge_ebd
             # get angle info
             if self.a_compress_rate != 0:
                 assert self.a_compress_n_linear is not None
                 assert self.a_compress_e_linear is not None
                 node_ebd_for_angle = self.a_compress_n_linear(node_ebd)
-                edge_ebd_for_angle = self.a_compress_e_linear(edge_ebd)
+                edge_ebd_for_angle = self.a_compress_e_linear(edge_ebd_for_a_before_cp)
             else:
                 node_ebd_for_angle = node_ebd
-                edge_ebd_for_angle = edge_ebd
+                edge_ebd_for_angle = edge_ebd_for_a_before_cp
 
             # nb x nloc x a_nnei x a_nnei x n_dim
             node_for_angle_info = torch.tile(

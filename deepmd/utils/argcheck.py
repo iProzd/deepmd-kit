@@ -1542,6 +1542,12 @@ def dpa3_repflow_args():
             default=True,
         ),
         Argument(
+            "a_use_e_mess",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "a_compress_e_rate",
             int,
             optional=True,
