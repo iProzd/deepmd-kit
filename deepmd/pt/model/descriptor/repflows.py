@@ -89,6 +89,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         a_compress_e_rate: int = 1,
         a_mess_has_n: bool = True,
         a_use_e_mess: bool = False,
+        a_compress_use_split: bool = False,
         n_multi_edge_message: int = 1,
         axis_neuron: int = 4,
         update_angle: bool = True,
@@ -195,6 +196,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.a_mess_has_n = a_mess_has_n
         self.a_use_e_mess = a_use_e_mess
         self.a_compress_e_rate = a_compress_e_rate
+        self.a_compress_use_split = a_compress_use_split
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -238,6 +240,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     a_compress_rate=self.a_compress_rate,
                     a_mess_has_n=self.a_mess_has_n,
                     a_use_e_mess=self.a_use_e_mess,
+                    a_compress_use_split=self.a_compress_use_split,
                     a_compress_e_rate=self.a_compress_e_rate,
                     n_multi_edge_message=self.n_multi_edge_message,
                     axis_neuron=self.axis_neuron,

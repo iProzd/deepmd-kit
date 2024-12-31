@@ -1548,6 +1548,12 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "a_compress_use_split",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "a_compress_e_rate",
             int,
             optional=True,
