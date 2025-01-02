@@ -1569,7 +1569,7 @@ def dpa3_repflow_args():
             "h1_dim",
             int,
             optional=True,
-            default=32,
+            default=16,
         ),
     ]
 
