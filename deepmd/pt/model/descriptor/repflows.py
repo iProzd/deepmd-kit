@@ -97,6 +97,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         update_style: str = "res_residual",
         update_residual: float = 0.1,
         update_residual_init: str = "const",
+        update_n_has_h1: bool = False,
+        h1_dim: int = 16,
         set_davg_zero: bool = True,
         exclude_types: list[tuple[int, int]] = [],
         env_protection: float = 0.0,
@@ -197,6 +199,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.a_use_e_mess = a_use_e_mess
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
+        self.update_n_has_h1 = update_n_has_h1
+        self.h1_dim = h1_dim
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -223,6 +227,17 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.angle_embd = MLPLayer(
             1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
         )
+        if self.update_n_has_h1:
+            self.h1_embd = MLPLayer(
+                1,
+                self.h1_dim,
+                precision=precision,
+                bias=False,
+                stddev=self.h1_dim**0.5,
+                seed=child_seed(seed, 2),
+            )
+        else:
+            self.h1_embd = None
         layers = []
         for ii in range(nlayers):
             layers.append(
@@ -245,6 +260,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     n_multi_edge_message=self.n_multi_edge_message,
                     axis_neuron=self.axis_neuron,
                     update_angle=self.update_angle,
+                    update_n_has_h1=self.update_n_has_h1,
+                    h1_dim=self.h1_dim,
                     activation_function=self.activation_function,
                     update_style=self.update_style,
                     update_residual=self.update_residual,
@@ -436,6 +453,13 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_ebd = self.angle_embd(cosine_ij).reshape(
             nframes, nloc, self.a_sel, self.a_sel, self.a_dim
         )
+        if self.update_n_has_h1:
+            assert self.h1_embd is not None
+            h1 = torch.sum(
+                self.h1_embd(h2.view([nframes, nloc, nnei, 3, 1])), dim=2
+            ) / (nnei**0.5)
+        else:
+            h1 = None
 
         # set all padding positions to index of 0
         # if the a neighbor is real or not is indicated by nlist_mask
@@ -443,16 +467,32 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nb x nall x n_dim
         if comm_dict is None:
             assert mapping is not None
+            mapping3 = (
+                mapping.view(nframes, nall)
+                .unsqueeze(-1)
+                .unsqueeze(-1)
+                .expand(-1, -1, 3, self.h1_dim)
+            )
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
+        else:
+            mapping3 = None
+
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim
             if comm_dict is None:
                 assert mapping is not None
+                assert mapping3 is not None
                 node_ebd_ext = torch.gather(node_ebd, 1, mapping)
+                if self.update_n_has_h1:
+                    assert h1 is not None
+                    h1_ext = torch.gather(h1, 1, mapping3)
+                else:
+                    h1_ext = None
             else:
+                h1_ext = None
                 has_spin = "has_spin" in comm_dict
                 if not has_spin:
                     n_padding = nall - nloc
@@ -509,7 +549,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            node_ebd, edge_ebd, angle_ebd = ll.forward(
+            node_ebd, edge_ebd, angle_ebd, h1 = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
                 h2,
@@ -520,6 +560,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_nlist,
                 a_nlist_mask,
                 a_sw,
+                h1_ext,
             )
 
         # nb x nloc x 3 x e_dim

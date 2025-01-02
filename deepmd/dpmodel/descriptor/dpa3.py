@@ -24,6 +24,8 @@ class RepFlowArgs:
         update_style: str = "res_residual",
         update_residual: float = 0.1,
         update_residual_init: str = "const",
+        update_n_has_h1: bool = False,
+        h1_dim: int = 16,
         skip_stat: bool = False,
         a_compress_use_split: bool = False,
     ) -> None:
@@ -97,6 +99,8 @@ class RepFlowArgs:
         self.a_use_e_mess = a_use_e_mess
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
+        self.update_n_has_h1 = update_n_has_h1
+        self.h1_dim = h1_dim
 
     def __getitem__(self, key):
         if hasattr(self, key):

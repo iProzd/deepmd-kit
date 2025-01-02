@@ -1559,6 +1559,18 @@ def dpa3_repflow_args():
             optional=True,
             default=1,
         ),
+        Argument(
+            "update_n_has_h1",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "h1_dim",
+            int,
+            optional=True,
+            default=32,
+        ),
     ]
 
 
