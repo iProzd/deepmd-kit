@@ -25,6 +25,10 @@ class RepFlowArgs:
         update_residual: float = 0.1,
         update_residual_init: str = "const",
         update_n_has_h1: bool = False,
+        update_e_has_h1: bool = False,
+        h1_message_sub_axis: int = 4,
+        h1_message_idc: bool = False,
+        h1_message_only_nei: bool = False,
         h1_dim: int = 16,
         skip_stat: bool = False,
         a_compress_use_split: bool = False,
@@ -100,6 +104,10 @@ class RepFlowArgs:
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
         self.update_n_has_h1 = update_n_has_h1
+        self.update_e_has_h1 = update_e_has_h1
+        self.h1_message_sub_axis = h1_message_sub_axis
+        self.h1_message_idc = h1_message_idc
+        self.h1_message_only_nei = h1_message_only_nei
         self.h1_dim = h1_dim
 
     def __getitem__(self, key):

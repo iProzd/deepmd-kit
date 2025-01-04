@@ -1571,6 +1571,30 @@ def dpa3_repflow_args():
             optional=True,
             default=16,
         ),
+        Argument(
+            "update_e_has_h1",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "h1_message_sub_axis",
+            int,
+            optional=True,
+            default=4,
+        ),
+        Argument(
+            "h1_message_idc",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "h1_message_only_nei",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

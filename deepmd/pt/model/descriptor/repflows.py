@@ -98,6 +98,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         update_residual: float = 0.1,
         update_residual_init: str = "const",
         update_n_has_h1: bool = False,
+        update_e_has_h1: bool = False,
+        h1_message_sub_axis: int = 4,
+        h1_message_idc: bool = False,
+        h1_message_only_nei: bool = False,
         h1_dim: int = 16,
         set_davg_zero: bool = True,
         exclude_types: list[tuple[int, int]] = [],
@@ -200,6 +204,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
         self.update_n_has_h1 = update_n_has_h1
+        self.update_e_has_h1 = update_e_has_h1
+        self.h1_message_sub_axis = h1_message_sub_axis
+        self.h1_message_idc = h1_message_idc
+        self.h1_message_only_nei = h1_message_only_nei
         self.h1_dim = h1_dim
 
         self.n_dim = n_dim
@@ -227,7 +235,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.angle_embd = MLPLayer(
             1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
         )
-        if self.update_n_has_h1:
+        self.has_h1 = self.update_n_has_h1 or self.update_e_has_h1
+        if self.has_h1:
             self.h1_embd = MLPLayer(
                 1,
                 self.h1_dim,
@@ -261,6 +270,10 @@ class DescrptBlockRepflows(DescriptorBlock):
                     axis_neuron=self.axis_neuron,
                     update_angle=self.update_angle,
                     update_n_has_h1=self.update_n_has_h1,
+                    update_e_has_h1=self.update_e_has_h1,
+                    h1_message_sub_axis=self.h1_message_sub_axis,
+                    h1_message_idc=self.h1_message_idc,
+                    h1_message_only_nei=self.h1_message_only_nei,
                     h1_dim=self.h1_dim,
                     activation_function=self.activation_function,
                     update_style=self.update_style,
@@ -453,7 +466,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_ebd = self.angle_embd(cosine_ij).reshape(
             nframes, nloc, self.a_sel, self.a_sel, self.a_dim
         )
-        if self.update_n_has_h1:
+        if self.has_h1:
             assert self.h1_embd is not None
             h1 = torch.sum(
                 self.h1_embd(h2.view([nframes, nloc, nnei, 3, 1])), dim=2
@@ -486,7 +499,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 assert mapping is not None
                 assert mapping3 is not None
                 node_ebd_ext = torch.gather(node_ebd, 1, mapping)
-                if self.update_n_has_h1:
+                if self.has_h1:
                     assert h1 is not None
                     h1_ext = torch.gather(h1, 1, mapping3)
                 else:

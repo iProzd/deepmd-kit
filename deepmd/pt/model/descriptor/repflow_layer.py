@@ -54,6 +54,10 @@ class RepFlowLayer(torch.nn.Module):
         axis_neuron: int = 4,
         update_angle: bool = True,  # angle
         update_n_has_h1: bool = False,
+        update_e_has_h1: bool = False,
+        h1_message_sub_axis: int = 4,
+        h1_message_idc: bool = False,
+        h1_message_only_nei: bool = False,
         h1_dim: int = 16,
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -99,6 +103,11 @@ class RepFlowLayer(torch.nn.Module):
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
         self.update_n_has_h1 = update_n_has_h1
+        self.update_e_has_h1 = update_e_has_h1
+        self.h1_message_sub_axis = h1_message_sub_axis
+        self.h1_message_idc = h1_message_idc
+        self.h1_message_only_nei = h1_message_only_nei
+        self.has_h1 = self.update_n_has_h1 or self.update_e_has_h1
         self.precision = precision
         self.seed = seed
         self.prec = PRECISION_DICT[precision]
@@ -115,7 +124,20 @@ class RepFlowLayer(torch.nn.Module):
         self.a_residual = []
         self.h1_residual = []
         self.edge_info_dim = self.n_dim * 2 + self.e_dim
-        self.node_h1_dim = self.n_dim * 2 + self.h1_dim * self.h1_dim * 3
+        # h_dim * h1_axis or h_dim * 1
+        self.h_info_dim = (
+            self.h1_dim * self.h1_message_sub_axis
+            if not self.h1_message_idc
+            else self.h1_dim
+        )
+        self.node_h1_dim = self.n_dim * 2 + self.e_dim
+        self.node_h1_dim += (
+            self.h_info_dim * 3 if not self.h1_message_only_nei else self.h_info_dim
+        )
+        self.node_h1_out_dim = 0
+        self.node_h1_out_dim += self.n_dim if self.update_n_has_h1 else 0
+        self.node_h1_out_dim += self.e_dim if self.update_e_has_h1 else 0
+        self.node_h1_out_dim += self.h1_dim * 2
 
         # node self mlp
         self.node_self_mlp = MLPLayer(
@@ -173,24 +195,15 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
 
-        # node h1 message
-        if self.update_n_has_h1:
-            self.node_h1_linear = MLPLayer(
+        # h1 message
+        if self.has_h1:
+            self.h1_linear = MLPLayer(
                 self.node_h1_dim,
-                self.n_dim + 2 * self.h1_dim,
+                self.node_h1_out_dim,
                 precision=precision,
                 seed=child_seed(seed, 5),
             )
             if self.update_style == "res_residual":
-                self.n_residual.append(
-                    get_residual(
-                        n_dim,
-                        self.update_residual,
-                        self.update_residual_init,
-                        precision=precision,
-                        seed=child_seed(seed, 15),
-                    )
-                )
                 self.h1_residual.append(
                     get_residual(
                         self.h1_dim,
@@ -201,7 +214,31 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
         else:
-            self.node_h1_linear = None
+            self.h1_linear = None
+
+        # node h1 message
+        if self.update_n_has_h1 and (self.update_style == "res_residual"):
+            self.n_residual.append(
+                get_residual(
+                    n_dim,
+                    self.update_residual,
+                    self.update_residual_init,
+                    precision=precision,
+                    seed=child_seed(seed, 15),
+                )
+            )
+
+        # edge h1 message
+        if self.update_e_has_h1 and (self.update_style == "res_residual"):
+            self.e_residual.append(
+                get_residual(
+                    e_dim,
+                    self.update_residual,
+                    self.update_residual_init,
+                    precision=precision,
+                    seed=child_seed(seed, 16),
+                )
+            )
 
         # edge self message
         self.edge_self_linear = MLPLayer(
@@ -545,10 +582,10 @@ class RepFlowLayer(torch.nn.Module):
         else:
             n_update_list.append(node_edge_update)
 
-        # node h1 message
-        if self.update_n_has_h1:
+        # h1 message
+        if self.has_h1:
             assert h1_ext is not None
-            assert self.node_h1_linear is not None
+            assert self.h1_linear is not None
             # nf x nloc x 3 x h1_dim
             h1 = h1_ext[:, :nloc]
             h1_update_list.append(h1)
@@ -558,45 +595,77 @@ class RepFlowLayer(torch.nn.Module):
             )
             # i: nf x nloc x nnei x 3 x h1_dim
             center_h1 = h1.unsqueeze(2).expand(-1, -1, nnei, -1, -1)
-            # hiThi : nf x nloc x nnei x (h1_dim x h1_dim)
-            h1i_h1i = (
-                torch.matmul(h1.transpose(2, 3), h1)
-                .view(nb, nloc, -1)
-                .unsqueeze(2)
-                .expand(-1, -1, nnei, -1)
+            # hiThj : nf x nloc x nnei x (h1_dim x h1_axis) or nf x nloc x nnei x h1_dim
+            h1i_h1j = (
+                torch.matmul(
+                    center_h1.transpose(3, 4), nei_h1[..., : self.h1_message_sub_axis]
+                ).view(nb, nloc, nnei, -1)
+                if not self.h1_message_idc
+                else ((center_h1 * nei_h1).sum(dim=-2))
             )
-            # hiThj : nf x nloc x nnei x (h1_dim x h1_dim)
-            h1i_h1j = torch.matmul(center_h1.transpose(3, 4), nei_h1).view(
-                nb, nloc, nnei, -1
-            )
-            # hjThj : nf x nloc x nnei x (h1_dim x h1_dim)
-            h1j_h1j = torch.matmul(nei_h1.transpose(3, 4), nei_h1).view(
-                nb, nloc, nnei, -1
-            )
-            # nf x nloc x nnei x (2 * n_dim + 3 * (h1_dim x h1_dim))
-            h1_node_info = torch.cat(
-                [
-                    torch.tile(node_ebd.unsqueeze(-2), [1, 1, self.nnei, 1]),
-                    nei_node_ebd,
-                    h1i_h1i,
-                    h1i_h1j,
-                    h1j_h1j,
-                ],
-                dim=-1,
-            )
-            # nf x nloc x nnei x (n_dim + 2 * h1_dim)
-            h1_node_info_mlp = self.act(
-                self.node_h1_linear(h1_node_info)
-            ) * sw.unsqueeze(-1)
-            # nf x nloc x nnei x n_dim
-            node_h1_update = h1_node_info_mlp[..., : self.n_dim]
-            # nf x nloc x n_dim
-            node_h1_update = torch.sum(node_h1_update, dim=-2) / self.nnei
-            n_update_list.append(node_h1_update)
+            h1_message_list = [
+                torch.tile(node_ebd.unsqueeze(-2), [1, 1, self.nnei, 1]),
+                nei_node_ebd,
+                edge_ebd,
+            ]
+            if not self.h1_message_only_nei:
+                # hiThi : nf x nloc x nnei x (h1_dim x h1_axis) or nf x nloc x nnei x h1_dim
+                h1i_h1i = (
+                    (
+                        torch.matmul(
+                            h1.transpose(2, 3), h1[..., : self.h1_message_sub_axis]
+                        )
+                        .view(nb, nloc, -1)
+                        .unsqueeze(2)
+                        .expand(-1, -1, nnei, -1)
+                    )
+                    if not self.h1_message_idc
+                    else ((h1 * h1).sum(dim=-2).unsqueeze(2).expand(-1, -1, nnei, -1))
+                )
+                # hjThj : nf x nloc x nnei x (h1_dim x h1_axis) or nf x nloc x nnei x h1_dim
+                h1j_h1j = (
+                    torch.matmul(
+                        nei_h1.transpose(3, 4), nei_h1[..., : self.h1_message_sub_axis]
+                    ).view(nb, nloc, nnei, -1)
+                    if not self.h1_message_idc
+                    else ((nei_h1 * nei_h1).sum(dim=-2))
+                )
+                h1_message_list += [h1i_h1i, h1i_h1j, h1j_h1j]
+            else:
+                h1_message_list += [h1i_h1j]
 
+            # nf x nloc x nnei x (2 * n_dim + e_dim + 3 * (h1_dim x h1_axis))
+            h1_info = torch.cat(h1_message_list, dim=-1)
+            # nf x nloc x nnei x (n_dim + 2 * h1_dim)
+            h1_info_mlp = self.act(self.h1_linear(h1_info)) * sw.unsqueeze(-1)
+            h1_out_axis_dim = 0
+
+            # node h1 message
+            if self.update_n_has_h1:
+                # nf x nloc x nnei x n_dim
+                node_h1_update = h1_info_mlp[
+                    ..., h1_out_axis_dim : h1_out_axis_dim + self.n_dim
+                ]
+                h1_out_axis_dim += self.n_dim
+                # nf x nloc x n_dim
+                node_h1_update = torch.sum(node_h1_update, dim=-2) / self.nnei
+                n_update_list.append(node_h1_update)
+
+            # edge h1 message
+            if self.update_e_has_h1:
+                # nf x nloc x nnei x e_dim
+                edge_h1_update = h1_info_mlp[
+                    ..., h1_out_axis_dim : h1_out_axis_dim + self.e_dim
+                ]
+                h1_out_axis_dim += self.e_dim
+                e_update_list.append(edge_h1_update)
+
+            # h1 self message
             # nf x nloc x nnei x h1_dim
-            h1_i_update = h1_node_info_mlp[..., self.n_dim : self.n_dim + self.h1_dim]
-            h1_j_update = h1_node_info_mlp[..., self.n_dim + self.h1_dim :]
+            h1_i_update = h1_info_mlp[
+                ..., h1_out_axis_dim : h1_out_axis_dim + self.h1_dim
+            ]
+            h1_j_update = h1_info_mlp[..., h1_out_axis_dim + self.h1_dim :]
             # nf x nloc x nnei x 3 x h1_dim
             h1_node_update = (
                 h1_i_update.unsqueeze(3) * center_h1 + h1_j_update.unsqueeze(3) * nei_h1
