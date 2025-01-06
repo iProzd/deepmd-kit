@@ -96,6 +96,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         use_tebd_bias: bool = False,
         type_map: Optional[List[str]] = None,
         old_impl: bool = False,
+        tebd_use_charge: bool = False,
     ):
         r"""The DPA-2 descriptor. see https://arxiv.org/abs/2312.15492.
 
@@ -257,6 +258,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         self.nsel_list = [ii[1] for ii in self.rcsl_list]
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
+        self.tebd_use_charge = tebd_use_charge
         self.type_map = type_map
         self.type_embedding = TypeEmbedNet(
             ntypes,
@@ -266,6 +268,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             use_econf_tebd=self.use_econf_tebd,
             use_tebd_bias=use_tebd_bias,
             type_map=type_map,
+            use_charge=self.tebd_use_charge,
         )
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision
@@ -687,6 +690,7 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[Dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
@@ -731,7 +735,9 @@ class DescrptDPA2(BaseDescriptor, torch.nn.Module):
             self.nsel_list,
         )
         # repinit
-        g1_ext = self.type_embedding(extended_atype)
+        g1_ext = self.type_embedding(
+            extended_atype, type_charge=extended_partial_charge
+        )
         g1_inp = g1_ext[:, :nloc, :]
         g1, _, _, _, _ = self.repinit(
             nlist_dict[

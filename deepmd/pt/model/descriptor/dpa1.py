@@ -249,6 +249,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         spin=None,
         type: Optional[str] = None,
         old_impl: bool = False,
+        tebd_use_charge: bool = False,
     ):
         super().__init__()
         # Ensure compatibility with the deprecated stripped_type_embedding option.
@@ -297,6 +298,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         )
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
+        self.tebd_use_charge = tebd_use_charge
         self.type_map = type_map
         self.type_embedding = TypeEmbedNet(
             ntypes,
@@ -306,6 +308,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             use_econf_tebd=use_econf_tebd,
             use_tebd_bias=use_tebd_bias,
             type_map=type_map,
+            use_charge=self.tebd_use_charge,
         )
         self.tebd_dim = tebd_dim
         self.concat_output_tebd = concat_output_tebd
@@ -563,6 +566,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[Dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 

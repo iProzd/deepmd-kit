@@ -155,6 +155,9 @@ def get_standard_model(model_params):
     # descriptor
     model_params["descriptor"]["ntypes"] = ntypes
     model_params["descriptor"]["type_map"] = copy.deepcopy(model_params["type_map"])
+    model_params["descriptor"]["tebd_use_charge"] = model_params.get(
+        "use_partial_charge", False
+    )
     descriptor = BaseDescriptor(**model_params["descriptor"])
     # fitting
     fitting_net = model_params.get("fitting_net", {})
@@ -193,6 +196,8 @@ def get_standard_model(model_params):
         pair_exclude_types=pair_exclude_types,
     )
     model.model_def_script = json.dumps(model_params_old)
+    if model_params.get("use_partial_charge", False):
+        model.set_charge()
     return model
 
 

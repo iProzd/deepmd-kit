@@ -63,6 +63,7 @@ class DPAtomicModel(BaseAtomicModel):
         self.rcut = self.descriptor.get_rcut()
         self.sel = self.descriptor.get_sel()
         self.fitting_net = fitting
+        self.has_charge = False
         super().init_out_stat()
 
     @torch.jit.export
@@ -73,6 +74,9 @@ class DPAtomicModel(BaseAtomicModel):
             if self.fitting_net is not None
             else self.coord_denoise_net.output_def()
         )
+
+    def set_charge(self):
+        self.has_charge = True
 
     @torch.jit.export
     def get_rcut(self) -> float:
@@ -158,6 +162,7 @@ class DPAtomicModel(BaseAtomicModel):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         comm_dict: Optional[Dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         """Return atomic prediction.
 
@@ -192,6 +197,7 @@ class DPAtomicModel(BaseAtomicModel):
             nlist,
             mapping=mapping,
             comm_dict=comm_dict,
+            extended_partial_charge=extended_partial_charge,
         )
         assert descriptor is not None
         # energy, force

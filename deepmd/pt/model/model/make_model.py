@@ -111,6 +111,7 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
             do_atomic_virial: bool = False,
+            partial_charge: Optional[torch.Tensor] = None,
         ) -> Dict[str, torch.Tensor]:
             """Return model prediction.
 
@@ -154,6 +155,13 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
                 mixed_types=self.mixed_types(),
                 box=bb,
             )
+
+            if partial_charge is not None:
+                extended_partial_charge = torch.gather(
+                    partial_charge, 1, mapping.unsqueeze(-1)
+                )
+            else:
+                extended_partial_charge = None
             model_predict_lower = self.forward_common_lower(
                 extended_coord,
                 extended_atype,
@@ -162,6 +170,7 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
                 do_atomic_virial=do_atomic_virial,
                 fparam=fp,
                 aparam=ap,
+                extended_partial_charge=extended_partial_charge,
             )
             model_predict = communicate_extended_output(
                 model_predict_lower,
@@ -216,6 +225,7 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
             do_atomic_virial: bool = False,
             comm_dict: Optional[Dict[str, torch.Tensor]] = None,
             extra_nlist_sort: bool = False,
+            extended_partial_charge: Optional[torch.Tensor] = None,
         ):
             """Return model prediction. Lower interface that takes
             extended atomic coordinates and types, nlist, and mapping
@@ -266,6 +276,7 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
                 fparam=fp,
                 aparam=ap,
                 comm_dict=comm_dict,
+                extended_partial_charge=extended_partial_charge,
             )
             model_predict = fit_output_to_model_output(
                 atomic_ret,
@@ -497,6 +508,14 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
         def get_dim_aparam(self) -> int:
             """Get the number (dimension) of atomic parameters of this atomic model."""
             return self.atomic_model.get_dim_aparam()
+
+        def has_charge(self) -> bool:
+            return getattr(self.atomic_model, "has_charge", False)
+
+        def set_charge(self):
+            set_charge = getattr(self.atomic_model, "set_charge", None)
+            if set_charge is not None and callable(set_charge):
+                set_charge()
 
         @torch.jit.export
         def get_sel_type(self) -> List[int]:
