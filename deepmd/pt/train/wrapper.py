@@ -73,6 +73,7 @@ class ModelWrapper(torch.nn.Module):
             class_type_base = shared_base["shared_type"]
             model_key_base = shared_base["model_key"]
             shared_level_base = shared_base["shared_level"]
+            base_atomic_model = self.model[model_key_base].atomic_model
             if "descriptor" in class_type_base:
                 if class_type_base == "descriptor":
                     base_class = self.model[model_key_base].get_descriptor()
@@ -113,8 +114,11 @@ class ModelWrapper(torch.nn.Module):
                         f"Shared params of {model_key_base}.{class_type_base} and {model_key_link}.{class_type_link}!"
                     )
             else:
-                if hasattr(self.model[model_key_base], class_type_base):
-                    base_class = self.model[model_key_base].__getattr__(class_type_base)
+                atomic_model_share_num = 1
+                if hasattr(self.model[model_key_base].atomic_model, class_type_base):
+                    base_class = self.model[model_key_base].atomic_model.__getattr__(
+                        class_type_base
+                    )
                     for link_item in shared_links[shared_item]["links"][1:]:
                         class_type_link = link_item["shared_type"]
                         model_key_link = link_item["model_key"]
@@ -125,15 +129,28 @@ class ModelWrapper(torch.nn.Module):
                         assert (
                             class_type_base == class_type_link
                         ), f"Class type mismatched: {class_type_base} vs {class_type_link}!"
-                        link_class = self.model[model_key_link].__getattr__(
-                            class_type_link
-                        )
+                        link_class = self.model[
+                            model_key_link
+                        ].atomic_model.__getattr__(class_type_link)
                         link_class.share_params(
                             base_class, shared_level_link, resume=resume
                         )
                         log.warning(
                             f"Shared params of {model_key_base}.{class_type_base} and {model_key_link}.{class_type_link}!"
                         )
+                        if class_type_base == "fitting_net" and shared_level_link == 1:
+                            # share bias in atomic model
+                            link_atomic_model = self.model[model_key_link].atomic_model
+                            link_atomic_model.share_params(
+                                base_atomic_model,
+                                shared_level_link,
+                                atomic_model_share_num,
+                                resume=resume,
+                            )
+                            atomic_model_share_num += 1
+                            log.warning(
+                                f"Shared out bias of {model_key_base} and {model_key_link}!"
+                            )
 
     def forward(
         self,
