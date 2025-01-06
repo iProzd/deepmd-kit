@@ -252,6 +252,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         # not implemented
         spin=None,
         type: Optional[str] = None,
+        tebd_use_charge: bool = False,
     ) -> None:
         super().__init__()
         # Ensure compatibility with the deprecated stripped_type_embedding option.
@@ -301,6 +302,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         )
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
+        self.tebd_use_charge = tebd_use_charge
         self.type_map = type_map
         self.compress = False
         self.type_embedding = TypeEmbedNet(
@@ -311,6 +313,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             use_econf_tebd=use_econf_tebd,
             use_tebd_bias=use_tebd_bias,
             type_map=type_map,
+            use_charge=self.tebd_use_charge,
         )
         self.prec = PRECISION_DICT[precision]
         self.tebd_dim = tebd_dim
@@ -647,6 +650,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
@@ -662,6 +666,8 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             The index mapping, not required by this descriptor.
         comm_dict
             The data needed for communication for parallel inference.
+        extended_partial_charge
+            The extended partial charges of atoms. shape: nf x nall x 1
 
         Returns
         -------
@@ -685,7 +691,9 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         del mapping
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
-        g1_ext = self.type_embedding(extended_atype)
+        g1_ext = self.type_embedding(
+            extended_atype, type_charge=extended_partial_charge
+        )
         g1_inp = g1_ext[:, :nloc, :]
         if self.tebd_input_mode in ["strip"]:
             type_embedding = self.type_embedding.get_full_embedding(g1_ext.device)

@@ -239,6 +239,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Common interface for atomic inference.
 
@@ -282,6 +283,10 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             nlist = torch.where(pair_mask == 1, nlist, -1)
 
         ext_atom_mask = self.make_atom_mask(extended_atype)
+        if extended_partial_charge is not None:
+            extended_partial_charge = torch.where(
+                ext_atom_mask.unsqueeze(-1), extended_partial_charge, 0.0
+            )
         ret_dict = self.forward_atomic(
             extended_coord,
             torch.where(ext_atom_mask, extended_atype, 0),
@@ -290,6 +295,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             fparam=fparam,
             aparam=aparam,
             comm_dict=comm_dict,
+            extended_partial_charge=extended_partial_charge,
         )
         ret_dict = self.apply_out_stat(ret_dict, atype)
 

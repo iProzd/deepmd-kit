@@ -165,6 +165,7 @@ class ModelWrapper(torch.nn.Module):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         input_dict_bind=None,
+        partial_charge: Optional[torch.Tensor] = None,
     ):
         if not self.multi_task:
             task_key = "Default"
@@ -175,6 +176,9 @@ class ModelWrapper(torch.nn.Module):
         has_spin = getattr(self.model[task_key], "has_spin", False)
         if callable(has_spin):
             has_spin = has_spin()
+        has_charge = getattr(self.model[task_key], "has_charge", False)
+        if callable(has_charge):
+            has_charge = has_charge()
         if input_dict_bind is None:
             input_dict = {
                 "coord": coord,
@@ -186,6 +190,8 @@ class ModelWrapper(torch.nn.Module):
             }
             if has_spin:
                 input_dict["spin"] = spin
+            if has_charge:
+                input_dict["partial_charge"] = partial_charge
             if self.inference_only or inference_only:
                 model_pred = self.model[task_key](**input_dict)
                 return model_pred, None, None
@@ -212,6 +218,10 @@ class ModelWrapper(torch.nn.Module):
                 }
                 if has_spin:
                     input_dict[kk]["spin"] = input_dict_bind[kk]["spin"]
+                if has_charge:
+                    input_dict[kk]["partial_charge"] = input_dict_bind[kk][
+                        "partial_charge"
+                    ]
             if self.inference_only or inference_only:
                 model_pred = {}
                 for kk in input_dict_bind.keys():

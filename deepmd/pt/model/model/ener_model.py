@@ -60,6 +60,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         do_atomic_virial: bool = False,
+        partial_charge: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         model_ret = self.forward_common(
             coord,
@@ -68,6 +69,7 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
             fparam=fparam,
             aparam=aparam,
             do_atomic_virial=do_atomic_virial,
+            partial_charge=partial_charge,
         )
         if self.get_fitting_net() is not None:
             model_predict = {}

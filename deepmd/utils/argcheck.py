@@ -2086,6 +2086,18 @@ def model_args(exclude_hybrid=False):
         [
             Argument("type_map", list[str], optional=True, doc=doc_type_map),
             Argument(
+                "use_partial_charge",
+                bool,
+                optional=True,
+                default=False,
+            ),
+            Argument(
+                "allow_default_zero_charge",
+                bool,
+                optional=True,
+                default=False,
+            ),
+            Argument(
                 "data_stat_nbatch",
                 int,
                 optional=True,
