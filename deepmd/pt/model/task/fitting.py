@@ -68,6 +68,14 @@ class Fitting(torch.nn.Module, BaseFitting):
             # the following will successfully link all the params except buffers, which need manually link.
             for item in self._modules:
                 self._modules[item] = base_class._modules[item]
+        elif shared_level == 1:
+            # also share the bias_atom_e
+            # link buffers
+            if hasattr(self, "bias_atom_e"):
+                self.bias_atom_e = base_class.bias_atom_e
+            # the following will successfully link all the params except buffers, which need manually link.
+            for item in self._modules:
+                self._modules[item] = base_class._modules[item]
         else:
             raise NotImplementedError
 

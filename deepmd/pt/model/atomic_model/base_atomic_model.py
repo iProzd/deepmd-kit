@@ -104,6 +104,44 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
     def set_out_bias(self, out_bias: torch.Tensor) -> None:
         self.out_bias = out_bias
 
+    def share_params(
+        self, base_class, shared_level, atomic_model_share_num, resume=False
+    ):
+        """
+        Share the parameters of self to the base_class with shared_level during multitask training.
+        If not start from checkpoint (resume is False),
+        some seperated parameters (e.g. mean and stddev) will be re-calculated across different classes.
+        """
+        assert (
+            self.__class__ == base_class.__class__
+        ), "Only atomic models of the same type can share params!"
+        if shared_level == 1:
+            # only share out_bias
+            if not resume:
+                from deepmd.pt.utils.utils import (
+                    to_numpy_array,
+                )
+
+                his_out_bias = to_numpy_array(base_class.out_bias)
+                link_out_bias = to_numpy_array(self.out_bias)
+                out_bias_update = his_out_bias + link_out_bias
+                common_index = (his_out_bias != 0.0) & (link_out_bias != 0.0)
+                mean_common_val = (
+                    his_out_bias * atomic_model_share_num + link_out_bias
+                ) / (atomic_model_share_num + 1)
+                out_bias_update[common_index] = mean_common_val[common_index]
+                # non-zeros be mean, zero be the non-zero
+                base_class.out_bias.copy_(
+                    torch.tensor(
+                        out_bias_update,
+                        device=env.DEVICE,
+                        dtype=base_class.out_bias.dtype,
+                    )
+                )
+            self.out_bias = base_class.out_bias
+        else:
+            raise NotImplementedError
+
     def __setitem__(self, key, value) -> None:
         if key in ["out_bias"]:
             self.out_bias = value
