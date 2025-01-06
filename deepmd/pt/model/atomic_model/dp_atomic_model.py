@@ -60,6 +60,7 @@ class DPAtomicModel(BaseAtomicModel):
         self.rcut = self.descriptor.get_rcut()
         self.sel = self.descriptor.get_sel()
         self.fitting_net = fitting
+        self.has_charge = False
         super().init_out_stat()
         self.enable_eval_descriptor_hook = False
         self.eval_descriptor_list = []
@@ -83,6 +84,10 @@ class DPAtomicModel(BaseAtomicModel):
             if self.fitting_net is not None
             else self.coord_denoise_net.output_def()
         )
+
+    def set_charge(self):
+        """Open the charge input option for the model."""
+        self.has_charge = True
 
     @torch.jit.export
     def get_rcut(self) -> float:
@@ -206,6 +211,7 @@ class DPAtomicModel(BaseAtomicModel):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Return atomic prediction.
 
@@ -223,6 +229,8 @@ class DPAtomicModel(BaseAtomicModel):
             frame parameter. nf x ndf
         aparam
             atomic parameter. nf x nloc x nda
+        extended_partial_charge
+            partial charges in extended region
 
         Returns
         -------
@@ -240,6 +248,7 @@ class DPAtomicModel(BaseAtomicModel):
             nlist,
             mapping=mapping,
             comm_dict=comm_dict,
+            extended_partial_charge=extended_partial_charge,
         )
         assert descriptor is not None
         if self.enable_eval_descriptor_hook:

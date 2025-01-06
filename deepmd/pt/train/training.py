@@ -214,8 +214,11 @@ class Trainer:
             _stat_file_path,
             _data_requirement,
             finetune_has_new_type=False,
+            _extra_params=None,
         ):
-            _data_requirement += get_additional_data_requirement(_model)
+            _data_requirement += get_additional_data_requirement(
+                _model, _extra_params=_extra_params
+            )
             _training_data.add_data_requirement(_data_requirement)
             if _validation_data is not None:
                 _validation_data.add_data_requirement(_data_requirement)
@@ -300,6 +303,7 @@ class Trainer:
                 finetune_has_new_type=self.finetune_links["Default"].get_has_new_type()
                 if self.finetune_links is not None
                 else False,
+                _extra_params=model_params,
             )
             (
                 self.training_dataloader,
@@ -338,6 +342,7 @@ class Trainer:
                     ].get_has_new_type()
                     if self.finetune_links is not None
                     else False,
+                    _extra_params=model_params["model_dict"][model_key],
                 )
                 (
                     self.training_dataloader[model_key],
@@ -1101,6 +1106,7 @@ class Trainer:
             "coord",
             "atype",
             "spin",
+            "partial_charge",
             "box",
             "fparam",
             "aparam",
@@ -1183,7 +1189,7 @@ class Trainer:
         fout.flush()
 
 
-def get_additional_data_requirement(_model):
+def get_additional_data_requirement(_model, _extra_params=None):
     additional_data_requirement = []
     if _model.get_dim_fparam() > 0:
         fparam_requirement_items = [
@@ -1207,6 +1213,19 @@ def get_additional_data_requirement(_model):
             DataRequirementItem("spin", ndof=3, atomic=True, must=True)
         ]
         additional_data_requirement += spin_requirement_items
+    # get charge
+    allow_default_zero_charge = _extra_params.get("allow_default_zero_charge", False)
+    use_partial_charge = _extra_params.get("use_partial_charge", False)
+    if use_partial_charge:
+        charge_requirement_items = [
+            DataRequirementItem(
+                "partial_charge",
+                ndof=1,
+                atomic=True,
+                must=(not allow_default_zero_charge),
+            )
+        ]
+        additional_data_requirement += charge_requirement_items
     return additional_data_requirement
 
 

@@ -78,6 +78,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         seed: Optional[Union[int, list[int]]] = None,
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
+        tebd_use_charge: bool = False,
         type_map: Optional[list[str]] = None,
     ) -> None:
         r"""The DPA-3 descriptor.
@@ -106,6 +107,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             Whether to use electronic configuration type embedding.
         use_tebd_bias : bool, Optional
             Whether to use bias in the type embedding layer.
+        tebd_use_charge : bool, Optional
+            Whether to use charge embeddings in the type embedding.
         type_map : list[str], Optional
             A list of strings. Give the name to each type of atoms.
 
@@ -170,6 +173,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
 
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
+        self.tebd_use_charge = tebd_use_charge
         self.type_map = type_map
         self.tebd_dim = self.repflow_args.n_dim
         self.type_embedding = TypeEmbedNet(
@@ -180,6 +184,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             use_econf_tebd=self.use_econf_tebd,
             use_tebd_bias=use_tebd_bias,
             type_map=type_map,
+            use_charge=self.tebd_use_charge,
         )
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision
@@ -439,6 +444,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        extended_partial_charge: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
@@ -454,6 +460,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             The index mapping, mapps extended region index to local region.
         comm_dict
             The data needed for communication for parallel inference.
+        extended_partial_charge
+            The extended partial charges. shape: nf x nall
 
         Returns
         -------
@@ -477,7 +485,9 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
 
-        node_ebd_ext = self.type_embedding(extended_atype)
+        node_ebd_ext = self.type_embedding(
+            extended_atype, type_charge=extended_partial_charge
+        )
         node_ebd_inp = node_ebd_ext[:, :nloc, :]
         # repflows
         node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows(

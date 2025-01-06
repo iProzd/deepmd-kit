@@ -253,6 +253,7 @@ class TypeEmbedNet(nn.Module):
         use_econf_tebd=False,
         use_tebd_bias: bool = False,
         type_map=None,
+        use_charge: bool = False,
     ) -> None:
         """Construct a type embedding net."""
         super().__init__()
@@ -262,6 +263,7 @@ class TypeEmbedNet(nn.Module):
         self.stddev = stddev
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
+        self.use_charge = use_charge
         self.type_map = type_map
         self.embedding = TypeEmbedNetConsistent(
             ntypes=self.type_nums,
@@ -270,13 +272,14 @@ class TypeEmbedNet(nn.Module):
             activation_function="Linear",
             use_econf_tebd=use_econf_tebd,
             use_tebd_bias=use_tebd_bias,
+            use_charge=use_charge,
             type_map=type_map,
             precision=precision,
             seed=seed,
         )
         # nn.init.normal_(self.embedding.weight[:-1], mean=bavg, std=stddev)
 
-    def forward(self, atype):
+    def forward(self, atype, type_charge=None):
         """
         Args:
             atype: Type of each input, [nframes, nloc] or [nframes, nloc, nnei].
@@ -286,7 +289,14 @@ class TypeEmbedNet(nn.Module):
         type_embedding:
 
         """
-        return self.embedding(atype.device)[atype]
+        if self.use_charge:
+            assert type_charge is not None
+            full_embed = self.embedding(atype.device)
+            charge_embd = full_embed[-1].view(1, 1, -1) * type_charge
+            result = full_embed[atype] + charge_embd
+        else:
+            result = self.embedding(atype.device)[atype]
+        return result
 
     def get_full_embedding(self, device: torch.device):
         """
@@ -372,6 +382,7 @@ class TypeEmbedNetConsistent(nn.Module):
         padding: bool = False,
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
+        use_charge: bool = False,
         type_map: Optional[list[str]] = None,
     ) -> None:
         """Construct a type embedding net."""
@@ -388,8 +399,9 @@ class TypeEmbedNetConsistent(nn.Module):
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
         self.type_map = type_map
+        self.use_charge = use_charge
         self.econf_tebd = None
-        embed_input_dim = ntypes
+        embed_input_dim = ntypes if not self.use_charge else ntypes + 1
         if self.use_econf_tebd:
             econf_tebd, embed_input_dim = get_econf_tebd(
                 self.type_map, precision=self.precision
@@ -415,17 +427,28 @@ class TypeEmbedNetConsistent(nn.Module):
         type_embedding: torch.Tensor
             Type embedding network.
         """
+        ntypes = self.ntypes if not self.use_charge else self.ntypes + 1
         if not self.use_econf_tebd:
             embed = self.embedding_net(
-                torch.eye(self.ntypes, dtype=self.prec, device=device)
+                torch.eye(ntypes, dtype=self.prec, device=device)
             )
         else:
             assert self.econf_tebd is not None
             embed = self.embedding_net(self.econf_tebd.to(device))
         if self.padding:
-            embed = torch.cat(
-                [embed, torch.zeros(1, embed.shape[1], dtype=self.prec, device=device)]
-            )
+            if self.use_charge:
+                # need to replace padding and charge embedding, to ensure index [ntypes] is padding, [ntypes + 1] is charge
+                embed_list = [
+                    embed[:-1],
+                    torch.zeros(1, embed.shape[1], dtype=self.prec, device=device),
+                    embed[-1:],
+                ]
+            else:
+                embed_list = [
+                    embed,
+                    torch.zeros(1, embed.shape[1], dtype=self.prec, device=device),
+                ]
+            embed = torch.cat(embed_list)
         return embed
 
     def change_type_map(

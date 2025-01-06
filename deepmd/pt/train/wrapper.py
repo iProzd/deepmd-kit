@@ -149,6 +149,7 @@ class ModelWrapper(torch.nn.Module):
         do_atomic_virial=False,
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
+        partial_charge: Optional[torch.Tensor] = None,
     ):
         if not self.multi_task:
             task_key = "Default"
@@ -169,6 +170,11 @@ class ModelWrapper(torch.nn.Module):
             has_spin = has_spin()
         if has_spin:
             input_dict["spin"] = spin
+        has_charge = getattr(self.model[task_key], "has_charge", False)
+        if callable(has_charge):
+            has_charge = has_charge()
+        if has_charge:
+            input_dict["partial_charge"] = partial_charge
 
         if self.inference_only or inference_only:
             model_pred = self.model[task_key](**input_dict)
