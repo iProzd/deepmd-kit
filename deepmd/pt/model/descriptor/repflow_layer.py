@@ -20,6 +20,9 @@ from deepmd.pt.model.descriptor.repformer_layer import (
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
+from deepmd.pt.utils import (
+    env,
+)
 from deepmd.pt.utils.env import (
     PRECISION_DICT,
 )
@@ -63,6 +66,7 @@ class RepFlowLayer(torch.nn.Module):
         update_n_has_attn: bool = False,
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
+        pre_ln: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -118,11 +122,46 @@ class RepFlowLayer(torch.nn.Module):
         self.precision = precision
         self.seed = seed
         self.prec = PRECISION_DICT[precision]
+        self.pre_ln = pre_ln
 
         assert update_residual_init in [
             "norm",
             "const",
         ], "'update_residual_init' only support 'norm' or 'const'!"
+
+        if self.pre_ln:
+            assert self.update_style == "res_layer"
+
+        if self.update_style == "res_layer":
+            self.node_layernorm = nn.LayerNorm(
+                self.n_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=False,
+            )
+            self.edge_layernorm = nn.LayerNorm(
+                self.e_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=False,
+            )
+            self.angle_layernorm = nn.LayerNorm(
+                self.a_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=False,
+            )
+            self.h1_layernorm = nn.LayerNorm(
+                self.h1_dim,
+                device=env.DEVICE,
+                dtype=self.prec,
+                elementwise_affine=False,
+            )
+        else:
+            self.node_layernorm = None
+            self.edge_layernorm = None
+            self.angle_layernorm = None
+            self.h1_layernorm = None
 
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
@@ -559,6 +598,16 @@ class RepFlowLayer(torch.nn.Module):
         a_update_list: list[torch.Tensor] = [angle_ebd]
         h1_update_list: list[torch.Tensor] = []
 
+        # pre layernorm
+        if self.pre_ln:
+            assert self.node_layernorm is not None
+            assert self.edge_layernorm is not None
+            assert self.angle_layernorm is not None
+            node_ebd_ext = self.node_layernorm(node_ebd_ext)
+            node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+            edge_ebd = self.edge_layernorm(edge_ebd)
+            angle_ebd = self.angle_layernorm(angle_ebd)
+
         # node self mlp
         node_self_mlp = self.act(self.node_self_mlp(node_ebd))
         n_update_list.append(node_self_mlp)
@@ -624,6 +673,12 @@ class RepFlowLayer(torch.nn.Module):
             # nf x nloc x 3 x h1_dim
             h1 = h1_ext[:, :nloc]
             h1_update_list.append(h1)
+
+            if self.pre_ln:
+                assert self.h1_layernorm is not None
+                h1_ext = self.h1_layernorm(h1_ext)
+                h1 = h1_ext[:, :nloc]
+
             # j: nf x nloc x nnei x 3 x h1_dim
             nei_h1 = _make_nei_g1(h1_ext.view(nb, nall, -1), nlist).view(
                 nb, nloc, nnei, 3, -1
@@ -877,6 +932,34 @@ class RepFlowLayer(torch.nn.Module):
         return uu
 
     @torch.jit.export
+    def list_update_res_layer(
+        self, update_list: list[torch.Tensor], update_name: str = "node"
+    ) -> torch.Tensor:
+        nitem = len(update_list)
+        uu = update_list[0]
+        for ii in range(1, nitem):
+            uu = uu + update_list[ii]
+        if not self.pre_ln:
+            # make jit happy
+            if update_name == "node":
+                assert self.node_layernorm is not None
+                out = self.node_layernorm(uu)
+            elif update_name == "edge":
+                assert self.edge_layernorm is not None
+                out = self.edge_layernorm(uu)
+            elif update_name == "angle":
+                assert self.angle_layernorm is not None
+                out = self.angle_layernorm(uu)
+            elif update_name == "h1":
+                assert self.h1_layernorm is not None
+                out = self.h1_layernorm(uu)
+            else:
+                raise NotImplementedError
+        else:
+            out = uu
+        return out
+
+    @torch.jit.export
     def list_update(
         self, update_list: list[torch.Tensor], update_name: str = "node"
     ) -> torch.Tensor:
@@ -886,6 +969,8 @@ class RepFlowLayer(torch.nn.Module):
             return self.list_update_res_incr(update_list)
         elif self.update_style == "res_residual":
             return self.list_update_res_residual(update_list, update_name=update_name)
+        elif self.update_style == "res_layer":
+            return self.list_update_res_layer(update_list, update_name=update_name)
         else:
             raise RuntimeError(f"unknown update style {self.update_style}")
 

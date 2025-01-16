@@ -35,6 +35,7 @@ class RepFlowArgs:
         update_n_has_attn: bool = False,
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
+        pre_ln: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -115,6 +116,7 @@ class RepFlowArgs:
         self.update_n_has_attn = update_n_has_attn
         self.n_attn_hidden = n_attn_hidden
         self.n_attn_head = n_attn_head
+        self.pre_ln = pre_ln
 
     def __getitem__(self, key):
         if hasattr(self, key):

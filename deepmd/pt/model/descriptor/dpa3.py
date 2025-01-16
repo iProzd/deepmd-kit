@@ -172,6 +172,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             n_attn_hidden=self.repflow_args.n_attn_hidden,
             n_attn_head=self.repflow_args.n_attn_head,
             h1_dim=self.repflow_args.h1_dim,
+            pre_ln=self.repflow_args.pre_ln,
             skip_stat=self.repflow_args.skip_stat,
             exclude_types=exclude_types,
             env_protection=env_protection,
