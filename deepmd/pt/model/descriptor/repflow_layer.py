@@ -11,6 +11,7 @@ from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
 from deepmd.pt.model.descriptor.repformer_layer import (
+    LocalAtten,
     _apply_nlist_mask,
     _apply_switch,
     _make_nei_g1,
@@ -59,6 +60,9 @@ class RepFlowLayer(torch.nn.Module):
         h1_message_idc: bool = False,
         h1_message_only_nei: bool = False,
         h1_dim: int = 16,
+        update_n_has_attn: bool = False,
+        n_attn_hidden: int = 64,
+        n_attn_head: int = 4,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -107,6 +111,9 @@ class RepFlowLayer(torch.nn.Module):
         self.h1_message_sub_axis = h1_message_sub_axis
         self.h1_message_idc = h1_message_idc
         self.h1_message_only_nei = h1_message_only_nei
+        self.update_n_has_attn = update_n_has_attn
+        self.n_attn_hidden = n_attn_hidden
+        self.n_attn_head = n_attn_head
         self.has_h1 = self.update_n_has_h1 or self.update_e_has_h1
         self.precision = precision
         self.seed = seed
@@ -194,6 +201,29 @@ class RepFlowLayer(torch.nn.Module):
                         seed=child_seed(child_seed(seed, 5), head_index),
                     )
                 )
+
+        # node local attention
+        if self.update_n_has_attn:
+            self.node_attn = LocalAtten(
+                self.n_dim,
+                self.n_attn_hidden,
+                self.n_attn_head,
+                True,
+                precision=precision,
+                seed=child_seed(seed, 6),
+            )
+            if self.update_style == "res_residual":
+                self.n_residual.append(
+                    get_residual(
+                        n_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 3),
+                    )
+                )
+        else:
+            self.node_attn = None
 
         # h1 message
         if self.has_h1:
@@ -581,6 +611,11 @@ class RepFlowLayer(torch.nn.Module):
                 n_update_list.append(node_edge_update_mul_head[:, :, head_index, :])
         else:
             n_update_list.append(node_edge_update)
+
+        # node local attn
+        if self.update_n_has_attn:
+            assert self.node_attn is not None
+            n_update_list.append(self.node_attn(node_ebd, nei_node_ebd, nlist_mask, sw))
 
         # h1 message
         if self.has_h1:

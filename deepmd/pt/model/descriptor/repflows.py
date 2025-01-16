@@ -103,6 +103,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         h1_message_idc: bool = False,
         h1_message_only_nei: bool = False,
         h1_dim: int = 16,
+        update_n_has_attn: bool = False,
+        n_attn_hidden: int = 64,
+        n_attn_head: int = 4,
         set_davg_zero: bool = True,
         exclude_types: list[tuple[int, int]] = [],
         env_protection: float = 0.0,
@@ -209,6 +212,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.h1_message_idc = h1_message_idc
         self.h1_message_only_nei = h1_message_only_nei
         self.h1_dim = h1_dim
+        self.update_n_has_attn = update_n_has_attn
+        self.n_attn_hidden = n_attn_hidden
+        self.n_attn_head = n_attn_head
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -275,6 +281,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     h1_message_idc=self.h1_message_idc,
                     h1_message_only_nei=self.h1_message_only_nei,
                     h1_dim=self.h1_dim,
+                    update_n_has_attn=self.update_n_has_attn,
+                    n_attn_hidden=self.n_attn_hidden,
+                    n_attn_head=self.n_attn_head,
                     activation_function=self.activation_function,
                     update_style=self.update_style,
                     update_residual=self.update_residual,

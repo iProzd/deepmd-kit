@@ -32,6 +32,9 @@ class RepFlowArgs:
         h1_dim: int = 16,
         skip_stat: bool = False,
         a_compress_use_split: bool = False,
+        update_n_has_attn: bool = False,
+        n_attn_hidden: int = 64,
+        n_attn_head: int = 4,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -109,6 +112,9 @@ class RepFlowArgs:
         self.h1_message_idc = h1_message_idc
         self.h1_message_only_nei = h1_message_only_nei
         self.h1_dim = h1_dim
+        self.update_n_has_attn = update_n_has_attn
+        self.n_attn_hidden = n_attn_hidden
+        self.n_attn_head = n_attn_head
 
     def __getitem__(self, key):
         if hasattr(self, key):

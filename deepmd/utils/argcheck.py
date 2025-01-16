@@ -1595,6 +1595,24 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "update_n_has_attn",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "n_attn_hidden",
+            int,
+            optional=True,
+            default=64,
+        ),
+        Argument(
+            "n_attn_head",
+            int,
+            optional=True,
+            default=4,
+        ),
     ]
 
 
