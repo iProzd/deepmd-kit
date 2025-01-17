@@ -129,10 +129,10 @@ class RepFlowLayer(torch.nn.Module):
             "const",
         ], "'update_residual_init' only support 'norm' or 'const'!"
 
-        if self.pre_ln:
-            assert self.update_style == "res_layer"
+        # if self.pre_ln:
+        #     assert self.update_style == "res_layer"
 
-        if self.update_style == "res_layer":
+        if self.update_style == "res_layer" or self.pre_ln:
             self.node_layernorm = nn.LayerNorm(
                 self.n_dim,
                 device=env.DEVICE,

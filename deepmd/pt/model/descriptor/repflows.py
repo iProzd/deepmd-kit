@@ -236,14 +236,14 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
         self.pre_ln = pre_ln
-        self.out_ln = None
-        if self.pre_ln:
-            self.out_ln = torch.nn.LayerNorm(
-                self.n_dim,
-                device=env.DEVICE,
-                dtype=self.prec,
-                elementwise_affine=False,
-            )
+        # self.out_ln = None
+        # if self.pre_ln:
+        #     self.out_ln = torch.nn.LayerNorm(
+        #         self.n_dim,
+        #         device=env.DEVICE,
+        #         dtype=self.prec,
+        #         elementwise_affine=False,
+        #     )
 
         self.edge_embd = MLPLayer(
             1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
@@ -600,9 +600,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         h2g2 = RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
         # (nb x nloc) x e_dim x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
-        if self.pre_ln:
-            assert self.out_ln is not None
-            node_ebd = self.out_ln(node_ebd)
+        # if self.pre_ln:
+        #     assert self.out_ln is not None
+        #     node_ebd = self.out_ln(node_ebd)
 
         return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
 
