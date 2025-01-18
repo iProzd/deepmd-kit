@@ -63,6 +63,8 @@ class NeighborStat(ABC):
         min_nbor_dist = 100.0
         max_nbor_size = np.zeros(1 if self.mixed_type else self.ntypes, dtype=int)
 
+        sel_list = []
+
         for mn, dt, jj in self.iterator(data):
             if np.isinf(dt):
                 log.warning(
@@ -78,6 +80,12 @@ class NeighborStat(ABC):
                     )
                 min_nbor_dist = dt
             max_nbor_size = np.maximum(mn, max_nbor_size)
+            sel_list.append(mn)
+
+        sel_list = np.array(sel_list).reshape(-1)
+        print("rcut: ", self.rcut)  # noqa T201
+        print("mean: ", sel_list.mean())  # noqa T201
+        print("std: ", sel_list.std())  # noqa T201
 
         # do sqrt in the final
         min_nbor_dist = math.sqrt(min_nbor_dist)
