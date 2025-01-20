@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import os
 from typing import (
     ClassVar,
     Optional,
@@ -107,6 +108,11 @@ class MLPLayer(nn.Module):
         else:
             self.idt = None
         self.resnet = resnet
+
+        # get init method from environment
+        init_env = os.environ.get("MLP_INIT", "default")
+        if init == "default":
+            init = init_env
         if init == "default":
             self._default_normal_init(
                 bavg=bavg, stddev=stddev, generator=random_generator
