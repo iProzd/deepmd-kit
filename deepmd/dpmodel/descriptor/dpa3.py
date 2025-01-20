@@ -32,6 +32,7 @@ class RepFlowArgs:
         h1_dim: int = 16,
         skip_stat: bool = False,
         a_compress_use_split: bool = False,
+        a_norm_use_max_v: bool = False,
         update_n_has_attn: bool = False,
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
@@ -117,6 +118,7 @@ class RepFlowArgs:
         self.n_attn_hidden = n_attn_hidden
         self.n_attn_head = n_attn_head
         self.pre_ln = pre_ln
+        self.a_norm_use_max_v = a_norm_use_max_v
 
     def __getitem__(self, key):
         if hasattr(self, key):
