@@ -67,6 +67,7 @@ class RepFlowLayer(torch.nn.Module):
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
         a_norm_use_max_v: bool = False,
+        e_norm_use_max_v: bool = False,
         pre_ln: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -125,6 +126,7 @@ class RepFlowLayer(torch.nn.Module):
         self.prec = PRECISION_DICT[precision]
         self.pre_ln = pre_ln
         self.a_norm_use_max_v = a_norm_use_max_v
+        self.e_norm_use_max_v = e_norm_use_max_v
 
         assert update_residual_init in [
             "norm",
@@ -613,6 +615,10 @@ class RepFlowLayer(torch.nn.Module):
         # only norm angle with max absolute value
         if self.a_norm_use_max_v:
             angle_ebd = angle_ebd / (angle_ebd.abs().max(-1)[0] + 1e-4).unsqueeze(-1)
+
+        # only norm edge with max absolute value
+        if self.e_norm_use_max_v:
+            edge_ebd = edge_ebd / (edge_ebd.abs().max(-1)[0] + 1e-4).unsqueeze(-1)
 
         # node self mlp
         node_self_mlp = self.act(self.node_self_mlp(node_ebd))

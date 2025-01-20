@@ -113,6 +113,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         skip_stat: bool = True,
         pre_ln: bool = False,
         a_norm_use_max_v: bool = False,
+        e_norm_use_max_v: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -230,6 +231,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.act = ActivationFn(activation_function)
         self.prec = PRECISION_DICT[precision]
         self.a_norm_use_max_v = a_norm_use_max_v
+        self.e_norm_use_max_v = e_norm_use_max_v
 
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
@@ -297,6 +299,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     n_attn_hidden=self.n_attn_hidden,
                     n_attn_head=self.n_attn_head,
                     a_norm_use_max_v=self.a_norm_use_max_v,
+                    e_norm_use_max_v=self.e_norm_use_max_v,
                     activation_function=self.activation_function,
                     update_style=self.update_style,
                     update_residual=self.update_residual,
