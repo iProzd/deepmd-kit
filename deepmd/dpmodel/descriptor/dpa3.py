@@ -34,6 +34,7 @@ class RepFlowArgs:
         a_compress_use_split: bool = False,
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
+        e_a_reduce_use_sqrt: bool = True,
         update_n_has_attn: bool = False,
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
@@ -121,6 +122,7 @@ class RepFlowArgs:
         self.pre_ln = pre_ln
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
+        self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
 
     def __getitem__(self, key):
         if hasattr(self, key):

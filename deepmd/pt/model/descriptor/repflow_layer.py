@@ -68,6 +68,7 @@ class RepFlowLayer(torch.nn.Module):
         n_attn_head: int = 4,
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
+        e_a_reduce_use_sqrt: bool = True,
         pre_ln: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -127,6 +128,7 @@ class RepFlowLayer(torch.nn.Module):
         self.pre_ln = pre_ln
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
+        self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
 
         assert update_residual_init in [
             "norm",
@@ -853,9 +855,14 @@ class RepFlowLayer(torch.nn.Module):
                 * a_sw[:, :, None, :, None]
             )
             # nb x nloc x a_nnei x e_dim
-            reduced_edge_angle_update = torch.sum(
-                weighted_edge_angle_update, dim=-2
-            ) / (self.a_sel**0.5)
+            if self.e_a_reduce_use_sqrt:
+                reduced_edge_angle_update = torch.sum(
+                    weighted_edge_angle_update, dim=-2
+                ) / (self.a_sel**0.5)
+            else:
+                reduced_edge_angle_update = (
+                    torch.sum(weighted_edge_angle_update, dim=-2) / self.a_sel
+                )
             # nb x nloc x nnei x e_dim
             padding_edge_angle_update = torch.concat(
                 [

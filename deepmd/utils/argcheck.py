@@ -1631,6 +1631,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "e_a_reduce_use_sqrt",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 
