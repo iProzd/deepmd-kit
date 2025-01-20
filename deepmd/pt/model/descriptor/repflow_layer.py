@@ -614,11 +614,11 @@ class RepFlowLayer(torch.nn.Module):
 
         # only norm angle with max absolute value
         if self.a_norm_use_max_v:
-            angle_ebd = angle_ebd / (angle_ebd.abs().max(-1)[0] + 1e-4).unsqueeze(-1)
+            angle_ebd = angle_ebd / (angle_ebd.abs().max(-1)[0] + 1e-5).unsqueeze(-1)
 
         # only norm edge with max absolute value
         if self.e_norm_use_max_v:
-            edge_ebd = edge_ebd / (edge_ebd.abs().max(-1)[0] + 1e-4).unsqueeze(-1)
+            edge_ebd = edge_ebd / (edge_ebd.abs().max(-1)[0] + 1e-5).unsqueeze(-1)
 
         # node self mlp
         node_self_mlp = self.act(self.node_self_mlp(node_ebd))
