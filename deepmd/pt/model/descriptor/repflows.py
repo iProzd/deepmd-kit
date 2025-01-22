@@ -540,8 +540,6 @@ class DescrptBlockRepflows(DescriptorBlock):
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim
-            # print(idx, "node_ebd.std(): ", node_ebd.std().item(), "edge_ebd.std(): ", edge_ebd.std().item(),
-            #       "angle_ebd.std(): ", angle_ebd.std().item())
             if comm_dict is None:
                 assert mapping is not None
                 assert mapping3 is not None
