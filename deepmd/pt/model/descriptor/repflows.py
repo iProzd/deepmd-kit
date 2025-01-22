@@ -226,10 +226,24 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.update_angle = update_angle
 
         self.activation_function = activation_function
+        self.act_list = []
+        if "," in self.activation_function:
+            self.use_mix_act = True
+            for act_str in self.activation_function.split(","):
+                act_name, act_number = act_str.split(":")
+                act_number = int(act_number)
+                self.act_list += [act_name] * act_number
+            assert len(self.act_list) == self.nlayers
+        else:
+            self.use_mix_act = False
         self.update_style = update_style
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
-        self.act = ActivationFn(activation_function)
+        self.act = (
+            ActivationFn(activation_function)
+            if not self.use_mix_act
+            else ActivationFn(self.act_list[0])
+        )
         self.prec = PRECISION_DICT[precision]
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
@@ -303,7 +317,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     a_norm_use_max_v=self.a_norm_use_max_v,
                     e_norm_use_max_v=self.e_norm_use_max_v,
                     e_a_reduce_use_sqrt=self.e_a_reduce_use_sqrt,
-                    activation_function=self.activation_function,
+                    activation_function=self.activation_function
+                    if not self.use_mix_act
+                    else self.act_list[ii],
                     update_style=self.update_style,
                     update_residual=self.update_residual,
                     update_residual_init=self.update_residual_init,
@@ -524,6 +540,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim
+            # print(idx, "node_ebd.std(): ", node_ebd.std().item(), "edge_ebd.std(): ", edge_ebd.std().item(),
+            #       "angle_ebd.std(): ", angle_ebd.std().item())
             if comm_dict is None:
                 assert mapping is not None
                 assert mapping3 is not None
