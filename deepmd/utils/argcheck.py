@@ -1637,6 +1637,18 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "n_update_has_a",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "n_update_has_a_first_sum",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

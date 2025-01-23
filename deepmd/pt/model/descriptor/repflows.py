@@ -115,6 +115,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
         e_a_reduce_use_sqrt: bool = True,
+        n_update_has_a: bool = False,
+        n_update_has_a_first_sum: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -217,6 +219,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.h1_message_only_nei = h1_message_only_nei
         self.h1_dim = h1_dim
         self.update_n_has_attn = update_n_has_attn
+        self.n_update_has_a = n_update_has_a
+        self.n_update_has_a_first_sum = n_update_has_a_first_sum
         self.n_attn_hidden = n_attn_hidden
         self.n_attn_head = n_attn_head
 
@@ -323,6 +327,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     update_style=self.update_style,
                     update_residual=self.update_residual,
                     update_residual_init=self.update_residual_init,
+                    n_update_has_a=self.n_update_has_a,
+                    n_update_has_a_first_sum=self.n_update_has_a_first_sum,
                     precision=precision,
                     pre_ln=self.pre_ln,
                     seed=child_seed(child_seed(seed, 1), ii),

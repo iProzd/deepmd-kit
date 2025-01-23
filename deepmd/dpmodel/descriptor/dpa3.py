@@ -39,6 +39,8 @@ class RepFlowArgs:
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
         pre_ln: bool = False,
+        n_update_has_a: bool = False,
+        n_update_has_a_first_sum: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -123,6 +125,8 @@ class RepFlowArgs:
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
+        self.n_update_has_a = n_update_has_a
+        self.n_update_has_a_first_sum = n_update_has_a_first_sum
 
     def __getitem__(self, key):
         if hasattr(self, key):
