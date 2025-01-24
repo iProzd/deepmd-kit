@@ -39,6 +39,7 @@ class RepFlowArgs:
         n_attn_hidden: int = 64,
         n_attn_head: int = 4,
         pre_ln: bool = False,
+        only_e_ln: bool = False,
         n_update_has_a: bool = False,
         n_update_has_a_first_sum: bool = False,
     ) -> None:
@@ -122,6 +123,7 @@ class RepFlowArgs:
         self.n_attn_hidden = n_attn_hidden
         self.n_attn_head = n_attn_head
         self.pre_ln = pre_ln
+        self.only_e_ln = only_e_ln
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt

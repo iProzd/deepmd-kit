@@ -112,6 +112,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         precision: str = "float64",
         skip_stat: bool = True,
         pre_ln: bool = False,
+        only_e_ln: bool = False,
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
         e_a_reduce_use_sqrt: bool = True,
@@ -260,6 +261,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
         self.pre_ln = pre_ln
+        self.only_e_ln = only_e_ln
         self.out_ln = None
         if self.pre_ln:
             self.out_ln = torch.nn.LayerNorm(
@@ -331,6 +333,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     n_update_has_a_first_sum=self.n_update_has_a_first_sum,
                     precision=precision,
                     pre_ln=self.pre_ln,
+                    only_e_ln=self.only_e_ln,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

@@ -72,6 +72,7 @@ class RepFlowLayer(torch.nn.Module):
         n_update_has_a: bool = False,
         n_update_has_a_first_sum: bool = False,
         pre_ln: bool = False,
+        only_e_ln: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -128,6 +129,7 @@ class RepFlowLayer(torch.nn.Module):
         self.seed = seed
         self.prec = PRECISION_DICT[precision]
         self.pre_ln = pre_ln
+        self.only_e_ln = only_e_ln
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
@@ -139,10 +141,10 @@ class RepFlowLayer(torch.nn.Module):
             "const",
         ], "'update_residual_init' only support 'norm' or 'const'!"
 
-        if self.pre_ln:
-            assert self.update_style == "res_layer"
+        # if self.pre_ln:
+        #     assert self.update_style == "res_layer"
 
-        if self.update_style == "res_layer":
+        if self.update_style == "res_layer" or self.pre_ln:
             self.node_layernorm = nn.LayerNorm(
                 self.n_dim,
                 device=env.DEVICE,
@@ -634,10 +636,11 @@ class RepFlowLayer(torch.nn.Module):
             assert self.node_layernorm is not None
             assert self.edge_layernorm is not None
             assert self.angle_layernorm is not None
-            node_ebd_ext = self.node_layernorm(node_ebd_ext)
-            node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+            if not self.only_e_ln:
+                node_ebd_ext = self.node_layernorm(node_ebd_ext)
+                node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+                angle_ebd = self.angle_layernorm(angle_ebd)
             edge_ebd = self.edge_layernorm(edge_ebd)
-            angle_ebd = self.angle_layernorm(angle_ebd)
 
         # only norm angle with max absolute value
         if self.a_norm_use_max_v:

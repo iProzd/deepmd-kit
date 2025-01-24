@@ -1620,6 +1620,12 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "only_e_ln",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "a_norm_use_max_v",
             bool,
             optional=True,

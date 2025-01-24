@@ -178,6 +178,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             n_update_has_a_first_sum=self.repflow_args.n_update_has_a_first_sum,
             h1_dim=self.repflow_args.h1_dim,
             pre_ln=self.repflow_args.pre_ln,
+            only_e_ln=self.repflow_args.only_e_ln,
             skip_stat=self.repflow_args.skip_stat,
             exclude_types=exclude_types,
             env_protection=env_protection,
