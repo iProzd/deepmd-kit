@@ -40,6 +40,9 @@ class RepFlowArgs:
         n_attn_head: int = 4,
         pre_ln: bool = False,
         only_e_ln: bool = False,
+        pre_bn: bool = False,
+        only_e_bn: bool = False,
+        bn_moment: float = 0.1,
         n_update_has_a: bool = False,
         n_update_has_a_first_sum: bool = False,
     ) -> None:
@@ -124,6 +127,9 @@ class RepFlowArgs:
         self.n_attn_head = n_attn_head
         self.pre_ln = pre_ln
         self.only_e_ln = only_e_ln
+        self.pre_bn = pre_bn
+        self.only_e_bn = only_e_bn
+        self.bn_moment = bn_moment
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt

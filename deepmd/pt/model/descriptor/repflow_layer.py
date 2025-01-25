@@ -73,6 +73,9 @@ class RepFlowLayer(torch.nn.Module):
         n_update_has_a_first_sum: bool = False,
         pre_ln: bool = False,
         only_e_ln: bool = False,
+        pre_bn: bool = False,
+        only_e_bn: bool = False,
+        bn_moment: float = 0.1,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -130,6 +133,9 @@ class RepFlowLayer(torch.nn.Module):
         self.prec = PRECISION_DICT[precision]
         self.pre_ln = pre_ln
         self.only_e_ln = only_e_ln
+        self.pre_bn = pre_bn
+        self.only_e_bn = only_e_bn
+        self.bn_moment = bn_moment
         self.a_norm_use_max_v = a_norm_use_max_v
         self.e_norm_use_max_v = e_norm_use_max_v
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
@@ -174,6 +180,41 @@ class RepFlowLayer(torch.nn.Module):
             self.edge_layernorm = None
             self.angle_layernorm = None
             self.h1_layernorm = None
+
+        if self.pre_bn:
+            self.node_batchnorm = nn.BatchNorm1d(
+                self.n_dim,
+                affine=False,
+                device=env.DEVICE,
+                dtype=self.prec,
+                momentum=self.bn_moment,
+            )
+            self.edge_batchnorm = nn.BatchNorm1d(
+                self.e_dim,
+                affine=False,
+                device=env.DEVICE,
+                dtype=self.prec,
+                momentum=self.bn_moment,
+            )
+            self.angle_batchnorm = nn.BatchNorm1d(
+                self.a_dim,
+                affine=False,
+                device=env.DEVICE,
+                dtype=self.prec,
+                momentum=self.bn_moment,
+            )
+            self.h1_batchnorm = nn.BatchNorm1d(
+                self.h1_dim,
+                affine=False,
+                device=env.DEVICE,
+                dtype=self.prec,
+                momentum=self.bn_moment,
+            )
+        else:
+            self.node_batchnorm = None
+            self.edge_batchnorm = None
+            self.angle_batchnorm = None
+            self.h1_batchnorm = None
 
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
@@ -641,6 +682,22 @@ class RepFlowLayer(torch.nn.Module):
                 node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
                 angle_ebd = self.angle_layernorm(angle_ebd)
             edge_ebd = self.edge_layernorm(edge_ebd)
+
+        if self.pre_bn:
+            assert self.node_batchnorm is not None
+            assert self.edge_batchnorm is not None
+            assert self.angle_batchnorm is not None
+            if not self.only_e_bn:
+                node_ebd_ext = self.node_batchnorm(
+                    node_ebd_ext.view(nb * nall, self.n_dim)
+                ).view(nb, nall, self.n_dim)
+                node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+                angle_ebd = self.angle_batchnorm(
+                    angle_ebd.view(nb * nloc * self.a_sel * self.a_sel, self.a_dim)
+                ).view(nb, nloc, self.a_sel, self.a_sel, self.a_dim)
+            edge_ebd = self.edge_batchnorm(
+                edge_ebd.view(nb * nloc * self.nnei, self.e_dim)
+            ).view(nb, nloc, self.nnei, self.e_dim)
 
         # only norm angle with max absolute value
         if self.a_norm_use_max_v:

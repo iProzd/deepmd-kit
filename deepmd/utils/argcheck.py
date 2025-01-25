@@ -1626,6 +1626,24 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "pre_bn",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "only_e_bn",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "bn_moment",
+            float,
+            optional=True,
+            default=0.1,
+        ),
+        Argument(
             "a_norm_use_max_v",
             bool,
             optional=True,

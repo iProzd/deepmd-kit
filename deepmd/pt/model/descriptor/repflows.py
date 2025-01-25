@@ -113,6 +113,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         skip_stat: bool = True,
         pre_ln: bool = False,
         only_e_ln: bool = False,
+        pre_bn: bool = False,
+        only_e_bn: bool = False,
+        bn_moment: float = 0.1,
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
         e_a_reduce_use_sqrt: bool = True,
@@ -262,14 +265,17 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.seed = seed
         self.pre_ln = pre_ln
         self.only_e_ln = only_e_ln
-        self.out_ln = None
-        if self.pre_ln:
-            self.out_ln = torch.nn.LayerNorm(
-                self.n_dim,
-                device=env.DEVICE,
-                dtype=self.prec,
-                elementwise_affine=False,
-            )
+        self.pre_bn = pre_bn
+        self.only_e_bn = only_e_bn
+        self.bn_moment = bn_moment
+        # self.out_ln = None
+        # if self.pre_ln:
+        #     self.out_ln = torch.nn.LayerNorm(
+        #         self.n_dim,
+        #         device=env.DEVICE,
+        #         dtype=self.prec,
+        #         elementwise_affine=False,
+        #     )
 
         self.edge_embd = MLPLayer(
             1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
@@ -334,6 +340,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     precision=precision,
                     pre_ln=self.pre_ln,
                     only_e_ln=self.only_e_ln,
+                    pre_bn=self.pre_bn,
+                    only_e_bn=self.only_e_bn,
+                    bn_moment=self.bn_moment,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -634,9 +643,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         h2g2 = RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
         # (nb x nloc) x e_dim x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
-        if self.pre_ln:
-            assert self.out_ln is not None
-            node_ebd = self.out_ln(node_ebd)
+        # if self.pre_ln:
+        #     assert self.out_ln is not None
+        #     node_ebd = self.out_ln(node_ebd)
 
         return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
 
