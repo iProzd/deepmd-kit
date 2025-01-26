@@ -46,6 +46,27 @@ class CustomSilu(torch.nn.Module):
             return silu_part
 
 
+class CustomDSilu(torch.nn.Module):
+    def __init__(self, threshold=3.0, sig_w=1.0):
+        super().__init__()
+        self.threshold = threshold
+        self.sig_w = sig_w
+
+    def forward(self, x):
+        result = F.silu(x)
+        sig = torch.sigmoid(x - (self.threshold - 1))
+        return result + sig * (1 - x * sig)
+
+
+class dSiLU(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input):
+        sig = torch.sigmoid(input)
+        return sig * (1 + input * (1 - sig))
+
+
 class ActivationFn(torch.nn.Module):
     def __init__(self, activation: Optional[str]) -> None:
         super().__init__()
@@ -57,6 +78,16 @@ class ActivationFn(torch.nn.Module):
             self.custom_silu = CustomSilu(threshold=threshold)
         else:
             self.custom_silu = None
+
+        if self.activation.startswith("custom_dsilu"):
+            threshold = (
+                float(self.activation.split(":")[-1]) if ":" in self.activation else 3.0
+            )
+            self.custom_dsilu = CustomDSilu(threshold=threshold)
+        else:
+            self.custom_dsilu = None
+
+        self.dsilu = dSiLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Returns the tensor after applying activation function corresponding to `activation`."""
@@ -79,6 +110,11 @@ class ActivationFn(torch.nn.Module):
         elif self.activation.startswith("custom_silu"):
             assert self.custom_silu is not None
             return self.custom_silu(x)
+        elif self.activation.startswith("custom_dsilu"):
+            assert self.custom_dsilu is not None
+            return self.custom_dsilu(x)
+        elif self.activation.lower() == "dsilu":
+            return self.dsilu(x)
         elif self.activation.lower() == "linear" or self.activation.lower() == "none":
             return x
         else:
