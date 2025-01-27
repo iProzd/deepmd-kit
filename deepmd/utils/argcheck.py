@@ -1673,6 +1673,30 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "use_unet",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "use_unet_n",
+            bool,
+            optional=True,
+            default=True,
+        ),
+        Argument(
+            "use_unet_e",
+            bool,
+            optional=True,
+            default=True,
+        ),
+        Argument(
+            "use_unet_a",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 

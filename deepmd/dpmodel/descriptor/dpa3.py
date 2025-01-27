@@ -42,6 +42,10 @@ class RepFlowArgs:
         only_e_ln: bool = False,
         pre_bn: bool = False,
         only_e_bn: bool = False,
+        use_unet: bool = False,
+        use_unet_n: bool = True,
+        use_unet_e: bool = True,
+        use_unet_a: bool = True,
         bn_moment: float = 0.1,
         n_update_has_a: bool = False,
         n_update_has_a_first_sum: bool = False,
@@ -135,6 +139,10 @@ class RepFlowArgs:
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
         self.n_update_has_a = n_update_has_a
         self.n_update_has_a_first_sum = n_update_has_a_first_sum
+        self.use_unet = use_unet
+        self.use_unet_n = use_unet_n
+        self.use_unet_e = use_unet_e
+        self.use_unet_a = use_unet_a
 
     def __getitem__(self, key):
         if hasattr(self, key):

@@ -420,6 +420,9 @@ class RepFlowLayer(torch.nn.Module):
                         seed=child_seed(seed, 9),
                     )
                 else:
+                    # use split
+                    assert self.n_a_compress_dim <= self.n_dim
+                    assert self.e_a_compress_dim <= self.e_dim
                     self.a_compress_n_linear = None
                     self.a_compress_e_linear = None
 
