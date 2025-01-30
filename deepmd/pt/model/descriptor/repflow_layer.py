@@ -629,6 +629,7 @@ class RepFlowLayer(torch.nn.Module):
         a_nlist_mask: torch.Tensor,  # nf x nloc x a_nnei
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         h1_ext: Optional[torch.Tensor],  # nf x nall x 3 x h1_dim
+        node_ebd_split: Optional[torch.Tensor] = None,  # nf x nloc x n_dim
     ):
         """
         Parameters
@@ -665,7 +666,10 @@ class RepFlowLayer(torch.nn.Module):
         """
         nb, nloc, nnei, _ = edge_ebd.shape
         nall = node_ebd_ext.shape[1]
-        node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+        if node_ebd_split is None:
+            node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+        else:
+            node_ebd = node_ebd_split
         assert (nb, nloc) == node_ebd.shape[:2]
         assert (nb, nloc, nnei) == h2.shape[:3]
         del a_nlist  # may be used in the future

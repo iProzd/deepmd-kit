@@ -1697,6 +1697,12 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "auto_batchsize",
+            int,
+            optional=True,
+            default=0,
+        ),
     ]
 
 

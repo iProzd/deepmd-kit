@@ -120,6 +120,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_unet_e: bool = True,
         use_unet_a: bool = True,
         bn_moment: float = 0.1,
+        auto_batchsize: int = 0,
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
         e_a_reduce_use_sqrt: bool = True,
@@ -231,6 +232,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.n_update_has_a_first_sum = n_update_has_a_first_sum
         self.n_attn_hidden = n_attn_hidden
         self.n_attn_head = n_attn_head
+        self.auto_batchsize = auto_batchsize
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -654,20 +656,81 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            node_ebd, edge_ebd, angle_ebd, h1 = ll.forward(
-                node_ebd_ext,
-                edge_ebd,
-                h2,
-                angle_ebd,
-                nlist,
-                nlist_mask,
-                sw,
-                a_nlist,
-                a_nlist_mask,
-                a_sw,
-                h1_ext,
-            )
+            if self.auto_batchsize != 0 and nframes * nloc > self.auto_batchsize:
+                node_ebd_full, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
+                node_ebd_chunks = torch.split(node_ebd_full, self.auto_batchsize, dim=1)
+                edge_ebd_chunks = torch.split(edge_ebd, self.auto_batchsize, dim=1)
+                h2_chunks = torch.split(h2, self.auto_batchsize, dim=1)
+                angle_ebd_chunks = torch.split(angle_ebd, self.auto_batchsize, dim=1)
+                nlist_chunks = torch.split(nlist, self.auto_batchsize, dim=1)
+                nlist_mask_chunks = torch.split(nlist_mask, self.auto_batchsize, dim=1)
+                sw_chunks = torch.split(sw, self.auto_batchsize, dim=1)
+                a_nlist_chunks = torch.split(a_nlist, self.auto_batchsize, dim=1)
+                a_nlist_mask_chunks = torch.split(
+                    a_nlist_mask, self.auto_batchsize, dim=1
+                )
+                a_sw_chunks = torch.split(a_sw, self.auto_batchsize, dim=1)
 
+                node_ebd_list = []
+                edge_ebd_list = []
+                angle_ebd_list = []
+                for (
+                    node_ebd_sub,
+                    edge_ebd_sub,
+                    h2_sub,
+                    angle_ebd_sub,
+                    nlist_sub,
+                    nlist_mask_sub,
+                    sw_sub,
+                    a_nlist_sub,
+                    a_nlist_mask_sub,
+                    a_sw_sub,
+                ) in zip(
+                    node_ebd_chunks,
+                    edge_ebd_chunks,
+                    h2_chunks,
+                    angle_ebd_chunks,
+                    nlist_chunks,
+                    nlist_mask_chunks,
+                    sw_chunks,
+                    a_nlist_chunks,
+                    a_nlist_mask_chunks,
+                    a_sw_chunks,
+                ):
+                    node_ebd_tmp, edge_ebd_tmp, angle_ebd_tmp, h1_tmp = ll.forward(
+                        node_ebd_ext,
+                        edge_ebd_sub,
+                        h2_sub,
+                        angle_ebd_sub,
+                        nlist_sub,
+                        nlist_mask_sub,
+                        sw_sub,
+                        a_nlist_sub,
+                        a_nlist_mask_sub,
+                        a_sw_sub,
+                        h1_ext,
+                        node_ebd_split=node_ebd_sub,
+                    )
+                    node_ebd_list.append(node_ebd_tmp)
+                    edge_ebd_list.append(edge_ebd_tmp)
+                    angle_ebd_list.append(angle_ebd_tmp)
+                node_ebd = torch.cat(node_ebd_list, dim=1)
+                edge_ebd = torch.cat(edge_ebd_list, dim=1)
+                angle_ebd = torch.cat(angle_ebd_list, dim=1)
+            else:
+                node_ebd, edge_ebd, angle_ebd, h1 = ll.forward(
+                    node_ebd_ext,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    nlist,
+                    nlist_mask,
+                    sw,
+                    a_nlist,
+                    a_nlist_mask,
+                    a_sw,
+                    h1_ext,
+                )
             if self.use_unet:
                 if idx < self.unet_first_half - 1:
                     # stack half output
