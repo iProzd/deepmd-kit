@@ -50,6 +50,7 @@ class RepFlowArgs:
         n_update_has_a: bool = False,
         n_update_has_a_first_sum: bool = False,
         auto_batchsize: int = 0,
+        optim_angle: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -145,6 +146,7 @@ class RepFlowArgs:
         self.use_unet_e = use_unet_e
         self.use_unet_a = use_unet_a
         self.auto_batchsize = auto_batchsize
+        self.optim_angle = optim_angle
 
     def __getitem__(self, key):
         if hasattr(self, key):

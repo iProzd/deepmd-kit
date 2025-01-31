@@ -1703,6 +1703,12 @@ def dpa3_repflow_args():
             optional=True,
             default=0,
         ),
+        Argument(
+            "optim_angle",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

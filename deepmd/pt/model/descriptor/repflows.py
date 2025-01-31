@@ -121,6 +121,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_unet_a: bool = True,
         bn_moment: float = 0.1,
         auto_batchsize: int = 0,
+        optim_angle: bool = False,
         a_norm_use_max_v: bool = False,
         e_norm_use_max_v: bool = False,
         e_a_reduce_use_sqrt: bool = True,
@@ -233,6 +234,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.n_attn_hidden = n_attn_hidden
         self.n_attn_head = n_attn_head
         self.auto_batchsize = auto_batchsize
+        self.optim_angle = optim_angle
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -368,6 +370,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     pre_bn=self.pre_bn,
                     only_e_bn=self.only_e_bn,
                     bn_moment=self.bn_moment,
+                    optim_angle=self.optim_angle,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
