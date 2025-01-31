@@ -76,8 +76,7 @@ class RepFlowLayer(torch.nn.Module):
         pre_bn: bool = False,
         only_e_bn: bool = False,
         bn_moment: float = 0.1,
-        optim_angle: bool = False,
-        optim_edge: bool = False,
+        optim_update: bool = True,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -143,8 +142,7 @@ class RepFlowLayer(torch.nn.Module):
         self.e_a_reduce_use_sqrt = e_a_reduce_use_sqrt
         self.n_update_has_a = n_update_has_a
         self.n_update_has_a_first_sum = n_update_has_a_first_sum
-        self.optim_angle = optim_angle
-        self.optim_edge = optim_edge
+        self.optim_update = optim_update
 
         assert update_residual_init in [
             "norm",
@@ -843,7 +841,7 @@ class RepFlowLayer(torch.nn.Module):
         node_sym = self.act(self.node_sym_linear(torch.cat(node_sym_list, dim=-1)))
         n_update_list.append(node_sym)
 
-        if not self.optim_edge:
+        if not self.optim_update:
             # nb x nloc x nnei x (n_dim * 2 + e_dim)
             edge_info = torch.cat(
                 [
@@ -858,7 +856,7 @@ class RepFlowLayer(torch.nn.Module):
 
         # node edge message
         # nb x nloc x nnei x (h * n_dim)
-        if not self.optim_edge:
+        if not self.optim_update:
             assert edge_info is not None
             node_edge_update = self.act(
                 self.node_edge_linear(edge_info)
@@ -992,7 +990,7 @@ class RepFlowLayer(torch.nn.Module):
             h1_update = None
 
         # edge self message
-        if not self.optim_edge:
+        if not self.optim_update:
             assert edge_info is not None
             edge_self_update = self.act(self.edge_self_linear(edge_info))
         else:
@@ -1040,7 +1038,7 @@ class RepFlowLayer(torch.nn.Module):
             edge_for_angle = torch.where(
                 a_nlist_mask.unsqueeze(-1), edge_for_angle, 0.0
             )
-            if not self.optim_angle:
+            if not self.optim_update:
                 # nb x nloc x a_nnei x a_nnei x n_dim
                 node_for_angle_info = torch.tile(
                     node_ebd_for_angle.unsqueeze(2).unsqueeze(2),
@@ -1101,7 +1099,7 @@ class RepFlowLayer(torch.nn.Module):
 
             # edge angle message
             # nb x nloc x a_nnei x a_nnei x e_dim
-            if not self.optim_angle:
+            if not self.optim_update:
                 assert angle_info is not None
                 edge_angle_update = self.act(self.edge_angle_linear1(angle_info))
             else:
@@ -1165,7 +1163,7 @@ class RepFlowLayer(torch.nn.Module):
 
             # angle self message
             # nb x nloc x a_nnei x a_nnei x dim_a
-            if not self.optim_angle:
+            if not self.optim_update:
                 assert angle_info is not None
                 angle_self_update = self.act(self.angle_self_linear(angle_info))
             else:
