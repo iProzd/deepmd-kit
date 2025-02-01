@@ -117,10 +117,18 @@ class MLPLayer(nn.Module):
             self._default_normal_init(
                 bavg=bavg, stddev=stddev, generator=random_generator
             )
-        elif init.startswith("custom_glorot"):
+        elif init.startswith("custom_glorot_step"):
             step_size = float(init.split(":")[-1]) if ":" in init else 0.1
-            self._custom_glorot_normal(
+            self._custom_glorot_normal_step(
                 step_size=step_size,
+                bavg=bavg,
+                stddev=stddev,
+                generator=random_generator,
+            )
+        elif init.startswith("custom_glorot_rate"):
+            rate = float(init.split(":")[-1]) if ":" in init else 2
+            self._custom_glorot_normal_rate(
+                rate=rate,
                 bavg=bavg,
                 stddev=stddev,
                 generator=random_generator,
@@ -174,7 +182,7 @@ class MLPLayer(nn.Module):
         if self.idt is not None:
             normal_(self.idt.data, mean=0.1, std=0.001, generator=generator)
 
-    def _custom_glorot_normal(
+    def _custom_glorot_normal_step(
         self,
         step_size: float = 0.1,
         bavg: float = 0.0,
@@ -184,6 +192,23 @@ class MLPLayer(nn.Module):
         normal_(
             self.matrix.data,
             std=stddev * np.sqrt(2 / (step_size**2 * (self.num_out + self.num_in))),
+            generator=generator,
+        )
+        if self.bias is not None:
+            normal_(self.bias.data, mean=bavg, std=stddev, generator=generator)
+        if self.idt is not None:
+            normal_(self.idt.data, mean=0.1, std=0.001, generator=generator)
+
+    def _custom_glorot_normal_rate(
+        self,
+        rate: float = 2.0,
+        bavg: float = 0.0,
+        stddev: float = 1.0,
+        generator: Optional[torch.Generator] = None,
+    ) -> None:
+        normal_(
+            self.matrix.data,
+            std=stddev * np.sqrt(rate / (self.num_out + self.num_in)),
             generator=generator,
         )
         if self.bias is not None:
