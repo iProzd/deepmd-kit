@@ -1709,6 +1709,12 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "unet_rate",
+            float,
+            optional=True,
+            default=0.5,
+        ),
     ]
 
 

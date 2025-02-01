@@ -104,9 +104,9 @@ class RepFlowLayer(torch.nn.Module):
         self.a_compress_rate = a_compress_rate
         self.a_use_e_mess = a_use_e_mess
         if a_compress_rate != 0:
-            assert a_dim % (2 * a_compress_rate) == 0, (
-                f"For a_compress_rate of {a_compress_rate}, a_dim must be divisible by {2 * a_compress_rate}. "
-                f"Currently, a_dim={a_dim} is not valid."
+            assert (a_dim * a_compress_e_rate) % (2 * a_compress_rate) == 0, (
+                f"For a_compress_rate of {a_compress_rate}, a_dim*a_compress_e_rate must be divisible by {2 * a_compress_rate}. "
+                f"Currently, a_dim={a_dim} and a_compress_e_rate={a_compress_e_rate} is not valid."
             )
         self.n_multi_edge_message = n_multi_edge_message
         assert self.n_multi_edge_message >= 1, "n_multi_edge_message must >= 1!"
@@ -402,8 +402,8 @@ class RepFlowLayer(torch.nn.Module):
                 self.angle_dim += (
                     self.a_dim // self.a_compress_rate
                 ) * self.a_compress_e_rate
-                self.e_a_compress_dim = (
-                    self.a_dim // (2 * self.a_compress_rate) * self.a_compress_e_rate
+                self.e_a_compress_dim = (self.a_dim * self.a_compress_e_rate) // (
+                    2 * self.a_compress_rate
                 )
                 self.n_a_compress_dim = self.a_dim // self.a_compress_rate
                 if not self.a_compress_use_split:

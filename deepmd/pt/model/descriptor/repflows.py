@@ -119,6 +119,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_unet_n: bool = True,
         use_unet_e: bool = True,
         use_unet_a: bool = True,
+        unet_rate: float = 0.5,
         bn_moment: float = 0.1,
         auto_batchsize: int = 0,
         optim_update: bool = True,
@@ -280,6 +281,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_unet_n = use_unet_n
         self.use_unet_e = use_unet_e
         self.use_unet_a = use_unet_a
+        self.unet_rate = unet_rate
         # self.out_ln = None
         # if self.pre_ln:
         #     self.out_ln = torch.nn.LayerNorm(
@@ -312,8 +314,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.unet_first_half = int((self.nlayers + 1) / 2)
         self.unet_rest_half = int(self.nlayers / 2)
         if self.use_unet:
-            self.unet_scale = [(0.5**i) for i in range(self.unet_first_half)] + [
-                (0.5 ** (self.unet_rest_half - 1 - i))
+            self.unet_scale = [
+                (self.unet_rate**i) for i in range(self.unet_first_half)
+            ] + [
+                (self.unet_rate ** (self.unet_rest_half - 1 - i))
                 for i in range(self.unet_rest_half)
             ]
 
@@ -741,18 +745,21 @@ class DescrptBlockRepflows(DescriptorBlock):
                     tmp_e_dim = int(self.e_dim * self.unet_scale[idx + 1])
                     tmp_a_dim = int(self.a_dim * self.unet_scale[idx + 1])
                     if self.use_unet_n:
+                        ori_dim = node_ebd.shape[-1]
                         stack_node_ebd, node_ebd = torch.split(
-                            node_ebd, [tmp_n_dim, tmp_n_dim], dim=-1
+                            node_ebd, [ori_dim - tmp_n_dim, tmp_n_dim], dim=-1
                         )
                         unet_list_node.append(stack_node_ebd)
                     if self.use_unet_e:
+                        ori_dim = edge_ebd.shape[-1]
                         stack_edge_ebd, edge_ebd = torch.split(
-                            edge_ebd, [tmp_e_dim, tmp_e_dim], dim=-1
+                            edge_ebd, [ori_dim - tmp_e_dim, tmp_e_dim], dim=-1
                         )
                         unet_list_edge.append(stack_edge_ebd)
                     if self.use_unet_a:
+                        ori_dim = angle_ebd.shape[-1]
                         stack_angle_ebd, angle_ebd = torch.split(
-                            angle_ebd, [tmp_a_dim, tmp_a_dim], dim=-1
+                            angle_ebd, [ori_dim - tmp_a_dim, tmp_a_dim], dim=-1
                         )
                         unet_list_angle.append(stack_angle_ebd)
                 elif self.unet_rest_half - 1 < idx < self.nlayers - 1:
