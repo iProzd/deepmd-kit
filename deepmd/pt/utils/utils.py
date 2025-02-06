@@ -60,15 +60,17 @@ class CustomSilu(torch.nn.Module):
 
 
 class CustomDSilu(torch.nn.Module):
-    def __init__(self, threshold=3.0, sig_w=1.0):
+    def __init__(self, threshold=3.0, sig_s=3.0):
         super().__init__()
         self.threshold = threshold
-        self.sig_w = sig_w
+        self.sig_s = sig_s
 
     def forward(self, x):
-        result = F.silu(x)
-        sig = torch.sigmoid(x - (self.threshold - 1))
-        return result + sig * (1 - x * sig)
+        # result = F.silu(x)
+        # sig = torch.sigmoid(x - (self.threshold - 1))
+        # return result + sig * (1 - x * sig)
+        result = torch.ops.deepmd.cdsilu(x.contiguous(), self.threshold, self.sig_s)
+        return result
 
 
 class dSiLU(torch.nn.Module):
