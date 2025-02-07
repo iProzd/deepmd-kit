@@ -315,6 +315,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.unet_scale = [1.0 for _ in range(self.nlayers)]
         self.unet_first_half = int((self.nlayers + 1) / 2)
         self.unet_rest_half = int(self.nlayers / 2)
+        self.unet_norm_n = None
+        self.unet_norm_e = None
+        self.unet_norm_a = None
         if self.use_unet:
             self.unet_scale = [
                 (self.unet_rate**i) for i in range(self.unet_first_half)
@@ -322,9 +325,6 @@ class DescrptBlockRepflows(DescriptorBlock):
                 (self.unet_rate ** (self.unet_rest_half - 1 - i))
                 for i in range(self.unet_rest_half)
             ]
-            self.unet_norm_n = None
-            self.unet_norm_e = None
-            self.unet_norm_a = None
             if self.unet_norm != "None":
                 norm_idx = self.unet_first_half - 1
                 if self.unet_norm == "batchnorm":
