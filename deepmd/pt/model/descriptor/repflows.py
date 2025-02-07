@@ -120,6 +120,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_unet_e: bool = True,
         use_unet_a: bool = True,
         unet_rate: float = 0.5,
+        unet_norm: str = "None",
         bn_moment: float = 0.1,
         auto_batchsize: int = 0,
         optim_update: bool = True,
@@ -282,6 +283,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_unet_e = use_unet_e
         self.use_unet_a = use_unet_a
         self.unet_rate = unet_rate
+        self.unet_norm = unet_norm
         # self.out_ln = None
         # if self.pre_ln:
         #     self.out_ln = torch.nn.LayerNorm(
@@ -320,6 +322,78 @@ class DescrptBlockRepflows(DescriptorBlock):
                 (self.unet_rate ** (self.unet_rest_half - 1 - i))
                 for i in range(self.unet_rest_half)
             ]
+            self.unet_norm_n = None
+            self.unet_norm_e = None
+            self.unet_norm_a = None
+            if self.unet_norm != "None":
+                norm_idx = self.unet_first_half - 1
+                if self.unet_norm == "batchnorm":
+                    self.unet_norm_n = (
+                        torch.nn.BatchNorm1d(
+                            int(self.n_dim * self.unet_scale[norm_idx]),
+                            affine=False,
+                            device=env.DEVICE,
+                            dtype=self.prec,
+                            momentum=self.bn_moment,
+                        )
+                        if self.use_unet_n
+                        else None
+                    )
+                    self.unet_norm_e = (
+                        torch.nn.BatchNorm1d(
+                            int(self.e_dim * self.unet_scale[norm_idx]),
+                            affine=False,
+                            device=env.DEVICE,
+                            dtype=self.prec,
+                            momentum=self.bn_moment,
+                        )
+                        if self.use_unet_e
+                        else None
+                    )
+                    self.unet_norm_a = (
+                        torch.nn.BatchNorm1d(
+                            int(self.a_dim * self.unet_scale[norm_idx]),
+                            affine=False,
+                            device=env.DEVICE,
+                            dtype=self.prec,
+                            momentum=self.bn_moment,
+                        )
+                        if self.use_unet_a
+                        else None
+                    )
+                elif self.unet_norm == "layernorm":
+                    self.unet_norm_n = (
+                        torch.nn.LayerNorm(
+                            int(self.n_dim * self.unet_scale[norm_idx]),
+                            device=env.DEVICE,
+                            dtype=self.prec,
+                            elementwise_affine=False,
+                        )
+                        if self.use_unet_n
+                        else None
+                    )
+                    self.unet_norm_e = (
+                        torch.nn.LayerNorm(
+                            int(self.e_dim * self.unet_scale[norm_idx]),
+                            device=env.DEVICE,
+                            dtype=self.prec,
+                            elementwise_affine=False,
+                        )
+                        if self.use_unet_e
+                        else None
+                    )
+                    self.unet_norm_a = (
+                        torch.nn.LayerNorm(
+                            int(self.a_dim * self.unet_scale[norm_idx]),
+                            device=env.DEVICE,
+                            dtype=self.prec,
+                            elementwise_affine=False,
+                        )
+                        if self.use_unet_a
+                        else None
+                    )
+                else:
+                    raise ValueError(f"Unsupported unet norm {self.unet_norm}!")
 
         for ii in range(nlayers):
             layers.append(
@@ -739,6 +813,22 @@ class DescrptBlockRepflows(DescriptorBlock):
                     h1_ext,
                 )
             if self.use_unet:
+                if self.unet_norm != "None" and idx == self.unet_first_half - 1:
+                    if self.use_unet_n:
+                        assert self.unet_norm_n is not None
+                        node_ebd = self.unet_norm_n(
+                            node_ebd.view(nframes * nloc, -1)
+                        ).view(nframes, nloc, -1)
+                    if self.use_unet_e:
+                        assert self.unet_norm_e is not None
+                        edge_ebd = self.unet_norm_e(
+                            edge_ebd.view(nframes * nloc * self.nnei, -1)
+                        ).view(nframes, nloc, nnei, -1)
+                    if self.use_unet_a:
+                        assert self.unet_norm_a is not None
+                        angle_ebd = self.unet_norm_a(
+                            angle_ebd.view(nframes * nloc * self.a_sel * self.a_sel, -1)
+                        ).view(nframes, nloc, self.a_sel, self.a_sel, -1)
                 if idx < self.unet_first_half - 1:
                     # stack half output
                     tmp_n_dim = int(self.n_dim * self.unet_scale[idx + 1])

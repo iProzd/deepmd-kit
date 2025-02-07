@@ -46,6 +46,7 @@ class RepFlowArgs:
         use_unet_n: bool = True,
         use_unet_e: bool = True,
         use_unet_a: bool = True,
+        unet_norm: str = "None",
         unet_rate: float = 0.5,
         bn_moment: float = 0.1,
         n_update_has_a: bool = False,
@@ -147,6 +148,7 @@ class RepFlowArgs:
         self.use_unet_e = use_unet_e
         self.use_unet_a = use_unet_a
         self.unet_rate = unet_rate
+        self.unet_norm = unet_norm
         self.auto_batchsize = auto_batchsize
         self.optim_update = optim_update
 

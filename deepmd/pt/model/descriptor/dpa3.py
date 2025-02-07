@@ -186,6 +186,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             use_unet_e=self.repflow_args.use_unet_e,
             use_unet_a=self.repflow_args.use_unet_a,
             unet_rate=self.repflow_args.unet_rate,
+            unet_norm=self.repflow_args.unet_norm,
             bn_moment=self.repflow_args.bn_moment,
             auto_batchsize=self.repflow_args.auto_batchsize,
             optim_update=self.repflow_args.optim_update,

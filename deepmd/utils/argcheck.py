@@ -1715,6 +1715,12 @@ def dpa3_repflow_args():
             optional=True,
             default=0.5,
         ),
+        Argument(
+            "unet_norm",
+            str,
+            optional=True,
+            default="None",
+        ),
     ]
 
 
