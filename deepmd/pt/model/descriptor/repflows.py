@@ -111,6 +111,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         env_protection: float = 0.0,
         precision: str = "float64",
         skip_stat: bool = True,
+        no_sym: bool = False,
         pre_ln: bool = False,
         only_e_ln: bool = False,
         pre_bn: bool = False,
@@ -237,6 +238,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.n_attn_head = n_attn_head
         self.auto_batchsize = auto_batchsize
         self.optim_update = optim_update
+        self.no_sym = no_sym
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -449,6 +451,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     only_e_bn=self.only_e_bn,
                     bn_moment=self.bn_moment,
                     optim_update=self.optim_update,
+                    no_sym=self.no_sym,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

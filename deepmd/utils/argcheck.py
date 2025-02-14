@@ -1721,6 +1721,12 @@ def dpa3_repflow_args():
             optional=True,
             default="None",
         ),
+        Argument(
+            "no_sym",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

@@ -191,6 +191,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             auto_batchsize=self.repflow_args.auto_batchsize,
             optim_update=self.repflow_args.optim_update,
             skip_stat=self.repflow_args.skip_stat,
+            no_sym=self.repflow_args.no_sym,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

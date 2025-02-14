@@ -77,6 +77,7 @@ class RepFlowLayer(torch.nn.Module):
         only_e_bn: bool = False,
         bn_moment: float = 0.1,
         optim_update: bool = True,
+        no_sym: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -143,6 +144,7 @@ class RepFlowLayer(torch.nn.Module):
         self.n_update_has_a = n_update_has_a
         self.n_update_has_a_first_sum = n_update_has_a_first_sum
         self.optim_update = optim_update
+        self.no_sym = no_sym
 
         assert update_residual_init in [
             "norm",
@@ -259,23 +261,26 @@ class RepFlowLayer(torch.nn.Module):
             )
 
         # node sym (grrg + drrd)
-        self.n_sym_dim = n_dim * self.axis_neuron + e_dim * self.axis_neuron
-        self.node_sym_linear = MLPLayer(
-            self.n_sym_dim,
-            n_dim,
-            precision=precision,
-            seed=child_seed(seed, 2),
-        )
-        if self.update_style == "res_residual":
-            self.n_residual.append(
-                get_residual(
-                    n_dim,
-                    self.update_residual,
-                    self.update_residual_init,
-                    precision=precision,
-                    seed=child_seed(seed, 3),
-                )
+        if not self.no_sym:
+            self.n_sym_dim = n_dim * self.axis_neuron + e_dim * self.axis_neuron
+            self.node_sym_linear = MLPLayer(
+                self.n_sym_dim,
+                n_dim,
+                precision=precision,
+                seed=child_seed(seed, 2),
             )
+            if self.update_style == "res_residual":
+                self.n_residual.append(
+                    get_residual(
+                        n_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 3),
+                    )
+                )
+        else:
+            self.node_sym_linear = None
 
         # node edge message
         self.node_edge_linear = MLPLayer(
@@ -818,28 +823,30 @@ class RepFlowLayer(torch.nn.Module):
 
         nei_node_ebd = _make_nei_g1(node_ebd_ext, nlist)
 
-        # node sym (grrg + drrd)
-        node_sym_list: list[torch.Tensor] = []
-        node_sym_list.append(
-            self.symmetrization_op(
-                edge_ebd,
-                h2,
-                nlist_mask,
-                sw,
-                self.axis_neuron,
+        if not self.no_sym:
+            assert self.node_sym_linear is not None
+            # node sym (grrg + drrd)
+            node_sym_list: list[torch.Tensor] = []
+            node_sym_list.append(
+                self.symmetrization_op(
+                    edge_ebd,
+                    h2,
+                    nlist_mask,
+                    sw,
+                    self.axis_neuron,
+                )
             )
-        )
-        node_sym_list.append(
-            self.symmetrization_op(
-                nei_node_ebd,
-                h2,
-                nlist_mask,
-                sw,
-                self.axis_neuron,
+            node_sym_list.append(
+                self.symmetrization_op(
+                    nei_node_ebd,
+                    h2,
+                    nlist_mask,
+                    sw,
+                    self.axis_neuron,
+                )
             )
-        )
-        node_sym = self.act(self.node_sym_linear(torch.cat(node_sym_list, dim=-1)))
-        n_update_list.append(node_sym)
+            node_sym = self.act(self.node_sym_linear(torch.cat(node_sym_list, dim=-1)))
+            n_update_list.append(node_sym)
 
         if not self.optim_update:
             # nb x nloc x nnei x (n_dim * 2 + e_dim)
