@@ -279,7 +279,7 @@ class TypeEmbedNet(nn.Module):
         )
         # nn.init.normal_(self.embedding.weight[:-1], mean=bavg, std=stddev)
 
-    def forward(self, atype, type_charge=None):
+    def forward(self, atype, type_charge: Optional[torch.Tensor] = None):
         """
         Args:
             atype: Type of each input, [nframes, nloc] or [nframes, nloc, nnei].
