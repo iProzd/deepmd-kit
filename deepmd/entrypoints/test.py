@@ -304,6 +304,9 @@ def test_ener(
         data.add("spin", 3, atomic=True, must=True, high_prec=False)
         data.add("force_mag", 3, atomic=True, must=False, high_prec=False)
 
+    if dp.has_charge:
+        data.add("partial_charge", 1, atomic=True, must=False, high_prec=False)
+
     test_data = data.get_test()
     mixed_type = data.mixed_type
     natoms = len(test_data["type"][0])
@@ -320,6 +323,14 @@ def test_ener(
         spin = test_data["spin"][:numb_test].reshape([numb_test, -1])
     else:
         spin = None
+
+    if dp.has_charge:
+        partial_charge = test_data["partial_charge"][:numb_test].reshape(
+            [numb_test, -1]
+        )
+    else:
+        partial_charge = None
+
     if not data.pbc:
         box = None
     if mixed_type:
@@ -345,6 +356,7 @@ def test_ener(
         efield=efield,
         mixed_type=mixed_type,
         spin=spin,
+        partial_charge=partial_charge,
     )
     energy = ret[0]
     force = ret[1]
