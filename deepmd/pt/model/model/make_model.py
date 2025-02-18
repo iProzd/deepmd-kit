@@ -509,6 +509,7 @@ def make_model(T_AtomicModel: Type[BaseAtomicModel]):
             """Get the number (dimension) of atomic parameters of this atomic model."""
             return self.atomic_model.get_dim_aparam()
 
+        @torch.jit.export
         def has_charge(self) -> bool:
             return getattr(self.atomic_model, "has_charge", False)
 

@@ -146,6 +146,10 @@ class DeepEval(DeepEvalBackend):
         if callable(self._has_spin):
             self._has_spin = self._has_spin()
 
+        self._has_charge = getattr(self.dp.model["Default"], "has_charge", False)
+        if callable(self._has_charge):
+            self._has_charge = self._has_charge()
+
     def get_rcut(self) -> float:
         """Get the cutoff radius of this model."""
         return self.rcut
@@ -210,6 +214,10 @@ class DeepEval(DeepEvalBackend):
         """Check if the model has spin atom types."""
         return self._has_spin
 
+    def get_has_charge(self):
+        """Check if the model has spin atom types."""
+        return self._has_charge
+
     def eval(
         self,
         coords: np.ndarray,
@@ -266,9 +274,20 @@ class DeepEval(DeepEvalBackend):
         )
         request_defs = self._get_request_defs(atomic)
         if "spin" not in kwargs or kwargs["spin"] is None:
-            out = self._eval_func(self._eval_model, numb_test, natoms)(
-                coords, cells, atom_types, fparam, aparam, request_defs
-            )
+            if "partial_charge" in kwargs and kwargs["partial_charge"] is not None:
+                out = self._eval_func(self._eval_model_with_charge, numb_test, natoms)(
+                    coords,
+                    cells,
+                    atom_types,
+                    np.array(kwargs["partial_charge"]),
+                    fparam,
+                    aparam,
+                    request_defs,
+                )
+            else:
+                out = self._eval_func(self._eval_model, numb_test, natoms)(
+                    coords, cells, atom_types, fparam, aparam, request_defs
+                )
         else:
             out = self._eval_func(self._eval_model_spin, numb_test, natoms)(
                 coords,
@@ -425,6 +444,93 @@ class DeepEval(DeepEvalBackend):
             do_atomic_virial=do_atomic_virial,
             fparam=fparam_input,
             aparam=aparam_input,
+        )
+        if isinstance(batch_output, tuple):
+            batch_output = batch_output[0]
+
+        results = []
+        for odef in request_defs:
+            pt_name = self._OUTDEF_DP2BACKEND[odef.name]
+            if pt_name in batch_output:
+                shape = self._get_output_shape(odef, nframes, natoms)
+                out = batch_output[pt_name].reshape(shape).detach().cpu().numpy()
+                results.append(out)
+            else:
+                shape = self._get_output_shape(odef, nframes, natoms)
+                results.append(
+                    np.full(np.abs(shape), np.nan)  # pylint: disable=no-explicit-dtype
+                )  # this is kinda hacky
+        return tuple(results)
+
+    def _eval_model_with_charge(
+        self,
+        coords: np.ndarray,
+        cells: Optional[np.ndarray],
+        atom_types: np.ndarray,
+        partial_charge: np.ndarray,
+        fparam: Optional[np.ndarray],
+        aparam: Optional[np.ndarray],
+        request_defs: List[OutputVariableDef],
+    ):
+        model = self.dp.to(DEVICE)
+
+        nframes = coords.shape[0]
+        if len(atom_types.shape) == 1:
+            natoms = len(atom_types)
+            atom_types = np.tile(atom_types, nframes).reshape(nframes, -1)
+        else:
+            natoms = len(atom_types[0])
+
+        coord_input = torch.tensor(
+            coords.reshape([nframes, natoms, 3]).astype(
+                NP_PRECISION_DICT[RESERVED_PRECISON_DICT[GLOBAL_PT_FLOAT_PRECISION]]
+            ),
+            dtype=GLOBAL_PT_FLOAT_PRECISION,
+            device=DEVICE,
+        )
+        type_input = torch.tensor(
+            atom_types.astype(NP_PRECISION_DICT[RESERVED_PRECISON_DICT[torch.long]]),
+            dtype=torch.long,
+            device=DEVICE,
+        )
+        partial_charge_input = torch.tensor(
+            partial_charge.reshape([nframes, natoms, 1]),
+            dtype=GLOBAL_PT_FLOAT_PRECISION,
+            device=DEVICE,
+        )
+        if cells is not None:
+            box_input = torch.tensor(
+                cells.reshape([nframes, 3, 3]).astype(
+                    NP_PRECISION_DICT[RESERVED_PRECISON_DICT[GLOBAL_PT_FLOAT_PRECISION]]
+                ),
+                dtype=GLOBAL_PT_FLOAT_PRECISION,
+                device=DEVICE,
+            )
+        else:
+            box_input = None
+        if fparam is not None:
+            fparam_input = to_torch_tensor(
+                fparam.reshape(nframes, self.get_dim_fparam())
+            )
+        else:
+            fparam_input = None
+        if aparam is not None:
+            aparam_input = to_torch_tensor(
+                aparam.reshape(nframes, natoms, self.get_dim_aparam())
+            )
+        else:
+            aparam_input = None
+        do_atomic_virial = any(
+            x.category == OutputVariableCategory.DERV_C for x in request_defs
+        )
+        batch_output = model(
+            coord_input,
+            type_input,
+            box=box_input,
+            do_atomic_virial=do_atomic_virial,
+            fparam=fparam_input,
+            aparam=aparam_input,
+            partial_charge=partial_charge_input,
         )
         if isinstance(batch_output, tuple):
             batch_output = batch_output[0]

@@ -278,6 +278,10 @@ class DeepEvalBackend(ABC):
         """Check if the model has spin atom types."""
         return False
 
+    def get_has_charge(self):
+        """Check if the model has spin atom types."""
+        return False
+
     @abstractmethod
     def get_ntypes_spin(self) -> int:
         """Get the number of spin atom types of this model. Only used in old implement."""
@@ -540,6 +544,11 @@ class DeepEval(ABC):
     def has_spin(self) -> bool:
         """Check if the model has spin."""
         return self.deep_eval.get_has_spin()
+
+    @property
+    def has_charge(self) -> bool:
+        """Check if the model has spin."""
+        return self.deep_eval.get_has_charge()
 
     def get_ntypes_spin(self) -> int:
         """Get the number of spin atom types of this model. Only used in old implement."""
