@@ -19,6 +19,102 @@ from .env import (
 from .env import PRECISION_DICT as PT_PRECISION_DICT
 
 
+@torch.jit.script
+def custom_silu_forward_inner(
+    x: torch.Tensor, threshold: float, slope: float, const_val: float
+) -> torch.Tensor:
+    sig = 1.0 / (1.0 + torch.exp(-x))
+    silu = x * sig
+    tanh_part = torch.tanh(slope * (x - threshold)) + const_val
+    return torch.where(x >= threshold, tanh_part, silu)
+
+
+@torch.jit.script
+def custom_silu_backward_inner(
+    x: torch.Tensor,
+    threshold: float,
+    slope: float,
+) -> torch.Tensor:
+    sig = 1.0 / (1.0 + torch.exp(-x))
+    grad_silu = sig * (1 + x * (1 - sig))
+    tanh_term = torch.tanh(slope * (x - threshold))
+    grad_tanh = slope * (1 - tanh_term * tanh_term)
+    grad = torch.where(x >= threshold, grad_tanh, grad_silu)
+    return grad
+
+
+@torch.jit.script
+def custom_silu_double_backward_inner(
+    x: torch.Tensor,
+    grad_grad_output: torch.Tensor,
+    grad_output: torch.Tensor,
+    threshold: float,
+    slope: float,
+) -> torch.Tensor:
+    mask = x >= threshold
+    grad_grad = torch.zeros_like(x)
+
+    # Tanh branch
+    tanh_term = torch.tanh(slope * (x[mask] - threshold))
+    grad_grad[mask] = -2 * slope * slope * tanh_term * (1 - tanh_term * tanh_term)
+
+    # SiLU branch
+    x_else = x[~mask]
+    sig = 1.0 / (1.0 + torch.exp(-x_else))
+    sig_prime = sig * (1 - sig)
+    grad_grad[~mask] = sig_prime * (2 + x_else * (1 - 2 * sig))
+
+    return grad_output * grad_grad * grad_grad_output
+
+
+class CustomSiluScript(torch.nn.Module):
+    def __init__(self, threshold=3.0):
+        super().__init__()
+        self.threshold = threshold
+
+        # Precompute parameters for the tanh replacement
+        sigmoid_threshold = 1 / (1 + np.exp(-threshold))
+        self.slope = float(
+            sigmoid_threshold + threshold * sigmoid_threshold * (1 - sigmoid_threshold)
+        )
+        self.const = float(threshold * sigmoid_threshold)
+
+        self._define_autograd_functions()
+
+    def _define_autograd_functions(self):
+        class CustomSiluForward(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x):
+                ctx.save_for_backward(x)
+                return custom_silu_forward_inner(
+                    x, self.threshold, self.slope, self.const
+                )
+
+            @staticmethod
+            def backward(ctx, grad_output):
+                (x,) = ctx.saved_tensors
+                return CustomSiluBackward.apply(x, grad_output)
+
+        class CustomSiluBackward(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, grad_output):
+                grad = custom_silu_backward_inner(x, self.threshold, self.slope)
+                ctx.save_for_backward(x, grad_output, grad)
+                return grad * grad_output
+
+            @staticmethod
+            def backward(ctx, grad_grad_output):
+                (x, grad_output, grad) = ctx.saved_tensors
+                return custom_silu_double_backward_inner(
+                    x, grad_grad_output, grad_output, self.threshold, self.slope
+                ), grad * grad_grad_output
+
+        self.CustomSiluForward = CustomSiluForward
+
+    def forward(self, x):
+        return self.CustomSiluForward.apply(x)
+
+
 class CustomSiluJit(torch.nn.Module):
     def __init__(self, threshold=3.0):
         super().__init__()
@@ -270,6 +366,8 @@ class ActivationFn(torch.nn.Module):
                 self.custom_silu = CustomSiluOp(threshold=threshold)
             elif SILU_OP == "jit":
                 self.custom_silu = CustomSiluJit(threshold=threshold)
+            elif SILU_OP == "script":
+                self.custom_silu = CustomSiluScript(threshold=threshold)
             else:
                 raise ValueError(f"Not defined SILU_OP: {SILU_OP}!")
         else:
