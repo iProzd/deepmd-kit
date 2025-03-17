@@ -55,3 +55,7 @@ class DeepmdDataSetForLoader(Dataset):
                 dtype=data_item["dtype"],
                 output_natoms_for_type_sel=data_item["output_natoms_for_type_sel"],
             )
+
+    @property
+    def natoms(self):
+        return self._natoms

@@ -87,10 +87,17 @@ class DpLoaderSet(Dataset):
             with h5py.File(systems) as file:
                 systems = [os.path.join(systems, item) for item in file.keys()]
 
+        MAX_SYS_NATOMS = int(os.environ.get("MAX_SYS_NATOMS", 0))
+
         def construct_dataset(system):
-            return DeepmdDataSetForLoader(
+            sys_loader = DeepmdDataSetForLoader(
                 system=system,
                 type_map=type_map,
+            )
+            return (
+                sys_loader
+                if (MAX_SYS_NATOMS == 0 or sys_loader.natoms <= MAX_SYS_NATOMS)
+                else None
             )
 
         self.systems: list[DeepmdDataSetForLoader] = []
@@ -104,6 +111,17 @@ class DpLoaderSet(Dataset):
         if dist.is_initialized():
             dist.broadcast_object_list(self.systems)
             assert self.systems[-1] is not None
+        if MAX_SYS_NATOMS != 0:
+            new_list = []
+            for system_item in self.systems:
+                if system_item is not None:
+                    new_list.append(system_item)
+            large_sys = len(self.systems) - len(new_list)
+            if large_sys > 0:
+                log.info(
+                    f"Deprecate {large_sys} DataLoaders from {len(systems)} systems with natoms larger than {MAX_SYS_NATOMS}"
+                )
+            self.systems = new_list
         self.sampler_list: list[DistributedSampler] = []
         self.index = []
         self.total_batch = 0
@@ -127,7 +145,7 @@ class DpLoaderSet(Dataset):
         elif isinstance(batch_size, list):
             self.batch_sizes = batch_size
         else:
-            self.batch_sizes = batch_size * np.ones(len(systems), dtype=int)
+            self.batch_sizes = batch_size * np.ones(len(self.systems), dtype=int)
         assert len(self.systems) == len(self.batch_sizes)
         for system, batch_size in zip(self.systems, self.batch_sizes):
             if dist.is_available() and dist.is_initialized():
