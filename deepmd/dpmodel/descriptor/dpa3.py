@@ -54,6 +54,9 @@ class RepFlowArgs:
         auto_batchsize: int = 0,
         optim_update: bool = True,
         no_sym: bool = False,
+        smooth_angle_init: bool = False,
+        angle_init_use_sin: bool = False,
+        smooth_edge_update: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -153,6 +156,9 @@ class RepFlowArgs:
         self.auto_batchsize = auto_batchsize
         self.optim_update = optim_update
         self.no_sym = no_sym
+        self.smooth_angle_init = smooth_angle_init
+        self.angle_init_use_sin = angle_init_use_sin
+        self.smooth_edge_update = smooth_edge_update
 
     def __getitem__(self, key):
         if hasattr(self, key):

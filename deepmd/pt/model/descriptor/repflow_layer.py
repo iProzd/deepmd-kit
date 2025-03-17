@@ -78,6 +78,7 @@ class RepFlowLayer(torch.nn.Module):
         bn_moment: float = 0.1,
         optim_update: bool = True,
         no_sym: bool = False,
+        smooth_edge_update: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -145,6 +146,7 @@ class RepFlowLayer(torch.nn.Module):
         self.n_update_has_a_first_sum = n_update_has_a_first_sum
         self.optim_update = optim_update
         self.no_sym = no_sym
+        self.smooth_edge_update = smooth_edge_update
 
         assert update_residual_init in [
             "norm",
@@ -1146,20 +1148,22 @@ class RepFlowLayer(torch.nn.Module):
                 ],
                 dim=2,
             )
-            full_mask = torch.concat(
-                [
-                    a_nlist_mask,
-                    torch.zeros(
-                        [nb, nloc, self.nnei - self.a_sel],
-                        dtype=a_nlist_mask.dtype,
-                        device=a_nlist_mask.device,
-                    ),
-                ],
-                dim=-1,
-            )
-            padding_edge_angle_update = torch.where(
-                full_mask.unsqueeze(-1), padding_edge_angle_update, edge_ebd
-            )
+            if not self.smooth_edge_update:
+                # will be deprecated in the future
+                full_mask = torch.concat(
+                    [
+                        a_nlist_mask,
+                        torch.zeros(
+                            [nb, nloc, self.nnei - self.a_sel],
+                            dtype=a_nlist_mask.dtype,
+                            device=a_nlist_mask.device,
+                        ),
+                    ],
+                    dim=-1,
+                )
+                padding_edge_angle_update = torch.where(
+                    full_mask.unsqueeze(-1), padding_edge_angle_update, edge_ebd
+                )
             e_update_list.append(
                 self.act(self.edge_angle_linear2(padding_edge_angle_update))
             )
