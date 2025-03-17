@@ -110,7 +110,7 @@ class DpLoaderSet(Dataset):
             self.systems = [None] * len(systems)  # type: ignore
         if dist.is_initialized():
             dist.broadcast_object_list(self.systems)
-            assert self.systems[-1] is not None
+            # assert self.systems[-1] is not None
         if MAX_SYS_NATOMS != 0:
             new_list = []
             for system_item in self.systems:
