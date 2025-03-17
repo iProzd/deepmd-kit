@@ -100,6 +100,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         env_protection: float = 0.0,
         precision: str = "float64",
         skip_stat: bool = True,
+        smooth_angle_init: bool = False,
+        angle_init_use_sin: bool = False,
+        smooth_edge_update: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -202,6 +205,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.skip_stat = skip_stat
         self.a_compress_use_split = a_compress_use_split
         self.optim_update = optim_update
+        self.smooth_angle_init = smooth_angle_init
+        self.angle_init_use_sin = angle_init_use_sin
+        self.smooth_edge_update = smooth_edge_update
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -226,7 +232,11 @@ class DescrptBlockRepflows(DescriptorBlock):
             1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
         )
         self.angle_embd = MLPLayer(
-            1, self.a_dim, precision=precision, bias=False, seed=child_seed(seed, 1)
+            1 if not self.angle_init_use_sin else 2,
+            self.a_dim,
+            precision=precision,
+            bias=False,
+            seed=child_seed(seed, 1),
         )
         layers = []
         for ii in range(nlayers):
@@ -254,6 +264,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     update_residual_init=self.update_residual_init,
                     precision=precision,
                     optim_update=self.optim_update,
+                    smooth_edge_update=self.smooth_edge_update,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -434,10 +445,21 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nf x nloc x a_nnei x a_nnei
         # 1 - 1e-6 for torch.acos stability
         cosine_ij = torch.matmul(normalized_diff_i, normalized_diff_j) * (1 - 1e-6)
-        # nf x nloc x a_nnei x a_nnei x 1
-        cosine_ij = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
+        sine_ij = torch.sqrt(1 - cosine_ij**2)
+        if self.smooth_angle_init:
+            cosine_ij = cosine_ij * a_sw.unsqueeze(-1) * a_sw.unsqueeze(-2)
+            sine_ij = sine_ij * a_sw.unsqueeze(-1) * a_sw.unsqueeze(-2)
+
+        if not self.angle_init_use_sin:
+            # nf x nloc x a_nnei x a_nnei x 1
+            angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
+        else:
+            angle_input = torch.cat(
+                [cosine_ij.unsqueeze(-1), sine_ij.unsqueeze(-1)], dim=-1
+            ) / (torch.pi**0.5)
+
         # nf x nloc x a_nnei x a_nnei x a_dim
-        angle_ebd = self.angle_embd(cosine_ij).reshape(
+        angle_ebd = self.angle_embd(angle_input).reshape(
             nframes, nloc, self.a_sel, self.a_sel, self.a_dim
         )
 
