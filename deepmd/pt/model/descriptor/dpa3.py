@@ -195,6 +195,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             smooth_angle_init=self.repflow_args.smooth_angle_init,
             angle_init_use_sin=self.repflow_args.angle_init_use_sin,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
+            angle_multi_freq=self.repflow_args.angle_multi_freq,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

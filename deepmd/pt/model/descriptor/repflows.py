@@ -115,6 +115,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         smooth_angle_init: bool = False,
         angle_init_use_sin: bool = False,
         smooth_edge_update: bool = False,
+        angle_multi_freq: Optional[str] = None,
         pre_ln: bool = False,
         only_e_ln: bool = False,
         pre_bn: bool = False,
@@ -245,6 +246,24 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.smooth_angle_init = smooth_angle_init
         self.angle_init_use_sin = angle_init_use_sin
         self.smooth_edge_update = smooth_edge_update
+        self.angle_multi_freq = angle_multi_freq
+        self.angle_use_multi_freq = angle_multi_freq is not None
+        self.angle_multi_freq_list_float = (
+            [float(freq) for freq in angle_multi_freq.split(":")]
+            if self.angle_use_multi_freq
+            else []
+        )
+        if self.angle_use_multi_freq:
+            self.register_buffer(
+                "angle_multi_freq_list",
+                torch.tensor(
+                    self.angle_multi_freq_list_float,
+                    dtype=torch.float,
+                    device=env.DEVICE,
+                ),
+            )
+        else:
+            self.angle_multi_freq_list = None
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -305,7 +324,9 @@ class DescrptBlockRepflows(DescriptorBlock):
             1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
         )
         self.angle_embd = MLPLayer(
-            1 if not self.angle_init_use_sin else 2,
+            len(self.angle_multi_freq_list_float) + 1
+            if not self.angle_init_use_sin
+            else 2 * (len(self.angle_multi_freq_list_float) + 1),
             self.a_dim,
             precision=precision,
             bias=False,
@@ -648,13 +669,22 @@ class DescrptBlockRepflows(DescriptorBlock):
             cosine_ij = cosine_ij * a_sw.unsqueeze(-1) * a_sw.unsqueeze(-2)
             sine_ij = sine_ij * a_sw.unsqueeze(-1) * a_sw.unsqueeze(-2)
 
-        if not self.angle_init_use_sin:
-            # nf x nloc x a_nnei x a_nnei x 1
-            angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
+        if self.angle_use_multi_freq:
+            assert self.angle_multi_freq_list is not None
+            theta = torch.acos(cosine_ij)
+            theta_list = theta[..., None] * self.angle_multi_freq_list
         else:
-            angle_input = torch.cat(
-                [cosine_ij.unsqueeze(-1), sine_ij.unsqueeze(-1)], dim=-1
-            ) / (torch.pi**0.5)
+            theta_list = None
+
+        # nf x nloc x a_nnei x a_nnei x 1,  nf x nloc x a_nnei x a_nnei x n_freq
+        angle_input_list = [cosine_ij.unsqueeze(-1)] + (
+            [torch.cos(theta_list)] if theta_list is not None else []
+        )
+        if self.angle_init_use_sin:
+            angle_input_list += [sine_ij.unsqueeze(-1)] + (
+                [torch.sin(theta_list)] if theta_list is not None else []
+            )
+        angle_input = torch.cat(angle_input_list, dim=-1) / (torch.pi**0.5)
 
         # nf x nloc x a_nnei x a_nnei x a_dim
         angle_ebd = self.angle_embd(angle_input).reshape(

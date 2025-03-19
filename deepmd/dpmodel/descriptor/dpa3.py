@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+from typing import (
+    Optional,
+)
 
 
 class RepFlowArgs:
@@ -57,6 +60,7 @@ class RepFlowArgs:
         smooth_angle_init: bool = False,
         angle_init_use_sin: bool = False,
         smooth_edge_update: bool = False,
+        angle_multi_freq: Optional[str] = None,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -159,6 +163,7 @@ class RepFlowArgs:
         self.smooth_angle_init = smooth_angle_init
         self.angle_init_use_sin = angle_init_use_sin
         self.smooth_edge_update = smooth_edge_update
+        self.angle_multi_freq = angle_multi_freq
 
     def __getitem__(self, key):
         if hasattr(self, key):

@@ -1745,6 +1745,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "angle_multi_freq",
+            str,
+            optional=True,
+            default=None,
+        ),
     ]
 
 
