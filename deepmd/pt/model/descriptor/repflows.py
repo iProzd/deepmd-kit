@@ -104,6 +104,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_init_use_sin: bool = False,
         smooth_edge_update: bool = False,
         angle_multi_freq: Optional[str] = None,
+        no_sel: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -209,6 +210,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.smooth_angle_init = smooth_angle_init
         self.angle_init_use_sin = angle_init_use_sin
         self.smooth_edge_update = smooth_edge_update
+        self.no_sel = no_sel
         self.angle_multi_freq = angle_multi_freq
         self.angle_use_multi_freq = angle_multi_freq is not None
         self.angle_multi_freq_list_float = (
@@ -285,6 +287,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     update_residual_init=self.update_residual_init,
                     precision=precision,
                     optim_update=self.optim_update,
+                    no_sel=self.no_sel,
                     smooth_edge_update=self.smooth_edge_update,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
