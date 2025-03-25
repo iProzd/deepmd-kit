@@ -772,7 +772,7 @@ class RepFlowLayer(torch.nn.Module):
         nb, nloc, nnei = nlist.shape
         nall = node_ebd_ext.shape[1]
         node_ebd, _ = torch.split(node_ebd_ext, [nloc, nall - nloc], dim=1)
-        n_edge = nlist_mask.sum().item()
+        n_edge = int(nlist_mask.sum().item())
         assert (nb, nloc) == node_ebd.shape[:2]
         if not self.use_dynamic_sel:
             assert (nb, nloc, nnei, 3) == h2.shape
