@@ -32,7 +32,8 @@ class RepFlowArgs:
         angle_init_use_sin: bool = False,
         smooth_edge_update: bool = False,
         angle_multi_freq: Optional[str] = None,
-        no_sel: bool = False,
+        use_dynamic_sel: bool = False,
+        sel_reduce_factor: float = 10.0,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -114,7 +115,8 @@ class RepFlowArgs:
         self.angle_init_use_sin = angle_init_use_sin
         self.smooth_edge_update = smooth_edge_update
         self.angle_multi_freq = angle_multi_freq
-        self.no_sel = no_sel
+        self.use_dynamic_sel = use_dynamic_sel
+        self.sel_reduce_factor = sel_reduce_factor
 
     def __getitem__(self, key):
         if hasattr(self, key):

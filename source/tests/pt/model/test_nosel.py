@@ -87,6 +87,7 @@ class TestDescrptDPA3Nosel(unittest.TestCase, TestCaseSingleFrameWithNlist):
                 update_residual_init=ruri,
                 optim_update=optim,
                 smooth_edge_update=True,
+                sel_reduce_factor=1.0,  # test consistent when sel_reduce_factor == 1.0
             )
 
             # dpa3 new impl
@@ -101,7 +102,7 @@ class TestDescrptDPA3Nosel(unittest.TestCase, TestCaseSingleFrameWithNlist):
                 seed=GLOBAL_SEED,
             ).to(env.DEVICE)
 
-            repflow.no_sel = True
+            repflow.use_dynamic_sel = True
 
             # dpa3 new impl
             dd1 = DescrptDPA3(

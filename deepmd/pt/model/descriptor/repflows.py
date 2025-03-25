@@ -107,7 +107,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_init_use_sin: bool = False,
         smooth_edge_update: bool = False,
         angle_multi_freq: Optional[str] = None,
-        no_sel: bool = False,
+        use_dynamic_sel: bool = False,
+        sel_reduce_factor: float = 10.0,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -213,7 +214,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.smooth_angle_init = smooth_angle_init
         self.angle_init_use_sin = angle_init_use_sin
         self.smooth_edge_update = smooth_edge_update
-        self.no_sel = no_sel
+        self.use_dynamic_sel = use_dynamic_sel
+        self.sel_reduce_factor = sel_reduce_factor
         self.angle_multi_freq = angle_multi_freq
         self.angle_use_multi_freq = angle_multi_freq is not None
         self.angle_multi_freq_list_float = (
@@ -290,7 +292,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     update_residual_init=self.update_residual_init,
                     precision=precision,
                     optim_update=self.optim_update,
-                    no_sel=self.no_sel,
+                    use_dynamic_sel=self.use_dynamic_sel,
+                    sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
@@ -497,7 +500,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
         angle_input = torch.cat(angle_input_list, dim=-1) / (torch.pi**0.5)
 
-        if self.no_sel:
+        if self.use_dynamic_sel:
             # get graph index
             edge_index, angle_index = get_graph_index(
                 nlist, nlist_mask, a_nlist_mask, nall
@@ -613,15 +616,15 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nb x nloc x 3 x e_dim
         h2g2 = (
             RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
-            if not self.no_sel
-            else RepFlowLayer._cal_hg_nosel(
+            if not self.use_dynamic_sel
+            else RepFlowLayer._cal_hg_dynamic(
                 edge_ebd,
                 h2,
                 sw,
                 owner=edge_index[:, 0],
                 num_owner=nframes * nloc,
                 nloc=nloc,
-                scale_factor=1.0 / (float(nnei) ** 0.5),
+                scale_factor=(self.nnei / self.sel_reduce_factor) ** (-0.5),
             )
         )
         # (nb x nloc) x e_dim x 3
