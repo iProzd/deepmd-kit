@@ -68,38 +68,26 @@ def get_graph_index(
 
     Returns
     -------
-    n2e_index : n_edge
-        Broadcast indices from node(i) to edge(ij), or reduction indices from edge(ij) to node(i).
-    n_ext2e_index : n_edge
-        Broadcast indices from extended node(j) to edge(ij).
-    n2a_index : n_angle
-        Broadcast indices from extended node(j) to angle(ijk).
-    eij2a_index : n_angle
-        Broadcast indices from extended edge(ij) to angle(ijk), or reduction indices from angle(ijk) to edge(ij).
-    eik2a_index : n_angle
-        Broadcast indices from extended edge(ik) to angle(ijk).
+    edge_index : n_edge x 2
+        n2e_index : n_edge
+            Broadcast indices from node(i) to edge(ij), or reduction indices from edge(ij) to node(i).
+        n_ext2e_index : n_edge
+            Broadcast indices from extended node(j) to edge(ij).
+    angle_index : n_angle x 3
+        n2a_index : n_angle
+            Broadcast indices from extended node(j) to angle(ijk).
+        eij2a_index : n_angle
+            Broadcast indices from extended edge(ij) to angle(ijk), or reduction indices from angle(ijk) to edge(ij).
+        eik2a_index : n_angle
+            Broadcast indices from extended edge(ik) to angle(ijk).
     """
     nf, nloc, nnei = nlist.shape
     _, _, a_nnei = a_nlist_mask.shape
-    # nf x nloc x nnei
-    a_nlist_mask_full = torch.concat(
-        [
-            a_nlist_mask,
-            torch.zeros(
-                [nf, nloc, nnei - a_nnei],
-                dtype=a_nlist_mask.dtype,
-                device=a_nlist_mask.device,
-            ),
-        ],
-        dim=-1,
-    )
     # nf x nloc x nnei x nnei
-    nlist_mask_3d = nlist_mask[:, :, :, None] & nlist_mask[:, :, None, :]
-    a_nlist_mask_full_3d = (
-        a_nlist_mask_full[:, :, :, None] & a_nlist_mask_full[:, :, None, :]
-    )
+    # nlist_mask_3d = nlist_mask[:, :, :, None] & nlist_mask[:, :, None, :]
+    a_nlist_mask_3d = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
     n_edge = nlist_mask.sum().item()
-    n_angle = a_nlist_mask_full_3d.sum().item()
+    # n_angle = a_nlist_mask_3d.sum().item()
 
     # following: get n2e_index, n_ext2e_index, n2a_index, eij2a_index, eik2a_index
 
@@ -119,22 +107,29 @@ def get_graph_index(
 
     # 2. edge graph
     # node(i) to angle(ijk) index_select
-    n2a_index = nlist_loc_index.reshape(nf, nloc, 1, 1).expand(-1, -1, nnei, nnei)
+    n2a_index = nlist_loc_index.reshape(nf, nloc, 1, 1).expand(-1, -1, a_nnei, a_nnei)
     # n_angle
-    n2a_index = n2a_index[a_nlist_mask_full_3d]
+    n2a_index = n2a_index[a_nlist_mask_3d]
 
     # edge(ij) to angle(ijk) index_select; angle(ijk) to edge(ij) aggregate
     edge_id = torch.arange(0, n_edge, dtype=nlist.dtype, device=nlist.device)
     # nf x nloc x nnei
     edge_index = torch.zeros([nf, nloc, nnei], dtype=nlist.dtype, device=nlist.device)
     edge_index[nlist_mask] = edge_id
-    edge_index_ij = edge_index.unsqueeze(-1).expand(-1, -1, -1, nnei)
+    # only cut a_nnei neighbors, to avoid nnei x nnei
+    edge_index = edge_index[:, :, :a_nnei]
+    edge_index_ij = edge_index.unsqueeze(-1).expand(-1, -1, -1, a_nnei)
     # n_angle
-    eij2a_index = edge_index_ij[a_nlist_mask_full_3d]
+    eij2a_index = edge_index_ij[a_nlist_mask_3d]
 
     # edge(ik) to angle(ijk) index_select
-    edge_index_ik = edge_index.unsqueeze(-2).expand(-1, -1, nnei, -1)
+    edge_index_ik = edge_index.unsqueeze(-2).expand(-1, -1, a_nnei, -1)
     # n_angle
-    eik2a_index = edge_index_ik[a_nlist_mask_full_3d]
+    eik2a_index = edge_index_ik[a_nlist_mask_3d]
 
-    return n2e_index, n_ext2e_index, n2a_index, eij2a_index, eik2a_index
+    return torch.cat(
+        [n2e_index.unsqueeze(-1), n_ext2e_index.unsqueeze(-1)], dim=-1
+    ), torch.cat(
+        [n2a_index.unsqueeze(-1), eij2a_index.unsqueeze(-1), eik2a_index.unsqueeze(-1)],
+        dim=-1,
+    )

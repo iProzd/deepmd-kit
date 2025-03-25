@@ -52,6 +52,7 @@ class TestDescrptDPA3Nosel(unittest.TestCase, TestCaseSingleFrameWithNlist):
             nme,
             prec,
             ect,
+            optim,
         ) in itertools.product(
             [True, False],  # update_angle
             ["res_residual"],  # update_style
@@ -60,6 +61,7 @@ class TestDescrptDPA3Nosel(unittest.TestCase, TestCaseSingleFrameWithNlist):
             [1, 2],  # n_multi_edge_message
             ["float64"],  # precision
             [False],  # use_econf_tebd
+            [True, False],  # optim_update
         ):
             dtype = PRECISION_DICT[prec]
             rtol, atol = get_tols(prec)
@@ -76,13 +78,14 @@ class TestDescrptDPA3Nosel(unittest.TestCase, TestCaseSingleFrameWithNlist):
                 e_sel=nnei,
                 a_rcut=self.rcut - 0.1,
                 a_rcut_smth=self.rcut_smth,
-                a_sel=nnei - 1,
+                a_sel=nnei,
                 a_compress_rate=acr,
                 n_multi_edge_message=nme,
                 axis_neuron=4,
                 update_angle=ua,
                 update_style=rus,
                 update_residual_init=ruri,
+                optim_update=optim,
                 smooth_edge_update=True,
             )
 

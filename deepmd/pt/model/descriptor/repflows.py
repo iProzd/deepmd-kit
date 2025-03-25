@@ -19,6 +19,9 @@ from deepmd.pt.model.descriptor.env_mat import (
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
+from deepmd.pt.model.network.utils import (
+    get_graph_index,
+)
 from deepmd.pt.utils import (
     env,
 )
@@ -423,21 +426,6 @@ class DescrptBlockRepflows(DescriptorBlock):
         # beyond the cutoff sw should be 0.0
         sw = sw.masked_fill(~nlist_mask, 0.0)
 
-        # [nframes, nloc, tebd_dim]
-        if comm_dict is None:
-            assert isinstance(extended_atype_embd, torch.Tensor)  # for jit
-            atype_embd = extended_atype_embd[:, :nloc, :]
-            assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
-        else:
-            atype_embd = extended_atype_embd
-        assert isinstance(atype_embd, torch.Tensor)  # for jit
-        node_ebd = self.act(atype_embd)
-        n_dim = node_ebd.shape[-1]
-        # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
-        edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
-        # nb x nloc x nnei x e_dim
-        edge_ebd = self.act(self.edge_embd(edge_input))
-
         # get angle nlist (maybe smaller)
         a_dist_mask = (torch.linalg.norm(diff, dim=-1) < self.a_rcut)[
             :, :, : self.a_sel
@@ -458,8 +446,26 @@ class DescrptBlockRepflows(DescriptorBlock):
         a_sw = torch.squeeze(a_sw, -1)
         # beyond the cutoff sw should be 0.0
         a_sw = a_sw.masked_fill(~a_nlist_mask, 0.0)
+        # set all padding positions to index of 0
+        # if the a neighbor is real or not is indicated by nlist_mask
+        nlist[nlist == -1] = 0
         a_nlist[a_nlist == -1] = 0
 
+        # get node embedding
+        # [nframes, nloc, tebd_dim]
+        if comm_dict is None:
+            assert isinstance(extended_atype_embd, torch.Tensor)  # for jit
+            atype_embd = extended_atype_embd[:, :nloc, :]
+            assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
+        else:
+            atype_embd = extended_atype_embd
+        assert isinstance(atype_embd, torch.Tensor)  # for jit
+        node_ebd = self.act(atype_embd)
+        n_dim = node_ebd.shape[-1]
+
+        # get edge and angle embedding input
+        # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
+        edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
         # nf x nloc x a_nnei x 3
         normalized_diff_i = a_diff / (
             torch.linalg.norm(a_diff, dim=-1, keepdim=True) + 1e-6
@@ -491,14 +497,35 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
         angle_input = torch.cat(angle_input_list, dim=-1) / (torch.pi**0.5)
 
-        # nf x nloc x a_nnei x a_nnei x a_dim
-        angle_ebd = self.angle_embd(angle_input).reshape(
-            nframes, nloc, self.a_sel, self.a_sel, self.a_dim
-        )
+        if self.no_sel:
+            # get graph index
+            edge_index, angle_index = get_graph_index(
+                nlist, nlist_mask, a_nlist_mask, nall
+            )
+            # flat all the tensors
+            # n_edge x 1
+            edge_input = edge_input[nlist_mask]
+            # n_edge x 3
+            h2 = h2[nlist_mask]
+            # n_edge x 1
+            sw = sw[nlist_mask]
+            # nb x nloc x a_nnei x a_nnei
+            a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
+            # n_angle x 1
+            angle_input = angle_input[a_nlist_mask]
+            # n_angle x 1
+            a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
+        else:
+            # avoid jit assertion
+            edge_index = angle_index = torch.zeros(
+                [1, 3], device=nlist.device, dtype=nlist.dtype
+            )
+        # get edge and angle embedding
+        # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
+        edge_ebd = self.act(self.edge_embd(edge_input))
+        # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
+        angle_ebd = self.angle_embd(angle_input)
 
-        # set all padding positions to index of 0
-        # if the a neighbor is real or not is indicated by nlist_mask
-        nlist[nlist == -1] = 0
         # nb x nall x n_dim
         if comm_dict is None:
             assert mapping is not None
@@ -579,10 +606,24 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_nlist,
                 a_nlist_mask,
                 a_sw,
+                edge_index=edge_index,
+                angle_index=angle_index,
             )
 
         # nb x nloc x 3 x e_dim
-        h2g2 = RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
+        h2g2 = (
+            RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
+            if not self.no_sel
+            else RepFlowLayer._cal_hg_nosel(
+                edge_ebd,
+                h2,
+                sw,
+                owner=edge_index[:, 0],
+                num_owner=nframes * nloc,
+                nloc=nloc,
+                scale_factor=1.0 / (float(nnei) ** 0.5),
+            )
+        )
         # (nb x nloc) x e_dim x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
 
