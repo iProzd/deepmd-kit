@@ -879,7 +879,9 @@ class RepFlowLayer(torch.nn.Module):
         # nb x nloc x nnei x (h * n_dim)
         if not self.optim_update:
             assert edge_info is not None
-            node_edge_update = self.act(self.node_edge_linear(edge_info))
+            node_edge_update = self.act(
+                self.node_edge_linear(edge_info)
+            ) * sw.unsqueeze(-1)
         else:
             node_edge_update = self.act(
                 self.optim_edge_update(
@@ -898,13 +900,13 @@ class RepFlowLayer(torch.nn.Module):
                     n_ext2e_index,
                     "node",
                 )
-            )
+            ) * sw.unsqueeze(-1)
         node_edge_update = (
-            (torch.sum(node_edge_update * sw.unsqueeze(-1), dim=-2) / self.nnei)
+            (torch.sum(node_edge_update, dim=-2) / self.nnei)
             if not self.use_dynamic_sel
             else (
                 aggregate(
-                    node_edge_update * sw.unsqueeze(-1),
+                    node_edge_update,
                     n2e_index,
                     average=False,
                     num_owner=nb * nloc,
