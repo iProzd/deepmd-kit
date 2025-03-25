@@ -1592,6 +1592,18 @@ def dpa3_repflow_args():
             optional=True,
             default=None,
         ),
+        Argument(
+            "use_dynamic_sel",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "sel_reduce_factor",
+            float,
+            optional=True,
+            default=10.0,
+        ),
     ]
 
 

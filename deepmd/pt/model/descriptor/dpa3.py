@@ -167,6 +167,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             angle_init_use_sin=self.repflow_args.angle_init_use_sin,
             smooth_edge_update=self.repflow_args.smooth_edge_update,
             angle_multi_freq=self.repflow_args.angle_multi_freq,
+            use_dynamic_sel=self.repflow_args.use_dynamic_sel,
+            sel_reduce_factor=self.repflow_args.sel_reduce_factor,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
@@ -193,8 +195,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         self.env_protection = env_protection
         self.trainable = trainable
 
-        assert self.repflows.e_rcut > self.repflows.a_rcut
-        assert self.repflows.e_sel > self.repflows.a_sel
+        assert self.repflows.e_rcut >= self.repflows.a_rcut
+        assert self.repflows.e_sel >= self.repflows.a_sel
 
         self.rcut = self.repflows.get_rcut()
         self.rcut_smth = self.repflows.get_rcut_smth()
