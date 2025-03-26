@@ -1569,28 +1569,10 @@ def dpa3_repflow_args():
             default=True,
         ),
         Argument(
-            "smooth_angle_init",
-            bool,
-            optional=True,
-            default=False,
-        ),
-        Argument(
-            "angle_init_use_sin",
-            bool,
-            optional=True,
-            default=False,
-        ),
-        Argument(
             "smooth_edge_update",
             bool,
             optional=True,
             default=False,
-        ),
-        Argument(
-            "angle_multi_freq",
-            str,
-            optional=True,
-            default=None,
         ),
         Argument(
             "use_dynamic_sel",

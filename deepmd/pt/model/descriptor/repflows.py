@@ -103,10 +103,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         env_protection: float = 0.0,
         precision: str = "float64",
         skip_stat: bool = True,
-        smooth_angle_init: bool = False,
-        angle_init_use_sin: bool = False,
         smooth_edge_update: bool = False,
-        angle_multi_freq: Optional[str] = None,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         optim_update: bool = True,
@@ -211,29 +208,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.skip_stat = skip_stat
         self.a_compress_use_split = a_compress_use_split
         self.optim_update = optim_update
-        self.smooth_angle_init = smooth_angle_init
-        self.angle_init_use_sin = angle_init_use_sin
         self.smooth_edge_update = smooth_edge_update
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
-        self.angle_multi_freq = angle_multi_freq
-        self.angle_use_multi_freq = angle_multi_freq is not None
-        self.angle_multi_freq_list_float = (
-            [float(freq) for freq in angle_multi_freq.split(":")]
-            if self.angle_use_multi_freq
-            else []
-        )
-        if self.angle_use_multi_freq:
-            self.register_buffer(
-                "angle_multi_freq_list",
-                torch.tensor(
-                    self.angle_multi_freq_list_float,
-                    dtype=torch.float,
-                    device=env.DEVICE,
-                ),
-            )
-        else:
-            self.angle_multi_freq_list = None
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -258,9 +235,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
         )
         self.angle_embd = MLPLayer(
-            len(self.angle_multi_freq_list_float) + 1
-            if not self.angle_init_use_sin
-            else 2 * (len(self.angle_multi_freq_list_float) + 1),
+            1,
             self.a_dim,
             precision=precision,
             bias=False,
@@ -478,27 +453,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nf x nloc x a_nnei x a_nnei
         # 1 - 1e-6 for torch.acos stability
         cosine_ij = torch.matmul(normalized_diff_i, normalized_diff_j) * (1 - 1e-6)
-        sine_ij = torch.sqrt(1 - cosine_ij**2)
-        if self.smooth_angle_init:
-            cosine_ij = cosine_ij * a_sw.unsqueeze(-1) * a_sw.unsqueeze(-2)
-            sine_ij = sine_ij * a_sw.unsqueeze(-1) * a_sw.unsqueeze(-2)
-
-        if self.angle_use_multi_freq:
-            assert self.angle_multi_freq_list is not None
-            theta = torch.acos(cosine_ij)
-            theta_list = theta[..., None] * self.angle_multi_freq_list
-        else:
-            theta_list = None
-
-        # nf x nloc x a_nnei x a_nnei x 1,  nf x nloc x a_nnei x a_nnei x n_freq
-        angle_input_list = [cosine_ij.unsqueeze(-1)] + (
-            [torch.cos(theta_list)] if theta_list is not None else []
-        )
-        if self.angle_init_use_sin:
-            angle_input_list += [sine_ij.unsqueeze(-1)] + (
-                [torch.sin(theta_list)] if theta_list is not None else []
-            )
-        angle_input = torch.cat(angle_input_list, dim=-1) / (torch.pi**0.5)
+        angle_input = cosine_ij.unsqueeze(-1) / (torch.pi**0.5)
 
         if self.use_dynamic_sel:
             # get graph index
