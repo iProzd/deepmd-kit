@@ -34,6 +34,7 @@ class RepFlowArgs:
         angle_multi_freq: Optional[str] = None,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
+        use_env_envelope: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -117,6 +118,7 @@ class RepFlowArgs:
         self.angle_multi_freq = angle_multi_freq
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
+        self.use_env_envelope = use_env_envelope
 
     def __getitem__(self, key):
         if hasattr(self, key):

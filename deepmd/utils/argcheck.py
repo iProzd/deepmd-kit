@@ -1604,6 +1604,12 @@ def dpa3_repflow_args():
             optional=True,
             default=10.0,
         ),
+        Argument(
+            "use_env_envelope",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

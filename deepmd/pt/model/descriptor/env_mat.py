@@ -3,6 +3,7 @@
 import torch
 
 from deepmd.pt.utils.preprocess import (
+    compute_envelope,
     compute_smooth_weight,
 )
 
@@ -14,6 +15,7 @@ def _make_env_mat(
     ruct_smth: float,
     radial_only: bool = False,
     protection: float = 0.0,
+    use_env_envelope: bool = False,
 ):
     """Make smooth environment matrix."""
     bsz, natoms, nnei = nlist.shape
@@ -32,7 +34,11 @@ def _make_env_mat(
     length = length + ~mask.unsqueeze(-1)
     t0 = 1 / (length + protection)
     t1 = diff / (length + protection) ** 2
-    weight = compute_smooth_weight(length, ruct_smth, rcut)
+    weight = (
+        compute_smooth_weight(length, ruct_smth, rcut)
+        if not use_env_envelope
+        else compute_envelope(length, ruct_smth, rcut)
+    )
     weight = weight * mask.unsqueeze(-1)
     if radial_only:
         env_mat = t0 * weight
@@ -51,6 +57,7 @@ def prod_env_mat(
     rcut_smth: float,
     radial_only: bool = False,
     protection: float = 0.0,
+    use_env_envelope: bool = False,
 ):
     """Generate smooth environment matrix from atom coordinates and other context.
 
@@ -75,6 +82,7 @@ def prod_env_mat(
         rcut_smth,
         radial_only,
         protection=protection,
+        use_env_envelope=use_env_envelope,
     )  # shape [n_atom, dim, 4 or 1]
     t_avg = mean[atype]  # [n_atom, dim, 4 or 1]
     t_std = stddev[atype]  # [n_atom, dim, 4 or 1]
