@@ -110,6 +110,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         use_env_envelope: bool = False,
+        use_new_sw: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -236,6 +237,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             self.angle_multi_freq_list = None
         self.use_env_envelope = use_env_envelope
+        self.use_new_sw = use_new_sw
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -426,6 +428,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.e_rcut_smth,
             protection=self.env_protection,
             use_env_envelope=self.use_env_envelope,
+            use_new_sw=self.use_new_sw,
         )
         nlist_mask = nlist != -1
         sw = torch.squeeze(sw, -1)
@@ -448,6 +451,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.a_rcut_smth,
             protection=self.env_protection,
             use_env_envelope=self.use_env_envelope,
+            use_new_sw=self.use_new_sw,
         )
         a_nlist_mask = a_nlist != -1
         a_sw = torch.squeeze(a_sw, -1)

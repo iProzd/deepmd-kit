@@ -1605,6 +1605,12 @@ def dpa3_repflow_args():
             default=10.0,
         ),
         Argument(
+            "use_new_sw",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "use_env_envelope",
             bool,
             optional=True,

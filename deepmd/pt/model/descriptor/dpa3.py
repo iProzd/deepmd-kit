@@ -170,6 +170,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             use_dynamic_sel=self.repflow_args.use_dynamic_sel,
             sel_reduce_factor=self.repflow_args.sel_reduce_factor,
             use_env_envelope=self.repflow_args.use_env_envelope,
+            use_new_sw=self.repflow_args.use_new_sw,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
