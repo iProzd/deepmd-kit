@@ -21,14 +21,10 @@ def compute_envelope(distance, rmin: float, rmax: float):
     if rmin >= rmax:
         raise ValueError("rmin should be less than rmax.")
     distance = torch.clamp(distance, min=0.0, max=rmax)
-    cutoff = rmax
-    p = rmax - rmin
-    a = -(p + 1) * (p + 2) / 2
-    b = p * (p + 2)
-    c = -p * (p + 1) / 2
-
-    r_scaled = distance / cutoff
-    env_val = 1 + a * r_scaled**p + b * r_scaled ** (p + 1) + c * r_scaled ** (p + 2)
+    C = 20
+    a = C / rmin
+    b = rmin
+    env_val = torch.exp(-torch.exp(a * (distance - b)))
     return env_val
 
 
