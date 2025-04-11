@@ -50,7 +50,9 @@ def get_graph_index(
     nlist: torch.Tensor,
     nlist_mask: torch.Tensor,
     a_nlist_mask: torch.Tensor,
+    d_nlist_mask: torch.Tensor,
     nall: int,
+    calculate_dihedral: bool = False,
 ):
     """
     Get the index mapping for edge graph and angle graph, ready in `aggregate` or `index_select`.
@@ -77,9 +79,14 @@ def get_graph_index(
         n2a_index : n_angle
             Broadcast indices from extended node(j) to angle(ijk).
         eij2a_index : n_angle
-            Broadcast indices from extended edge(ij) to angle(ijk), or reduction indices from angle(ijk) to edge(ij).
+            Broadcast indices from edge(ij) to angle(ijk), or reduction indices from angle(ijk) to edge(ij).
         eik2a_index : n_angle
-            Broadcast indices from extended edge(ik) to angle(ijk).
+            Broadcast indices from edge(ik) to angle(ijk).
+    dihedral_index : n_dihedral x 2
+        aijk2d_index : n_dihedral
+            Broadcast indices from angle(ijk) to dihedral(ijkl), or reduction indices from dihedral(ijkl) to angle(ijk).
+        aijl2d_index : n_dihedral
+            Broadcast indices from angle(ijl) to dihedral(ijkl).
     """
     nf, nloc, nnei = nlist.shape
     _, _, a_nnei = a_nlist_mask.shape
@@ -87,7 +94,6 @@ def get_graph_index(
     # nlist_mask_3d = nlist_mask[:, :, :, None] & nlist_mask[:, :, None, :]
     a_nlist_mask_3d = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
     n_edge = nlist_mask.sum().item()
-    # n_angle = a_nlist_mask_3d.sum().item()
 
     # following: get n2e_index, n_ext2e_index, n2a_index, eij2a_index, eik2a_index
 
@@ -127,9 +133,60 @@ def get_graph_index(
     # n_angle
     eik2a_index = edge_index_ik[a_nlist_mask_3d]
 
-    return torch.cat(
-        [n2e_index.unsqueeze(-1), n_ext2e_index.unsqueeze(-1)], dim=-1
-    ), torch.cat(
-        [n2a_index.unsqueeze(-1), eij2a_index.unsqueeze(-1), eik2a_index.unsqueeze(-1)],
-        dim=-1,
+    if calculate_dihedral:
+        # 3. angle graph
+        n_angle = a_nlist_mask_3d.sum().item()
+        _, _, d_nnei = d_nlist_mask.shape
+
+        # nf x nloc x d_nnei x d_nnei x d_nnei
+        # should expel same j k l
+        d_nlist_mask_4d = (
+            d_nlist_mask[:, :, :, None, None]
+            & d_nlist_mask[:, :, None, :, None]
+            & d_nlist_mask[:, :, None, None, :]
+        )
+        # d_nnei x d_nnei
+        d_eye = torch.eye(d_nnei, dtype=d_nlist_mask.dtype, device=d_nlist_mask.device)
+        d_eye = d_eye[:, :, None] | d_eye[:, None, :] | d_eye[None, :, :]
+        d_nlist_mask_4d = d_nlist_mask_4d & ~d_eye[None, None, ...]
+
+        # angle(ijk) to dihedral(ijkl) index_select; dihedral(ijkl) to angle(ijk) aggregate
+        angle_id = torch.arange(0, n_angle, dtype=nlist.dtype, device=nlist.device)
+        # nf x nloc x a_nnei x a_nnei
+        angle_index = torch.zeros(
+            [nf, nloc, a_nnei, a_nnei], dtype=nlist.dtype, device=nlist.device
+        )
+        angle_index[a_nlist_mask_3d] = angle_id
+
+        # only cut d_nnei neighbors, to avoid a_nnei x a_nnei x a_nnei
+        angle_index = angle_index[:, :, :d_nnei, :d_nnei]
+        angle_index_ijk = angle_index.unsqueeze(-1).expand(-1, -1, -1, -1, d_nnei)
+        # n_dihedral
+        aijk2d_index = angle_index_ijk[d_nlist_mask_4d]
+
+        # angle(ijl) to dihedral(ijkl) index_select;
+        angle_index_ijl = angle_index.unsqueeze(-2).expand(-1, -1, -1, d_nnei, -1)
+        # n_dihedral
+        aijl2d_index = angle_index_ijl[d_nlist_mask_4d]
+
+        dihedral_index = torch.cat(
+            [aijk2d_index.unsqueeze(-1), aijl2d_index.unsqueeze(-1)], dim=-1
+        )
+    else:
+        dihedral_index = None
+        d_nlist_mask_4d = None
+
+    return (
+        torch.cat([n2e_index.unsqueeze(-1), n_ext2e_index.unsqueeze(-1)], dim=-1),
+        torch.cat(
+            [
+                n2a_index.unsqueeze(-1),
+                eij2a_index.unsqueeze(-1),
+                eik2a_index.unsqueeze(-1),
+            ],
+            dim=-1,
+        ),
+        dihedral_index,
+        a_nlist_mask_3d,
+        d_nlist_mask_4d,
     )

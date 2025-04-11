@@ -111,6 +111,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         sel_reduce_factor: float = 10.0,
         use_env_envelope: bool = False,
         use_new_sw: bool = False,
+        update_dihedral: bool = False,
+        d_dim: int = 32,
+        d_sel: int = 10,
+        d_rcut: float = 2.8,
+        d_rcut_smth: float = 2.0,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -238,6 +243,11 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.angle_multi_freq_list = None
         self.use_env_envelope = use_env_envelope
         self.use_new_sw = use_new_sw
+        self.update_dihedral = update_dihedral
+        self.d_dim = d_dim
+        self.d_sel = d_sel
+        self.d_rcut = d_rcut
+        self.d_rcut_smth = d_rcut_smth
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -270,6 +280,13 @@ class DescrptBlockRepflows(DescriptorBlock):
             bias=False,
             seed=child_seed(seed, 1),
         )
+        if self.update_dihedral:
+            self.dihedral_embd = MLPLayer(
+                1, self.d_dim, precision=precision, seed=child_seed(seed, 2)
+            )
+        else:
+            self.dihedral_embd = None
+
         layers = []
         for ii in range(nlayers):
             layers.append(
@@ -299,6 +316,11 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_dynamic_sel=self.use_dynamic_sel,
                     sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
+                    update_dihedral=self.update_dihedral,
+                    d_dim=self.d_dim,
+                    d_sel=self.d_sel,
+                    d_rcut=self.d_rcut,
+                    d_rcut_smth=self.d_rcut_smth,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -436,9 +458,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         sw = sw.masked_fill(~nlist_mask, 0.0)
 
         # get angle nlist (maybe smaller)
-        a_dist_mask = (torch.linalg.norm(diff, dim=-1) < self.a_rcut)[
-            :, :, : self.a_sel
-        ]
+        length_nei = torch.linalg.norm(diff, dim=-1)
+        a_dist_mask = (length_nei < self.a_rcut)[:, :, : self.a_sel]
         a_nlist = nlist[:, :, : self.a_sel]
         a_nlist = torch.where(a_dist_mask, a_nlist, -1)
         _, a_diff, a_sw = prod_env_mat(
@@ -457,6 +478,12 @@ class DescrptBlockRepflows(DescriptorBlock):
         a_sw = torch.squeeze(a_sw, -1)
         # beyond the cutoff sw should be 0.0
         a_sw = a_sw.masked_fill(~a_nlist_mask, 0.0)
+
+        # get dihedral nlist (maybe smaller)
+        d_dist_mask = (length_nei < self.d_rcut)[:, :, : self.d_sel]
+        d_nlist = nlist[:, :, : self.d_sel]
+        d_nlist = torch.where(d_dist_mask, d_nlist, -1)
+        d_nlist_mask = d_nlist != -1
         # set all padding positions to index of 0
         # if the a neighbor is real or not is indicated by nlist_mask
         nlist[nlist == -1] = 0
@@ -508,34 +535,113 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
         angle_input = torch.cat(angle_input_list, dim=-1) / (torch.pi**0.5)
 
+        if self.update_dihedral:
+            _, d_diff, d_sw = prod_env_mat(
+                extended_coord,
+                d_nlist,
+                atype,
+                self.mean[:, : self.d_sel],
+                self.stddev[:, : self.d_sel],
+                self.d_rcut,
+                self.d_rcut_smth,
+                protection=self.env_protection,
+                use_env_envelope=self.use_env_envelope,
+                use_new_sw=self.use_new_sw,
+            )
+            d_sw = torch.squeeze(d_sw, -1)
+            # beyond the cutoff sw should be 0.0
+            d_sw = d_sw.masked_fill(~d_nlist_mask, 0.0)
+            d_nlist[d_nlist == -1] = 0
+
+            # compute dihedral
+            # nf x nloc x d_nnei x 3
+            normalized_d = d_diff / (
+                torch.linalg.norm(d_diff, dim=-1, keepdim=True) + 1e-6
+            )
+            # nf x nloc x d_nnei x [d_nnei] x 3
+            normalized_d_ij = normalized_d[:, :, :, None, :].expand(
+                [-1, -1, -1, self.d_sel, -1]
+            )
+            # nf x nloc x [d_nnei] x d_nnei x 3
+            normalized_d_ik = normalized_d[:, :, None, :, :].expand(
+                [-1, -1, self.d_sel, -1, -1]
+            )
+            # nf x nloc x d_nnei x d_nnei x 3
+            norm_ij_ik = torch.cross(normalized_d_ij, normalized_d_ik, dim=-1)
+            norm_ij_ik = norm_ij_ik / (
+                torch.linalg.norm(norm_ij_ik, dim=-1, keepdim=True) + 1e-6
+            )
+            # nf x nloc x d_nnei x d_nnei x 3
+            norm_il_ij = -norm_ij_ik
+
+            # nf x nloc x d_nnei x d_nnei x d_nnei
+            cos_ijkl = -torch.matmul(norm_ij_ik, norm_il_ij.transpose(-1, -2)) * (
+                1 - 1e-6
+            )
+            dihedral_input = cos_ijkl.unsqueeze(-1) / (torch.pi**0.5)
+        else:
+            d_sw = None
+            dihedral_input = None
+
         if self.use_dynamic_sel:
             # get graph index
-            edge_index, angle_index = get_graph_index(
-                nlist, nlist_mask, a_nlist_mask, nall
+            edge_index, angle_index, dihedral_index, a_nlist_mask_3d, d_nlist_mask4d = (
+                get_graph_index(
+                    nlist,
+                    nlist_mask,
+                    a_nlist_mask,
+                    d_nlist_mask,
+                    nall,
+                    calculate_dihedral=self.update_dihedral,
+                )
             )
             # flat all the tensors
             # n_edge x 1
             edge_input = edge_input[nlist_mask]
             # n_edge x 3
             h2 = h2[nlist_mask]
-            # n_edge x 1
+            # n_edge
             sw = sw[nlist_mask]
+
             # nb x nloc x a_nnei x a_nnei
-            a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
+            a_nlist_mask = a_nlist_mask_3d
             # n_angle x 1
             angle_input = angle_input[a_nlist_mask]
-            # n_angle x 1
+            # n_angle
             a_sw = (a_sw[:, :, :, None] * a_sw[:, :, None, :])[a_nlist_mask]
+            if self.update_dihedral:
+                assert dihedral_input is not None
+                assert d_sw is not None
+                assert d_nlist_mask4d is not None
+                # nb x nloc x d_nnei x d_nnei x d_nnei
+                d_nlist_mask = d_nlist_mask4d
+                # n_dihedral x 1
+                dihedral_input = dihedral_input[d_nlist_mask]
+                # n_dihedral x 1
+                d_sw = (
+                    d_sw[:, :, :, None, None]
+                    * d_sw[:, :, None, :, None]
+                    * d_sw[:, :, None, None, :]
+                )[d_nlist_mask]
         else:
             # avoid jit assertion
             edge_index = angle_index = torch.zeros(
                 [1, 3], device=nlist.device, dtype=nlist.dtype
             )
+            dihedral_index = None
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         edge_ebd = self.act(self.edge_embd(edge_input))
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
+
+        if self.update_dihedral:
+            assert self.dihedral_embd is not None
+            assert dihedral_input is not None
+            # n_dihedral x d_dim
+            dihedral_ebd = self.dihedral_embd(dihedral_input)
+        else:
+            dihedral_ebd = None
 
         # nb x nall x n_dim
         if comm_dict is None:
@@ -606,7 +712,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
-            node_ebd, edge_ebd, angle_ebd = ll.forward(
+            node_ebd, edge_ebd, angle_ebd, dihedral_ebd = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
                 h2,
@@ -619,6 +725,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_sw,
                 edge_index=edge_index,
                 angle_index=angle_index,
+                dihedral_index=dihedral_index,
+                dihedral_ebd=dihedral_ebd,
+                d_sw=d_sw,
             )
 
         # nb x nloc x 3 x e_dim

@@ -58,6 +58,11 @@ class RepFlowLayer(torch.nn.Module):
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         smooth_edge_update: bool = False,
+        update_dihedral: bool = False,
+        d_dim: int = 32,
+        d_sel: int = 10,
+        d_rcut: float = 2.8,
+        d_rcut_smth: float = 2.0,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -108,6 +113,16 @@ class RepFlowLayer(torch.nn.Module):
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
 
+        self.update_dihedral = update_dihedral
+        self.d_dim = d_dim
+        self.d_sel = d_sel
+        self.d_rcut = d_rcut
+        self.d_rcut_smth = d_rcut_smth
+        self.dynamic_d_sel = (self.d_sel * 4) / self.sel_reduce_factor
+
+        if self.update_dihedral:
+            assert self.use_dynamic_sel, "Dihedral update requires dynamic selection!"
+
         assert update_residual_init in [
             "norm",
             "const",
@@ -118,6 +133,7 @@ class RepFlowLayer(torch.nn.Module):
         self.n_residual = []
         self.e_residual = []
         self.a_residual = []
+        self.d_residual = []
         self.edge_info_dim = self.n_dim * 2 + self.e_dim
 
         # node self mlp
@@ -272,6 +288,47 @@ class RepFlowLayer(torch.nn.Module):
                         seed=child_seed(seed, 14),
                     )
                 )
+
+            if self.update_dihedral:
+                self.dihedral_dim = self.d_dim + 2 * self.a_dim
+                # angle dihedral message
+                self.angle_dihedral_linear = MLPLayer(
+                    self.dihedral_dim,
+                    self.a_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 15),
+                )
+                if self.update_style == "res_residual":
+                    self.a_residual.append(
+                        get_residual(
+                            self.a_dim,
+                            self.update_residual,
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 16),
+                        )
+                    )
+
+                # dihedral self message
+                self.dihedral_self_linear = MLPLayer(
+                    self.dihedral_dim,
+                    self.d_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 17),
+                )
+                if self.update_style == "res_residual":
+                    self.d_residual.append(
+                        get_residual(
+                            self.d_dim,
+                            self.update_residual,
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 18),
+                        )
+                    )
+            else:
+                self.angle_dihedral_linear = None
+                self.dihedral_self_linear = None
         else:
             self.angle_self_linear = None
             self.edge_angle_linear1 = None
@@ -279,10 +336,14 @@ class RepFlowLayer(torch.nn.Module):
             self.a_compress_n_linear = None
             self.a_compress_e_linear = None
             self.angle_dim = 0
+            self.dihedral_dim = 0
+            self.angle_dihedral_linear = None
+            self.dihedral_self_linear = None
 
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
         self.a_residual = nn.ParameterList(self.a_residual)
+        self.d_residual = nn.ParameterList(self.d_residual)
 
     @staticmethod
     def _cal_hg(
@@ -723,6 +784,9 @@ class RepFlowLayer(torch.nn.Module):
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         edge_index: torch.Tensor,  # n_edge x 2
         angle_index: torch.Tensor,  # n_angle x 3
+        dihedral_index: Optional[torch.Tensor] = None,  # n_dihedral x 2
+        dihedral_ebd: Optional[torch.Tensor] = None,  # n_dihedral x d_dim
+        d_sw: Optional[torch.Tensor] = None,  # n_dihedral
     ):
         """
         Parameters
@@ -1133,13 +1197,56 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
             a_update_list.append(angle_self_update)
+            if self.update_dihedral:
+                n_angle = int(a_nlist_mask.sum().item())
+                assert self.use_dynamic_sel, "dihedral update only support dynamic sel"
+                assert dihedral_ebd is not None
+                assert d_sw is not None
+                assert dihedral_index is not None
+                assert self.angle_dihedral_linear is not None
+                assert self.dihedral_self_linear is not None
+                aijk2d_index, aijl2d_index = dihedral_index[:, 0], dihedral_index[:, 1]
+
+                # n_dihedral x a_dim
+                angle_for_dihedral_k = torch.index_select(angle_ebd, 0, aijk2d_index)
+                angle_for_dihedral_l = torch.index_select(angle_ebd, 0, aijl2d_index)
+
+                # n_dihedral x (d + a + a)
+                dihedral_info = torch.cat(
+                    [dihedral_ebd, angle_for_dihedral_k, angle_for_dihedral_l], dim=-1
+                )
+
+                # angle dihedral message
+                # n_dihedral x a_dim
+                angle_dihedral_update = self.act(
+                    self.angle_dihedral_linear(dihedral_info)
+                ) * d_sw.unsqueeze(-1)
+                # n_angle x a_dim
+                padding_angle_dihedral_update = aggregate(
+                    angle_dihedral_update,
+                    aijk2d_index,
+                    average=False,
+                    num_owner=n_angle,
+                ) / (self.dynamic_d_sel**0.5)
+                a_update_list.append(padding_angle_dihedral_update)
+
+                # dihedral self update
+                # n_dihedral x d_dim
+                dihedral_self_update = self.act(
+                    self.dihedral_self_linear(dihedral_info)
+                )
+                d_update_list: list[torch.Tensor] = [dihedral_ebd, dihedral_self_update]
+                d_updated = self.list_update(d_update_list, "dihedral")
+            else:
+                d_updated = dihedral_ebd
         else:
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
+            d_updated = dihedral_ebd
 
         # update angle_ebd
         a_updated = self.list_update(a_update_list, "angle")
-        return n_updated, e_updated, a_updated
+        return n_updated, e_updated, a_updated, d_updated
 
     @torch.jit.export
     def list_update_res_avg(
@@ -1176,6 +1283,9 @@ class RepFlowLayer(torch.nn.Module):
                 uu = uu + vv * update_list[ii + 1]
         elif update_name == "angle":
             for ii, vv in enumerate(self.a_residual):
+                uu = uu + vv * update_list[ii + 1]
+        elif update_name == "dihedral":
+            for ii, vv in enumerate(self.d_residual):
                 uu = uu + vv * update_list[ii + 1]
         else:
             raise NotImplementedError

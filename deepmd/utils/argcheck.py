@@ -1616,6 +1616,36 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "update_dihedral",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "d_dim",
+            int,
+            optional=True,
+            default=32,
+        ),
+        Argument(
+            "d_sel",
+            int,
+            optional=True,
+            default=10,
+        ),
+        Argument(
+            "d_rcut",
+            float,
+            optional=True,
+            default=2.8,
+        ),
+        Argument(
+            "d_rcut_smth",
+            float,
+            optional=True,
+            default=2.0,
+        ),
     ]
 
 

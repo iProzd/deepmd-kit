@@ -36,6 +36,11 @@ class RepFlowArgs:
         sel_reduce_factor: float = 10.0,
         use_env_envelope: bool = False,
         use_new_sw: bool = False,
+        update_dihedral: bool = False,
+        d_dim: int = 32,
+        d_sel: int = 10,
+        d_rcut: float = 2.8,
+        d_rcut_smth: float = 2.0,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -121,6 +126,11 @@ class RepFlowArgs:
         self.sel_reduce_factor = sel_reduce_factor
         self.use_env_envelope = use_env_envelope
         self.use_new_sw = use_new_sw
+        self.update_dihedral = update_dihedral
+        self.d_dim = d_dim
+        self.d_sel = d_sel
+        self.d_rcut = d_rcut
+        self.d_rcut_smth = d_rcut_smth
 
     def __getitem__(self, key):
         if hasattr(self, key):
