@@ -25,6 +25,9 @@ class RepFlowArgs:
         update_residual_init: str = "const",
         skip_stat: bool = False,
         optim_update: bool = True,
+        smooth_edge_update: bool = False,
+        use_dynamic_sel: bool = False,
+        sel_reduce_factor: float = 10.0,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -102,6 +105,9 @@ class RepFlowArgs:
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
         self.optim_update = optim_update
+        self.smooth_edge_update = smooth_edge_update
+        self.use_dynamic_sel = use_dynamic_sel
+        self.sel_reduce_factor = sel_reduce_factor
 
     def __getitem__(self, key):
         if hasattr(self, key):
