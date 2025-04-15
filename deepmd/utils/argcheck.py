@@ -1653,7 +1653,19 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "use_ffn_edge_edge_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "use_ffn_edge_angle_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "use_ffn_angle_angle_message",
             bool,
             optional=True,
             default=False,

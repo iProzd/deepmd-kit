@@ -117,7 +117,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         d_rcut: float = 2.8,
         d_rcut_smth: float = 2.0,
         use_ffn_node_edge_message: bool = False,
+        use_ffn_edge_edge_message: bool = False,
         use_ffn_edge_angle_message: bool = False,
+        use_ffn_angle_angle_message: bool = False,
         ffn_hidden_dim: int = 1024,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -252,7 +254,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.d_rcut = d_rcut
         self.d_rcut_smth = d_rcut_smth
         self.use_ffn_node_edge_message = use_ffn_node_edge_message
+        self.use_ffn_edge_edge_message = use_ffn_edge_edge_message
         self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
+        self.use_ffn_angle_angle_message = use_ffn_angle_angle_message
         self.ffn_hidden_dim = ffn_hidden_dim
 
         self.n_dim = n_dim
@@ -328,7 +332,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     d_rcut=self.d_rcut,
                     d_rcut_smth=self.d_rcut_smth,
                     use_ffn_node_edge_message=self.use_ffn_node_edge_message,
+                    use_ffn_edge_edge_message=self.use_ffn_edge_edge_message,
                     use_ffn_edge_angle_message=self.use_ffn_edge_angle_message,
+                    use_ffn_angle_angle_message=self.use_ffn_angle_angle_message,
                     ffn_hidden_dim=self.ffn_hidden_dim,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )

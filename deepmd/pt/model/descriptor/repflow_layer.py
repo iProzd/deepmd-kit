@@ -17,7 +17,6 @@ from deepmd.pt.model.descriptor.repformer_layer import (
     get_residual,
 )
 from deepmd.pt.model.network.mlp import (
-    FeedForward,
     MLPLayer,
 )
 from deepmd.pt.model.network.utils import (
@@ -65,7 +64,9 @@ class RepFlowLayer(torch.nn.Module):
         d_rcut: float = 2.8,
         d_rcut_smth: float = 2.0,
         use_ffn_node_edge_message: bool = False,
+        use_ffn_edge_edge_message: bool = False,
         use_ffn_edge_angle_message: bool = False,
+        use_ffn_angle_angle_message: bool = False,
         ffn_hidden_dim: int = 1024,
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -124,9 +125,16 @@ class RepFlowLayer(torch.nn.Module):
         self.d_rcut_smth = d_rcut_smth
         self.dynamic_d_sel = (self.d_sel * 4) / self.sel_reduce_factor
         self.use_ffn_node_edge_message = use_ffn_node_edge_message
+        self.use_ffn_edge_edge_message = use_ffn_edge_edge_message
         self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
+        self.use_ffn_angle_angle_message = use_ffn_angle_angle_message
         self.ffn_hidden_dim = ffn_hidden_dim
-        if self.use_ffn_node_edge_message or self.use_ffn_edge_angle_message:
+        if (
+            self.use_ffn_node_edge_message
+            or self.use_ffn_edge_edge_message
+            or self.use_ffn_edge_angle_message
+            or self.use_ffn_angle_angle_message
+        ):
             assert not self.optim_update, "FFN does not support optim update!"
 
         if self.update_dihedral:
@@ -183,20 +191,13 @@ class RepFlowLayer(torch.nn.Module):
             )
 
         # node edge message
-        self.node_edge_linear = (
-            MLPLayer(
-                self.edge_info_dim,
-                self.n_multi_edge_message * n_dim,
-                precision=precision,
-                seed=child_seed(seed, 4),
-            )
+        self.node_edge_linear = MLPLayer(
+            self.edge_info_dim
             if not self.use_ffn_node_edge_message
-            else FeedForward(
-                self.edge_info_dim,
-                self.n_multi_edge_message * n_dim,
-                self.ffn_hidden_dim,
-                activation_function=self.activation_function,
-            )
+            else self.ffn_hidden_dim,
+            self.n_multi_edge_message * n_dim,
+            precision=precision,
+            seed=child_seed(seed, 4),
         )
         if self.update_style == "res_residual":
             for head_index in range(self.n_multi_edge_message):
@@ -212,7 +213,9 @@ class RepFlowLayer(torch.nn.Module):
 
         # edge self message
         self.edge_self_linear = MLPLayer(
-            self.edge_info_dim,
+            self.edge_info_dim
+            if not self.use_ffn_edge_edge_message
+            else self.ffn_hidden_dim,
             e_dim,
             precision=precision,
             seed=child_seed(seed, 6),
@@ -266,20 +269,13 @@ class RepFlowLayer(torch.nn.Module):
                     self.a_compress_e_linear = None
 
             # edge angle message
-            self.edge_angle_linear1 = (
-                MLPLayer(
-                    self.angle_dim,
-                    self.e_dim,
-                    precision=precision,
-                    seed=child_seed(seed, 10),
-                )
+            self.edge_angle_linear1 = MLPLayer(
+                self.angle_dim
                 if not self.use_ffn_edge_angle_message
-                else FeedForward(
-                    self.angle_dim,
-                    self.e_dim,
-                    self.ffn_hidden_dim,
-                    activation_function=self.activation_function,
-                )
+                else self.ffn_hidden_dim,
+                self.e_dim,
+                precision=precision,
+                seed=child_seed(seed, 10),
             )
             self.edge_angle_linear2 = MLPLayer(
                 self.e_dim,
@@ -300,7 +296,9 @@ class RepFlowLayer(torch.nn.Module):
 
             # angle self message
             self.angle_self_linear = MLPLayer(
-                self.angle_dim,
+                self.angle_dim
+                if not self.use_ffn_angle_angle_message
+                else self.ffn_hidden_dim,
                 self.a_dim,
                 precision=precision,
                 seed=child_seed(seed, 13),
@@ -366,6 +364,28 @@ class RepFlowLayer(torch.nn.Module):
             self.dihedral_dim = 0
             self.angle_dihedral_linear = None
             self.dihedral_self_linear = None
+
+        if self.use_ffn_node_edge_message or self.use_ffn_edge_edge_message:
+            self.edge_message_ffn1 = MLPLayer(
+                self.edge_info_dim,
+                self.ffn_hidden_dim,
+                precision=precision,
+                bias=False,
+                seed=child_seed(seed, 19),
+            )
+        else:
+            self.edge_message_ffn1 = None
+
+        if self.use_ffn_edge_angle_message or self.use_ffn_angle_angle_message:
+            self.angle_message_ffn1 = MLPLayer(
+                self.angle_dim,
+                self.ffn_hidden_dim,
+                precision=precision,
+                bias=False,
+                seed=child_seed(seed, 20),
+            )
+        else:
+            self.angle_message_ffn1 = None
 
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
@@ -963,16 +983,28 @@ class RepFlowLayer(torch.nn.Module):
                     ],
                     dim=-1,
                 )
+            if self.use_ffn_node_edge_message or self.use_ffn_edge_edge_message:
+                assert self.edge_message_ffn1 is not None
+                edge_info_ffn = self.act(self.edge_message_ffn1(edge_info))
+            else:
+                edge_info_ffn = None
         else:
             edge_info = None
+            edge_info_ffn = None
 
         # node edge message
         # nb x nloc x nnei x (h * n_dim)
         if not self.optim_update:
             assert edge_info is not None
-            node_edge_update = self.act(
-                self.node_edge_linear(edge_info)
-            ) * sw.unsqueeze(-1)
+            if not self.use_ffn_node_edge_message:
+                node_edge_update = self.act(
+                    self.node_edge_linear(edge_info)
+                ) * sw.unsqueeze(-1)
+            else:
+                assert edge_info_ffn is not None
+                node_edge_update = self.act(
+                    self.node_edge_linear(edge_info_ffn)
+                ) * sw.unsqueeze(-1)
         else:
             node_edge_update = self.act(
                 self.optim_edge_update(
@@ -1021,7 +1053,11 @@ class RepFlowLayer(torch.nn.Module):
         # edge self message
         if not self.optim_update:
             assert edge_info is not None
-            edge_self_update = self.act(self.edge_self_linear(edge_info))
+            if not self.use_ffn_edge_edge_message:
+                edge_self_update = self.act(self.edge_self_linear(edge_info))
+            else:
+                assert edge_info_ffn is not None
+                edge_self_update = self.act(self.edge_self_linear(edge_info_ffn))
         else:
             edge_self_update = self.act(
                 self.optim_edge_update(
@@ -1111,14 +1147,26 @@ class RepFlowLayer(torch.nn.Module):
                 # [OR]
                 # n_angle x (a + n_dim + e_dim*2) or (a + a/c + a/c)
                 angle_info = torch.cat(angle_info_list, dim=-1)
+                if self.use_ffn_edge_angle_message or self.use_ffn_angle_angle_message:
+                    assert self.angle_message_ffn1 is not None
+                    angle_info_ffn = self.act(self.angle_message_ffn1(angle_info))
+                else:
+                    angle_info_ffn = None
             else:
                 angle_info = None
+                angle_info_ffn = None
 
             # edge angle message
             # nb x nloc x a_nnei x a_nnei x e_dim [OR] n_angle x e_dim
             if not self.optim_update:
                 assert angle_info is not None
-                edge_angle_update = self.act(self.edge_angle_linear1(angle_info))
+                if not self.use_ffn_edge_angle_message:
+                    edge_angle_update = self.act(self.edge_angle_linear1(angle_info))
+                else:
+                    assert angle_info_ffn is not None
+                    edge_angle_update = self.act(
+                        self.edge_angle_linear1(angle_info_ffn)
+                    )
             else:
                 edge_angle_update = self.act(
                     self.optim_angle_update(
@@ -1203,7 +1251,11 @@ class RepFlowLayer(torch.nn.Module):
             # nb x nloc x a_nnei x a_nnei x dim_a
             if not self.optim_update:
                 assert angle_info is not None
-                angle_self_update = self.act(self.angle_self_linear(angle_info))
+                if not self.use_ffn_angle_angle_message:
+                    angle_self_update = self.act(self.angle_self_linear(angle_info))
+                else:
+                    assert angle_info_ffn is not None
+                    angle_self_update = self.act(self.angle_self_linear(angle_info_ffn))
             else:
                 angle_self_update = self.act(
                     self.optim_angle_update(
