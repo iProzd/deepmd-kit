@@ -40,6 +40,9 @@ from deepmd.pt.utils.utils import (
     to_numpy_array,
     to_torch_tensor,
 )
+from deepmd.utils.version import (
+    check_version_compatibility,
+)
 
 
 def empty_t(shape, precision):
@@ -275,6 +278,83 @@ class MLPLayer(nn.Module):
         obj.matrix = check_load_param("matrix")
         obj.bias = check_load_param("bias")
         obj.idt = check_load_param("idt")
+        return obj
+
+
+class FeedForward(nn.Module):
+    """
+    A feed forward network with two linear layers and an activation function.
+    No dropout, no gate and no residual connection.
+    """
+
+    def __init__(
+        self,
+        num_in: int,
+        num_out: int,
+        hidden_dim: int,
+        activation_function: Optional[str] = None,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        self.num_in = num_in
+        self.num_out = num_out
+        self.hidden_dim = hidden_dim
+        self.activation_function = activation_function
+        self.bias = bias
+        self.w1 = MLPLayer(
+            num_in=num_in,
+            num_out=hidden_dim,
+            bias=bias,
+        )
+        self.act = ActivationFn(activation_function)
+        self.w2 = MLPLayer(
+            num_in=hidden_dim,
+            num_out=num_out,
+            bias=bias,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.w2(self.act(self.w1(x)))
+
+    def serialize(self) -> dict:
+        """Serialize the networks to a dict.
+
+        Returns
+        -------
+        dict
+            The serialized networks.
+        """
+        data = {
+            "@class": "FeedForward",
+            "@version": 1,
+            "num_in": self.num_in,
+            "num_out": self.num_out,
+            "hidden_dim": self.hidden_dim,
+            "activation_function": self.activation_function,
+            "bias": self.bias,
+            "w1": self.w1.serialize(),
+            "w2": self.w2.serialize(),
+        }
+        return data
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "FeedForward":
+        """Deserialize the networks from a dict.
+
+        Parameters
+        ----------
+        data : dict
+            The dict to deserialize from.
+        """
+        data = data.copy()
+        check_version_compatibility(data.pop("@version"), 1, 1)
+        data.pop("@class")
+        w1 = data.pop("w1")
+        w2 = data.pop("w2")
+
+        obj = cls(**data)
+        obj.w1 = MLPLayer.deserialize(w1)
+        obj.w2 = MLPLayer.deserialize(w2)
         return obj
 
 

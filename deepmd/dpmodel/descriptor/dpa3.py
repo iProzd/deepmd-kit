@@ -41,6 +41,9 @@ class RepFlowArgs:
         d_sel: int = 10,
         d_rcut: float = 2.8,
         d_rcut_smth: float = 2.0,
+        use_ffn_node_edge_message: bool = False,
+        use_ffn_edge_angle_message: bool = False,
+        ffn_hidden_dim: int = 1024,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -131,6 +134,9 @@ class RepFlowArgs:
         self.d_sel = d_sel
         self.d_rcut = d_rcut
         self.d_rcut_smth = d_rcut_smth
+        self.use_ffn_node_edge_message = use_ffn_node_edge_message
+        self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
+        self.ffn_hidden_dim = ffn_hidden_dim
 
     def __getitem__(self, key):
         if hasattr(self, key):

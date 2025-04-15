@@ -1646,6 +1646,24 @@ def dpa3_repflow_args():
             optional=True,
             default=2.0,
         ),
+        Argument(
+            "use_ffn_node_edge_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "use_ffn_edge_angle_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "ffn_hidden_dim",
+            int,
+            optional=True,
+            default=1024,
+        ),
     ]
 
 
