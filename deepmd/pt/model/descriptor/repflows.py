@@ -20,6 +20,7 @@ from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
 from deepmd.pt.model.network.utils import (
+    BesselBasis,
     get_graph_index,
 )
 from deepmd.pt.utils import (
@@ -121,6 +122,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_ffn_edge_angle_message: bool = False,
         use_ffn_angle_angle_message: bool = False,
         ffn_hidden_dim: int = 1024,
+        edge_use_rbf: bool = False,
+        edge_use_dist: bool = False,
+        embed_use_bias: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -258,6 +262,15 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
         self.use_ffn_angle_angle_message = use_ffn_angle_angle_message
         self.ffn_hidden_dim = ffn_hidden_dim
+        self.edge_use_rbf = edge_use_rbf
+        self.edge_use_dist = edge_use_dist
+        self.embed_use_bias = embed_use_bias
+        self.edge_embed_input_dim = 1
+        if self.edge_use_rbf:
+            self.rbf = BesselBasis(self.e_rcut)
+            self.edge_embed_input_dim = self.rbf.num_basis
+        else:
+            self.rbf = None
 
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -279,7 +292,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.seed = seed
 
         self.edge_embd = MLPLayer(
-            1, self.e_dim, precision=precision, seed=child_seed(seed, 0)
+            self.edge_embed_input_dim,
+            self.e_dim,
+            precision=precision,
+            seed=child_seed(seed, 0),
+            bias=self.embed_use_bias,
         )
         self.angle_embd = MLPLayer(
             len(self.angle_multi_freq_list_float) + 1
@@ -519,6 +536,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         # get edge and angle embedding input
         # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
         edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
+        if self.edge_use_rbf or self.edge_use_dist:
+            # nb x nloc x nnei x 1
+            edge_input = torch.linalg.norm(diff, dim=-1, keepdim=True)
         # nf x nloc x a_nnei x 3
         normalized_diff_i = a_diff / (
             torch.linalg.norm(a_diff, dim=-1, keepdim=True) + 1e-6
@@ -646,7 +666,14 @@ class DescrptBlockRepflows(DescriptorBlock):
             dihedral_index = None
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
-        edge_ebd = self.act(self.edge_embd(edge_input))
+        if self.edge_use_dist:
+            edge_ebd = self.edge_embd(edge_input)
+        elif self.edge_use_rbf:
+            assert self.rbf is not None
+            edge_ebd = self.edge_embd(self.rbf(edge_input))
+        else:
+            edge_ebd = self.act(self.edge_embd(edge_input))
+
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
 

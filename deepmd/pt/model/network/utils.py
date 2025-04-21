@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import math
 from typing import (
     Optional,
 )
@@ -190,3 +191,25 @@ def get_graph_index(
         a_nlist_mask_3d,
         d_nlist_mask_4d,
     )
+
+
+class BesselBasis(torch.nn.Module):
+    """f : (*, 1) -> (*, bessel_basis_num)."""
+
+    def __init__(
+        self,
+        cutoff_length: float,
+        bessel_basis_num: int = 8,
+        trainable_coeff: bool = True,
+    ):
+        super().__init__()
+        self.num_basis = bessel_basis_num
+        self.prefactor = 2.0 / cutoff_length
+        self.coeffs = torch.FloatTensor(
+            [n * math.pi / cutoff_length for n in range(1, bessel_basis_num + 1)]
+        )
+        if trainable_coeff:
+            self.coeffs = torch.nn.Parameter(self.coeffs)
+
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        return self.prefactor * torch.sin(self.coeffs * r) / (r + 1e-8)

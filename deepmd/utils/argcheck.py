@@ -1676,6 +1676,24 @@ def dpa3_repflow_args():
             optional=True,
             default=1024,
         ),
+        Argument(
+            "edge_use_rbf",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "edge_use_dist",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "embed_use_bias",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 
