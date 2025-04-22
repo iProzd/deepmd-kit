@@ -11,10 +11,15 @@ from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
 from deepmd.pt.model.descriptor.repformer_layer import (
+    Atten2Map,
+    Atten2MultiHeadApply,
     _apply_nlist_mask,
     _apply_switch,
     _make_nei_g1,
     get_residual,
+)
+from deepmd.pt.model.network.layernorm import (
+    LayerNorm,
 )
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
@@ -68,6 +73,10 @@ class RepFlowLayer(torch.nn.Module):
         use_ffn_edge_angle_message: bool = False,
         use_ffn_angle_angle_message: bool = False,
         ffn_hidden_dim: int = 1024,
+        edge_use_attn: bool = False,
+        edge_attn_hidden: int = 32,
+        edge_attn_head: int = 4,
+        edge_attn_use_ln: bool = True,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -139,6 +148,14 @@ class RepFlowLayer(torch.nn.Module):
 
         if self.update_dihedral:
             assert self.use_dynamic_sel, "Dihedral update requires dynamic selection!"
+        self.edge_use_attn = edge_use_attn
+        self.edge_attn_hidden = edge_attn_hidden
+        self.edge_attn_head = edge_attn_head
+        self.edge_attn_use_ln = edge_attn_use_ln
+        if self.edge_use_attn:
+            assert (
+                not self.use_dynamic_sel
+            ), "Attention does not support dynamic selection!"
 
         assert update_residual_init in [
             "norm",
@@ -230,6 +247,44 @@ class RepFlowLayer(torch.nn.Module):
                     seed=child_seed(seed, 7),
                 )
             )
+
+        # edge attention
+        if self.edge_use_attn:
+            self.edge_attn_map = Atten2Map(
+                e_dim,
+                self.edge_attn_hidden,
+                self.edge_attn_head,
+                has_gate=True,
+                smooth=True,
+                precision=precision,
+                seed=child_seed(seed, 21),
+            )
+            self.edge_mh_apply = Atten2MultiHeadApply(
+                e_dim,
+                self.edge_attn_head,
+                precision=precision,
+                seed=child_seed(seed, 22),
+            )
+            self.edge_lm = LayerNorm(
+                e_dim,
+                trainable=True,
+                precision=precision,
+                seed=child_seed(seed, 23),
+            )
+            if self.update_style == "res_residual":
+                self.e_residual.append(
+                    get_residual(
+                        e_dim,
+                        self.update_residual,
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 24),
+                    )
+                )
+        else:
+            self.edge_attn_map = None
+            self.edge_mh_apply = None
+            self.edge_lm = None
 
         if self.update_angle:
             self.angle_dim = self.a_dim
@@ -1078,6 +1133,20 @@ class RepFlowLayer(torch.nn.Module):
                 )
             )
         e_update_list.append(edge_self_update)
+
+        # edge attention message
+        if self.edge_use_attn:
+            # gated_attention(g2, h2)
+            assert self.edge_attn_map is not None
+            assert self.edge_mh_apply is not None
+            assert self.edge_lm is not None
+            # nf x nloc x nnei x nnei x nh
+            attention_weights = self.edge_attn_map(edge_ebd, h2, nlist_mask, sw)
+            # nf x nloc x nnei x e_dim
+            edge_attention_update = self.edge_mh_apply(attention_weights, edge_ebd)
+            if self.edge_attn_use_ln:
+                edge_attention_update = self.edge_lm(edge_attention_update)
+            e_update_list.append(edge_attention_update)
 
         if self.update_angle:
             assert self.angle_self_linear is not None

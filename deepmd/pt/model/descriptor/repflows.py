@@ -126,6 +126,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         edge_use_rbf: bool = False,
         edge_use_dist: bool = False,
         embed_use_bias: bool = True,
+        edge_use_attn: bool = False,
+        edge_attn_hidden: int = 32,
+        edge_attn_head: int = 4,
+        edge_attn_use_ln: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -267,6 +271,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.edge_use_rbf = edge_use_rbf
         self.edge_use_dist = edge_use_dist
         self.embed_use_bias = embed_use_bias
+        self.edge_use_attn = edge_use_attn
+        self.edge_attn_hidden = edge_attn_hidden
+        self.edge_attn_head = edge_attn_head
+        self.edge_attn_use_ln = edge_attn_use_ln
         self.edge_embed_input_dim = 1
         if self.edge_use_concat_rbf:
             self.rbf = BesselBasis(self.e_rcut)
@@ -358,6 +366,10 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_ffn_edge_angle_message=self.use_ffn_edge_angle_message,
                     use_ffn_angle_angle_message=self.use_ffn_angle_angle_message,
                     ffn_hidden_dim=self.ffn_hidden_dim,
+                    edge_use_attn=self.edge_use_attn,
+                    edge_attn_hidden=self.edge_attn_hidden,
+                    edge_attn_head=self.edge_attn_head,
+                    edge_attn_use_ln=self.edge_attn_use_ln,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

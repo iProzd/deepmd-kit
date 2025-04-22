@@ -1700,6 +1700,30 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "edge_use_attn",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "edge_attn_hidden",
+            int,
+            optional=True,
+            default=32,
+        ),
+        Argument(
+            "edge_attn_head",
+            int,
+            optional=True,
+            default=4,
+        ),
+        Argument(
+            "edge_attn_use_ln",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 
