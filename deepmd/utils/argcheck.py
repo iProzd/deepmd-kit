@@ -1677,6 +1677,12 @@ def dpa3_repflow_args():
             default=1024,
         ),
         Argument(
+            "edge_use_concat_rbf",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "edge_use_rbf",
             bool,
             optional=True,

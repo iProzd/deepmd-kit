@@ -122,6 +122,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_ffn_edge_angle_message: bool = False,
         use_ffn_angle_angle_message: bool = False,
         ffn_hidden_dim: int = 1024,
+        edge_use_concat_rbf: bool = False,
         edge_use_rbf: bool = False,
         edge_use_dist: bool = False,
         embed_use_bias: bool = True,
@@ -262,11 +263,15 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
         self.use_ffn_angle_angle_message = use_ffn_angle_angle_message
         self.ffn_hidden_dim = ffn_hidden_dim
+        self.edge_use_concat_rbf = edge_use_concat_rbf
         self.edge_use_rbf = edge_use_rbf
         self.edge_use_dist = edge_use_dist
         self.embed_use_bias = embed_use_bias
         self.edge_embed_input_dim = 1
-        if self.edge_use_rbf:
+        if self.edge_use_concat_rbf:
+            self.rbf = BesselBasis(self.e_rcut)
+            self.edge_embed_input_dim = 1 + self.rbf.num_basis
+        elif self.edge_use_rbf:
             self.rbf = BesselBasis(self.e_rcut)
             self.edge_embed_input_dim = self.rbf.num_basis
         else:
@@ -536,7 +541,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         # get edge and angle embedding input
         # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
         edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
-        if self.edge_use_rbf or self.edge_use_dist:
+        if self.edge_use_concat_rbf or self.edge_use_rbf or self.edge_use_dist:
             # nb x nloc x nnei x 1
             edge_input = torch.linalg.norm(diff, dim=-1, keepdim=True)
         # nf x nloc x a_nnei x 3
@@ -668,6 +673,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         if self.edge_use_dist:
             edge_ebd = self.edge_embd(edge_input)
+        elif self.edge_use_concat_rbf:
+            assert self.rbf is not None
+            edge_ebd = self.edge_embd(
+                torch.cat([dmatrix[..., :1], self.rbf(edge_input)], dim=-1)
+            )
         elif self.edge_use_rbf:
             assert self.rbf is not None
             edge_ebd = self.edge_embd(self.rbf(edge_input))

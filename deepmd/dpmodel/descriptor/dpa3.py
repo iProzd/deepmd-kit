@@ -46,6 +46,7 @@ class RepFlowArgs:
         use_ffn_edge_angle_message: bool = False,
         use_ffn_angle_angle_message: bool = False,
         ffn_hidden_dim: int = 1024,
+        edge_use_concat_rbf: bool = False,
         edge_use_rbf: bool = False,
         edge_use_dist: bool = False,
         embed_use_bias: bool = True,
@@ -144,6 +145,7 @@ class RepFlowArgs:
         self.use_ffn_edge_angle_message = use_ffn_edge_angle_message
         self.use_ffn_angle_angle_message = use_ffn_angle_angle_message
         self.ffn_hidden_dim = ffn_hidden_dim
+        self.edge_use_concat_rbf = edge_use_concat_rbf
         self.edge_use_rbf = edge_use_rbf
         self.edge_use_dist = edge_use_dist
         self.embed_use_bias = embed_use_bias
