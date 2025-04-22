@@ -642,6 +642,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             h2 = h2[nlist_mask]
             # n_edge
             sw = sw[nlist_mask]
+            # n_edge x 4
+            dmatrix = dmatrix[nlist_mask]
 
             # nb x nloc x a_nnei x a_nnei
             a_nlist_mask = a_nlist_mask_3d
