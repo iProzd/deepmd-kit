@@ -189,6 +189,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             edge_attn_hidden=self.repflow_args.edge_attn_hidden,
             edge_attn_head=self.repflow_args.edge_attn_head,
             edge_attn_use_ln=self.repflow_args.edge_attn_use_ln,
+            edge_rbf_dot_self=self.repflow_args.edge_rbf_dot_self,
+            edge_rbf_dot_message=self.repflow_args.edge_rbf_dot_message,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

@@ -1724,6 +1724,18 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "edge_rbf_dot_self",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "edge_rbf_dot_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

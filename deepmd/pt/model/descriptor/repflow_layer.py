@@ -77,6 +77,9 @@ class RepFlowLayer(torch.nn.Module):
         edge_attn_hidden: int = 32,
         edge_attn_head: int = 4,
         edge_attn_use_ln: bool = True,
+        edge_rbf_dot_self: bool = False,
+        edge_rbf_dot_message: bool = False,
+        rbf_dim: int = 8,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -152,6 +155,30 @@ class RepFlowLayer(torch.nn.Module):
         self.edge_attn_hidden = edge_attn_hidden
         self.edge_attn_head = edge_attn_head
         self.edge_attn_use_ln = edge_attn_use_ln
+        self.edge_rbf_dot_self = edge_rbf_dot_self
+        self.edge_rbf_dot_message = edge_rbf_dot_message
+        self.rbf_dim = rbf_dim
+
+        if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
+            self.rbf_mlp = MLPLayer(
+                rbf_dim,
+                self.e_dim,
+                precision=precision,
+                seed=child_seed(seed, 30),
+            )
+        else:
+            self.rbf_mlp = None
+
+        if self.edge_rbf_dot_message:
+            self.rbf_mlp_message = MLPLayer(
+                rbf_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 31),
+            )
+        else:
+            self.rbf_mlp_message = None
+
         if self.edge_use_attn:
             assert (
                 not self.use_dynamic_sel
@@ -889,6 +916,7 @@ class RepFlowLayer(torch.nn.Module):
         dihedral_index: Optional[torch.Tensor] = None,  # n_dihedral x 2
         dihedral_ebd: Optional[torch.Tensor] = None,  # n_dihedral x d_dim
         d_sw: Optional[torch.Tensor] = None,  # n_dihedral
+        rbf_ebd: Optional[torch.Tensor] = None,  # n_edge x num_b
     ):
         """
         Parameters
@@ -961,6 +989,25 @@ class RepFlowLayer(torch.nn.Module):
                 node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
             )
         )
+
+        # handle edge rbf
+        if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
+            assert rbf_ebd is not None
+            assert self.rbf_mlp is not None
+            edge_rbf = self.rbf_mlp(rbf_ebd)
+        else:
+            edge_rbf = None
+
+        if self.edge_rbf_dot_message:
+            assert rbf_ebd is not None
+            assert self.rbf_mlp_message is not None
+            edge_rbf_node = self.rbf_mlp_message(rbf_ebd)
+        else:
+            edge_rbf_node = None
+
+        if self.edge_rbf_dot_self:
+            assert edge_rbf is not None
+            edge_ebd = edge_ebd * edge_rbf
 
         n_update_list: list[torch.Tensor] = [node_ebd]
         e_update_list: list[torch.Tensor] = [edge_ebd]
@@ -1079,6 +1126,9 @@ class RepFlowLayer(torch.nn.Module):
                     "node",
                 )
             ) * sw.unsqueeze(-1)
+        if self.edge_rbf_dot_message:
+            assert edge_rbf_node is not None
+            node_edge_update = node_edge_update * edge_rbf_node
         node_edge_update = (
             (torch.sum(node_edge_update, dim=-2) / self.nnei)
             if not self.use_dynamic_sel
@@ -1132,6 +1182,9 @@ class RepFlowLayer(torch.nn.Module):
                     "edge",
                 )
             )
+        if self.edge_rbf_dot_message:
+            assert edge_rbf is not None
+            edge_self_update = edge_self_update * edge_rbf
         e_update_list.append(edge_self_update)
 
         # edge attention message

@@ -130,6 +130,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         edge_attn_hidden: int = 32,
         edge_attn_head: int = 4,
         edge_attn_use_ln: bool = True,
+        edge_rbf_dot_self: bool = False,
+        edge_rbf_dot_message: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -275,6 +277,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.edge_attn_hidden = edge_attn_hidden
         self.edge_attn_head = edge_attn_head
         self.edge_attn_use_ln = edge_attn_use_ln
+        self.edge_rbf_dot_self = edge_rbf_dot_self
+        self.edge_rbf_dot_message = edge_rbf_dot_message
+        if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
+            assert self.edge_use_rbf or self.edge_use_concat_rbf, "rbf is not used"
         self.edge_embed_input_dim = 1
         if self.edge_use_concat_rbf:
             self.rbf = BesselBasis(self.e_rcut)
@@ -370,6 +376,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_attn_hidden=self.edge_attn_hidden,
                     edge_attn_head=self.edge_attn_head,
                     edge_attn_use_ln=self.edge_attn_use_ln,
+                    edge_rbf_dot_self=self.edge_rbf_dot_self,
+                    edge_rbf_dot_message=self.edge_rbf_dot_message,
+                    rbf_dim=self.edge_embed_input_dim,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -687,15 +696,17 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         if self.edge_use_dist:
             edge_ebd = self.edge_embd(edge_input)
+            rbf_ebd = None
         elif self.edge_use_concat_rbf:
             assert self.rbf is not None
-            edge_ebd = self.edge_embd(
-                torch.cat([dmatrix[..., :1], self.rbf(edge_input)], dim=-1)
-            )
+            rbf_ebd = torch.cat([dmatrix[..., :1], self.rbf(edge_input)], dim=-1)
+            edge_ebd = self.edge_embd(rbf_ebd)
         elif self.edge_use_rbf:
             assert self.rbf is not None
-            edge_ebd = self.edge_embd(self.rbf(edge_input))
+            rbf_ebd = self.rbf(edge_input)
+            edge_ebd = self.edge_embd(rbf_ebd)
         else:
+            rbf_ebd = None
             edge_ebd = self.act(self.edge_embd(edge_input))
 
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
@@ -794,6 +805,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 dihedral_index=dihedral_index,
                 dihedral_ebd=dihedral_ebd,
                 d_sw=d_sw,
+                rbf_ebd=rbf_ebd,
             )
 
         # nb x nloc x 3 x e_dim

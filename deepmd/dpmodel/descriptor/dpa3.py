@@ -54,6 +54,8 @@ class RepFlowArgs:
         edge_attn_hidden: int = 32,
         edge_attn_head: int = 4,
         edge_attn_use_ln: bool = True,
+        edge_rbf_dot_self: bool = False,
+        edge_rbf_dot_message: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -157,6 +159,8 @@ class RepFlowArgs:
         self.edge_attn_hidden = edge_attn_hidden
         self.edge_attn_head = edge_attn_head
         self.edge_attn_use_ln = edge_attn_use_ln
+        self.edge_rbf_dot_self = edge_rbf_dot_self
+        self.edge_rbf_dot_message = edge_rbf_dot_message
 
     def __getitem__(self, key):
         if hasattr(self, key):
