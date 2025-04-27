@@ -78,6 +78,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         seed: Optional[Union[int, list[int]]] = None,
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
+        use_torch_embed: bool = False,
         type_map: Optional[list[str]] = None,
     ) -> None:
         r"""The DPA-3 descriptor.
@@ -194,6 +195,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             edge_use_esen_rbf=self.repflow_args.edge_use_esen_rbf,
             edge_use_esen_atom_ebd=self.repflow_args.edge_use_esen_atom_ebd,
             edge_use_esen_env=self.repflow_args.edge_use_esen_env,
+            residual_pref=self.repflow_args.residual_pref,
+            tebd_use_act=self.repflow_args.tebd_use_act,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
@@ -202,20 +205,26 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
 
         self.use_econf_tebd = use_econf_tebd
         self.use_tebd_bias = use_tebd_bias
+        self.use_torch_embed = use_torch_embed
         self.type_map = type_map
         self.tebd_dim = self.repflow_args.n_dim
-        self.type_embedding = TypeEmbedNet(
-            ntypes,
-            self.tebd_dim,
-            precision=precision,
-            seed=child_seed(seed, 2),
-            use_econf_tebd=self.use_econf_tebd,
-            use_tebd_bias=use_tebd_bias,
-            type_map=type_map,
-        )
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision
         self.prec = PRECISION_DICT[self.precision]
+        if self.use_torch_embed:
+            self.type_embedding = torch.nn.Embedding(
+                ntypes, self.tebd_dim, device=env.DEVICE, dtype=self.prec
+            )
+        else:
+            self.type_embedding = TypeEmbedNet(
+                ntypes,
+                self.tebd_dim,
+                precision=precision,
+                seed=child_seed(seed, 2),
+                use_econf_tebd=self.use_econf_tebd,
+                use_tebd_bias=use_tebd_bias,
+                type_map=type_map,
+            )
         self.exclude_types = exclude_types
         self.env_protection = env_protection
         self.trainable = trainable

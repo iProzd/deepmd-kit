@@ -80,6 +80,7 @@ class RepFlowLayer(torch.nn.Module):
         edge_rbf_dot_self: bool = False,
         edge_rbf_dot_message: bool = False,
         rbf_dim: int = 8,
+        residual_pref: list = [],
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -158,6 +159,10 @@ class RepFlowLayer(torch.nn.Module):
         self.edge_rbf_dot_self = edge_rbf_dot_self
         self.edge_rbf_dot_message = edge_rbf_dot_message
         self.rbf_dim = rbf_dim
+        self.residual_pref = residual_pref
+        if not self.residual_pref:
+            self.residual_pref = [1.0] * 10
+        residual_idx = 0
 
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             self.rbf_mlp = MLPLayer(
@@ -208,12 +213,13 @@ class RepFlowLayer(torch.nn.Module):
             self.n_residual.append(
                 get_residual(
                     n_dim,
-                    self.update_residual,
+                    self.update_residual * self.residual_pref[residual_idx],
                     self.update_residual_init,
                     precision=precision,
                     seed=child_seed(seed, 1),
                 )
             )
+            residual_idx += 1
 
         # node sym (grrg + drrd)
         self.n_sym_dim = n_dim * self.axis_neuron + e_dim * self.axis_neuron
@@ -227,12 +233,13 @@ class RepFlowLayer(torch.nn.Module):
             self.n_residual.append(
                 get_residual(
                     n_dim,
-                    self.update_residual,
+                    self.update_residual * self.residual_pref[residual_idx],
                     self.update_residual_init,
                     precision=precision,
                     seed=child_seed(seed, 3),
                 )
             )
+            residual_idx += 1
 
         # node edge message
         self.node_edge_linear = MLPLayer(
@@ -248,12 +255,13 @@ class RepFlowLayer(torch.nn.Module):
                 self.n_residual.append(
                     get_residual(
                         n_dim,
-                        self.update_residual,
+                        self.update_residual * self.residual_pref[residual_idx],
                         self.update_residual_init,
                         precision=precision,
                         seed=child_seed(child_seed(seed, 5), head_index),
                     )
                 )
+                residual_idx += 1
 
         # edge self message
         self.edge_self_linear = MLPLayer(

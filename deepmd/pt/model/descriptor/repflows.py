@@ -138,6 +138,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         edge_use_esen_rbf: bool = False,
         edge_use_esen_atom_ebd: bool = False,
         edge_use_esen_env: bool = False,
+        residual_pref: list = [],
+        tebd_use_act: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -314,6 +316,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.e_dim = e_dim
         self.a_dim = a_dim
         self.update_angle = update_angle
+        self.residual_pref = residual_pref
+        self.tebd_use_act = tebd_use_act
 
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -422,6 +426,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_rbf_dot_self=self.edge_rbf_dot_self,
                     edge_rbf_dot_message=self.edge_rbf_dot_message,
                     rbf_dim=self.edge_embed_input_dim,
+                    residual_pref=self.residual_pref,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -619,7 +624,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             atype_embd = extended_atype_embd
         assert isinstance(atype_embd, torch.Tensor)  # for jit
-        node_ebd = self.act(atype_embd)
+        if not self.tebd_use_act:
+            node_ebd = atype_embd
+        else:
+            node_ebd = self.act(atype_embd)
         n_dim = node_ebd.shape[-1]
 
         # get edge and angle embedding input
