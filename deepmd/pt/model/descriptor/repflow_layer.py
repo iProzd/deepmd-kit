@@ -160,8 +160,7 @@ class RepFlowLayer(torch.nn.Module):
         self.edge_rbf_dot_message = edge_rbf_dot_message
         self.rbf_dim = rbf_dim
         self.residual_pref = residual_pref
-        if not self.residual_pref:
-            self.residual_pref = [1.0] * 10
+        self.residual_pref += [1.0] * 10
         residual_idx = 0
 
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
@@ -276,12 +275,13 @@ class RepFlowLayer(torch.nn.Module):
             self.e_residual.append(
                 get_residual(
                     e_dim,
-                    self.update_residual,
+                    self.update_residual * self.residual_pref[residual_idx],
                     self.update_residual_init,
                     precision=precision,
                     seed=child_seed(seed, 7),
                 )
             )
+            residual_idx += 1
 
         # edge attention
         if self.edge_use_attn:
@@ -377,12 +377,13 @@ class RepFlowLayer(torch.nn.Module):
                 self.e_residual.append(
                     get_residual(
                         self.e_dim,
-                        self.update_residual,
+                        self.update_residual * self.residual_pref[residual_idx],
                         self.update_residual_init,
                         precision=precision,
                         seed=child_seed(seed, 12),
                     )
                 )
+                residual_idx += 1
 
             # angle self message
             self.angle_self_linear = MLPLayer(
