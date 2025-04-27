@@ -6,6 +6,10 @@ from typing import (
 
 import torch
 
+from deepmd.pt.utils import (
+    env,
+)
+
 
 @torch.jit.export
 def aggregate(
@@ -213,3 +217,71 @@ class BesselBasis(torch.nn.Module):
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
         return self.prefactor * torch.sin(self.coeffs * r) / (r + 1e-8)
+
+
+class GaussianSmearing(torch.nn.Module):
+    def __init__(
+        self,
+        start: float = -5.0,
+        stop: float = 5.0,
+        num_gaussians: int = 50,
+        basis_width_scalar: float = 1.0,
+    ) -> None:
+        super().__init__()
+        self.num_output = num_gaussians
+        offset = torch.linspace(
+            start, stop, num_gaussians, device=env.DEVICE, dtype=torch.float32
+        )
+        self.coeff = -0.5 / (basis_width_scalar * (offset[1] - offset[0])).item() ** 2
+        self.register_buffer("offset", offset)
+
+    def forward(self, dist) -> torch.Tensor:
+        dist = dist - self.offset
+        return torch.exp(self.coeff * torch.pow(dist, 2))
+
+
+class RadialMLP(torch.nn.Module):
+    """Contruct a radial function (linear layers + layer normalization + SiLU) given a list of channels."""
+
+    def __init__(self, channels_list) -> None:
+        super().__init__()
+        modules = []
+        input_channels = channels_list[0]
+        for i in range(len(channels_list)):
+            if i == 0:
+                continue
+
+            modules.append(torch.nn.Linear(input_channels, channels_list[i], bias=True))
+            input_channels = channels_list[i]
+
+            if i == len(channels_list) - 1:
+                break
+
+            modules.append(torch.nn.LayerNorm(channels_list[i]))
+            modules.append(torch.nn.SiLU())
+
+        self.net = torch.nn.Sequential(*modules)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        return self.net(inputs)
+
+
+class PolynomialEnvelope(torch.nn.Module):
+    """Polynomial envelope function that ensures a smooth cutoff."""
+
+    def __init__(self, exponent: int = 5) -> None:
+        super().__init__()
+        assert exponent > 0
+        self.p: float = float(exponent)
+        self.a: float = -(self.p + 1) * (self.p + 2) / 2
+        self.b: float = self.p * (self.p + 2)
+        self.c: float = -self.p * (self.p + 1) / 2
+
+    def forward(self, d_scaled: torch.Tensor) -> torch.Tensor:
+        env_val = (
+            1
+            + self.a * d_scaled**self.p
+            + self.b * d_scaled ** (self.p + 1)
+            + self.c * d_scaled ** (self.p + 2)
+        )
+        return torch.where(d_scaled < 1, env_val, torch.zeros_like(d_scaled))

@@ -21,6 +21,9 @@ from deepmd.pt.model.network.mlp import (
 )
 from deepmd.pt.model.network.utils import (
     BesselBasis,
+    GaussianSmearing,
+    PolynomialEnvelope,
+    RadialMLP,
     get_graph_index,
 )
 from deepmd.pt.utils import (
@@ -132,6 +135,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         edge_attn_use_ln: bool = True,
         edge_rbf_dot_self: bool = False,
         edge_rbf_dot_message: bool = False,
+        edge_use_esen_rbf: bool = False,
+        edge_use_esen_atom_ebd: bool = False,
+        edge_use_esen_env: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -279,10 +285,23 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.edge_attn_use_ln = edge_attn_use_ln
         self.edge_rbf_dot_self = edge_rbf_dot_self
         self.edge_rbf_dot_message = edge_rbf_dot_message
+        self.edge_use_esen_rbf = edge_use_esen_rbf
+        self.edge_use_esen_atom_ebd = edge_use_esen_atom_ebd
+        self.edge_use_esen_env = edge_use_esen_env
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             assert self.edge_use_rbf or self.edge_use_concat_rbf, "rbf is not used"
         self.edge_embed_input_dim = 1
-        if self.edge_use_concat_rbf:
+        if self.edge_use_esen_atom_ebd or self.edge_use_esen_env:
+            assert self.edge_use_esen_rbf, "esen rbf is not used"
+        if self.edge_use_esen_rbf:
+            self.rbf = GaussianSmearing(
+                0.0,
+                self.e_rcut,
+                10,
+                2.0,
+            )
+            self.edge_embed_input_dim = 10
+        elif self.edge_use_concat_rbf:
             self.rbf = BesselBasis(self.e_rcut)
             self.edge_embed_input_dim = 1 + self.rbf.num_basis
         elif self.edge_use_rbf:
@@ -295,6 +314,21 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.e_dim = e_dim
         self.a_dim = a_dim
         self.update_angle = update_angle
+
+        if self.edge_use_esen_atom_ebd:
+            self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
+            self.target_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
+            torch.nn.init.uniform_(self.source_embedding.weight.data, -0.001, 0.001)
+            torch.nn.init.uniform_(self.target_embedding.weight.data, -0.001, 0.001)
+            self.edge_embed_input_dim += 2 * self.e_dim
+        else:
+            self.source_embedding = None
+            self.target_embedding = None
+
+        if self.edge_use_esen_env:
+            self.env = PolynomialEnvelope(exponent=5)
+        else:
+            self.env = None
 
         self.activation_function = activation_function
         self.update_style = update_style
@@ -310,13 +344,22 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
 
-        self.edge_embd = MLPLayer(
-            self.edge_embed_input_dim,
-            self.e_dim,
-            precision=precision,
-            seed=child_seed(seed, 0),
-            bias=self.embed_use_bias,
-        )
+        if not self.edge_use_esen_rbf:
+            self.edge_embd = MLPLayer(
+                self.edge_embed_input_dim,
+                self.e_dim,
+                precision=precision,
+                seed=child_seed(seed, 0),
+                bias=self.embed_use_bias,
+            )
+        else:
+            edge_channels_list = [
+                self.edge_embed_input_dim,
+                self.e_dim,
+                self.e_dim,
+                self.e_dim,
+            ]
+            self.edge_embd = RadialMLP(edge_channels_list)
         self.angle_embd = MLPLayer(
             len(self.angle_multi_freq_list_float) + 1
             if not self.angle_init_use_sin
@@ -511,6 +554,22 @@ class DescrptBlockRepflows(DescriptorBlock):
             use_new_sw=self.use_new_sw,
         )
         nlist_mask = nlist != -1
+        if (
+            self.edge_use_esen_rbf
+            or self.edge_use_concat_rbf
+            or self.edge_use_rbf
+            or self.edge_use_dist
+        ):
+            # nb x nloc x nnei x 1
+            edge_dist = torch.linalg.norm(diff, dim=-1, keepdim=True)
+        else:
+            edge_dist = None
+
+        if self.edge_use_esen_env:
+            assert self.env is not None
+            assert edge_dist is not None
+            sw = self.env(edge_dist / self.e_rcut)
+
         sw = torch.squeeze(sw, -1)
         # beyond the cutoff sw should be 0.0
         sw = sw.masked_fill(~nlist_mask, 0.0)
@@ -533,6 +592,10 @@ class DescrptBlockRepflows(DescriptorBlock):
             use_new_sw=self.use_new_sw,
         )
         a_nlist_mask = a_nlist != -1
+        if self.edge_use_esen_env:
+            assert self.env is not None
+            edge_dist_a = torch.linalg.norm(a_diff, dim=-1, keepdim=True)
+            a_sw = self.env(edge_dist_a / self.a_rcut)
         a_sw = torch.squeeze(a_sw, -1)
         # beyond the cutoff sw should be 0.0
         a_sw = a_sw.masked_fill(~a_nlist_mask, 0.0)
@@ -562,9 +625,15 @@ class DescrptBlockRepflows(DescriptorBlock):
         # get edge and angle embedding input
         # nb x nloc x nnei x 1,  nb x nloc x nnei x 3
         edge_input, h2 = torch.split(dmatrix, [1, 3], dim=-1)
-        if self.edge_use_concat_rbf or self.edge_use_rbf or self.edge_use_dist:
+        if (
+            self.edge_use_esen_rbf
+            or self.edge_use_concat_rbf
+            or self.edge_use_rbf
+            or self.edge_use_dist
+        ):
+            assert edge_dist is not None
             # nb x nloc x nnei x 1
-            edge_input = torch.linalg.norm(diff, dim=-1, keepdim=True)
+            edge_input = edge_dist
         # nf x nloc x a_nnei x 3
         normalized_diff_i = a_diff / (
             torch.linalg.norm(a_diff, dim=-1, keepdim=True) + 1e-6
@@ -644,6 +713,18 @@ class DescrptBlockRepflows(DescriptorBlock):
             d_sw = None
             dihedral_input = None
 
+        if self.edge_use_esen_atom_ebd:
+            # nf x (nl x nnei)
+            nlist_index = nlist.reshape(nframes, nloc * nnei)
+            # nf x (nl x nnei)
+            source_type = torch.gather(
+                extended_atype, dim=1, index=nlist_index
+            ).reshape(nframes, nloc, nnei)
+            target_type = atype.unsqueeze(-1).expand(-1, -1, nnei)
+        else:
+            source_type = None
+            target_type = None
+
         if self.use_dynamic_sel:
             # get graph index
             edge_index, angle_index, dihedral_index, a_nlist_mask_3d, d_nlist_mask4d = (
@@ -665,6 +746,12 @@ class DescrptBlockRepflows(DescriptorBlock):
             sw = sw[nlist_mask]
             # n_edge x 4
             dmatrix = dmatrix[nlist_mask]
+
+            if self.edge_use_esen_atom_ebd:
+                assert source_type is not None
+                assert target_type is not None
+                source_type = source_type[nlist_mask]
+                target_type = target_type[nlist_mask]
 
             # nb x nloc x a_nnei x a_nnei
             a_nlist_mask = a_nlist_mask_3d
@@ -694,7 +781,19 @@ class DescrptBlockRepflows(DescriptorBlock):
             dihedral_index = None
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
-        if self.edge_use_dist:
+        if self.edge_use_esen_rbf:
+            assert self.rbf is not None
+            rbf_ebd = self.rbf(edge_input)
+            if self.edge_use_esen_atom_ebd:
+                assert source_type is not None
+                assert target_type is not None
+                source_ebd = self.source_embedding(source_type)
+                target_ebd = self.target_embedding(target_type)
+                rbf_input = torch.cat((rbf_ebd, source_ebd, target_ebd), dim=-1)
+            else:
+                rbf_input = rbf_ebd
+            edge_ebd = self.edge_embd(rbf_input)
+        elif self.edge_use_dist:
             edge_ebd = self.edge_embd(edge_input)
             rbf_ebd = None
         elif self.edge_use_concat_rbf:

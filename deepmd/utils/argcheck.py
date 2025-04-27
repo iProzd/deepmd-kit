@@ -1736,6 +1736,24 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "edge_use_esen_rbf",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "edge_use_esen_atom_ebd",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "edge_use_esen_env",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
