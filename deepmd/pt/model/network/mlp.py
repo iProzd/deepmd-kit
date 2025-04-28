@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import math
 from typing import (
     ClassVar,
     Optional,
@@ -25,9 +26,12 @@ from deepmd.dpmodel.utils import (
     make_multilayer_network,
 )
 from deepmd.pt.model.network.init import (
+    _calculate_fan_in_and_fan_out,
     kaiming_normal_,
+    kaiming_uniform_,
     normal_,
     trunc_normal_,
+    uniform_,
     xavier_uniform_,
 )
 from deepmd.pt.utils.env import (
@@ -111,6 +115,8 @@ class MLPLayer(nn.Module):
             self.idt = None
         self.resnet = resnet
         if init == "default":
+            init = env.MLP_INIT
+        if init == "default":
             self._default_normal_init(
                 bavg=bavg, stddev=stddev, generator=random_generator
             )
@@ -124,6 +130,8 @@ class MLPLayer(nn.Module):
             self._zero_init(self.use_bias)
         elif init == "kaiming_normal":
             self._normal_init(generator=random_generator)
+        elif init == "kaiming_uniform":
+            self._kaiming_uniform_init(generator=random_generator)
         elif init == "final":
             self._zero_init(False)
         else:
@@ -185,6 +193,15 @@ class MLPLayer(nn.Module):
 
     def _normal_init(self, generator: Optional[torch.Generator] = None) -> None:
         kaiming_normal_(self.matrix, nonlinearity="linear", generator=generator)
+
+    def _kaiming_uniform_init(
+        self, generator: Optional[torch.Generator] = None
+    ) -> None:
+        kaiming_uniform_(self.matrix, a=math.sqrt(5), generator=generator)
+        if self.bias is not None:
+            fan_in, _ = _calculate_fan_in_and_fan_out(self.matrix)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            uniform_(self.bias, -bound, bound)
 
     def forward(
         self,
