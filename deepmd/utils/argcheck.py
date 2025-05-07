@@ -1778,6 +1778,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "use_combined_output",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

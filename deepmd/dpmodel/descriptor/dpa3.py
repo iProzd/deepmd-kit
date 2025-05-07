@@ -62,6 +62,7 @@ class RepFlowArgs:
         residual_pref: list = [],
         tebd_use_act: bool = True,
         message_use_self_concat: bool = False,
+        use_combined_output: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -173,6 +174,7 @@ class RepFlowArgs:
         self.residual_pref = residual_pref
         self.tebd_use_act = tebd_use_act
         self.message_use_self_concat = message_use_self_concat
+        self.use_combined_output = use_combined_output
 
     def __getitem__(self, key):
         if hasattr(self, key):

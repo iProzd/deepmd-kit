@@ -24,6 +24,7 @@ from deepmd.pt.model.network.utils import (
     GaussianSmearing,
     PolynomialEnvelope,
     RadialMLP,
+    aggregate,
     get_graph_index,
 )
 from deepmd.pt.utils import (
@@ -141,6 +142,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         residual_pref: list = [],
         tebd_use_act: bool = True,
         message_use_self_concat: bool = False,
+        use_combined_output: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -248,6 +250,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.smooth_edge_update = smooth_edge_update
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
+        self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
+        self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
         self.angle_multi_freq = angle_multi_freq
         self.angle_use_multi_freq = angle_multi_freq is not None
         self.angle_multi_freq_list_float = (
@@ -320,6 +324,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.residual_pref = residual_pref
         self.tebd_use_act = tebd_use_act
         self.message_use_self_concat = message_use_self_concat
+        self.use_combined_output = use_combined_output
 
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -511,7 +516,12 @@ class DescrptBlockRepflows(DescriptorBlock):
     @property
     def dim_out(self):
         """Returns the output dimension of this descriptor."""
-        return self.n_dim
+        out_dim = self.n_dim
+        if self.use_combined_output:
+            out_dim += (
+                self.e_dim if not self.update_angle else self.e_dim + self.a_dim
+            )  # edge or edge + angle
+        return out_dim
 
     @property
     def dim_in(self):
@@ -917,6 +927,47 @@ class DescrptBlockRepflows(DescriptorBlock):
                 d_sw=d_sw,
                 rbf_ebd=rbf_ebd,
             )
+
+        if self.use_combined_output:
+            concat_list = [node_ebd]
+            edge_part = edge_ebd * sw.unsqueeze(-1)
+            edge_part = (
+                (torch.sum(edge_part, dim=-2) / self.nnei)
+                if not self.use_dynamic_sel
+                else (
+                    aggregate(
+                        edge_part,
+                        edge_index[:, 0],
+                        average=False,
+                        num_owner=nframes * nloc,
+                    ).reshape(nframes, nloc, -1)
+                    / self.dynamic_e_sel
+                )
+            )
+            concat_list.append(edge_part)
+            if self.update_angle:
+                if not self.use_dynamic_sel:
+                    angle_part = (
+                        angle_ebd
+                        * a_sw[:, :, :, None, None]
+                        * a_sw[:, :, None, :, None]
+                    )
+                    angle_part = (
+                        torch.sum(torch.sum(angle_part, dim=-2), dim=-2) / self.a_sel
+                    )  # (self.a_sel**0.5)**2
+                else:
+                    angle_part = angle_ebd * a_sw.unsqueeze(-1)
+                    angle_part = (
+                        aggregate(
+                            angle_part,
+                            angle_index[:, 0],
+                            average=False,
+                            num_owner=nframes * nloc,
+                        ).reshape(nframes, nloc, -1)
+                        / self.dynamic_a_sel
+                    )
+                concat_list.append(angle_part)
+            node_ebd = torch.concat(concat_list, dim=-1)
 
         # nb x nloc x 3 x e_dim
         h2g2 = (
