@@ -197,6 +197,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             edge_use_esen_env=self.repflow_args.edge_use_esen_env,
             residual_pref=self.repflow_args.residual_pref,
             tebd_use_act=self.repflow_args.tebd_use_act,
+            message_use_self_concat=self.repflow_args.message_use_self_concat,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

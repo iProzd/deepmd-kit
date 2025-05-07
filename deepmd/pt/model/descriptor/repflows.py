@@ -140,6 +140,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         edge_use_esen_env: bool = False,
         residual_pref: list = [],
         tebd_use_act: bool = True,
+        message_use_self_concat: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -318,6 +319,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.update_angle = update_angle
         self.residual_pref = residual_pref
         self.tebd_use_act = tebd_use_act
+        self.message_use_self_concat = message_use_self_concat
 
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -427,6 +429,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_rbf_dot_message=self.edge_rbf_dot_message,
                     rbf_dim=self.edge_embed_input_dim,
                     residual_pref=self.residual_pref,
+                    message_use_self_concat=self.message_use_self_concat,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

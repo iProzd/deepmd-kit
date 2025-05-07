@@ -61,6 +61,7 @@ class RepFlowArgs:
         edge_use_esen_env: bool = False,
         residual_pref: list = [],
         tebd_use_act: bool = True,
+        message_use_self_concat: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -171,6 +172,7 @@ class RepFlowArgs:
         self.edge_use_esen_env = edge_use_esen_env
         self.residual_pref = residual_pref
         self.tebd_use_act = tebd_use_act
+        self.message_use_self_concat = message_use_self_concat
 
     def __getitem__(self, key):
         if hasattr(self, key):

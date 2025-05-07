@@ -1772,6 +1772,12 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "message_use_self_concat",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

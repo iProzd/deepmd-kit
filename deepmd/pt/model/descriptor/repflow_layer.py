@@ -81,6 +81,7 @@ class RepFlowLayer(torch.nn.Module):
         edge_rbf_dot_message: bool = False,
         rbf_dim: int = 8,
         residual_pref: list = [],
+        message_use_self_concat: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -162,6 +163,11 @@ class RepFlowLayer(torch.nn.Module):
         self.residual_pref = residual_pref
         self.residual_pref += [1.0] * 10
         residual_idx = 0
+        self.message_use_self_concat = message_use_self_concat
+        if self.message_use_self_concat:
+            assert (
+                self.n_multi_edge_message == 1
+            ), "Only one message head is supported for self concatenation!"
 
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             self.rbf_mlp = MLPLayer(
@@ -249,6 +255,16 @@ class RepFlowLayer(torch.nn.Module):
             precision=precision,
             seed=child_seed(seed, 4),
         )
+        if self.message_use_self_concat:
+            self.node_edge_linear_2 = MLPLayer(
+                self.n_dim + self.n_dim,
+                self.n_dim,
+                precision=precision,
+                seed=child_seed(seed, 5),
+            )
+        else:
+            self.node_edge_linear_2 = None
+
         if self.update_style == "res_residual":
             for head_index in range(self.n_multi_edge_message):
                 self.n_residual.append(
@@ -368,7 +384,9 @@ class RepFlowLayer(torch.nn.Module):
                 seed=child_seed(seed, 10),
             )
             self.edge_angle_linear2 = MLPLayer(
-                self.e_dim,
+                self.e_dim
+                if not self.message_use_self_concat
+                else self.e_dim + self.e_dim,
                 self.e_dim,
                 precision=precision,
                 seed=child_seed(seed, 11),
@@ -1160,6 +1178,13 @@ class RepFlowLayer(torch.nn.Module):
             for head_index in range(self.n_multi_edge_message):
                 n_update_list.append(node_edge_update_mul_head[:, :, head_index, :])
         else:
+            if self.message_use_self_concat:
+                assert self.node_edge_linear_2 is not None
+                node_edge_update = self.act(
+                    self.node_edge_linear_2(
+                        torch.cat([node_ebd, node_edge_update], dim=-1)
+                    )
+                )
             n_update_list.append(node_edge_update)
         # update node_ebd
         n_updated = self.list_update(n_update_list, "node")
@@ -1371,6 +1396,10 @@ class RepFlowLayer(torch.nn.Module):
                 )
                 padding_edge_angle_update = torch.where(
                     full_mask.unsqueeze(-1), padding_edge_angle_update, edge_ebd
+                )
+            if self.message_use_self_concat:
+                padding_edge_angle_update = torch.cat(
+                    [edge_ebd, padding_edge_angle_update], dim=-1
                 )
             e_update_list.append(
                 self.act(self.edge_angle_linear2(padding_edge_angle_update))
