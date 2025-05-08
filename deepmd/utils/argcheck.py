@@ -1784,6 +1784,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "use_slim_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

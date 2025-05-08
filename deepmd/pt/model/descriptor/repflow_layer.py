@@ -82,6 +82,7 @@ class RepFlowLayer(torch.nn.Module):
         rbf_dim: int = 8,
         residual_pref: list = [],
         message_use_self_concat: bool = False,
+        use_slim_message: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -164,6 +165,7 @@ class RepFlowLayer(torch.nn.Module):
         self.residual_pref += [1.0] * 10
         residual_idx = 0
         self.message_use_self_concat = message_use_self_concat
+        self.use_slim_message = use_slim_message
         if self.message_use_self_concat:
             assert (
                 self.n_multi_edge_message == 1
@@ -383,14 +385,17 @@ class RepFlowLayer(torch.nn.Module):
                 precision=precision,
                 seed=child_seed(seed, 10),
             )
-            self.edge_angle_linear2 = MLPLayer(
-                self.e_dim
-                if not self.message_use_self_concat
-                else self.e_dim + self.e_dim,
-                self.e_dim,
-                precision=precision,
-                seed=child_seed(seed, 11),
-            )
+            if not self.use_slim_message:
+                self.edge_angle_linear2 = MLPLayer(
+                    self.e_dim
+                    if not self.message_use_self_concat
+                    else self.e_dim + self.e_dim,
+                    self.e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 11),
+                )
+            else:
+                self.edge_angle_linear2 = None
             if self.update_style == "res_residual":
                 self.e_residual.append(
                     get_residual(
@@ -1238,7 +1243,7 @@ class RepFlowLayer(torch.nn.Module):
         if self.update_angle:
             assert self.angle_self_linear is not None
             assert self.edge_angle_linear1 is not None
-            assert self.edge_angle_linear2 is not None
+            # assert self.edge_angle_linear2 is not None
             # get angle info
             if self.a_compress_rate != 0:
                 if not self.a_compress_use_split:
@@ -1401,9 +1406,13 @@ class RepFlowLayer(torch.nn.Module):
                 padding_edge_angle_update = torch.cat(
                     [edge_ebd, padding_edge_angle_update], dim=-1
                 )
-            e_update_list.append(
-                self.act(self.edge_angle_linear2(padding_edge_angle_update))
-            )
+            if not self.use_slim_message:
+                assert self.edge_angle_linear2 is not None
+                e_update_list.append(
+                    self.act(self.edge_angle_linear2(padding_edge_angle_update))
+                )
+            else:
+                e_update_list.append(padding_edge_angle_update)
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
 

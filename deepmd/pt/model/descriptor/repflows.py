@@ -142,6 +142,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         residual_pref: list = [],
         tebd_use_act: bool = True,
         message_use_self_concat: bool = False,
+        use_slim_message: bool = False,
         use_combined_output: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -324,7 +325,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.residual_pref = residual_pref
         self.tebd_use_act = tebd_use_act
         self.message_use_self_concat = message_use_self_concat
+        self.use_slim_message = use_slim_message
         self.use_combined_output = use_combined_output
+        assert not (
+            self.message_use_self_concat and self.use_slim_message
+        ), "only one of message_use_self_concat and use_slim_message can be True"
 
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -435,6 +440,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     rbf_dim=self.edge_embed_input_dim,
                     residual_pref=self.residual_pref,
                     message_use_self_concat=self.message_use_self_concat,
+                    use_slim_message=self.use_slim_message,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
