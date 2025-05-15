@@ -152,8 +152,6 @@ class RepFlowLayer(torch.nn.Module):
         ):
             assert not self.optim_update, "FFN does not support optim update!"
 
-        if self.update_dihedral:
-            assert self.use_dynamic_sel, "Dihedral update requires dynamic selection!"
         self.edge_use_attn = edge_use_attn
         self.edge_attn_hidden = edge_attn_hidden
         self.edge_attn_head = edge_attn_head
@@ -725,7 +723,47 @@ class RepFlowLayer(torch.nn.Module):
         # nb x nloc x (axis x e_dim)
         grrg = self._cal_grrg(h2g2, axis_neuron)
         return grrg
+    
+    def optim_dihedral_update(
+        self,
+        dihedral_ebd: torch.Tensor,
+        angle_ebd: torch.Tensor,
+        feat: str = "angle",
+    ) -> torch.Tensor:
+        angle_dim = angle_ebd.shape[-1]
+        dihedral_dim = dihedral_ebd.shape[-1]
+        sub_dihedral_idx = (0, angle_dim)
+        sub_angle_idx_ijk = (angle_dim, angle_dim + angle_dim)
+        sub_edge_idx_ijl = (angle_dim + angle_dim, angle_dim + angle_dim + angle_dim)
+        
+        if feat == "angle":
+            matrix, bias = self.angle_dihedral_linear.matrix, self.angle_dihedral_linear.bias
+        elif feat == "dihedral":
+            matrix, bias = self.dihedral_self_linear.matrix, self.dihedral_self_linear.bias
+        else:
+            raise NotImplementedError
+        assert dihedral_dim + 2 * angle_dim == matrix.size()[0]
+        
+        sub_dihedral_update = torch.matmul(
+            dihedral_ebd, matrix[sub_dihedral_idx[0] : sub_dihedral_idx[1]]
+        )
+        
+        sub_angle_update_ijk = torch.matmul(
+            angle_ebd, matrix[sub_angle_idx_ijk[0] : sub_angle_idx_ijk[1]]
+        )
+        
+        sub_angle_update_ijl = torch.matmul(
+            angle_ebd, matrix[sub_edge_idx_ijl[0] : sub_edge_idx_ijl[1]]
+        )
+        result_update = (
+            sub_dihedral_update
+            + sub_angle_update_ijk[:, :, :, :, None, :]
+            + sub_angle_update_ijl[:, :, :, None, :, :]
+        ) + bias
+        return result_update
+        
 
+        
     def optim_angle_update(
         self,
         angle_ebd: torch.Tensor,
@@ -945,6 +983,8 @@ class RepFlowLayer(torch.nn.Module):
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         edge_index: torch.Tensor,  # n_edge x 2
         angle_index: torch.Tensor,  # n_angle x 3
+        d_nlist: Optional[torch.Tensor] = None,  # nf x nloc x d_nnei
+        d_nlist_mask: Optional[torch.Tensor] = None,  # nf x nloc x d_nnei
         dihedral_index: Optional[torch.Tensor] = None,  # n_dihedral x 2
         dihedral_ebd: Optional[torch.Tensor] = None,  # n_dihedral x d_dim
         d_sw: Optional[torch.Tensor] = None,  # n_dihedral
@@ -1239,7 +1279,7 @@ class RepFlowLayer(torch.nn.Module):
             if self.edge_attn_use_ln:
                 edge_attention_update = self.edge_lm(edge_attention_update)
             e_update_list.append(edge_attention_update)
-
+        
         if self.update_angle:
             assert self.angle_self_linear is not None
             assert self.edge_angle_linear1 is not None
@@ -1329,6 +1369,7 @@ class RepFlowLayer(torch.nn.Module):
                         self.edge_angle_linear1(angle_info_ffn)
                     )
             else:
+                
                 edge_angle_update = self.act(
                     self.optim_angle_update(
                         angle_ebd,
@@ -1445,9 +1486,83 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
             a_update_list.append(angle_self_update)
-            if self.update_dihedral:
+
+            # dihedral update with fixed sel
+            if self.update_dihedral and not self.use_dynamic_sel:
+                assert d_nlist is not None
+                assert d_nlist_mask is not None
+                assert dihedral_ebd is not None
+                assert d_sw is not None
+                assert self.angle_dihedral_linear is not None
+
+                # nb x nloc x d_sel x d_sel x e_dim
+                angle_ebd_for_dihedral = angle_ebd[:, :, :self.d_sel, :self.d_sel, :]
+                # nb x nloc x d_sel x d_sel x e_dim
+                d_nlist_mask = d_nlist_mask[:,:,:,None] * d_nlist_mask[:,:,None,:]
+                angle_ebd_for_dihedral = torch.where(
+                    d_nlist_mask.unsqueeze(-1), angle_ebd_for_dihedral, 0.0
+                )
+
+                # nb x nloc x d_sel x d_sel x d_sel x a_dim
+                angle_dihedral_update = self.act(
+                    self.optim_dihedral_update(
+                        dihedral_ebd,
+                        angle_ebd_for_dihedral,
+                        "angle",
+                    )
+                )              
+                # nb x nloc x d_sel x d_sel x d_sel x a_dim
+                weighted_angle_dihedral_update = (
+                    angle_dihedral_update
+                    * d_sw[:, :, :, None, None, None]
+                    * d_sw[:, :, None, :, None, None]
+                    * d_sw[:, :, None, None, :, None]
+                )
+                # nb x nloc x d_sel x d_sel x a_dim
+                reduced_angle_dihedral_update = torch.sum(
+                    weighted_angle_dihedral_update, dim=-2
+                ) / (self.d_sel**0.5)
+
+                # Need two dimensional padding
+                # nb x nloc x a_sel x a_sel x a_dim
+                padding_angle_dihedral_update = torch.concat(
+                    [
+                        reduced_angle_dihedral_update,
+                        torch.zeros(
+                            [nb, nloc, self.d_sel, self.a_sel - self.d_sel, self.a_dim],
+                            dtype=edge_ebd.dtype,
+                            device=edge_ebd.device,
+                        ),
+                    ],
+                    dim=-2,
+                )
+                padding_angle_dihedral_update = torch.concat(
+                    [
+                        padding_angle_dihedral_update,
+                        torch.zeros(
+                            [nb, nloc, self.a_sel-self.d_sel, self.a_sel, self.a_dim],
+                            dtype=edge_ebd.dtype,
+                            device=edge_ebd.device,
+                        ),
+                    ],
+                    dim=-3,
+                )
+                a_update_list.append(padding_angle_dihedral_update)
+
+                dihedral_self_update = self.act(
+                    self.optim_dihedral_update(
+                        dihedral_ebd,
+                        angle_ebd_for_dihedral,
+                        "dihedral",
+                    )
+                )
+
+                d_update_list: list[torch.Tensor] = [dihedral_ebd, dihedral_self_update]
+                d_updated = self.list_update(d_update_list, "dihedral")
+
+            # dihedral update with dynamic sel
+            elif self.update_dihedral and self.use_dynamic_sel:
                 n_angle = int(a_nlist_mask.sum().item())
-                assert self.use_dynamic_sel, "dihedral update only support dynamic sel"
                 assert dihedral_ebd is not None
                 assert d_sw is not None
                 assert dihedral_index is not None
