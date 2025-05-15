@@ -733,7 +733,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             d_sw = None
             dihedral_input = None
-
+        
         if self.edge_use_esen_atom_ebd:
             # nf x (nl x nnei)
             nlist_index = nlist.reshape(nframes, nloc * nnei)
@@ -909,6 +909,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     node_ebd_ext = concat_switch_virtual(
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
+            
             node_ebd, edge_ebd, angle_ebd, dihedral_ebd = ll.forward(
                 node_ebd_ext,
                 edge_ebd,
@@ -920,6 +921,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_nlist,
                 a_nlist_mask,
                 a_sw,
+                d_nlist=d_nlist,
+                d_nlist_mask = d_nlist_mask,
                 edge_index=edge_index,
                 angle_index=angle_index,
                 dihedral_index=dihedral_index,
