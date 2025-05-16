@@ -121,6 +121,7 @@ defalut_fit_param = [
             ],
             *[(param_func, DescrptDPA1) for param_func in DescriptorParamDPA1List],
             *[(param_func, DescrptDPA2) for param_func in DescriptorParamDPA2List],
+            *[(param_func, DescrptDPA3) for param_func in DescriptorParamDPA3List],
             (DescriptorParamHybrid, DescrptHybrid),
             (DescriptorParamHybridMixed, DescrptHybrid),
             (DescriptorParamHybridMixedTTebd, DescrptHybrid),
@@ -135,6 +136,7 @@ defalut_fit_param = [
             (DescriptorParamSeTTebd, DescrptSeTTebd),
             (DescriptorParamDPA1, DescrptDPA1),
             (DescriptorParamDPA2, DescrptDPA2),
+            (DescriptorParamDPA3, DescrptDPA3),
         ),  # descrpt_class_param & class
         (
             *[(param_func, EnergyFittingNet) for param_func in FittingParamEnergyList],

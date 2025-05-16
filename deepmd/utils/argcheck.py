@@ -1426,6 +1426,12 @@ def descrpt_dpa3_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "use_loc_mapping",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 

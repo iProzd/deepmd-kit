@@ -144,6 +144,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         message_use_self_concat: bool = False,
         use_slim_message: bool = False,
         use_combined_output: bool = False,
+        use_loc_mapping: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -327,6 +328,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.message_use_self_concat = message_use_self_concat
         self.use_slim_message = use_slim_message
         self.use_combined_output = use_combined_output
+        self.use_loc_mapping = use_loc_mapping
         assert not (
             self.message_use_self_concat and self.use_slim_message
         ), "only one of message_use_self_concat and use_slim_message can be True"
@@ -555,9 +557,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
     ):
-        if comm_dict is None:
+        parrallel_mode = comm_dict is not None
+        if not parrallel_mode:
             assert mapping is not None
-            assert extended_atype_embd is not None
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
         atype = extended_atype[:, :nloc]
@@ -636,12 +638,9 @@ class DescrptBlockRepflows(DescriptorBlock):
 
         # get node embedding
         # [nframes, nloc, tebd_dim]
-        if comm_dict is None:
-            assert isinstance(extended_atype_embd, torch.Tensor)  # for jit
-            atype_embd = extended_atype_embd[:, :nloc, :]
-            assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
-        else:
-            atype_embd = extended_atype_embd
+        assert extended_atype_embd is not None
+        atype_embd = extended_atype_embd[:, :nloc, :]
+        assert list(atype_embd.shape) == [nframes, nloc, self.n_dim]
         assert isinstance(atype_embd, torch.Tensor)  # for jit
         if not self.tebd_use_act:
             node_ebd = atype_embd
@@ -752,6 +751,15 @@ class DescrptBlockRepflows(DescriptorBlock):
             source_type = None
             target_type = None
 
+        if not parrallel_mode and self.use_loc_mapping:
+            assert mapping is not None
+            # convert nlist from nall to nloc index
+            nlist = torch.gather(
+                mapping,
+                1,
+                index=nlist.reshape(nframes, -1),
+            ).reshape(nlist.shape)
+
         if self.use_dynamic_sel:
             # get graph index
             edge_index, angle_index, dihedral_index, a_nlist_mask_3d, d_nlist_mask4d = (
@@ -762,6 +770,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     d_nlist_mask,
                     nall,
                     calculate_dihedral=self.update_dihedral,
+                    use_loc_mapping=self.use_loc_mapping,
                 )
             )
             # flat all the tensors
@@ -847,18 +856,23 @@ class DescrptBlockRepflows(DescriptorBlock):
             dihedral_ebd = None
 
         # nb x nall x n_dim
-        if comm_dict is None:
+        if not parrallel_mode:
             assert mapping is not None
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
-            # node_ebd_ext: nb x nall x n_dim
-            if comm_dict is None:
+            # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
+            if not parrallel_mode:
                 assert mapping is not None
-                node_ebd_ext = torch.gather(node_ebd, 1, mapping)
+                node_ebd_ext = (
+                    torch.gather(node_ebd, 1, mapping)
+                    if not self.use_loc_mapping
+                    else node_ebd
+                )
             else:
+                assert comm_dict is not None
                 has_spin = "has_spin" in comm_dict
                 if not has_spin:
                     n_padding = nall - nloc

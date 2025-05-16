@@ -79,6 +79,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         use_econf_tebd: bool = False,
         use_tebd_bias: bool = False,
         use_torch_embed: bool = False,
+        use_loc_mapping: bool = True,
         type_map: Optional[list[str]] = None,
     ) -> None:
         r"""The DPA-3 descriptor.
@@ -200,6 +201,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             message_use_self_concat=self.repflow_args.message_use_self_concat,
             use_slim_message=self.repflow_args.use_slim_message,
             use_combined_output=self.repflow_args.use_combined_output,
+            use_loc_mapping=use_loc_mapping,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
@@ -207,6 +209,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         )
 
         self.use_econf_tebd = use_econf_tebd
+        self.use_loc_mapping = use_loc_mapping
         self.use_tebd_bias = use_tebd_bias
         self.use_torch_embed = use_torch_embed
         self.type_map = type_map
@@ -516,12 +519,16 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             The smooth switch function. shape: nf x nloc x nnei
 
         """
+        parrallel_mode = comm_dict is not None
         # cast the input to internal precsion
         extended_coord = extended_coord.to(dtype=self.prec)
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
 
-        node_ebd_ext = self.type_embedding(extended_atype)
+        if not parrallel_mode and self.use_loc_mapping:
+            node_ebd_ext = self.type_embedding(extended_atype[:, :nloc])
+        else:
+            node_ebd_ext = self.type_embedding(extended_atype)
         node_ebd_inp = node_ebd_ext[:, :nloc, :]
         # repflows
         node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows(
