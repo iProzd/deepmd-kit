@@ -723,7 +723,7 @@ class RepFlowLayer(torch.nn.Module):
         # nb x nloc x (axis x e_dim)
         grrg = self._cal_grrg(h2g2, axis_neuron)
         return grrg
-    
+
     def optim_dihedral_update(
         self,
         dihedral_ebd: torch.Tensor,
@@ -735,23 +735,29 @@ class RepFlowLayer(torch.nn.Module):
         sub_dihedral_idx = (0, angle_dim)
         sub_angle_idx_ijk = (angle_dim, angle_dim + angle_dim)
         sub_edge_idx_ijl = (angle_dim + angle_dim, angle_dim + angle_dim + angle_dim)
-        
+
         if feat == "angle":
-            matrix, bias = self.angle_dihedral_linear.matrix, self.angle_dihedral_linear.bias
+            matrix, bias = (
+                self.angle_dihedral_linear.matrix,
+                self.angle_dihedral_linear.bias,
+            )
         elif feat == "dihedral":
-            matrix, bias = self.dihedral_self_linear.matrix, self.dihedral_self_linear.bias
+            matrix, bias = (
+                self.dihedral_self_linear.matrix,
+                self.dihedral_self_linear.bias,
+            )
         else:
             raise NotImplementedError
         assert dihedral_dim + 2 * angle_dim == matrix.size()[0]
-        
+
         sub_dihedral_update = torch.matmul(
             dihedral_ebd, matrix[sub_dihedral_idx[0] : sub_dihedral_idx[1]]
         )
-        
+
         sub_angle_update_ijk = torch.matmul(
             angle_ebd, matrix[sub_angle_idx_ijk[0] : sub_angle_idx_ijk[1]]
         )
-        
+
         sub_angle_update_ijl = torch.matmul(
             angle_ebd, matrix[sub_edge_idx_ijl[0] : sub_edge_idx_ijl[1]]
         )
@@ -761,9 +767,7 @@ class RepFlowLayer(torch.nn.Module):
             + sub_angle_update_ijl[:, :, :, None, :, :]
         ) + bias
         return result_update
-        
 
-        
     def optim_angle_update(
         self,
         angle_ebd: torch.Tensor,
@@ -1279,7 +1283,7 @@ class RepFlowLayer(torch.nn.Module):
             if self.edge_attn_use_ln:
                 edge_attention_update = self.edge_lm(edge_attention_update)
             e_update_list.append(edge_attention_update)
-        
+
         if self.update_angle:
             assert self.angle_self_linear is not None
             assert self.edge_angle_linear1 is not None
@@ -1369,7 +1373,6 @@ class RepFlowLayer(torch.nn.Module):
                         self.edge_angle_linear1(angle_info_ffn)
                     )
             else:
-                
                 edge_angle_update = self.act(
                     self.optim_angle_update(
                         angle_ebd,
@@ -1496,9 +1499,9 @@ class RepFlowLayer(torch.nn.Module):
                 assert self.angle_dihedral_linear is not None
 
                 # nb x nloc x d_sel x d_sel x e_dim
-                angle_ebd_for_dihedral = angle_ebd[:, :, :self.d_sel, :self.d_sel, :]
+                angle_ebd_for_dihedral = angle_ebd[:, :, : self.d_sel, : self.d_sel, :]
                 # nb x nloc x d_sel x d_sel x e_dim
-                d_nlist_mask = d_nlist_mask[:,:,:,None] * d_nlist_mask[:,:,None,:]
+                d_nlist_mask = d_nlist_mask[:, :, :, None] * d_nlist_mask[:, :, None, :]
                 angle_ebd_for_dihedral = torch.where(
                     d_nlist_mask.unsqueeze(-1), angle_ebd_for_dihedral, 0.0
                 )
@@ -1510,7 +1513,7 @@ class RepFlowLayer(torch.nn.Module):
                         angle_ebd_for_dihedral,
                         "angle",
                     )
-                )              
+                )
                 # nb x nloc x d_sel x d_sel x d_sel x a_dim
                 weighted_angle_dihedral_update = (
                     angle_dihedral_update
@@ -1540,7 +1543,7 @@ class RepFlowLayer(torch.nn.Module):
                     [
                         padding_angle_dihedral_update,
                         torch.zeros(
-                            [nb, nloc, self.a_sel-self.d_sel, self.a_sel, self.a_dim],
+                            [nb, nloc, self.a_sel - self.d_sel, self.a_sel, self.a_dim],
                             dtype=edge_ebd.dtype,
                             device=edge_ebd.device,
                         ),
