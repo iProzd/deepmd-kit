@@ -485,6 +485,21 @@ def test_ener(
                 header=f"{system}: data_fx data_fy data_fz pred_fx pred_fy pred_fz",
                 append=append_detail,
             )
+            pf_abs_max = np.concatenate(
+                (
+                    np.reshape(np.abs(test_data["force"][:numb_test]).max(-1), [-1, 1]),
+                    np.reshape(
+                        np.abs(force - test_data["force"][:numb_test]).max(-1), [-1, 1]
+                    ),
+                ),
+                axis=1,
+            )
+            save_txt_file(
+                detail_path.with_suffix(".f_abs_max.out"),
+                pf_abs_max,
+                header=f"{system}: data_fabs_max diff_fabs_max",
+                append=append_detail,
+            )
         else:
             pf_real = np.concatenate(
                 (np.reshape(test_force_r, [-1, 3]), np.reshape(force_r, [-1, 3])),
@@ -528,6 +543,29 @@ def test_ener(
             header=f"{system}: data_vxx data_vxy data_vxz data_vyx data_vyy "
             "data_vyz data_vzx data_vzy data_vzz pred_vxx pred_vxy pred_vxz pred_vyx "
             "pred_vyy pred_vyz pred_vzx pred_vzy pred_vzz",
+            append=append_detail,
+        )
+
+        pv_peratom_abs_max = (
+            np.concatenate(
+                (
+                    np.reshape(
+                        np.abs(test_data["virial"][:numb_test]).max(-1), [-1, 1]
+                    ),
+                    np.reshape(
+                        np.abs(virial - test_data["virial"][:numb_test]).max(-1),
+                        [-1, 1],
+                    ),
+                ),
+                axis=1,
+            )
+            / natoms
+        )
+
+        save_txt_file(
+            detail_path.with_suffix(".v_peratom_abs_max.out"),
+            pv_peratom_abs_max,
+            header=f"{system}: data_vabs_max diff_vabs_max",
             append=append_detail,
         )
     if not out_put_spin:
