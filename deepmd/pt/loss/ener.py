@@ -187,6 +187,9 @@ class EnergyStdLoss(TaskLoss):
             Other losses for display.
         """
         model_pred = model(**input_dict)
+
+        if "force" not in model_pred and "dforce" in model_pred:
+            model_pred["force"] = model_pred["dforce"]
         coef = learning_rate / self.starter_learning_rate
         pref_e = self.limit_pref_e + (self.start_pref_e - self.limit_pref_e) * coef
         pref_f = self.limit_pref_f + (self.start_pref_f - self.limit_pref_f) * coef

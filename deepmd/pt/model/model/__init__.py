@@ -90,14 +90,14 @@ def _get_standard_model_components(model_params, ntypes):
     fitting_net["ntypes"] = descriptor.get_ntypes()
     fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
     fitting_net["mixed_types"] = descriptor.mixed_types()
-    if fitting_net["type"] in ["dipole", "polar"]:
+    if fitting_net["type"] in ["dipole", "polar", "ener_direct"]:
         fitting_net["embedding_width"] = descriptor.get_dim_emb()
     fitting_net["dim_descrpt"] = descriptor.get_dim_out()
-    grad_force = "direct" not in fitting_net["type"]
-    if not grad_force:
-        fitting_net["out_dim"] = descriptor.get_dim_emb()
-        if "ener" in fitting_net["type"]:
-            fitting_net["return_energy"] = True
+    # grad_force = "direct" not in fitting_net["type"]
+    # if not grad_force:
+    #     fitting_net["out_dim"] = descriptor.get_dim_emb()
+    #     if "ener" in fitting_net["type"]:
+    #         fitting_net["return_energy"] = True
     fitting = BaseFitting(**fitting_net)
     return descriptor, fitting, fitting_net["type"]
 
@@ -261,7 +261,7 @@ def get_standard_model(model_params):
         modelcls = PolarModel
     elif fitting_net_type == "dos":
         modelcls = DOSModel
-    elif fitting_net_type in ["ener", "direct_force_ener"]:
+    elif fitting_net_type in ["ener", "direct_force_ener", "ener_direct"]:
         modelcls = EnergyModel
     elif fitting_net_type == "property":
         modelcls = PropertyModel

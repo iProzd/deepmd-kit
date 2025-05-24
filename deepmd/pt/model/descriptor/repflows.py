@@ -447,6 +447,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
+        self.additional_output_for_fitting: dict[str, Optional[torch.Tensor]] = {}
 
         wanted_shape = (self.ntypes, self.nnei, 4)
         mean = torch.zeros(wanted_shape, dtype=self.prec, device=env.DEVICE)
@@ -460,6 +461,8 @@ class DescrptBlockRepflows(DescriptorBlock):
     def get_rcut(self) -> float:
         """Returns the cut-off radius."""
         return self.e_rcut
+
+    additional_output_for_fitting: dict[str, Optional[torch.Tensor]]
 
     def get_rcut_smth(self) -> float:
         """Returns the radius where the neighbor information starts to smoothly decay to 0."""
@@ -547,6 +550,9 @@ class DescrptBlockRepflows(DescriptorBlock):
     ) -> None:
         self.exclude_types = exclude_types
         self.emask = PairExcludeMask(self.ntypes, exclude_types=exclude_types)
+
+    def get_additional_output_for_fitting(self):
+        return self.additional_output_for_fitting
 
     def forward(
         self,
@@ -782,6 +788,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             sw = sw[nlist_mask]
             # n_edge x 4
             dmatrix = dmatrix[nlist_mask]
+            # n_edge x 3
+            diff = diff[nlist_mask]
 
             if self.edge_use_esen_atom_ebd:
                 assert source_type is not None
@@ -809,12 +817,16 @@ class DescrptBlockRepflows(DescriptorBlock):
                     * d_sw[:, :, None, :, None]
                     * d_sw[:, :, None, None, :]
                 )[d_nlist_mask]
+            self.additional_output_for_fitting["edge_index"] = edge_index
         else:
             # avoid jit assertion
             edge_index = angle_index = torch.zeros(
                 [1, 3], device=nlist.device, dtype=nlist.dtype
             )
             dihedral_index = None
+            self.additional_output_for_fitting["edge_index"] = None
+        self.additional_output_for_fitting["diff"] = diff
+        self.additional_output_for_fitting["sw"] = sw
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         if self.edge_use_esen_rbf:
