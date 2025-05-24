@@ -573,6 +573,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             h2 = h2[nlist_mask]
             # n_edge x 1
             sw = sw[nlist_mask]
+            # n_edge x 3
+            diff = diff[nlist_mask]
             # nb x nloc x a_nnei x a_nnei
             a_nlist_mask = a_nlist_mask[:, :, :, None] & a_nlist_mask[:, :, None, :]
             # n_angle x 1
@@ -585,6 +587,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             edge_index = torch.zeros([2, 1], device=nlist.device, dtype=nlist.dtype)
             angle_index = torch.zeros([3, 1], device=nlist.device, dtype=nlist.dtype)
             self.additional_output_for_fitting["edge_index"] = None
+        self.additional_output_for_fitting["diff"] = diff
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         if not self.edge_init_use_dist:

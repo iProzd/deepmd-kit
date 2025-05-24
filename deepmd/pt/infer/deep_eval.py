@@ -535,10 +535,19 @@ class DeepEval(DeepEvalBackend):
                 out = batch_output[pt_name].reshape(shape).detach().cpu().numpy()
                 results.append(out)
             else:
-                shape = self._get_output_shape(odef, nframes, natoms)
-                results.append(
-                    np.full(np.abs(shape), np.nan, dtype=prec)
-                )  # this is kinda hacky
+                if (
+                    self._OUTDEF_DP2BACKEND[odef.name] == "force"
+                    and "dforce" in batch_output
+                ):
+                    # if no force, use dforce if possible
+                    shape = self._get_output_shape(odef, nframes, natoms)
+                    out = batch_output["dforce"].reshape(shape).detach().cpu().numpy()
+                    results.append(out)
+                else:
+                    shape = self._get_output_shape(odef, nframes, natoms)
+                    results.append(
+                        np.full(np.abs(shape), np.nan, dtype=prec)
+                    )  # this is kinda hacky
         return tuple(results)
 
     def _eval_model_spin(

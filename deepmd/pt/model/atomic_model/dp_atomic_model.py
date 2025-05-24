@@ -286,6 +286,7 @@ class DPAtomicModel(BaseAtomicModel):
                 aparam=aparam,
                 sw=sw,
                 edge_index=add_input.get("edge_index", None),
+                diff=add_input.get("diff", None),
             )
         if self.enable_eval_fitting_last_layer_hook:
             assert "middle_output" in fit_ret, (

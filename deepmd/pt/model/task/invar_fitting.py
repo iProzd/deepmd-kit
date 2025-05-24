@@ -178,6 +178,7 @@ class InvarFitting(GeneralFitting):
         aparam: Optional[torch.Tensor] = None,
         sw: Optional[torch.Tensor] = None,
         edge_index: Optional[torch.Tensor] = None,
+        diff: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Based on embedding net output, alculate total energy.
 
