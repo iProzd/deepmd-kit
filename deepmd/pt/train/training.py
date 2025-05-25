@@ -24,6 +24,7 @@ from deepmd.loggers.training import (
 )
 from deepmd.pt.loss import (
     DenoiseLoss,
+    DeNSLoss,
     DOSLoss,
     EnergySpinLoss,
     EnergyStdLoss,
@@ -1235,8 +1236,8 @@ def get_loss(loss_params, start_lr, _ntypes, _model):
         loss_params["starter_learning_rate"] = start_lr
         return EnergySpinLoss(**loss_params)
     elif loss_type == "denoise":
-        loss_params["ntypes"] = _ntypes
-        return DenoiseLoss(**loss_params)
+        loss_params["starter_learning_rate"] = start_lr
+        return DeNSLoss(**loss_params)
     elif loss_type == "tensor":
         model_output_type = _model.model_output_type()
         if "mask" in model_output_type:

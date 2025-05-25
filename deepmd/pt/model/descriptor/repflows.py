@@ -144,6 +144,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         message_use_self_concat: bool = False,
         use_slim_message: bool = False,
         use_combined_output: bool = False,
+        use_force_embedding: bool = False,
         use_loc_mapping: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -274,6 +275,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.angle_multi_freq_list = None
         self.use_env_envelope = use_env_envelope
         self.use_new_sw = use_new_sw
+        self.use_force_embedding = use_force_embedding
         self.update_dihedral = update_dihedral
         self.d_dim = d_dim
         self.d_sel = d_sel
@@ -393,6 +395,13 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
         else:
             self.dihedral_embd = None
+
+        if self.use_force_embedding:
+            self.force_embedding_linear = MLPLayer(
+                1, self.n_dim, precision=precision, seed=child_seed(seed, 3)
+            )
+        else:
+            self.force_embedding_linear = None
 
         layers = []
         for ii in range(nlayers):
@@ -562,6 +571,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         extended_atype_embd: Optional[torch.Tensor] = None,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        force_embedding_input: Optional[torch.Tensor] = None,
     ):
         parrallel_mode = comm_dict is not None
         if not parrallel_mode:
@@ -827,6 +837,58 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.additional_output_for_fitting["edge_index"] = None
         self.additional_output_for_fitting["diff"] = diff
         self.additional_output_for_fitting["sw"] = sw
+
+        # add force embedding to node for DeNS
+        if self.use_force_embedding:
+            assert self.force_embedding_linear is not None
+            if force_embedding_input is None:
+                force_input = torch.zeros(
+                    (nframes, nloc, 3),
+                    dtype=node_ebd.dtype,
+                    device=node_ebd.device,
+                )
+            else:
+                force_input = force_embedding_input
+            if not self.use_dynamic_sel:
+                # nb x nloc x nnei x 3
+                force_input = force_input.unsqueeze(-2).expand(-1, -1, self.nnei, -1)
+                # nb x nloc x nnei x 1
+                edge_force_dot = (force_input * diff).sum(-1, keepdim=True) / (
+                    torch.linalg.norm(diff, dim=-1, keepdim=True) + 1e-6
+                )
+                # nb x nloc x nnei x n_dim
+                edge_force_embedding = self.act(
+                    self.force_embedding_linear(edge_force_dot)
+                ) * sw.unsqueeze(-1)
+                # nb x nloc x n_dim
+                edge_force_embedding = edge_force_embedding.sum(-2) / self.nnei
+
+            else:
+                n2e_index = edge_index[:, 0]
+                # nedge x 3
+                force_input = torch.index_select(
+                    force_input.reshape(-1, 3), 0, n2e_index
+                )
+                # nedge x 1
+                edge_force_dot = (force_input * diff).sum(-1, keepdim=True) / (
+                    torch.linalg.norm(diff, dim=-1, keepdim=True) + 1e-6
+                )
+                # nedge x n_dim
+                edge_force_embedding = self.act(
+                    self.force_embedding_linear(edge_force_dot)
+                ) * sw.unsqueeze(-1)
+                # nb x nloc x n_dim
+                edge_force_embedding = (
+                    aggregate(
+                        edge_force_embedding,
+                        n2e_index,
+                        average=False,
+                        num_owner=nframes * nloc,
+                    ).reshape(nframes, nloc, -1)
+                    / self.dynamic_e_sel
+                )
+            node_ebd = node_ebd + edge_force_embedding
+
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
         if self.edge_use_esen_rbf:

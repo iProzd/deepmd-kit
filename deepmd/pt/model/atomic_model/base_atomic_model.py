@@ -201,6 +201,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        force_embedding_input: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Common interface for atomic inference.
 
@@ -252,6 +253,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             fparam=fparam,
             aparam=aparam,
             comm_dict=comm_dict,
+            force_embedding_input=force_embedding_input,
         )
         ret_dict = self.apply_out_stat(ret_dict, atype)
 

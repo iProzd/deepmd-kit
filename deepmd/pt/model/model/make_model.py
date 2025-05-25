@@ -135,6 +135,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
             fparam: Optional[torch.Tensor] = None,
             aparam: Optional[torch.Tensor] = None,
             do_atomic_virial: bool = False,
+            force_embedding_input: Optional[torch.Tensor] = None,
         ) -> dict[str, torch.Tensor]:
             """Return model prediction.
 
@@ -188,6 +189,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
                 do_atomic_virial=do_atomic_virial,
                 fparam=fp,
                 aparam=ap,
+                force_embedding_input=force_embedding_input,
             )
             model_predict = communicate_extended_output(
                 model_predict_lower,
@@ -242,6 +244,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
             do_atomic_virial: bool = False,
             comm_dict: Optional[dict[str, torch.Tensor]] = None,
             extra_nlist_sort: bool = False,
+            force_embedding_input: Optional[torch.Tensor] = None,
         ):
             """Return model prediction. Lower interface that takes
             extended atomic coordinates and types, nlist, and mapping
@@ -292,6 +295,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
                 fparam=fp,
                 aparam=ap,
                 comm_dict=comm_dict,
+                force_embedding_input=force_embedding_input,
             )
             model_predict = fit_output_to_model_output(
                 atomic_ret,

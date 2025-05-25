@@ -206,6 +206,7 @@ class DPAtomicModel(BaseAtomicModel):
         fparam: Optional[torch.Tensor] = None,
         aparam: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        force_embedding_input: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         """Return atomic prediction.
 
@@ -234,13 +235,26 @@ class DPAtomicModel(BaseAtomicModel):
         atype = extended_atype[:, :nloc]
         if self.do_grad_r() or self.do_grad_c():
             extended_coord.requires_grad_(True)
-        descriptor, rot_mat, g2, h2, sw = self.descriptor(
-            extended_coord,
-            extended_atype,
-            nlist,
-            mapping=mapping,
-            comm_dict=comm_dict,
-        )
+        if (
+            hasattr(self.descriptor, "use_force_embedding")
+            and self.descriptor.use_force_embedding
+        ):
+            descriptor, rot_mat, g2, h2, sw = self.descriptor(
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping=mapping,
+                comm_dict=comm_dict,
+                force_embedding_input=force_embedding_input,
+            )
+        else:
+            descriptor, rot_mat, g2, h2, sw = self.descriptor(
+                extended_coord,
+                extended_atype,
+                nlist,
+                mapping=mapping,
+                comm_dict=comm_dict,
+            )
         assert descriptor is not None
         if self.enable_eval_descriptor_hook:
             self.eval_descriptor_list.append(descriptor)

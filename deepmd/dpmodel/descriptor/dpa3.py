@@ -64,6 +64,7 @@ class RepFlowArgs:
         message_use_self_concat: bool = False,
         use_combined_output: bool = False,
         use_slim_message: bool = False,
+        use_force_embedding: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -177,6 +178,7 @@ class RepFlowArgs:
         self.message_use_self_concat = message_use_self_concat
         self.use_combined_output = use_combined_output
         self.use_slim_message = use_slim_message
+        self.use_force_embedding = use_force_embedding
 
     def __getitem__(self, key):
         if hasattr(self, key):

@@ -201,6 +201,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             message_use_self_concat=self.repflow_args.message_use_self_concat,
             use_slim_message=self.repflow_args.use_slim_message,
             use_combined_output=self.repflow_args.use_combined_output,
+            use_force_embedding=self.repflow_args.use_force_embedding,
             use_loc_mapping=use_loc_mapping,
             exclude_types=exclude_types,
             env_protection=env_protection,
@@ -217,6 +218,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         self.concat_output_tebd = concat_output_tebd
         self.precision = precision
         self.prec = PRECISION_DICT[self.precision]
+        self.use_force_embedding = self.repflow_args.use_force_embedding
         if self.use_torch_embed:
             self.type_embedding = torch.nn.Embedding(
                 ntypes, self.tebd_dim, device=env.DEVICE, dtype=self.prec
@@ -489,6 +491,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        force_embedding_input: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
@@ -525,6 +528,11 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         parrallel_mode = comm_dict is not None
         # cast the input to internal precsion
         extended_coord = extended_coord.to(dtype=self.prec)
+        force_embedding_input = (
+            force_embedding_input.to(dtype=self.prec)
+            if force_embedding_input is not None
+            else None
+        )
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
 
@@ -541,6 +549,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext,
             mapping,
             comm_dict=comm_dict,
+            force_embedding_input=force_embedding_input,
         )
         if self.concat_output_tebd:
             node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)

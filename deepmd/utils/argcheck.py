@@ -1797,6 +1797,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "use_force_embedding",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
@@ -2856,6 +2862,56 @@ def loss_ener():
             bool,
             optional=True,
             default=False,
+        ),
+    ]
+
+
+@loss_args_plugin.register("denoise")
+def loss_denoise():
+    doc_start_pref_e = start_pref("energy", abbr="e")
+    doc_limit_pref_e = limit_pref("energy")
+    doc_start_pref_n = start_pref("noise", abbr="n")
+    doc_limit_pref_n = limit_pref("noise")
+    return [
+        Argument(
+            "start_pref_e",
+            [float, int],
+            optional=True,
+            default=0.2,
+            doc=doc_start_pref_e,
+        ),
+        Argument(
+            "limit_pref_e",
+            [float, int],
+            optional=True,
+            default=100,
+            doc=doc_limit_pref_e,
+        ),
+        Argument(
+            "start_pref_n",
+            [float, int],
+            optional=True,
+            default=10,
+            doc=doc_start_pref_n,
+        ),
+        Argument(
+            "limit_pref_n",
+            [float, int],
+            optional=True,
+            default=2,
+            doc=doc_limit_pref_n,
+        ),
+        Argument(
+            "noise_std",
+            float,
+            optional=True,
+            default=0.1,
+        ),
+        Argument(
+            "corrupt_ratio",
+            float,
+            optional=True,
+            default=1.0,
         ),
     ]
 

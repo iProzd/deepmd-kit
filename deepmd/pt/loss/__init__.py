@@ -2,6 +2,9 @@
 from .denoise import (
     DenoiseLoss,
 )
+from .dens import (
+    DeNSLoss,
+)
 from .dos import (
     DOSLoss,
 )
@@ -23,6 +26,7 @@ from .tensor import (
 
 __all__ = [
     "DOSLoss",
+    "DeNSLoss",
     "DenoiseLoss",
     "EnergySpinLoss",
     "EnergyStdLoss",
