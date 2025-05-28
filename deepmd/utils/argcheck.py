@@ -1803,6 +1803,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "force_embedding_on_edge",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
