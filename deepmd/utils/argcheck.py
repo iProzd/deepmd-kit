@@ -2051,6 +2051,12 @@ def fitting_ener_direct():
             default=False,
             doc=doc_use_aparam_as_mask,
         ),
+        Argument(
+            "additional_gradient",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
@@ -2906,6 +2912,31 @@ def loss_denoise():
             optional=True,
             default=2,
             doc=doc_limit_pref_n,
+        ),
+        # for gradient force/virial
+        Argument(
+            "start_pref_f",
+            [float, int],
+            optional=True,
+            default=0.00,
+        ),
+        Argument(
+            "limit_pref_f",
+            [float, int],
+            optional=True,
+            default=0.00,
+        ),
+        Argument(
+            "start_pref_v",
+            [float, int],
+            optional=True,
+            default=0.00,
+        ),
+        Argument(
+            "limit_pref_v",
+            [float, int],
+            optional=True,
+            default=0.00,
         ),
         Argument(
             "noise_std",

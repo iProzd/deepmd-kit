@@ -288,6 +288,7 @@ class EnergyFittingNetDirectHead(InvarFitting):
         mixed_types: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
         type_map: Optional[list[str]] = None,
+        additional_gradient: bool = False,
         **kwargs,
     ) -> None:
         """Construct a fitting net for energy.
@@ -299,6 +300,7 @@ class EnergyFittingNetDirectHead(InvarFitting):
         - bias_atom_e: Average energy per atom for each element.
         - resnet_dt: Using time-step in the ResNet construction.
         """
+        self.additional_gradient = additional_gradient
         super().__init__(
             "energy",
             ntypes,
@@ -349,8 +351,8 @@ class EnergyFittingNetDirectHead(InvarFitting):
                     self.var_name,
                     [self.dim_out],
                     reducible=True,
-                    r_differentiable=False,
-                    c_differentiable=False,
+                    r_differentiable=self.additional_gradient,
+                    c_differentiable=self.additional_gradient,
                 ),
                 OutputVariableDef(
                     "dforce",

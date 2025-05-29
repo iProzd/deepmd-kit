@@ -24,6 +24,10 @@ class DeNSLoss(TaskLoss):
         limit_pref_e=0.0,
         start_pref_n=0.0,
         limit_pref_n=0.0,
+        start_pref_f=0.0,
+        limit_pref_f=0.0,
+        start_pref_v=0.0,
+        limit_pref_v=0.0,
         noise_std=0.1,
         corrupt_ratio=1.0,
         inference=False,
@@ -52,11 +56,17 @@ class DeNSLoss(TaskLoss):
         self.starter_learning_rate = starter_learning_rate
         self.has_e = (start_pref_e != 0.0 and limit_pref_e != 0.0) or inference
         self.has_n = (start_pref_n != 0.0 and limit_pref_n != 0.0) or inference
+        self.has_f = (start_pref_f != 0.0 and limit_pref_f != 0.0) or inference
+        self.has_v = (start_pref_v != 0.0 and limit_pref_v != 0.0) or inference
 
         self.start_pref_e = start_pref_e
         self.limit_pref_e = limit_pref_e
         self.start_pref_n = start_pref_n
         self.limit_pref_n = limit_pref_n
+        self.start_pref_f = start_pref_f
+        self.limit_pref_f = limit_pref_f
+        self.start_pref_v = start_pref_v
+        self.limit_pref_v = limit_pref_v
         self.noise_std = noise_std
         self.corrupt_ratio = corrupt_ratio
         self.inference = inference
@@ -111,6 +121,8 @@ class DeNSLoss(TaskLoss):
         coef = learning_rate / self.starter_learning_rate
         pref_e = self.limit_pref_e + (self.start_pref_e - self.limit_pref_e) * coef
         pref_n = self.limit_pref_n + (self.start_pref_n - self.limit_pref_n) * coef
+        pref_f = self.limit_pref_f + (self.start_pref_f - self.limit_pref_f) * coef
+        pref_v = self.limit_pref_v + (self.start_pref_v - self.limit_pref_v) * coef
 
         loss = torch.zeros(1, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=env.DEVICE)[0]
         more_loss = {}
@@ -144,6 +156,35 @@ class DeNSLoss(TaskLoss):
             rmse_n = l2_noise_loss.sqrt()
             more_loss["rmse_n"] = self.display_if_exist(rmse_n.detach(), 1)
 
+        # gradient force for rest atoms
+        if self.has_f and "force" in model_pred and "force" in label:
+            find_force = label.get("find_force", 0.0)
+            pref_f = pref_f * find_force
+            force_pred = model_pred["force"]
+            force_label = label["force"]
+            diff_f = (force_label - force_pred)[~noise_mask].reshape(-1)
+            l2_force_loss = torch.mean(torch.square(diff_f))
+            if not self.inference:
+                more_loss["l2_force_loss"] = self.display_if_exist(
+                    l2_force_loss.detach(), find_force
+                )
+            loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+            rmse_f = l2_force_loss.sqrt()
+            more_loss["rmse_f"] = self.display_if_exist(rmse_f.detach(), find_force)
+
+        if self.has_v and "virial" in model_pred and "virial" in label:
+            find_virial = label.get("find_virial", 0.0)
+            pref_v = pref_v * find_virial
+            diff_v = label["virial"] - model_pred["virial"].reshape(-1, 9)
+            l2_virial_loss = torch.mean(torch.square(diff_v))
+            if not self.inference:
+                more_loss["l2_virial_loss"] = self.display_if_exist(
+                    l2_virial_loss.detach(), find_virial
+                )
+            loss += atom_norm * (pref_v * l2_virial_loss)
+            rmse_v = l2_virial_loss.sqrt() * atom_norm
+            more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
+
         if not self.inference:
             more_loss["rmse"] = torch.sqrt(loss.detach())
         return model_pred, loss, more_loss
@@ -162,12 +203,22 @@ class DeNSLoss(TaskLoss):
                     high_prec=True,
                 )
             )
-        if self.has_n:
+        if self.has_n or self.has_f:
             label_requirement.append(
                 DataRequirementItem(
                     "force",
                     ndof=3,
                     atomic=True,
+                    must=False,
+                    high_prec=False,
+                )
+            )
+        if self.has_v:
+            label_requirement.append(
+                DataRequirementItem(
+                    "virial",
+                    ndof=9,
+                    atomic=False,
                     must=False,
                     high_prec=False,
                 )
