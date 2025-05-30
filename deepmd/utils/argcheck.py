@@ -2057,6 +2057,12 @@ def fitting_ener_direct():
             optional=True,
             default=False,
         ),
+        Argument(
+            "additional_noise_head",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

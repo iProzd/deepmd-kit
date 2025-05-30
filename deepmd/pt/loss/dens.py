@@ -145,7 +145,9 @@ class DeNSLoss(TaskLoss):
             # more_loss['log_keys'].append('rmse_e')
 
         if self.has_n:
-            noise_predict = model_pred["dforce"]
+            noise_predict = (
+                model_pred["dnoise"] if "dnoise" in model_pred else model_pred["dforce"]
+            )
             diff_n = (noise_vec - noise_predict)[noise_mask].reshape(-1)
             l2_noise_loss = torch.mean(torch.square(diff_n))
             if not self.inference:
@@ -157,10 +159,16 @@ class DeNSLoss(TaskLoss):
             more_loss["rmse_n"] = self.display_if_exist(rmse_n.detach(), 1)
 
         # gradient force for rest atoms
-        if self.has_f and "force" in model_pred and "force" in label:
+        if (
+            self.has_f
+            and ("force" in model_pred or "dforce" in model_pred)
+            and "force" in label
+        ):
             find_force = label.get("find_force", 0.0)
             pref_f = pref_f * find_force
-            force_pred = model_pred["force"]
+            force_pred = (
+                model_pred["force"] if "force" in model_pred else model_pred["dforce"]
+            )
             force_label = label["force"]
             diff_f = (force_label - force_pred)[~noise_mask].reshape(-1)
             l2_force_loss = torch.mean(torch.square(diff_f))

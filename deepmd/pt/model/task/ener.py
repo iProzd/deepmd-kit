@@ -289,6 +289,7 @@ class EnergyFittingNetDirectHead(InvarFitting):
         seed: Optional[Union[int, list[int]]] = None,
         type_map: Optional[list[str]] = None,
         additional_gradient: bool = False,
+        additional_noise_head: bool = False,
         **kwargs,
     ) -> None:
         """Construct a fitting net for energy.
@@ -301,6 +302,7 @@ class EnergyFittingNetDirectHead(InvarFitting):
         - resnet_dt: Using time-step in the ResNet construction.
         """
         self.additional_gradient = additional_gradient
+        self.additional_noise_head = additional_noise_head
         super().__init__(
             "energy",
             ntypes,
@@ -340,36 +342,65 @@ class EnergyFittingNetDirectHead(InvarFitting):
                 for ii in range(self.ntypes if not self.mixed_types else 1)
             ],
         )
+        # additional noise head
+        self.noise_input_dim = embedding_width  # can add noise embedding if needed
+        if self.additional_noise_head:
+            # dforce for force; dnosie for noise
+            self.noise_embed = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        self.noise_input_dim,
+                        1,
+                        self.neuron,
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=True,
+                        seed=child_seed(self.seed + 200, ii),
+                    )
+                    for ii in range(self.ntypes if not self.mixed_types else 1)
+                ],
+            )
+        else:
+            # dforce for noise
+            self.noise_embed = None
+
         # set trainable
         for param in self.parameters():
             param.requires_grad = self.trainable
 
     def output_def(self) -> FittingOutputDef:
-        return FittingOutputDef(
-            [
+        out_list = [
+            OutputVariableDef(
+                self.var_name,
+                [self.dim_out],
+                reducible=True,
+                r_differentiable=self.additional_gradient,
+                c_differentiable=self.additional_gradient,
+            ),
+            OutputVariableDef(
+                "dforce",
+                [3],
+                reducible=False,
+                r_differentiable=False,
+                c_differentiable=False,
+            ),
+        ]
+        if self.additional_noise_head:
+            out_list.append(
                 OutputVariableDef(
-                    self.var_name,
-                    [self.dim_out],
-                    reducible=True,
-                    r_differentiable=self.additional_gradient,
-                    c_differentiable=self.additional_gradient,
-                ),
-                OutputVariableDef(
-                    "dforce",
+                    "dnoise",
                     [3],
                     reducible=False,
                     r_differentiable=False,
                     c_differentiable=False,
-                ),
-                # OutputVariableDef(
-                #     "virial",
-                #     [9],
-                #     reducible=False,
-                #     r_differentiable=False,
-                #     c_differentiable=False,
-                # ),
-            ]
-        )
+                )
+            )
+
+        return FittingOutputDef(out_list)
 
     # make jit happy with torch 2.0.0
     exclude_types: list[int]
@@ -450,4 +481,25 @@ class EnergyFittingNetDirectHead(InvarFitting):
             fi = torch.sum(fij, dim=-2)
 
         result["dforce"] = fi
+
+        if self.additional_noise_head:
+            assert self.noise_embed is not None
+            edge_weight = self.noise_embed.networks[0](edge_feature)
+            # nf x nloc x nnei x 3 [OR] nedge x 3
+            nij = edge_weight * edge_vec
+            if edge_index is not None:
+                # use dynamic sel
+                n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+                # nf x nloc x 3
+                ni = aggregate(
+                    nij,
+                    n2e_index,
+                    average=False,
+                    num_owner=nf * nloc,
+                ).reshape(nf, nloc, 3)
+            else:
+                # nf x nloc x 3
+                ni = torch.sum(nij, dim=-2)
+            result["dnoise"] = ni
+
         return result

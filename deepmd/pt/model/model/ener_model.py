@@ -85,6 +85,8 @@ class EnergyModel(DPModelCommon, DPEnergyModel_):
                     )
             if "dforce" in model_ret:
                 model_predict["dforce"] = model_ret["dforce"]
+            if "dnoise" in model_ret:
+                model_predict["dnoise"] = model_ret["dnoise"]
             if "mask" in model_ret:
                 model_predict["mask"] = model_ret["mask"]
         else:
