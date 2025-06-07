@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import os
 from typing import (
     Callable,
     Optional,
     Union,
 )
 
+import numpy as np
 import torch
 
 from deepmd.dpmodel.utils.seed import (
@@ -947,6 +949,24 @@ class DescrptBlockRepflows(DescriptorBlock):
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
+
+        def get_sys_glob_index():
+            from glob import (
+                glob,
+            )
+
+            idx_list = glob("idx_*")
+            for idx_file in idx_list:
+                os.system("rm -rf " + idx_file)
+            sys_index = (
+                max([int(iii.split("_")[-1]) for iii in idx_list]) + 1
+                if idx_list
+                else 0
+            )
+            os.system("touch idx_" + str(sys_index))
+            return sys_index
+
+        sys_ind = get_sys_glob_index()
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
@@ -1035,6 +1055,18 @@ class DescrptBlockRepflows(DescriptorBlock):
                 dihedral_ebd=dihedral_ebd,
                 d_sw=d_sw,
                 rbf_ebd=rbf_ebd,
+            )
+            np.save(
+                f"n_layer_{idx}_{sys_ind}.npy",
+                node_ebd.detach().clone().cpu().numpy().reshape(-1, self.n_dim),
+            )
+            np.save(
+                f"e_layer_{idx}_{sys_ind}.npy",
+                edge_ebd.detach().clone().cpu().numpy().reshape(-1, self.e_dim),
+            )
+            np.save(
+                f"a_layer_{idx}_{sys_ind}.npy",
+                angle_ebd.detach().clone().cpu().numpy().reshape(-1, self.a_dim),
             )
 
         if self.use_combined_output:
