@@ -22,6 +22,7 @@ from deepmd.pt.model.network.layernorm import (
     LayerNorm,
 )
 from deepmd.pt.model.network.mlp import (
+    GatedMLP,
     MLPLayer,
 )
 from deepmd.pt.model.network.utils import (
@@ -83,6 +84,8 @@ class RepFlowLayer(torch.nn.Module):
         residual_pref: list = [],
         message_use_self_concat: bool = False,
         use_slim_message: bool = False,
+        use_gated_mlp: bool = False,
+        gated_mlp_norm: str = "none",
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -169,6 +172,11 @@ class RepFlowLayer(torch.nn.Module):
                 self.n_multi_edge_message == 1
             ), "Only one message head is supported for self concatenation!"
 
+        self.use_gated_mlp = use_gated_mlp
+        self.gated_mlp_norm = gated_mlp_norm
+        if self.use_gated_mlp:
+            assert not self.optim_update, "Gated MLP does not support optim update!"
+
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             self.rbf_mlp = MLPLayer(
                 rbf_dim,
@@ -247,14 +255,26 @@ class RepFlowLayer(torch.nn.Module):
             residual_idx += 1
 
         # node edge message
-        self.node_edge_linear = MLPLayer(
-            self.edge_info_dim
-            if not self.use_ffn_node_edge_message
-            else self.ffn_hidden_dim,
-            self.n_multi_edge_message * n_dim,
-            precision=precision,
-            seed=child_seed(seed, 4),
-        )
+        if not self.use_gated_mlp:
+            self.node_edge_linear = MLPLayer(
+                self.edge_info_dim
+                if not self.use_ffn_node_edge_message
+                else self.ffn_hidden_dim,
+                self.n_multi_edge_message * n_dim,
+                precision=precision,
+                seed=child_seed(seed, 4),
+            )
+        else:
+            self.node_edge_linear = GatedMLP(
+                self.edge_info_dim
+                if not self.use_ffn_node_edge_message
+                else self.ffn_hidden_dim,
+                self.n_multi_edge_message * n_dim,
+                activation_function=self.activation_function,
+                norm=self.gated_mlp_norm,
+                precision=precision,
+                seed=child_seed(seed, 4),
+            )
         if self.message_use_self_concat:
             self.node_edge_linear_2 = MLPLayer(
                 self.n_dim + self.n_dim,
@@ -279,14 +299,26 @@ class RepFlowLayer(torch.nn.Module):
                 residual_idx += 1
 
         # edge self message
-        self.edge_self_linear = MLPLayer(
-            self.edge_info_dim
-            if not self.use_ffn_edge_edge_message
-            else self.ffn_hidden_dim,
-            e_dim,
-            precision=precision,
-            seed=child_seed(seed, 6),
-        )
+        if not self.use_gated_mlp:
+            self.edge_self_linear = MLPLayer(
+                self.edge_info_dim
+                if not self.use_ffn_edge_edge_message
+                else self.ffn_hidden_dim,
+                e_dim,
+                precision=precision,
+                seed=child_seed(seed, 6),
+            )
+        else:
+            self.edge_self_linear = GatedMLP(
+                self.edge_info_dim
+                if not self.use_ffn_edge_edge_message
+                else self.ffn_hidden_dim,
+                e_dim,
+                activation_function=self.activation_function,
+                norm=self.gated_mlp_norm,
+                precision=precision,
+                seed=child_seed(seed, 6),
+            )
         if self.update_style == "res_residual":
             self.e_residual.append(
                 get_residual(
@@ -375,14 +407,26 @@ class RepFlowLayer(torch.nn.Module):
                     self.a_compress_e_linear = None
 
             # edge angle message
-            self.edge_angle_linear1 = MLPLayer(
-                self.angle_dim
-                if not self.use_ffn_edge_angle_message
-                else self.ffn_hidden_dim,
-                self.e_dim,
-                precision=precision,
-                seed=child_seed(seed, 10),
-            )
+            if not self.use_gated_mlp:
+                self.edge_angle_linear1 = MLPLayer(
+                    self.angle_dim
+                    if not self.use_ffn_edge_angle_message
+                    else self.ffn_hidden_dim,
+                    self.e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 10),
+                )
+            else:
+                self.edge_angle_linear1 = GatedMLP(
+                    self.angle_dim
+                    if not self.use_ffn_edge_angle_message
+                    else self.ffn_hidden_dim,
+                    self.e_dim,
+                    activation_function=self.activation_function,
+                    norm=self.gated_mlp_norm,
+                    precision=precision,
+                    seed=child_seed(seed, 10),
+                )
             if not self.use_slim_message:
                 self.edge_angle_linear2 = MLPLayer(
                     self.e_dim
@@ -407,14 +451,27 @@ class RepFlowLayer(torch.nn.Module):
                 residual_idx += 1
 
             # angle self message
-            self.angle_self_linear = MLPLayer(
-                self.angle_dim
-                if not self.use_ffn_angle_angle_message
-                else self.ffn_hidden_dim,
-                self.a_dim,
-                precision=precision,
-                seed=child_seed(seed, 13),
-            )
+            if not self.use_gated_mlp:
+                self.angle_self_linear = MLPLayer(
+                    self.angle_dim
+                    if not self.use_ffn_angle_angle_message
+                    else self.ffn_hidden_dim,
+                    self.a_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 13),
+                )
+            else:
+                self.angle_self_linear = GatedMLP(
+                    self.angle_dim
+                    if not self.use_ffn_angle_angle_message
+                    else self.ffn_hidden_dim,
+                    self.a_dim,
+                    activation_function=self.activation_function,
+                    norm=self.gated_mlp_norm,
+                    precision=precision,
+                    seed=child_seed(seed, 13),
+                )
+
             if self.update_style == "res_residual":
                 self.a_residual.append(
                     get_residual(
@@ -1175,9 +1232,14 @@ class RepFlowLayer(torch.nn.Module):
         if not self.optim_update:
             assert edge_info is not None
             if not self.use_ffn_node_edge_message:
-                node_edge_update = self.act(
-                    self.node_edge_linear(edge_info)
-                ) * sw.unsqueeze(-1)
+                if not self.use_gated_mlp:
+                    node_edge_update = self.act(
+                        self.node_edge_linear(edge_info)
+                    ) * sw.unsqueeze(-1)
+                else:
+                    node_edge_update = self.node_edge_linear(edge_info) * sw.unsqueeze(
+                        -1
+                    )
             else:
                 assert edge_info_ffn is not None
                 node_edge_update = self.act(
@@ -1242,7 +1304,10 @@ class RepFlowLayer(torch.nn.Module):
         if not self.optim_update:
             assert edge_info is not None
             if not self.use_ffn_edge_edge_message:
-                edge_self_update = self.act(self.edge_self_linear(edge_info))
+                if not self.use_gated_mlp:
+                    edge_self_update = self.act(self.edge_self_linear(edge_info))
+                else:
+                    edge_self_update = self.edge_self_linear(edge_info)
             else:
                 assert edge_info_ffn is not None
                 edge_self_update = self.act(self.edge_self_linear(edge_info_ffn))
@@ -1366,7 +1431,12 @@ class RepFlowLayer(torch.nn.Module):
             if not self.optim_update:
                 assert angle_info is not None
                 if not self.use_ffn_edge_angle_message:
-                    edge_angle_update = self.act(self.edge_angle_linear1(angle_info))
+                    if not self.use_gated_mlp:
+                        edge_angle_update = self.act(
+                            self.edge_angle_linear1(angle_info)
+                        )
+                    else:
+                        edge_angle_update = self.edge_angle_linear1(angle_info)
                 else:
                     assert angle_info_ffn is not None
                     edge_angle_update = self.act(
@@ -1465,7 +1535,10 @@ class RepFlowLayer(torch.nn.Module):
             if not self.optim_update:
                 assert angle_info is not None
                 if not self.use_ffn_angle_angle_message:
-                    angle_self_update = self.act(self.angle_self_linear(angle_info))
+                    if not self.use_gated_mlp:
+                        angle_self_update = self.act(self.angle_self_linear(angle_info))
+                    else:
+                        angle_self_update = self.angle_self_linear(angle_info)
                 else:
                     assert angle_info_ffn is not None
                     angle_self_update = self.act(self.angle_self_linear(angle_info_ffn))

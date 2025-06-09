@@ -66,6 +66,8 @@ class RepFlowArgs:
         use_slim_message: bool = False,
         use_force_embedding: bool = False,
         force_embedding_on_edge: bool = False,
+        use_gated_mlp: bool = False,
+        gated_mlp_norm: str = "none",
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -181,6 +183,8 @@ class RepFlowArgs:
         self.use_slim_message = use_slim_message
         self.use_force_embedding = use_force_embedding
         self.force_embedding_on_edge = force_embedding_on_edge
+        self.use_gated_mlp = use_gated_mlp
+        self.gated_mlp_norm = gated_mlp_norm
 
     def __getitem__(self, key):
         if hasattr(self, key):

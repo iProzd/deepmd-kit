@@ -146,6 +146,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_combined_output: bool = False,
         use_force_embedding: bool = False,
         force_embedding_on_edge: bool = False,
+        use_gated_mlp: bool = False,
+        gated_mlp_norm: str = "none",
         use_loc_mapping: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -333,6 +335,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_slim_message = use_slim_message
         self.use_combined_output = use_combined_output
         self.use_loc_mapping = use_loc_mapping
+        self.use_gated_mlp = use_gated_mlp
+        self.gated_mlp_norm = gated_mlp_norm
         assert not (
             self.message_use_self_concat and self.use_slim_message
         ), "only one of message_use_self_concat and use_slim_message can be True"
@@ -457,6 +461,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     residual_pref=self.residual_pref,
                     message_use_self_concat=self.message_use_self_concat,
                     use_slim_message=self.use_slim_message,
+                    use_gated_mlp=self.use_gated_mlp,
+                    gated_mlp_norm=self.gated_mlp_norm,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

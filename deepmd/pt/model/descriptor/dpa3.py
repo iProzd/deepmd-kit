@@ -203,6 +203,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             use_combined_output=self.repflow_args.use_combined_output,
             use_force_embedding=self.repflow_args.use_force_embedding,
             force_embedding_on_edge=self.repflow_args.force_embedding_on_edge,
+            use_gated_mlp=self.repflow_args.use_gated_mlp,
+            gated_mlp_norm=self.repflow_args.gated_mlp_norm,
             use_loc_mapping=use_loc_mapping,
             exclude_types=exclude_types,
             env_protection=env_protection,
