@@ -148,6 +148,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         force_embedding_on_edge: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        use_res_gnn: bool = False,
+        res_gnn_layer: int = 6,
         use_loc_mapping: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -337,6 +339,12 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_loc_mapping = use_loc_mapping
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
+        self.use_res_gnn = use_res_gnn
+        self.res_gnn_layer = res_gnn_layer
+        if self.use_res_gnn:
+            assert (
+                self.nlayers % self.res_gnn_layer == 0
+            ), "nlayers must be divisible by res_gnn_layer"
         assert not (
             self.message_use_self_concat and self.use_slim_message
         ), "only one of message_use_self_concat and use_slim_message can be True"
@@ -953,6 +961,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             mapping = (
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
+        res_node_list = []
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
@@ -1042,6 +1051,11 @@ class DescrptBlockRepflows(DescriptorBlock):
                 d_sw=d_sw,
                 rbf_ebd=rbf_ebd,
             )
+            if self.use_res_gnn and (idx + 1) % self.res_gnn_layer == 0:
+                res_node_list.append(node_ebd.unsqueeze(-1))
+
+        if self.use_res_gnn:
+            node_ebd = torch.concat(res_node_list, dim=-1).mean(dim=-1)
 
         if self.use_combined_output:
             concat_list = [node_ebd]

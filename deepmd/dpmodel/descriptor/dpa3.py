@@ -68,6 +68,8 @@ class RepFlowArgs:
         force_embedding_on_edge: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        use_res_gnn: bool = False,
+        res_gnn_layer: int = 6,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -185,6 +187,8 @@ class RepFlowArgs:
         self.force_embedding_on_edge = force_embedding_on_edge
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
+        self.use_res_gnn = use_res_gnn
+        self.res_gnn_layer = res_gnn_layer
 
     def __getitem__(self, key):
         if hasattr(self, key):

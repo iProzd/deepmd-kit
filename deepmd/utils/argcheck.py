@@ -1821,6 +1821,18 @@ def dpa3_repflow_args():
             optional=True,
             default="none",
         ),
+        Argument(
+            "use_res_gnn",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "res_gnn_layer",
+            int,
+            optional=True,
+            default=6,
+        ),
     ]
 
 
