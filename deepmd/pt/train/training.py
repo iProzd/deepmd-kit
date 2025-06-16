@@ -614,17 +614,34 @@ class Trainer:
 
         # TODO add optimizers for multitask
         # author: iProzd
-        if self.opt_type in ["Adam", "AdamW"]:
+        if self.opt_type in ["Adam", "AdamW", "Lamb"]:
             if self.opt_type == "Adam":
                 self.optimizer = torch.optim.Adam(
                     self.wrapper.parameters(), lr=self.lr_exp.start_lr, fused=True
                 )
-            else:
+            elif self.opt_type == "AdamW":
                 self.optimizer = torch.optim.AdamW(
                     self.wrapper.parameters(),
                     lr=self.lr_exp.start_lr,
                     weight_decay=self.opt_param["weight_decay"],
                 )
+            elif self.opt_type == "Lamb":
+                import os
+
+                from pytorch_lamb import (
+                    Lamb,
+                )
+
+                weight_decay = float(os.environ.get("LAMB_WD", 0.01))
+                self.optimizer = Lamb(
+                    self.wrapper.parameters(),
+                    lr=self.lr_exp.start_lr,
+                    weight_decay=weight_decay,
+                    betas=(0.9, 0.999),
+                    adam=False,
+                )
+            else:
+                raise ValueError("Not reach here!")
             if optimizer_state_dict is not None and self.restart_training:
                 self.optimizer.load_state_dict(optimizer_state_dict)
             self.scheduler = torch.optim.lr_scheduler.LambdaLR(
@@ -720,7 +737,7 @@ class Trainer:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
                 fout1.flush()
-            if self.opt_type in ["Adam", "AdamW"]:
+            if self.opt_type in ["Adam", "AdamW", "Lamb"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr
