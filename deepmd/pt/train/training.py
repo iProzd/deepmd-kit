@@ -420,6 +420,14 @@ class Trainer:
                     if missing_keys:
                         target_state_dict = self.wrapper.state_dict()
                         slim_keys = []
+                        out_shape_list = [
+                            "model.Default.atomic_model.out_bias",
+                            "model.Default.atomic_model.out_std",
+                        ]
+                        for kk in out_shape_list:
+                            old_stat = state_dict[kk].clone().detach()
+                            state_dict[kk] = target_state_dict[kk].clone().detach()
+                            state_dict[kk][:1, :, :1] = old_stat
                         for item in missing_keys:
                             state_dict[item] = target_state_dict[item].clone().detach()
                             new_key = True
@@ -428,7 +436,7 @@ class Trainer:
                                     new_key = False
                                     break
                             if new_key:
-                                tmp_keys = ".".join(item.split(".")[:3])
+                                tmp_keys = ".".join(item.split(".")[:-2])
                                 slim_keys.append(tmp_keys)
                         slim_keys = [i + ".*" for i in slim_keys]
                         log.warning(
