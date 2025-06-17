@@ -417,6 +417,10 @@ class Trainer:
                     missing_keys = [
                         item for item in target_keys if item not in input_keys
                     ]
+                    old_model_params = self.wrapper.state_dict()["_extra_state"][
+                        "model_params"
+                    ]
+                    state_dict["_extra_state"]["model_params"] = old_model_params
                     if missing_keys:
                         target_state_dict = self.wrapper.state_dict()
                         slim_keys = []
