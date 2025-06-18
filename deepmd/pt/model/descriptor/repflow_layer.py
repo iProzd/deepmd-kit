@@ -20,6 +20,7 @@ from deepmd.pt.model.descriptor.repformer_layer import (
 )
 from deepmd.pt.model.network.layernorm import (
     LayerNorm,
+    RMSNorm,
 )
 from deepmd.pt.model.network.mlp import (
     GatedMLP,
@@ -86,6 +87,7 @@ class RepFlowLayer(torch.nn.Module):
         use_slim_message: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        node_use_rmsnorm: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -176,6 +178,11 @@ class RepFlowLayer(torch.nn.Module):
         self.gated_mlp_norm = gated_mlp_norm
         if self.use_gated_mlp:
             assert not self.optim_update, "Gated MLP does not support optim update!"
+        self.node_use_rmsnorm = node_use_rmsnorm
+        if self.node_use_rmsnorm:
+            self.node_rmsnorm = RMSNorm(self.n_dim, precision=precision, trainable=True)
+        else:
+            self.node_rmsnorm = None
 
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             self.rbf_mlp = MLPLayer(
@@ -1728,6 +1735,10 @@ class RepFlowLayer(torch.nn.Module):
                 uu = uu + vv * update_list[ii + 1]
         else:
             raise NotImplementedError
+
+        if update_name == "node" and self.node_use_rmsnorm:
+            assert self.node_rmsnorm is not None
+            uu = self.node_rmsnorm(uu)
         return uu
 
     @torch.jit.export

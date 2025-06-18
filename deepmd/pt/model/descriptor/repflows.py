@@ -150,6 +150,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         gated_mlp_norm: str = "none",
         use_res_gnn: bool = False,
         res_gnn_layer: int = 6,
+        node_use_rmsnorm: bool = False,
         use_loc_mapping: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -349,6 +350,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.message_use_self_concat and self.use_slim_message
         ), "only one of message_use_self_concat and use_slim_message can be True"
 
+        self.node_use_rmsnorm = node_use_rmsnorm
+
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
             self.target_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -471,6 +474,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_slim_message=self.use_slim_message,
                     use_gated_mlp=self.use_gated_mlp,
                     gated_mlp_norm=self.gated_mlp_norm,
+                    node_use_rmsnorm=self.node_use_rmsnorm,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

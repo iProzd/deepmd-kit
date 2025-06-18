@@ -70,6 +70,7 @@ class RepFlowArgs:
         gated_mlp_norm: str = "none",
         use_res_gnn: bool = False,
         res_gnn_layer: int = 6,
+        node_use_rmsnorm: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -189,6 +190,7 @@ class RepFlowArgs:
         self.gated_mlp_norm = gated_mlp_norm
         self.use_res_gnn = use_res_gnn
         self.res_gnn_layer = res_gnn_layer
+        self.node_use_rmsnorm = node_use_rmsnorm
 
     def __getitem__(self, key):
         if hasattr(self, key):

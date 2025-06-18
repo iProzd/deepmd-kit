@@ -205,6 +205,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             force_embedding_on_edge=self.repflow_args.force_embedding_on_edge,
             use_gated_mlp=self.repflow_args.use_gated_mlp,
             gated_mlp_norm=self.repflow_args.gated_mlp_norm,
+            node_use_rmsnorm=self.repflow_args.node_use_rmsnorm,
             use_res_gnn=self.repflow_args.use_res_gnn,
             res_gnn_layer=self.repflow_args.res_gnn_layer,
             use_loc_mapping=use_loc_mapping,

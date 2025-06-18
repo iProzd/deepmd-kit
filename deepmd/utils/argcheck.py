@@ -1833,6 +1833,12 @@ def dpa3_repflow_args():
             optional=True,
             default=6,
         ),
+        Argument(
+            "node_use_rmsnorm",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

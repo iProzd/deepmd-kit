@@ -151,3 +151,26 @@ class LayerNorm(nn.Module):
         obj.matrix = check_load_param("matrix")
         obj.bias = check_load_param("bias")
         return obj
+
+
+class RMSNorm(nn.Module):
+    def __init__(
+        self,
+        num_in,
+        eps: float = 1e-5,
+        precision: str = DEFAULT_PRECISION,
+        trainable: bool = True,
+    ):
+        super().__init__()
+        self.eps = eps
+        self.precision = precision
+        self.prec = PRECISION_DICT[self.precision]
+        self.weight = nn.Parameter(
+            torch.ones(num_in, dtype=self.prec, device=device), requires_grad=trainable
+        )
+
+    def _norm(self, x: torch.Tensor):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x: torch.Tensor):
+        return self.weight * self._norm(x)
