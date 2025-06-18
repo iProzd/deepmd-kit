@@ -432,6 +432,32 @@ class Trainer:
                             old_stat = state_dict[kk].clone().detach()
                             state_dict[kk] = target_state_dict[kk].clone().detach()
                             state_dict[kk][:1, :, :1] = old_stat
+
+                        # copy keys that are same in Default branch
+                        same_keys = [
+                            kk
+                            for kk in missing_keys
+                            if ".Default." not in kk
+                            and "model.Default." + ".".join(kk.split(".")[2:])
+                            in state_dict
+                        ]
+
+                        for same_k in same_keys:
+                            origin_k = "model.Default." + ".".join(
+                                same_k.split(".")[2:]
+                            )
+                            state_dict[same_k] = state_dict[origin_k].clone().detach()
+
+                        log.warning(
+                            "Force load mode allowed! All branches missing ones will use those in default branches if available."
+                        )
+
+                        missing_keys = [
+                            item
+                            for item in target_keys
+                            if item not in state_dict.keys()
+                        ]
+
                         for item in missing_keys:
                             state_dict[item] = target_state_dict[item].clone().detach()
                             new_key = True
