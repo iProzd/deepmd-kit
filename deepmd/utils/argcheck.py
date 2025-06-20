@@ -3582,6 +3582,7 @@ def training_args(
                 Argument("Adam", dict, [], [], optional=True),
                 Argument("Lamb", dict, [], [], optional=True),
                 Argument("AdamW", dict, [], [], optional=True),
+                Argument("Soap", dict, [], [], optional=True),
                 Argument(
                     "LKF",
                     dict,

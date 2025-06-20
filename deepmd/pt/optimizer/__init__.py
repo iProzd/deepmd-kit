@@ -5,5 +5,8 @@ from .KFWrapper import (
 from .LKF import (
     LKFOptimizer,
 )
+from .soap import (
+    SOAP,
+)
 
-__all__ = ["KFOptimizerWrapper", "LKFOptimizer"]
+__all__ = ["SOAP", "KFOptimizerWrapper", "LKFOptimizer"]
