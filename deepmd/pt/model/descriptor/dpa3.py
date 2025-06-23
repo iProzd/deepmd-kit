@@ -208,6 +208,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             node_use_rmsnorm=self.repflow_args.node_use_rmsnorm,
             use_res_gnn=self.repflow_args.use_res_gnn,
             res_gnn_layer=self.repflow_args.res_gnn_layer,
+            use_rk_update=self.repflow_args.use_rk_update,
             use_loc_mapping=use_loc_mapping,
             exclude_types=exclude_types,
             env_protection=env_protection,

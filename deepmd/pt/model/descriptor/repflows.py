@@ -152,6 +152,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         res_gnn_layer: int = 6,
         node_use_rmsnorm: bool = False,
         use_loc_mapping: bool = True,
+        use_rk_update: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -338,6 +339,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_slim_message = use_slim_message
         self.use_combined_output = use_combined_output
         self.use_loc_mapping = use_loc_mapping
+        self.use_rk_update = use_rk_update
+        if self.use_rk_update:
+            assert (
+                self.use_loc_mapping
+            ), "use_loc_mapping must be True when use_rk_update is True"
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
         self.use_res_gnn = use_res_gnn
@@ -1035,26 +1041,125 @@ class DescrptBlockRepflows(DescriptorBlock):
                         node_ebd_real_ext, node_ebd_virtual_ext, real_nloc
                     )
 
-            node_ebd, edge_ebd, angle_ebd, dihedral_ebd = ll.forward(
-                node_ebd_ext,
-                edge_ebd,
-                h2,
-                angle_ebd,
-                nlist,
-                nlist_mask,
-                sw,
-                a_nlist,
-                a_nlist_mask,
-                a_sw,
-                d_nlist=d_nlist,
-                d_nlist_mask=d_nlist_mask,
-                edge_index=edge_index,
-                angle_index=angle_index,
-                dihedral_index=dihedral_index,
-                dihedral_ebd=dihedral_ebd,
-                d_sw=d_sw,
-                rbf_ebd=rbf_ebd,
-            )
+            if self.update_dihedral:
+                # for jit
+                assert not self.use_rk_update
+                assert dihedral_ebd is not None
+                node_ebd, edge_ebd, angle_ebd, dihedral_ebd = ll.forward(
+                    node_ebd_ext,
+                    edge_ebd,
+                    h2,
+                    angle_ebd,
+                    nlist,
+                    nlist_mask,
+                    sw,
+                    a_nlist,
+                    a_nlist_mask,
+                    a_sw,
+                    d_nlist=d_nlist,
+                    d_nlist_mask=d_nlist_mask,
+                    edge_index=edge_index,
+                    angle_index=angle_index,
+                    dihedral_index=dihedral_index,
+                    dihedral_ebd=dihedral_ebd,
+                    d_sw=d_sw,
+                    rbf_ebd=rbf_ebd,
+                )
+            else:
+                assert dihedral_ebd is None
+                if not self.use_rk_update:
+                    node_ebd, edge_ebd, angle_ebd, ___ = ll.forward(
+                        node_ebd_ext,
+                        edge_ebd,
+                        h2,
+                        angle_ebd,
+                        nlist,
+                        nlist_mask,
+                        sw,
+                        a_nlist,
+                        a_nlist_mask,
+                        a_sw,
+                        d_nlist=d_nlist,
+                        d_nlist_mask=d_nlist_mask,
+                        edge_index=edge_index,
+                        angle_index=angle_index,
+                        dihedral_index=dihedral_index,
+                        dihedral_ebd=None,
+                        d_sw=d_sw,
+                        rbf_ebd=rbf_ebd,
+                    )
+                else:
+                    # use 4th order Runge-Kutta update
+                    node_ebd_k_in_ori = node_ebd_ext
+                    node_ebd_k_in = node_ebd_ext
+                    edge_ebd_k_in_ori = edge_ebd
+                    edge_ebd_k_in = edge_ebd
+                    angle_ebd_k_in_ori = angle_ebd
+                    angle_ebd_k_in = angle_ebd
+
+                    for kk in range(4):
+                        (
+                            node_ebd_k1,
+                            edge_ebd_k1,
+                            angle_ebd_k1,
+                            ___,
+                        ) = ll.forward(
+                            node_ebd_k_in,
+                            edge_ebd_k_in,
+                            h2,
+                            angle_ebd_k_in,
+                            nlist,
+                            nlist_mask,
+                            sw,
+                            a_nlist,
+                            a_nlist_mask,
+                            a_sw,
+                            d_nlist=d_nlist,
+                            d_nlist_mask=d_nlist_mask,
+                            edge_index=edge_index,
+                            angle_index=angle_index,
+                            dihedral_index=dihedral_index,
+                            dihedral_ebd=None,
+                            d_sw=d_sw,
+                            rbf_ebd=rbf_ebd,
+                        )
+                        # h * f(y), k1/2/3/4
+                        node_ebd_k1 = node_ebd_k1 - node_ebd_k_in
+                        edge_ebd_k1 = edge_ebd_k1 - edge_ebd_k_in
+                        angle_ebd_k1 = angle_ebd_k1 - angle_ebd_k_in
+                        if kk == 0:
+                            # k1
+                            node_ebd = node_ebd + node_ebd_k1 / 6.0
+                            edge_ebd = edge_ebd + edge_ebd_k1 / 6.0
+                            angle_ebd = angle_ebd + angle_ebd_k1 / 6.0
+                            # next input: y + k1/2
+                            node_ebd_k_in = node_ebd_k_in_ori + node_ebd_k1 / 2.0
+                            edge_ebd_k_in = edge_ebd_k_in_ori + edge_ebd_k1 / 2.0
+                            angle_ebd_k_in = angle_ebd_k_in_ori + angle_ebd_k1 / 2.0
+                        elif kk == 1:
+                            # k2
+                            node_ebd = node_ebd + node_ebd_k1 / 3.0
+                            edge_ebd = edge_ebd + edge_ebd_k1 / 3.0
+                            angle_ebd = angle_ebd + angle_ebd_k1 / 3.0
+                            # next input: y + k2/2
+                            node_ebd_k_in = node_ebd_k_in_ori + node_ebd_k1 / 2.0
+                            edge_ebd_k_in = edge_ebd_k_in_ori + edge_ebd_k1 / 2.0
+                            angle_ebd_k_in = angle_ebd_k_in_ori + angle_ebd_k1 / 2.0
+                        elif kk == 2:
+                            # k3
+                            node_ebd = node_ebd + node_ebd_k1 / 3.0
+                            edge_ebd = edge_ebd + edge_ebd_k1 / 3.0
+                            angle_ebd = angle_ebd + angle_ebd_k1 / 3.0
+                            # next input: y + k3
+                            node_ebd_k_in = node_ebd_k_in_ori + node_ebd_k1
+                            edge_ebd_k_in = edge_ebd_k_in_ori + edge_ebd_k1
+                            angle_ebd_k_in = angle_ebd_k_in_ori + angle_ebd_k1
+                        else:
+                            # k4
+                            node_ebd = node_ebd + node_ebd_k1 / 6.0
+                            edge_ebd = edge_ebd + edge_ebd_k1 / 6.0
+                            angle_ebd = angle_ebd + angle_ebd_k1 / 6.0
+
             if self.use_res_gnn and (idx + 1) % self.res_gnn_layer == 0:
                 res_node_list.append(node_ebd.unsqueeze(-1))
 
