@@ -54,6 +54,8 @@ class AutoBatchSize(AutoBatchSizeBase):
             or "CUDA driver error: out of memory" in e.args[0]
             or "cusolver error: CUSOLVER_STATUS_INTERNAL_ERROR" in e.args[0]
             or "CUDA error: CUBLAS_STATUS_INTERNAL_ERROR" in e.args[0]
+            or "nonzero is not supported for tensors with more than INT_MAX elements"
+            in e.args[0]
         ):
             # Release all unoccupied cached memory
             torch.cuda.empty_cache()
