@@ -72,6 +72,7 @@ class RepFlowArgs:
         res_gnn_layer: int = 6,
         node_use_rmsnorm: bool = False,
         use_rk_update: bool = False,
+        rk_order: int = 4,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -193,6 +194,7 @@ class RepFlowArgs:
         self.res_gnn_layer = res_gnn_layer
         self.node_use_rmsnorm = node_use_rmsnorm
         self.use_rk_update = use_rk_update
+        self.rk_order = rk_order
 
     def __getitem__(self, key):
         if hasattr(self, key):

@@ -1845,6 +1845,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "rk_order",
+            int,
+            optional=True,
+            default=4,
+        ),
     ]
 
 
