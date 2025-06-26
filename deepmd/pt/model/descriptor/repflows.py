@@ -154,6 +154,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_loc_mapping: bool = True,
         use_rk_update: bool = False,
         rk_order: int = 4,
+        rk_update_diff_layer: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -346,6 +347,12 @@ class DescrptBlockRepflows(DescriptorBlock):
                 self.use_loc_mapping
             ), "use_loc_mapping must be True when use_rk_update is True"
         self.rk_order = rk_order
+        self.rk_update_diff_layer = rk_update_diff_layer
+        if self.rk_update_diff_layer:
+            assert (
+                self.nlayers % self.rk_order == 0
+            ), "nlayers must be divisible by rk_order"
+            assert self.rk_order == 4, "rk_order must be 4 for now"
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
         self.use_res_gnn = use_res_gnn
@@ -974,6 +981,15 @@ class DescrptBlockRepflows(DescriptorBlock):
                 mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
             )
         res_node_list = []
+
+        # rk_update_diff_layer
+        node_ebd_k_in_ori_diff = node_ebd
+        node_ebd_k_in_diff = node_ebd
+        edge_ebd_k_in_ori_diff = edge_ebd
+        edge_ebd_k_in_diff = edge_ebd
+        angle_ebd_k_in_ori_diff = angle_ebd
+        angle_ebd_k_in_diff = angle_ebd
+
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
@@ -1090,7 +1106,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                         d_sw=d_sw,
                         rbf_ebd=rbf_ebd,
                     )
-                else:
+                elif not self.rk_update_diff_layer:
                     node_ebd_k_in_ori = node_ebd_ext
                     node_ebd_k_in = node_ebd_ext
                     edge_ebd_k_in_ori = edge_ebd
@@ -1210,6 +1226,81 @@ class DescrptBlockRepflows(DescriptorBlock):
                         raise ValueError(
                             f"Unsupported Runge-Kutta order: {self.rk_order}"
                         )
+                else:
+                    # use RK update with diff layer
+                    (
+                        node_ebd_k1,
+                        edge_ebd_k1,
+                        angle_ebd_k1,
+                        ___,
+                    ) = ll.forward(
+                        node_ebd_k_in_diff,
+                        edge_ebd_k_in_diff,
+                        h2,
+                        angle_ebd_k_in_diff,
+                        nlist,
+                        nlist_mask,
+                        sw,
+                        a_nlist,
+                        a_nlist_mask,
+                        a_sw,
+                        d_nlist=d_nlist,
+                        d_nlist_mask=d_nlist_mask,
+                        edge_index=edge_index,
+                        angle_index=angle_index,
+                        dihedral_index=dihedral_index,
+                        dihedral_ebd=None,
+                        d_sw=d_sw,
+                        rbf_ebd=rbf_ebd,
+                    )
+                    # h * f(y), k1/2/3/4
+                    node_ebd_k1 = node_ebd_k1 - node_ebd_k_in_diff
+                    edge_ebd_k1 = edge_ebd_k1 - edge_ebd_k_in_diff
+                    angle_ebd_k1 = angle_ebd_k1 - angle_ebd_k_in_diff
+                    if idx % self.rk_order == 0:
+                        # k1
+                        node_ebd = node_ebd + node_ebd_k1 / 6.0
+                        edge_ebd = edge_ebd + edge_ebd_k1 / 6.0
+                        angle_ebd = angle_ebd + angle_ebd_k1 / 6.0
+                        # next input: y + k1/2
+                        node_ebd_k_in_diff = node_ebd_k_in_ori_diff + node_ebd_k1 / 2.0
+                        edge_ebd_k_in_diff = edge_ebd_k_in_ori_diff + edge_ebd_k1 / 2.0
+                        angle_ebd_k_in_diff = (
+                            angle_ebd_k_in_ori_diff + angle_ebd_k1 / 2.0
+                        )
+                    elif idx % self.rk_order == 1:
+                        # k2
+                        node_ebd = node_ebd + node_ebd_k1 / 3.0
+                        edge_ebd = edge_ebd + edge_ebd_k1 / 3.0
+                        angle_ebd = angle_ebd + angle_ebd_k1 / 3.0
+                        # next input: y + k2/2
+                        node_ebd_k_in_diff = node_ebd_k_in_ori_diff + node_ebd_k1 / 2.0
+                        edge_ebd_k_in_diff = edge_ebd_k_in_ori_diff + edge_ebd_k1 / 2.0
+                        angle_ebd_k_in_diff = (
+                            angle_ebd_k_in_ori_diff + angle_ebd_k1 / 2.0
+                        )
+                    elif idx % self.rk_order == 2:
+                        # k3
+                        node_ebd = node_ebd + node_ebd_k1 / 3.0
+                        edge_ebd = edge_ebd + edge_ebd_k1 / 3.0
+                        angle_ebd = angle_ebd + angle_ebd_k1 / 3.0
+                        # next input: y + k3
+                        node_ebd_k_in_diff = node_ebd_k_in_ori_diff + node_ebd_k1
+                        edge_ebd_k_in_diff = edge_ebd_k_in_ori_diff + edge_ebd_k1
+                        angle_ebd_k_in_diff = angle_ebd_k_in_ori_diff + angle_ebd_k1
+                    else:
+                        # k4
+                        node_ebd = node_ebd + node_ebd_k1 / 6.0
+                        edge_ebd = edge_ebd + edge_ebd_k1 / 6.0
+                        angle_ebd = angle_ebd + angle_ebd_k1 / 6.0
+
+                        # next round of rk
+                        node_ebd_k_in_ori_diff = node_ebd
+                        node_ebd_k_in_diff = node_ebd
+                        edge_ebd_k_in_ori_diff = edge_ebd
+                        edge_ebd_k_in_diff = edge_ebd
+                        angle_ebd_k_in_ori_diff = angle_ebd
+                        angle_ebd_k_in_diff = angle_ebd
 
             if self.use_res_gnn and (idx + 1) % self.res_gnn_layer == 0:
                 res_node_list.append(node_ebd.unsqueeze(-1))

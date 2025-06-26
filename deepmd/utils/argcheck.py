@@ -1851,6 +1851,12 @@ def dpa3_repflow_args():
             optional=True,
             default=4,
         ),
+        Argument(
+            "rk_update_diff_layer",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
