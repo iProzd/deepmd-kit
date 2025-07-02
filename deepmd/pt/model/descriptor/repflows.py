@@ -884,6 +884,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             if self.edge_use_esen_atom_ebd:
                 assert source_type is not None
                 assert target_type is not None
+                assert self.source_embedding is not None
+                assert self.target_embedding is not None
                 source_ebd = self.source_embedding(source_type)
                 target_ebd = self.target_embedding(target_type)
                 rbf_input = torch.cat((rbf_ebd, source_ebd, target_ebd), dim=-1)
