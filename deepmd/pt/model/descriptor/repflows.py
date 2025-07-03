@@ -1108,6 +1108,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                         d_sw=d_sw,
                         rbf_ebd=rbf_ebd,
                     )
+                # may cause jit slow, todo fix
                 elif not self.rk_update_diff_layer:
                     node_ebd_k_in_ori = node_ebd_ext
                     node_ebd_k_in = node_ebd_ext
