@@ -49,6 +49,10 @@ def make_base_descriptor(
                 cls = cls.get_class_by_type(j_get_type(kwargs, cls.__name__))
             return super().__new__(cls)
 
+        def get_norm_fact(self) -> float:
+            """Returns the norm factor."""
+            raise NotImplementedError
+
         @abstractmethod
         def get_rcut(self) -> float:
             """Returns the cut-off radius."""

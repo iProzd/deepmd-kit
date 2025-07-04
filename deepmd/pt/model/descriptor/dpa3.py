@@ -263,6 +263,10 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         """Returns the cut-off radius."""
         return self.rcut
 
+    def get_norm_fact(self) -> float:
+        """Returns the norm factor."""
+        return self.repflows.get_norm_fact()
+
     def get_additional_output_for_fitting(self):
         return self.repflows.get_additional_output_for_fitting()
 

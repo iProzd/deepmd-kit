@@ -515,6 +515,10 @@ class DescrptBlockRepflows(DescriptorBlock):
         """Returns the radius where the neighbor information starts to smoothly decay to 0."""
         return self.e_rcut_smth
 
+    def get_norm_fact(self) -> float:
+        """Returns the norm factor."""
+        return float(self.dynamic_e_sel if self.use_dynamic_sel else self.nnei)
+
     def get_nsel(self) -> int:
         """Returns the number of selected atoms in the cut-off radius."""
         return sum(self.sel)
