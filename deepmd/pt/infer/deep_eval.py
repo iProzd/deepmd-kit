@@ -115,6 +115,8 @@ class DeepEval(DeepEvalBackend):
                 model_keys = list(self.input_param["model_dict"].keys())
                 if isinstance(head, int):
                     head = model_keys[0]
+                if head is None and "Default" in model_keys:
+                    head = "Default"
                 assert (
                     head is not None
                 ), f"Head must be set for multitask model! Available heads are: {model_keys}"
