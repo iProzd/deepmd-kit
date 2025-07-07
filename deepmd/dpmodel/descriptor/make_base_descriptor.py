@@ -49,7 +49,7 @@ def make_base_descriptor(
                 cls = cls.get_class_by_type(j_get_type(kwargs, cls.__name__))
             return super().__new__(cls)
 
-        def get_norm_fact(self) -> float:
+        def get_norm_fact(self) -> list[float]:
             """Returns the norm factor."""
             raise NotImplementedError
 
@@ -143,6 +143,10 @@ def make_base_descriptor(
         def get_stat_mean_and_stddev(self):
             """Get mean and stddev for descriptor."""
             pass
+
+        def get_angle_dim(self) -> int:
+            """Returns the angle embedding dimension."""
+            raise NotImplementedError
 
         def compute_input_stats(
             self,

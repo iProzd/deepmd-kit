@@ -282,6 +282,9 @@ class DPAtomicModel(BaseAtomicModel):
                 diff=add_input["diff"],
                 edge_index=add_input["edge_index"],
                 sw=add_input["sw"],
+                angle_embd=add_input["angle_embd"],
+                angle_index=add_input["angle_index"],
+                a_sw=add_input["a_sw"],
             )
         return fit_ret
 

@@ -437,6 +437,9 @@ class EnergyFittingNetDirectHead(InvarFitting):
         diff: Optional[torch.Tensor] = None,
         edge_index: Optional[torch.Tensor] = None,
         sw: Optional[torch.Tensor] = None,
+        angle_embd: Optional[torch.Tensor] = None,
+        angle_index: Optional[torch.Tensor] = None,
+        a_sw: Optional[torch.Tensor] = None,
     ):
         """Based on embedding net output, alculate total energy.
 
@@ -507,6 +510,7 @@ class EnergyFittingNetDirectHead(InvarFitting):
         return result
 
 
+@Fitting.register("ener_readout")
 @Fitting.register("ener_edge_readout")
 @fitting_check_output
 class EnergyFittingNetEdgeReadout(InvarFitting):
@@ -526,7 +530,12 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         mixed_types: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
         type_map: Optional[list[str]] = None,
-        norm_fact: float = 120.0,
+        angle_embedding_width: int = 32,
+        norm_fact: list[float] = [120.0, 30.0],
+        add_edge_readout: bool = True,
+        add_angle_readout: bool = False,
+        slim_edge_readout: bool = False,
+        slim_angle_readout: bool = False,
         **kwargs,
     ) -> None:
         """Construct a fitting net for energy.
@@ -538,6 +547,8 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         - bias_atom_e: Average energy per atom for each element.
         - resnet_dt: Using time-step in the ResNet construction.
         """
+        self.add_edge_readout = add_edge_readout
+        self.add_angle_readout = add_angle_readout
         super().__init__(
             "energy",
             ntypes,
@@ -559,25 +570,55 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
 
         # embedding for edge readout
         self.embedding_width = embedding_width
-        self.norm_fact = norm_fact
-        self.edge_embed = NetworkCollection(
-            1 if not self.mixed_types else 0,
-            self.ntypes,
-            network_type="fitting_network",
-            networks=[
-                FittingNet(
-                    self.embedding_width,
-                    1,
-                    self.neuron,
-                    self.activation_function,
-                    self.resnet_dt,
-                    self.precision,
-                    bias_out=True,
-                    seed=child_seed(self.seed + 100, ii),
-                )
-                for ii in range(self.ntypes if not self.mixed_types else 1)
-            ],
-        )
+        self.angle_embedding_width = angle_embedding_width
+        self.slim_edge_readout = slim_edge_readout
+        self.slim_angle_readout = slim_angle_readout
+        self.norm_e_fact = norm_fact[0]
+        self.norm_a_fact = norm_fact[1]
+
+        if self.add_edge_readout:
+            self.edge_embed = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        self.embedding_width,
+                        1,
+                        self.neuron if not self.slim_edge_readout else self.neuron[:1],
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=True,
+                        seed=child_seed(self.seed + 100, ii),
+                    )
+                    for ii in range(self.ntypes if not self.mixed_types else 1)
+                ],
+            )
+        else:
+            self.edge_embed = None
+
+        if self.add_angle_readout:
+            self.angle_embed = NetworkCollection(
+                1 if not self.mixed_types else 0,
+                self.ntypes,
+                network_type="fitting_network",
+                networks=[
+                    FittingNet(
+                        self.angle_embedding_width,
+                        1,
+                        self.neuron if not self.slim_angle_readout else self.neuron[:1],
+                        self.activation_function,
+                        self.resnet_dt,
+                        self.precision,
+                        bias_out=True,
+                        seed=child_seed(self.seed + 200, ii),
+                    )
+                    for ii in range(self.ntypes if not self.mixed_types else 1)
+                ],
+            )
+        else:
+            self.angle_embed = None
 
         # set trainable
         for param in self.parameters():
@@ -630,6 +671,9 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         diff: Optional[torch.Tensor] = None,
         edge_index: Optional[torch.Tensor] = None,
         sw: Optional[torch.Tensor] = None,
+        angle_embd: Optional[torch.Tensor] = None,
+        angle_index: Optional[torch.Tensor] = None,
+        a_sw: Optional[torch.Tensor] = None,
     ):
         """Based on embedding net output, alculate total energy.
 
@@ -645,31 +689,64 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
             self.var_name
         ]
 
-        # direct force
         assert g2 is not None
+        assert angle_embd is not None
         assert sw is not None
+        assert a_sw is not None
         nf, nloc, _ = descriptor.shape
 
-        # nf x nloc x nnei x d [OR] nedge x d
-        edge_feature = g2
-        # nf x nloc x nnei x 1 [OR] nedge x 1
-        edge_atomic_contrib = self.edge_embed.networks[0](edge_feature)
-        # nf x nloc x nnei x 1 [OR] nedge x 1
-        edge_atomic_contrib = edge_atomic_contrib * sw.unsqueeze(-1)
-        if edge_index is not None:
-            # use dynamic sel
-            n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
-            # nf x nloc x 1
-            edge_energy = aggregate(
-                edge_atomic_contrib,
-                n2e_index,
-                average=False,
-                num_owner=nf * nloc,
-            ).reshape(nf, nloc, 1)
-        else:
-            # nf x nloc x 1
-            edge_energy = torch.sum(edge_atomic_contrib, dim=-2)
+        if self.add_edge_readout:
+            assert self.edge_embed is not None
+            # nf x nloc x nnei x d [OR] nedge x d
+            edge_feature = g2
+            # nf x nloc x nnei x 1 [OR] nedge x 1
+            edge_atomic_contrib = self.edge_embed.networks[0](edge_feature)
+            # nf x nloc x nnei x 1 [OR] nedge x 1
+            edge_atomic_contrib = edge_atomic_contrib * sw.unsqueeze(-1)
+            if edge_index is not None:
+                # use dynamic sel
+                n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+                # nf x nloc x 1
+                edge_energy = aggregate(
+                    edge_atomic_contrib,
+                    n2e_index,
+                    average=False,
+                    num_owner=nf * nloc,
+                ).reshape(nf, nloc, 1)
+            else:
+                # nf x nloc x 1
+                edge_energy = torch.sum(edge_atomic_contrib, dim=-2)
+            # energy
+            out = out + edge_energy / self.norm_e_fact
 
-        # energy
-        out = out + edge_energy / self.norm_fact
+        if self.add_angle_readout:
+            assert self.angle_embed is not None
+            # nf x nloc x a_nnei x a_nnei x d [OR] nangle x d
+            angle_feature = angle_embd
+            # nf x nloc x a_nnei x a_nnei x 1 [OR] nangle x 1
+            angle_atomic_contrib = self.angle_embed.networks[0](angle_feature)
+            # nf x nloc x a_nnei x a_nnei x 1 [OR] nangle x 1
+            angle_atomic_contrib = angle_atomic_contrib * a_sw.unsqueeze(-1)
+            if angle_index is not None:
+                # use dynamic sel
+                n2a_index, eij2a_index, eik2a_index = (
+                    angle_index[:, 0],
+                    angle_index[:, 1],
+                    angle_index[:, 2],
+                )
+                # nf x nloc x 1
+                angle_energy = aggregate(
+                    angle_atomic_contrib,
+                    n2a_index,
+                    average=False,
+                    num_owner=nf * nloc,
+                ).reshape(nf, nloc, 1)
+            else:
+                # nf x nloc x 1
+                angle_energy = torch.sum(
+                    torch.sum(angle_atomic_contrib, dim=-2), dim=-2
+                )
+            # energy
+            # self.norm_a_fact ** 2
+            out = out + angle_energy / (self.norm_a_fact**2)
         return {self.var_name: out.to(env.GLOBAL_PT_FLOAT_PRECISION)}

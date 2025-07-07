@@ -515,9 +515,12 @@ class DescrptBlockRepflows(DescriptorBlock):
         """Returns the radius where the neighbor information starts to smoothly decay to 0."""
         return self.e_rcut_smth
 
-    def get_norm_fact(self) -> float:
+    def get_norm_fact(self) -> list[float]:
         """Returns the norm factor."""
-        return float(self.dynamic_e_sel if self.use_dynamic_sel else self.nnei)
+        return [
+            float(self.dynamic_e_sel if self.use_dynamic_sel else self.nnei),
+            float(self.dynamic_a_sel if self.use_dynamic_sel else self.a_sel),
+        ]
 
     def get_nsel(self) -> int:
         """Returns the number of selected atoms in the cut-off radius."""
@@ -870,6 +873,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     * d_sw[:, :, None, None, :]
                 )[d_nlist_mask]
             self.additional_output_for_fitting["edge_index"] = edge_index
+            self.additional_output_for_fitting["angle_index"] = angle_index
         else:
             # avoid jit assertion
             edge_index = angle_index = torch.zeros(
@@ -877,8 +881,10 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
             dihedral_index = None
             self.additional_output_for_fitting["edge_index"] = None
+            self.additional_output_for_fitting["angle_index"] = None
         self.additional_output_for_fitting["diff"] = diff
         self.additional_output_for_fitting["sw"] = sw
+        self.additional_output_for_fitting["a_sw"] = a_sw
 
         # get edge and angle embedding
         # nb x nloc x nnei x e_dim [OR] n_edge x e_dim
@@ -1372,6 +1378,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         )
         # (nb x nloc) x e_dim x 3
         rot_mat = torch.permute(h2g2, (0, 1, 3, 2))
+
+        self.additional_output_for_fitting["angle_embd"] = angle_ebd
 
         return node_ebd, edge_ebd, h2, rot_mat.view(nframes, nloc, self.dim_emb, 3), sw
 

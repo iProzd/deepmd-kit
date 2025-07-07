@@ -263,7 +263,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         """Returns the cut-off radius."""
         return self.rcut
 
-    def get_norm_fact(self) -> float:
+    def get_norm_fact(self) -> list[float]:
         """Returns the norm factor."""
         return self.repflows.get_norm_fact()
 
@@ -300,6 +300,10 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
     def get_dim_emb(self) -> int:
         """Returns the embedding dimension of this descriptor."""
         return self.repflows.dim_emb
+
+    def get_angle_dim(self) -> int:
+        """Returns the angle embedding dimension of this descriptor."""
+        return self.repflows.a_dim
 
     def mixed_types(self) -> bool:
         """If true, the descriptor

@@ -2115,8 +2115,8 @@ def fitting_ener_direct():
     ]
 
 
-@fitting_args_plugin.register("ener_edge_readout", doc=doc_ener_direct)
-def fitting_ener_edge_readout():
+@fitting_args_plugin.register("ener_readout")
+def fitting_ener_readout():
     doc_numb_fparam = "The dimension of the frame parameter. If set to >0, file `fparam.npy` should be included to provided the input fparams."
     doc_numb_aparam = "The dimension of the atomic parameter. If set to >0, file `aparam.npy` should be included to provided the input aparams."
     doc_dim_case_embd = "The dimension of the case embedding embedding. When training or fine-tuning a multitask model with case embedding embeddings, this number should be set to the number of model branches."
@@ -2195,6 +2195,30 @@ def fitting_ener_edge_readout():
             optional=True,
             default=False,
             doc=doc_use_aparam_as_mask,
+        ),
+        Argument(
+            "add_edge_readout",
+            bool,
+            optional=True,
+            default=True,
+        ),
+        Argument(
+            "add_angle_readout",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "slim_edge_readout",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "slim_angle_readout",
+            bool,
+            optional=True,
+            default=False,
         ),
     ]
 

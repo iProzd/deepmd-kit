@@ -90,9 +90,16 @@ def _get_standard_model_components(model_params, ntypes):
     fitting_net["ntypes"] = descriptor.get_ntypes()
     fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
     fitting_net["mixed_types"] = descriptor.mixed_types()
-    if fitting_net["type"] in ["dipole", "polar", "ener_direct", "ener_edge_readout"]:
+    if fitting_net["type"] in [
+        "dipole",
+        "polar",
+        "ener_direct",
+        "ener_readout",
+        "ener_edge_readout",
+    ]:
         fitting_net["embedding_width"] = descriptor.get_dim_emb()
-    if fitting_net["type"] in ["ener_edge_readout"]:
+    if fitting_net["type"] in ["ener_readout", "ener_edge_readout"]:
+        fitting_net["angle_embedding_width"] = descriptor.get_angle_dim()
         fitting_net["norm_fact"] = descriptor.get_norm_fact()
     fitting_net["dim_descrpt"] = descriptor.get_dim_out()
     # grad_force = "direct" not in fitting_net["type"]
@@ -267,7 +274,8 @@ def get_standard_model(model_params):
         "ener",
         "direct_force_ener",
         "ener_direct",
-        "ener_edge_readout",
+        "ener_readout",
+        "ener_edge_readout",  # will be deprecated
     ]:
         modelcls = EnergyModel
     elif fitting_net_type == "property":
