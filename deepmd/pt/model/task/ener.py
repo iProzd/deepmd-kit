@@ -574,7 +574,7 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         self.slim_edge_readout = slim_edge_readout
         self.slim_angle_readout = slim_angle_readout
         self.norm_e_fact = norm_fact[0]
-        self.norm_a_fact = norm_fact[1]
+        self.norm_a_fact = norm_fact[1] if add_angle_readout else 1
 
         if self.add_edge_readout:
             self.edge_embed = NetworkCollection(
@@ -688,14 +688,11 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         out = self._forward_common(descriptor, atype, gr, g2, h2, fparam, aparam)[
             self.var_name
         ]
-
-        assert g2 is not None
-        assert angle_embd is not None
-        assert sw is not None
-        assert a_sw is not None
         nf, nloc, _ = descriptor.shape
 
         if self.add_edge_readout:
+            assert g2 is not None
+            assert sw is not None
             assert self.edge_embed is not None
             # nf x nloc x nnei x d [OR] nedge x d
             edge_feature = g2
@@ -720,6 +717,8 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
             out = out + edge_energy / self.norm_e_fact
 
         if self.add_angle_readout:
+            assert angle_embd is not None
+            assert a_sw is not None
             assert self.angle_embed is not None
             # nf x nloc x a_nnei x a_nnei x d [OR] nangle x d
             angle_feature = angle_embd

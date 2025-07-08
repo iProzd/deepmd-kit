@@ -316,6 +316,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         self.tebd_dim = tebd_dim
         self.concat_output_tebd = concat_output_tebd
         self.trainable = trainable
+        self.use_force_embedding = False
         # set trainable
         for param in self.parameters():
             param.requires_grad = trainable
@@ -343,6 +344,17 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
     def get_type_map(self) -> list[str]:
         """Get the name to each type of atoms."""
         return self.type_map
+
+    def get_additional_output_for_fitting(self) -> dict[str, Optional[torch.Tensor]]:
+        return {}
+
+    def get_norm_fact(self) -> list[float]:
+        """Returns the norm factor."""
+        return [float(self.get_nnei())]
+
+    def get_angle_dim(self) -> int:
+        """Returns the angle embedding dimension of this descriptor."""
+        return 0
 
     def get_dim_out(self) -> int:
         """Returns the output dimension."""
@@ -647,6 +659,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        force_embedding_input: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
