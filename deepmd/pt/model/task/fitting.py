@@ -40,6 +40,9 @@ from deepmd.utils.finetune import (
     get_index_between_two_maps,
     map_atom_exclude_types,
 )
+from deepmd.utils.path import (
+    DPPath,
+)
 
 dtype = env.GLOBAL_PT_FLOAT_PRECISION
 device = env.DEVICE
@@ -76,6 +79,7 @@ class Fitting(torch.nn.Module, BaseFitting):
         self,
         merged: Union[Callable[[], list[dict]], list[dict]],
         protection: float = 1e-2,
+        stat_file_path: Optional[DPPath] = None,
     ) -> None:
         """
         Compute the input statistics (e.g. mean and stddev) for the fittings from packed data.
@@ -91,67 +95,111 @@ class Fitting(torch.nn.Module, BaseFitting):
                 the lazy function helps by only sampling once.
         protection : float
             Divided-by-zero protection
+        stat_file_path : Optional[DPPath]
+            The path to the stat file.
         """
         if self.numb_fparam == 0 and self.numb_aparam == 0:
             # skip data statistics
             return
-        if callable(merged):
-            sampled = merged()
-        else:
-            sampled = merged
+
+        def _restore_fparam_from_file(stat_file_path: DPPath) -> Optional[dict]:
+            if stat_file_path is None:
+                return None, None
+            fp_avg = stat_file_path / "fparam_avg"
+            fp_inv_std = stat_file_path / "fparam_inv_std"
+            if all(not (ii.is_file()) for ii in [fp_avg, fp_inv_std]):
+                return None, None
+            log.info(f"Load fparam stats from {fp_avg} and {fp_inv_std}.")
+            return fp_avg.load_numpy(), fp_inv_std.load_numpy()
+
+        def _restore_aparam_from_file(stat_file_path: DPPath) -> Optional[dict]:
+            if stat_file_path is None:
+                return None, None
+            fp_avg = stat_file_path / "aparam_avg"
+            fp_inv_std = stat_file_path / "aparam_inv_std"
+            if all(not (ii.is_file()) for ii in [fp_avg, fp_inv_std]):
+                return None, None
+            log.info(f"Load aparam stats from {fp_avg} and {fp_inv_std}.")
+            return fp_avg.load_numpy(), fp_inv_std.load_numpy()
+
+        def _save_to_file_fparam(
+            stat_file_path: DPPath,
+            fparam_avg: np.array,
+            fparam_inv_std: np.array,
+        ) -> None:
+            assert stat_file_path is not None
+            stat_file_path.mkdir(exist_ok=True, parents=True)
+            fp_avg = stat_file_path / "fparam_avg"
+            fp_avg.save_numpy(fparam_avg)
+            fp_inv_std = stat_file_path / "fparam_inv_std"
+            fp_inv_std.save_numpy(fparam_inv_std)
+            log.info(f"Save fparam stats to {fp_avg} and {fp_inv_std}.")
+
+        def _save_to_file_aparam(
+            stat_file_path: DPPath,
+            aparam_avg: np.array,
+            aparam_inv_std: np.array,
+        ) -> None:
+            assert stat_file_path is not None
+            stat_file_path.mkdir(exist_ok=True, parents=True)
+            fp_avg = stat_file_path / "aparam_avg"
+            fp_avg.save_numpy(aparam_avg)
+            fp_inv_std = stat_file_path / "aparam_inv_std"
+            fp_inv_std.save_numpy(aparam_inv_std)
+            log.info(f"Save aparam stats to {fp_avg} and {fp_inv_std}.")
+
         # stat fparam
         if self.numb_fparam > 0:
-            cat_data = torch.cat([frame["fparam"] for frame in sampled], dim=0)
-            cat_data = torch.reshape(cat_data, [-1, self.numb_fparam])
-            fparam_avg = torch.mean(cat_data, dim=0)
-            fparam_std = torch.std(cat_data, dim=0, unbiased=False)
-            fparam_std = torch.where(
-                fparam_std < protection,
-                torch.tensor(
-                    protection, dtype=fparam_std.dtype, device=fparam_std.device
-                ),
-                fparam_std,
-            )
-            fparam_inv_std = 1.0 / fparam_std
-            self.fparam_avg.copy_(
-                torch.tensor(fparam_avg, device=env.DEVICE, dtype=self.fparam_avg.dtype)
-            )
-            self.fparam_inv_std.copy_(
-                torch.tensor(
-                    fparam_inv_std, device=env.DEVICE, dtype=self.fparam_inv_std.dtype
+            fparam_avg, fparam_inv_std = _restore_fparam_from_file(stat_file_path)
+            if fparam_avg is None:
+                sampled = merged() if callable(merged) else merged
+                cat_data = to_numpy_array(torch.cat([frame["fparam"] for frame in sampled], dim=0))
+                cat_data = np.reshape(cat_data, [-1, self.numb_fparam])
+                fparam_avg = np.mean(cat_data, axis=0)
+                fparam_std = np.std(cat_data, axis=0)
+                fparam_std = np.where(
+                    fparam_std < protection,
+                    protection,
+                    fparam_std,
                 )
-            )
+                fparam_inv_std = 1.0 / fparam_std
+                if stat_file_path is not None:
+                    _save_to_file_fparam(stat_file_path, fparam_avg, fparam_inv_std)
+
+            log.info(f"fparam_avg is {fparam_avg}, fparam_inv_std is {fparam_inv_std}")
+            self.fparam_avg.copy_(to_torch_tensor(fparam_avg))
+            self.fparam_inv_std.copy_(to_torch_tensor(fparam_inv_std))
+
         # stat aparam
         if self.numb_aparam > 0:
-            sys_sumv = []
-            sys_sumv2 = []
-            sys_sumn = []
-            for ss_ in [frame["aparam"] for frame in sampled]:
-                ss = torch.reshape(ss_, [-1, self.numb_aparam])
-                sys_sumv.append(torch.sum(ss, dim=0))
-                sys_sumv2.append(torch.sum(ss * ss, dim=0))
-                sys_sumn.append(ss.shape[0])
-            sumv = torch.sum(torch.stack(sys_sumv), dim=0)
-            sumv2 = torch.sum(torch.stack(sys_sumv2), dim=0)
-            sumn = sum(sys_sumn)
-            aparam_avg = sumv / sumn
-            aparam_std = torch.sqrt(sumv2 / sumn - (sumv / sumn) ** 2)
-            aparam_std = torch.where(
-                aparam_std < protection,
-                torch.tensor(
-                    protection, dtype=aparam_std.dtype, device=aparam_std.device
-                ),
-                aparam_std,
-            )
-            aparam_inv_std = 1.0 / aparam_std
-            self.aparam_avg.copy_(
-                torch.tensor(aparam_avg, device=env.DEVICE, dtype=self.aparam_avg.dtype)
-            )
-            self.aparam_inv_std.copy_(
-                torch.tensor(
-                    aparam_inv_std, device=env.DEVICE, dtype=self.aparam_inv_std.dtype
+            aparam_avg, aparam_inv_std = _restore_aparam_from_file(stat_file_path)
+            if aparam_avg is None:
+                sampled = merged() if callable(merged) else merged
+                sys_sumv = []
+                sys_sumv2 = []
+                sys_sumn = []
+                for ss_ in [frame["aparam"] for frame in sampled]:
+                    ss = np.reshape(to_numpy_array(ss_), [-1, self.numb_aparam])
+                    sys_sumv.append(np.sum(ss, axis=0))
+                    sys_sumv2.append(np.sum(ss * ss, axis=0))
+                    sys_sumn.append(ss.shape[0])
+                sumv = np.sum(np.stack(sys_sumv), axis=0)
+                sumv2 = np.sum(np.stack(sys_sumv2), axis=0)
+                sumn = sum(sys_sumn)
+                aparam_avg = sumv / sumn
+                aparam_std = np.sqrt(sumv2 / sumn - (sumv / sumn) ** 2)
+                aparam_std = np.where(
+                    aparam_std < protection,
+                    protection,
+                    aparam_std,
                 )
-            )
+                aparam_inv_std = 1.0 / aparam_std
+                if stat_file_path is not None:
+                    _save_to_file_aparam(stat_file_path, aparam_avg, aparam_inv_std)
+
+            log.info(f"aparam_avg is {aparam_avg}, aparam_inv_std is {aparam_inv_std}")
+            self.aparam_avg.copy_(to_torch_tensor(aparam_avg))
+            self.aparam_inv_std.copy_(to_torch_tensor(aparam_inv_std))
 
 
 class GeneralFitting(Fitting):
