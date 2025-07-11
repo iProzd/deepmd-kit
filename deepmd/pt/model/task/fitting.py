@@ -7,6 +7,7 @@ from typing import (
     Callable,
     Optional,
     Union,
+    List,
 )
 
 import numpy as np
@@ -43,6 +44,9 @@ from deepmd.utils.finetune import (
 from deepmd.utils.path import (
     DPPath,
 )
+from deepmd.utils.env_mat_stat import (
+    StatItem,
+)
 
 dtype = env.GLOBAL_PT_FLOAT_PRECISION
 device = env.DEVICE
@@ -69,11 +73,141 @@ class Fitting(torch.nn.Module, BaseFitting):
         )
         if shared_level == 0:
             # only not share the bias_atom_e and the case_embd
+            # link fparam buffers
+            if hasattr(self, "fparam_avg"):
+                assert self.numb_fparam > 0
+                if not resume:
+                    base_fparam = base_class.stats["fparam"]
+                    assert len(base_fparam) == self.numb_fparam
+                    for ii in range(self.numb_fparam):
+                        base_fparam[ii] += self.get_stats()["fparam"][ii]
+                    fparam_avg = np.array([ii.compute_avg() for ii in base_fparam])
+                    fparam_std = np.array([ii.compute_std() for ii in base_fparam])
+                    fparam_inv_std = 1.0 / fparam_std
+                    base_class.fparam_avg.copy_(
+                        torch.tensor(
+                            fparam_avg, device=env.DEVICE, dtype=base_class.fparam_avg.dtype
+                        )
+                    )
+                    base_class.fparam_inv_std.copy_(
+                        torch.tensor(
+                            fparam_inv_std, device=env.DEVICE, dtype=base_class.fparam_inv_std.dtype
+                        )
+                    )
+                self.fparam_avg = base_class.fparam_avg
+                self.fparam_inv_std = base_class.fparam_inv_std
+
+            # link aparam buffers
+            if hasattr(self, "aparam_avg"):
+                assert self.numb_aparam > 0
+                if not resume:
+                    base_aparam = base_class.stats["aparam"]
+                    assert len(base_aparam) == self.numb_aparam
+                    for ii in range(self.numb_aparam):
+                        base_aparam[ii] += self.get_stats()["aparam"][ii]
+                    aparam_avg = np.array([ii.compute_avg() for ii in base_aparam])
+                    aparam_std = np.array([ii.compute_std() for ii in base_aparam])
+                    aparam_inv_std = 1.0 / aparam_std
+                    base_class.aparam_avg.copy_(
+                        torch.tensor(
+                            aparam_avg, device=env.DEVICE, dtype=base_class.aparam_avg.dtype
+                        )
+                    )
+                    base_class.aparam_inv_std.copy_(
+                        torch.tensor(
+                            aparam_inv_std, device=env.DEVICE, dtype=base_class.aparam_inv_std.dtype
+                        )
+                    )     
+                self.aparam_avg = base_class.aparam_avg
+                self.aparam_inv_std = base_class.aparam_inv_std
+
             # the following will successfully link all the params except buffers, which need manually link.
             for item in self._modules:
                 self._modules[item] = base_class._modules[item]
         else:
             raise NotImplementedError
+
+    def save_to_file_fparam(
+        self,
+        stat_file_path: DPPath,
+    ) -> None:
+        """Save the statistics of fparam.
+
+        Parameters
+        ----------
+        path : DPPath
+            The path to save the statistics of fparam.
+        """
+        assert stat_file_path is not None
+        stat_file_path.mkdir(exist_ok=True, parents=True)
+        if len(self.stats) == 0:
+            raise ValueError("The statistics hasn't been computed.")
+        fp = stat_file_path / "fparam"
+        _fparam_stat = []
+        for ii in range(self.numb_fparam):
+            _tmp_stat = self.stats["fparam"][ii]
+            _fparam_stat.append([_tmp_stat.number, _tmp_stat.sum, _tmp_stat.squared_sum])
+        _fparam_stat = np.array(_fparam_stat)
+        fp.save_numpy(_fparam_stat)
+        log.info(f"Save fparam stats to {fp}.")
+
+    def save_to_file_aparam(
+        self,
+        stat_file_path: DPPath,
+    ) -> None:
+        """Save the statistics of aparam.
+
+        Parameters
+        ----------
+        path : DPPath
+            The path to save the statistics of aparam.
+        """
+        assert stat_file_path is not None
+        stat_file_path.mkdir(exist_ok=True, parents=True)
+        if len(self.stats) == 0:
+            raise ValueError("The statistics hasn't been computed.")
+        fp = stat_file_path / "aparam"
+        _aparam_stat = []
+        for ii in range(self.numb_aparam):
+            _tmp_stat = self.stats["aparam"][ii]
+            _aparam_stat.append([_tmp_stat.number, _tmp_stat.sum, _tmp_stat.squared_sum])
+        _aparam_stat = np.array(_aparam_stat)
+        fp.save_numpy(_aparam_stat)
+        log.info(f"Save aparam stats to {fp}.")
+
+    def restore_fparam_from_file(self, stat_file_path: DPPath) -> None:
+        """Load the statistics of fparam.
+
+        Parameters
+        ----------
+        path : DPPath
+            The path to load the statistics of fparam.
+        """
+        fp = stat_file_path / "fparam"
+        arr = fp.load_numpy()
+        assert arr.shape == (self.numb_fparam, 3)
+        _fparam_stat = []
+        for ii in range(self.numb_fparam):
+            _fparam_stat.append(StatItem(number=arr[ii][0], sum=arr[ii][1], squared_sum=arr[ii][2]))
+        self.stats["fparam"] = _fparam_stat
+        log.info(f"Load fparam stats from {fp}.")
+
+    def restore_aparam_from_file(self, stat_file_path: DPPath) -> None:
+        """Load the statistics of aparam.
+
+        Parameters
+        ----------
+        path : DPPath
+            The path to load the statistics of aparam.
+        """
+        fp = stat_file_path / "aparam"
+        arr = fp.load_numpy()
+        assert arr.shape == (self.numb_aparam, 3)
+        _aparam_stat = []
+        for ii in range(self.numb_aparam):
+            _aparam_stat.append(StatItem(number=arr[ii][0], sum=arr[ii][1], squared_sum=arr[ii][2]))
+        self.stats["aparam"] = _aparam_stat
+        log.info(f"Load aparam stats from {fp}.")
 
     def compute_input_stats(
         self,
@@ -100,81 +234,48 @@ class Fitting(torch.nn.Module, BaseFitting):
         """
         if self.numb_fparam == 0 and self.numb_aparam == 0:
             # skip data statistics
+            self.stats = None
             return
 
-        def _restore_fparam_from_file(stat_file_path: DPPath) -> Optional[dict]:
-            if stat_file_path is None:
-                return None, None
-            fp_avg = stat_file_path / "fparam_avg"
-            fp_inv_std = stat_file_path / "fparam_inv_std"
-            if all(not (ii.is_file()) for ii in [fp_avg, fp_inv_std]):
-                return None, None
-            log.info(f"Load fparam stats from {fp_avg} and {fp_inv_std}.")
-            return fp_avg.load_numpy(), fp_inv_std.load_numpy()
-
-        def _restore_aparam_from_file(stat_file_path: DPPath) -> Optional[dict]:
-            if stat_file_path is None:
-                return None, None
-            fp_avg = stat_file_path / "aparam_avg"
-            fp_inv_std = stat_file_path / "aparam_inv_std"
-            if all(not (ii.is_file()) for ii in [fp_avg, fp_inv_std]):
-                return None, None
-            log.info(f"Load aparam stats from {fp_avg} and {fp_inv_std}.")
-            return fp_avg.load_numpy(), fp_inv_std.load_numpy()
-
-        def _save_to_file_fparam(
-            stat_file_path: DPPath,
-            fparam_avg: np.array,
-            fparam_inv_std: np.array,
-        ) -> None:
-            assert stat_file_path is not None
-            stat_file_path.mkdir(exist_ok=True, parents=True)
-            fp_avg = stat_file_path / "fparam_avg"
-            fp_avg.save_numpy(fparam_avg)
-            fp_inv_std = stat_file_path / "fparam_inv_std"
-            fp_inv_std.save_numpy(fparam_inv_std)
-            log.info(f"Save fparam stats to {fp_avg} and {fp_inv_std}.")
-
-        def _save_to_file_aparam(
-            stat_file_path: DPPath,
-            aparam_avg: np.array,
-            aparam_inv_std: np.array,
-        ) -> None:
-            assert stat_file_path is not None
-            stat_file_path.mkdir(exist_ok=True, parents=True)
-            fp_avg = stat_file_path / "aparam_avg"
-            fp_avg.save_numpy(aparam_avg)
-            fp_inv_std = stat_file_path / "aparam_inv_std"
-            fp_inv_std.save_numpy(aparam_inv_std)
-            log.info(f"Save aparam stats to {fp_avg} and {fp_inv_std}.")
+        self.stats = {}
 
         # stat fparam
         if self.numb_fparam > 0:
-            fparam_avg, fparam_inv_std = _restore_fparam_from_file(stat_file_path)
-            if fparam_avg is None:
+            if stat_file_path is not None and stat_file_path.is_dir():
+                self.restore_fparam_from_file(stat_file_path)
+            else:
                 sampled = merged() if callable(merged) else merged
+                self.stats["fparam"] = []
                 cat_data = to_numpy_array(torch.cat([frame["fparam"] for frame in sampled], dim=0))
                 cat_data = np.reshape(cat_data, [-1, self.numb_fparam])
-                fparam_avg = np.mean(cat_data, axis=0)
-                fparam_std = np.std(cat_data, axis=0)
-                fparam_std = np.where(
-                    fparam_std < protection,
-                    protection,
-                    fparam_std,
-                )
-                fparam_inv_std = 1.0 / fparam_std
+                sumv = np.sum(cat_data, axis=0)
+                sumv2 = np.sum(cat_data * cat_data, axis=0)
+                sumn = cat_data.shape[0]
+                for ii in range(self.numb_fparam):
+                    self.stats["fparam"].append(
+                        StatItem(
+                            number=sumn,
+                            sum=sumv[ii],
+                            squared_sum=sumv2[ii],
+                        )
+                    )
                 if stat_file_path is not None:
-                    _save_to_file_fparam(stat_file_path, fparam_avg, fparam_inv_std)
+                    self.save_to_file_fparam(stat_file_path)
 
+            fparam_avg = np.array([ii.compute_avg() for ii in self.stats["fparam"]])
+            fparam_std = np.array([ii.compute_std(protection=protection) for ii in self.stats["fparam"]])
+            fparam_inv_std = 1.0 / fparam_std
             log.info(f"fparam_avg is {fparam_avg}, fparam_inv_std is {fparam_inv_std}")
             self.fparam_avg.copy_(to_torch_tensor(fparam_avg))
             self.fparam_inv_std.copy_(to_torch_tensor(fparam_inv_std))
 
         # stat aparam
         if self.numb_aparam > 0:
-            aparam_avg, aparam_inv_std = _restore_aparam_from_file(stat_file_path)
-            if aparam_avg is None:
+            if stat_file_path is not None and stat_file_path.is_dir():
+                self.restore_aparam_from_file(stat_file_path)
+            else:
                 sampled = merged() if callable(merged) else merged
+                self.stats["aparam"] = []
                 sys_sumv = []
                 sys_sumv2 = []
                 sys_sumn = []
@@ -186,20 +287,31 @@ class Fitting(torch.nn.Module, BaseFitting):
                 sumv = np.sum(np.stack(sys_sumv), axis=0)
                 sumv2 = np.sum(np.stack(sys_sumv2), axis=0)
                 sumn = sum(sys_sumn)
-                aparam_avg = sumv / sumn
-                aparam_std = np.sqrt(sumv2 / sumn - (sumv / sumn) ** 2)
-                aparam_std = np.where(
-                    aparam_std < protection,
-                    protection,
-                    aparam_std,
-                )
-                aparam_inv_std = 1.0 / aparam_std
+                for ii in range(self.numb_aparam):
+                    self.stats["aparam"].append(
+                        StatItem(
+                            number=sumn,
+                            sum=sumv[ii],
+                            squared_sum=sumv2[ii],
+                        )
+                    )
                 if stat_file_path is not None:
-                    _save_to_file_aparam(stat_file_path, aparam_avg, aparam_inv_std)
+                    self.save_to_file_aparam(stat_file_path)
 
+            aparam_avg = np.array([ii.compute_avg() for ii in self.stats["aparam"]])
+            aparam_std = np.array([ii.compute_std(protection=protection) for ii in self.stats["aparam"]])
+            aparam_inv_std = 1.0 / aparam_std
             log.info(f"aparam_avg is {aparam_avg}, aparam_inv_std is {aparam_inv_std}")
             self.aparam_avg.copy_(to_torch_tensor(aparam_avg))
             self.aparam_inv_std.copy_(to_torch_tensor(aparam_inv_std))
+
+    def get_stats(self) -> dict[str, List[StatItem]]:
+        """Get the statistics of the fitting_net."""
+        if self.stats is None:
+            raise RuntimeError(
+                "The statistics of fitting net has not been computed."
+            )
+        return self.stats
 
 
 class GeneralFitting(Fitting):
