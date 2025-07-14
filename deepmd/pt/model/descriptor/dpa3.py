@@ -484,6 +484,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         """
         # cast the input to internal precsion
         extended_coord = extended_coord.to(dtype=self.prec)
+        extended_partial_charge = extended_partial_charge.to(dtype=self.prec)
         nframes, nloc, nnei = nlist.shape
         nall = extended_coord.view(nframes, -1).shape[1] // 3
 

@@ -20,6 +20,15 @@ from deepmd.utils.data import (
 )
 
 
+def custom_huber_loss(predictions, targets, delta=1.0):
+    error = targets - predictions
+    abs_error = torch.abs(error)
+    quadratic_loss = 0.5 * torch.pow(error, 2)
+    linear_loss = delta * (abs_error - 0.5 * delta)
+    loss = torch.where(abs_error <= delta, quadratic_loss, linear_loss)
+    return torch.mean(loss)
+
+
 class EnergyStdBindLoss(TaskLoss):
     def __init__(
         self,
@@ -43,6 +52,8 @@ class EnergyStdBindLoss(TaskLoss):
         numb_generalized_coord: int = 0,
         use_l1_all: bool = False,
         inference=False,
+        use_huber=False,
+        huber_delta=0.01,
         **kwargs,
     ):
         r"""Construct a layer to compute loss on energy, force and virial.
@@ -123,6 +134,8 @@ class EnergyStdBindLoss(TaskLoss):
             )
         self.use_l1_all = use_l1_all
         self.inference = inference
+        self.use_huber = use_huber
+        self.huber_delta = huber_delta
 
     def forward(self, input_dict, model, label, natoms, learning_rate, mae=False):
         """Return loss on energy and force.
@@ -194,7 +207,15 @@ class EnergyStdBindLoss(TaskLoss):
                         more_loss["l2_ener_loss"] = self.display_if_exist(
                             l2_ener_loss.detach(), find_energy
                         )
-                    loss += atom_norm * (pref_e * l2_ener_loss)
+                    if not self.use_huber:
+                        loss += atom_norm * (pref_e * l2_ener_loss)
+                    else:
+                        l_huber_loss = custom_huber_loss(
+                            atom_norm * model_pred["energy"],
+                            atom_norm * label_["energy"],
+                            delta=self.huber_delta,
+                        )
+                        loss += pref_e * l_huber_loss
                     rmse_e = l2_ener_loss.sqrt() * atom_norm
                     more_loss["rmse_e"] = self.display_if_exist(
                         rmse_e.detach(), find_energy
@@ -253,7 +274,17 @@ class EnergyStdBindLoss(TaskLoss):
                             more_loss["l2_force_loss"] = self.display_if_exist(
                                 l2_force_loss.detach(), find_force
                             )
-                        loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                        if not self.use_huber:
+                            loss += (pref_f * l2_force_loss).to(
+                                GLOBAL_PT_FLOAT_PRECISION
+                            )
+                        else:
+                            l_huber_loss = custom_huber_loss(
+                                force_pred.reshape(-1),
+                                force_label.reshape(-1),
+                                delta=self.huber_delta,
+                            )
+                            loss += pref_f * l_huber_loss
                         rmse_f = l2_force_loss.sqrt()
                         more_loss["rmse_f"] = self.display_if_exist(
                             rmse_f.detach(), find_force
@@ -327,7 +358,15 @@ class EnergyStdBindLoss(TaskLoss):
                     more_loss["l2_virial_loss"] = self.display_if_exist(
                         l2_virial_loss.detach(), find_virial
                     )
-                loss += atom_norm * (pref_v * l2_virial_loss)
+                if not self.use_huber:
+                    loss += atom_norm * (pref_v * l2_virial_loss)
+                else:
+                    l_huber_loss = custom_huber_loss(
+                        atom_norm * model_pred["virial"].reshape(-1),
+                        atom_norm * label_["virial"].reshape(-1),
+                        delta=self.huber_delta,
+                    )
+                    loss += pref_v * l_huber_loss
                 rmse_v = l2_virial_loss.sqrt() * atom_norm
                 more_loss["rmse_v"] = self.display_if_exist(
                     rmse_v.detach(), find_virial
@@ -352,7 +391,15 @@ class EnergyStdBindLoss(TaskLoss):
                     more_loss["l2_atom_ener_loss"] = self.display_if_exist(
                         l2_atom_ener_loss.detach(), find_atom_ener
                     )
-                loss += (pref_ae * l2_atom_ener_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                if not self.use_huber:
+                    loss += (pref_ae * l2_atom_ener_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                else:
+                    l_huber_loss = custom_huber_loss(
+                        atom_ener_reshape,
+                        atom_ener_label_reshape,
+                        delta=self.huber_delta,
+                    )
+                    loss += pref_ae * l_huber_loss
                 rmse_ae = l2_atom_ener_loss.sqrt()
                 more_loss["rmse_ae"] = self.display_if_exist(
                     rmse_ae.detach(), find_atom_ener
@@ -401,7 +448,15 @@ class EnergyStdBindLoss(TaskLoss):
                 more_loss_dict["l2_bind_loss"] = self.display_if_exist(
                     l2_bind_loss.detach(), find_bind
                 )
-            loss_all += atom_norm * (pref_bind * l2_bind_loss)
+            if not self.use_huber:
+                loss_all += atom_norm * (pref_bind * l2_bind_loss)
+            else:
+                l_huber_loss = custom_huber_loss(
+                    atom_norm * bind_pred,
+                    atom_norm * bind_label,
+                    delta=self.huber_delta,
+                )
+                loss_all += pref_bind * l_huber_loss
             rmse_e = l2_bind_loss.sqrt() * atom_norm
             more_loss_dict["rmse_e_bind"] = self.display_if_exist(
                 rmse_e.detach(), find_bind
