@@ -2220,6 +2220,18 @@ def fitting_ener_readout():
             optional=True,
             default=False,
         ),
+        Argument(
+            "edge_extra_fact",
+            float,
+            optional=True,
+            default=1.0,
+        ),
+        Argument(
+            "angle_extra_fact",
+            float,
+            optional=True,
+            default=1.0,
+        ),
     ]
 
 

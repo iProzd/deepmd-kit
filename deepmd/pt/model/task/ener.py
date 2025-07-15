@@ -536,6 +536,8 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         add_angle_readout: bool = False,
         slim_edge_readout: bool = False,
         slim_angle_readout: bool = False,
+        edge_extra_fact: float = 1.0,
+        angle_extra_fact: float = 1.0,
         **kwargs,
     ) -> None:
         """Construct a fitting net for energy.
@@ -549,6 +551,8 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
         """
         self.add_edge_readout = add_edge_readout
         self.add_angle_readout = add_angle_readout
+        self.edge_extra_fact = edge_extra_fact
+        self.angle_extra_fact = angle_extra_fact
         super().__init__(
             "energy",
             ntypes,
@@ -714,7 +718,7 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
                 # nf x nloc x 1
                 edge_energy = torch.sum(edge_atomic_contrib, dim=-2)
             # energy
-            out = out + edge_energy / self.norm_e_fact
+            out = out + (edge_energy * self.edge_extra_fact) / self.norm_e_fact
 
         if self.add_angle_readout:
             assert angle_embd is not None
@@ -747,5 +751,5 @@ class EnergyFittingNetEdgeReadout(InvarFitting):
                 )
             # energy
             # self.norm_a_fact ** 2
-            out = out + angle_energy / (self.norm_a_fact**2)
+            out = out + (angle_energy * self.angle_extra_fact) / (self.norm_a_fact**2)
         return {self.var_name: out.to(env.GLOBAL_PT_FLOAT_PRECISION)}
