@@ -155,6 +155,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_rk_update: bool = False,
         rk_order: int = 4,
         rk_update_diff_layer: bool = False,
+        angle_use_node: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
@@ -367,6 +368,12 @@ class DescrptBlockRepflows(DescriptorBlock):
 
         self.node_use_rmsnorm = node_use_rmsnorm
 
+        self.angle_use_node = angle_use_node
+        if not self.angle_use_node:
+            assert (
+                not self.optim_update
+            ), "optim_update must be False when angle_use_node is False"
+
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
             self.target_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -490,6 +497,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_gated_mlp=self.use_gated_mlp,
                     gated_mlp_norm=self.gated_mlp_norm,
                     node_use_rmsnorm=self.node_use_rmsnorm,
+                    angle_use_node=self.angle_use_node,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

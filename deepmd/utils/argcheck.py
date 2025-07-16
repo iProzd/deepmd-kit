@@ -1857,6 +1857,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "angle_use_node",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 

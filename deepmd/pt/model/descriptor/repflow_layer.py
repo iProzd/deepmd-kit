@@ -88,6 +88,7 @@ class RepFlowLayer(torch.nn.Module):
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
         node_use_rmsnorm: bool = False,
+        angle_use_node: bool = True,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -183,6 +184,8 @@ class RepFlowLayer(torch.nn.Module):
             self.node_rmsnorm = RMSNorm(self.n_dim, precision=precision, trainable=True)
         else:
             self.node_rmsnorm = None
+
+        self.angle_use_node = angle_use_node
 
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             self.rbf_mlp = MLPLayer(
@@ -380,16 +383,22 @@ class RepFlowLayer(torch.nn.Module):
             self.angle_dim = self.a_dim
             if self.a_compress_rate == 0:
                 # angle + node + edge * 2
-                self.angle_dim += self.n_dim + 2 * self.e_dim
+                self.angle_dim += (
+                    self.n_dim + 2 * self.e_dim
+                    if self.angle_use_node
+                    else 2 * self.e_dim
+                )
                 self.a_compress_n_linear = None
                 self.a_compress_e_linear = None
                 self.e_a_compress_dim = e_dim
                 self.n_a_compress_dim = n_dim
             else:
                 # angle + a_dim/c + a_dim/2c * 2 * e_rate
-                self.angle_dim += (1 + self.a_compress_e_rate) * (
-                    self.a_dim // self.a_compress_rate
-                )
+                self.angle_dim += (
+                    (1 + self.a_compress_e_rate)
+                    if self.angle_use_node
+                    else self.a_compress_e_rate
+                ) * (self.a_dim // self.a_compress_rate)
                 self.e_a_compress_dim = (
                     self.a_dim // (2 * self.a_compress_rate) * self.a_compress_e_rate
                 )
@@ -1383,20 +1392,6 @@ class RepFlowLayer(torch.nn.Module):
                     a_nlist_mask.unsqueeze(-1), edge_ebd_for_angle, 0.0
                 )
             if not self.optim_update:
-                # nb x nloc x a_nnei x a_nnei x n_dim [OR] n_angle x n_dim
-                node_for_angle_info = (
-                    torch.tile(
-                        node_ebd_for_angle.unsqueeze(2).unsqueeze(2),
-                        (1, 1, self.a_sel, self.a_sel, 1),
-                    )
-                    if not self.use_dynamic_sel
-                    else torch.index_select(
-                        node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
-                        0,
-                        n2a_index,
-                    )
-                )
-
                 # nb x nloc x (a_nnei) x a_nnei x e_dim [OR] n_angle x e_dim
                 edge_for_angle_k = (
                     torch.tile(
@@ -1418,7 +1413,21 @@ class RepFlowLayer(torch.nn.Module):
                     [edge_for_angle_k, edge_for_angle_j], dim=-1
                 )
                 angle_info_list = [angle_ebd]
-                angle_info_list.append(node_for_angle_info)
+                if self.angle_use_node:
+                    # nb x nloc x a_nnei x a_nnei x n_dim [OR] n_angle x n_dim
+                    node_for_angle_info = (
+                        torch.tile(
+                            node_ebd_for_angle.unsqueeze(2).unsqueeze(2),
+                            (1, 1, self.a_sel, self.a_sel, 1),
+                        )
+                        if not self.use_dynamic_sel
+                        else torch.index_select(
+                            node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
+                            0,
+                            n2a_index,
+                        )
+                    )
+                    angle_info_list.append(node_for_angle_info)
                 angle_info_list.append(edge_for_angle_info)
                 # nb x nloc x a_nnei x a_nnei x (a + n_dim + e_dim*2) or (a + a/c + a/c)
                 # [OR]

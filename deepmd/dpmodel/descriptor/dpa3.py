@@ -74,6 +74,7 @@ class RepFlowArgs:
         use_rk_update: bool = False,
         rk_order: int = 4,
         rk_update_diff_layer: bool = False,
+        angle_use_node: bool = True,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -197,6 +198,7 @@ class RepFlowArgs:
         self.use_rk_update = use_rk_update
         self.rk_order = rk_order
         self.rk_update_diff_layer = rk_update_diff_layer
+        self.angle_use_node = angle_use_node
 
     def __getitem__(self, key):
         if hasattr(self, key):
