@@ -1822,6 +1822,12 @@ def dpa3_repflow_args():
             default="none",
         ),
         Argument(
+            "only_angle_gated_mlp",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "use_res_gnn",
             bool,
             optional=True,

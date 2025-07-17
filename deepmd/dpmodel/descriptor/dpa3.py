@@ -68,6 +68,7 @@ class RepFlowArgs:
         force_embedding_on_edge: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        only_angle_gated_mlp: bool = False,
         use_res_gnn: bool = False,
         res_gnn_layer: int = 6,
         node_use_rmsnorm: bool = False,
@@ -199,6 +200,7 @@ class RepFlowArgs:
         self.rk_order = rk_order
         self.rk_update_diff_layer = rk_update_diff_layer
         self.angle_use_node = angle_use_node
+        self.only_angle_gated_mlp = only_angle_gated_mlp
 
     def __getitem__(self, key):
         if hasattr(self, key):

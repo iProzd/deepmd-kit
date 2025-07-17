@@ -148,6 +148,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         force_embedding_on_edge: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        only_angle_gated_mlp: bool = False,
         use_res_gnn: bool = False,
         res_gnn_layer: int = 6,
         node_use_rmsnorm: bool = False,
@@ -356,6 +357,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             assert self.rk_order == 4, "rk_order must be 4 for now"
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
+        self.only_angle_gated_mlp = only_angle_gated_mlp
         self.use_res_gnn = use_res_gnn
         self.res_gnn_layer = res_gnn_layer
         if self.use_res_gnn:
@@ -496,6 +498,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_slim_message=self.use_slim_message,
                     use_gated_mlp=self.use_gated_mlp,
                     gated_mlp_norm=self.gated_mlp_norm,
+                    only_angle_gated_mlp=self.only_angle_gated_mlp,
                     node_use_rmsnorm=self.node_use_rmsnorm,
                     angle_use_node=self.angle_use_node,
                     seed=child_seed(child_seed(seed, 1), ii),

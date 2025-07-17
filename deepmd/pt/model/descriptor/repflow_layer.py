@@ -87,6 +87,7 @@ class RepFlowLayer(torch.nn.Module):
         use_slim_message: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        only_angle_gated_mlp: bool = False,
         node_use_rmsnorm: bool = False,
         angle_use_node: bool = True,
         activation_function: str = "silu",
@@ -177,6 +178,7 @@ class RepFlowLayer(torch.nn.Module):
 
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
+        self.only_angle_gated_mlp = only_angle_gated_mlp
         if self.use_gated_mlp:
             assert not self.optim_update, "Gated MLP does not support optim update!"
         self.node_use_rmsnorm = node_use_rmsnorm
@@ -265,7 +267,7 @@ class RepFlowLayer(torch.nn.Module):
             residual_idx += 1
 
         # node edge message
-        if not self.use_gated_mlp:
+        if not self.use_gated_mlp or self.only_angle_gated_mlp:
             self.node_edge_linear = MLPLayer(
                 self.edge_info_dim
                 if not self.use_ffn_node_edge_message
@@ -309,7 +311,7 @@ class RepFlowLayer(torch.nn.Module):
                 residual_idx += 1
 
         # edge self message
-        if not self.use_gated_mlp:
+        if not self.use_gated_mlp or self.only_angle_gated_mlp:
             self.edge_self_linear = MLPLayer(
                 self.edge_info_dim
                 if not self.use_ffn_edge_edge_message
@@ -1248,7 +1250,7 @@ class RepFlowLayer(torch.nn.Module):
         if not self.optim_update:
             assert edge_info is not None
             if not self.use_ffn_node_edge_message:
-                if not self.use_gated_mlp:
+                if not self.use_gated_mlp or self.only_angle_gated_mlp:
                     node_edge_update = self.act(
                         self.node_edge_linear(edge_info)
                     ) * sw.unsqueeze(-1)
@@ -1320,7 +1322,7 @@ class RepFlowLayer(torch.nn.Module):
         if not self.optim_update:
             assert edge_info is not None
             if not self.use_ffn_edge_edge_message:
-                if not self.use_gated_mlp:
+                if not self.use_gated_mlp or self.only_angle_gated_mlp:
                     edge_self_update = self.act(self.edge_self_linear(edge_info))
                 else:
                     edge_self_update = self.edge_self_linear(edge_info)
