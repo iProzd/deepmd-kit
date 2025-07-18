@@ -62,9 +62,12 @@ class DPAtomicModel(BaseAtomicModel):
         self.fitting_net = fitting
         super().init_out_stat()
         self.enable_eval_descriptor_hook = False
+        self.enable_eval_fitting_last_layer_hook = False
         self.eval_descriptor_list = []
+        self.eval_fitting_last_layer_list = []
 
     eval_descriptor_list: list[torch.Tensor]
+    eval_fitting_last_layer_list: list[torch.Tensor]
 
     def set_eval_descriptor_hook(self, enable: bool) -> None:
         """Set the hook for evaluating descriptor and clear the cache for descriptor list."""
@@ -74,6 +77,17 @@ class DPAtomicModel(BaseAtomicModel):
     def eval_descriptor(self) -> torch.Tensor:
         """Evaluate the descriptor."""
         return torch.concat(self.eval_descriptor_list)
+
+    def set_eval_fitting_last_layer_hook(self, enable: bool) -> None:
+        """Set the hook for evaluating fitting last layer output and clear the cache for fitting last layer output list."""
+        self.enable_eval_fitting_last_layer_hook = enable
+        self.fitting_net.set_return_middle_output(enable)
+        # = [] does not work; See #4533
+        self.eval_fitting_last_layer_list.clear()
+
+    def eval_fitting_last_layer(self) -> torch.Tensor:
+        """Evaluate the fitting last layer output."""
+        return torch.concat(self.eval_fitting_last_layer_list)
 
     @torch.jit.export
     def fitting_output_def(self) -> FittingOutputDef:
@@ -285,6 +299,13 @@ class DPAtomicModel(BaseAtomicModel):
                 angle_embd=add_input.get("angle_embd", None),
                 angle_index=add_input.get("angle_index", None),
                 a_sw=add_input.get("a_sw", None),
+            )
+        if self.enable_eval_fitting_last_layer_hook:
+            assert (
+                "middle_output" in fit_ret
+            ), "eval_fitting_last_layer not supported for this fitting net!"
+            self.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
             )
         return fit_ret
 
