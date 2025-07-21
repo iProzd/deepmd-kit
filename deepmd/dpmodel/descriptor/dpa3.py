@@ -27,6 +27,7 @@ class RepFlowArgs:
         update_residual: float = 0.1,
         update_residual_init: str = "const",
         skip_stat: bool = False,
+        fix_stat_std: float = 0.3,
         optim_update: bool = True,
         smooth_angle_init: bool = False,
         angle_init_use_sin: bool = False,
@@ -201,6 +202,9 @@ class RepFlowArgs:
         self.rk_update_diff_layer = rk_update_diff_layer
         self.angle_use_node = angle_use_node
         self.only_angle_gated_mlp = only_angle_gated_mlp
+        assert (
+            fix_stat_std == 0.3
+        ), "fix_stat_std is not implemented in this version, please use skip_stat instead."
 
     def __getitem__(self, key):
         if hasattr(self, key):
