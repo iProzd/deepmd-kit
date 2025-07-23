@@ -77,6 +77,8 @@ class RepFlowArgs:
         rk_order: int = 4,
         rk_update_diff_layer: bool = False,
         angle_use_node: bool = True,
+        angle_self_attention: bool = False,
+        angle_self_attention_gate: str = "none",
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -202,6 +204,8 @@ class RepFlowArgs:
         self.rk_update_diff_layer = rk_update_diff_layer
         self.angle_use_node = angle_use_node
         self.only_angle_gated_mlp = only_angle_gated_mlp
+        self.angle_self_attention = angle_self_attention
+        self.angle_self_attention_gate = angle_self_attention_gate
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."

@@ -214,6 +214,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             rk_update_diff_layer=self.repflow_args.rk_update_diff_layer,
             angle_use_node=self.repflow_args.angle_use_node,
             use_loc_mapping=use_loc_mapping,
+            angle_self_attention=self.repflow_args.angle_self_attention,
+            angle_self_attention_gate=self.repflow_args.angle_self_attention_gate,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

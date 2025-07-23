@@ -158,6 +158,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         rk_update_diff_layer: bool = False,
         angle_use_node: bool = True,
         optim_update: bool = True,
+        angle_self_attention: bool = False,
+        angle_self_attention_gate: str = "none",
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -391,6 +393,18 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             self.env = None
 
+        self.angle_self_attention = angle_self_attention
+        self.angle_self_attention_gate = angle_self_attention_gate
+        if self.angle_self_attention:
+            assert (
+                not self.use_dynamic_sel
+            ), "angle_self_attention does not support dynamic selection so far"
+            assert self.angle_self_attention_gate in [
+                "none",
+                "edge",
+                "edge_feat",
+            ], "angle_self_attention_gate must be 'none', 'edge' or 'edge_feat'"
+
         self.activation_function = activation_function
         self.update_style = update_style
         self.update_residual = update_residual
@@ -501,6 +515,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     only_angle_gated_mlp=self.only_angle_gated_mlp,
                     node_use_rmsnorm=self.node_use_rmsnorm,
                     angle_use_node=self.angle_use_node,
+                    angle_self_attention=self.angle_self_attention,
+                    angle_self_attention_gate=self.angle_self_attention_gate,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

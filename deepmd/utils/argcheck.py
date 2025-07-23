@@ -1869,6 +1869,18 @@ def dpa3_repflow_args():
             optional=True,
             default=True,
         ),
+        Argument(
+            "angle_self_attention",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "angle_self_attention_gate",
+            str,
+            optional=True,
+            default="none",
+        ),
     ]
 
 

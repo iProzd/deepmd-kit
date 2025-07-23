@@ -90,6 +90,8 @@ class RepFlowLayer(torch.nn.Module):
         only_angle_gated_mlp: bool = False,
         node_use_rmsnorm: bool = False,
         angle_use_node: bool = True,
+        angle_self_attention: bool = False,
+        angle_self_attention_gate: str = "none",
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -188,6 +190,8 @@ class RepFlowLayer(torch.nn.Module):
             self.node_rmsnorm = None
 
         self.angle_use_node = angle_use_node
+        self.angle_self_attention = angle_self_attention
+        self.angle_self_attention_gate = angle_self_attention_gate
 
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             self.rbf_mlp = MLPLayer(
@@ -500,6 +504,23 @@ class RepFlowLayer(torch.nn.Module):
                         seed=child_seed(seed, 14),
                     )
                 )
+
+            if self.angle_self_attention:
+                self.angle_attention_mlp_in = MLPLayer(
+                    self.a_dim,
+                    self.a_dim * 3,  # query, key, value
+                    precision=precision,
+                    seed=child_seed(seed, 21),
+                )
+                self.angle_attention_mlp_out = MLPLayer(
+                    self.a_dim,
+                    self.a_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 22),
+                )
+            else:
+                self.angle_attention_mlp_in = None
+                self.angle_attention_mlp_out = None
 
             if self.update_dihedral:
                 self.dihedral_dim = self.d_dim + 2 * self.a_dim
@@ -1580,6 +1601,63 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
             a_update_list.append(angle_self_update)
+
+            if self.angle_self_attention:
+                # add a self-attention mechanism for angle_ebd with shape [nb x nloc x a_nnei x a_nnei x a_dim], on the last two dimensions
+                assert self.angle_attention_mlp_in is not None
+                assert self.angle_attention_mlp_out is not None
+                # nb x nloc x a_nnei x a_nnei x (3 * a_dim)
+                attention_output = self.angle_attention_mlp_in(angle_ebd)
+                # nb x nloc x a_nnei x a_nnei x a_dim
+                query, key, value = torch.chunk(
+                    attention_output, 3, dim=-1
+                )  # Split into query, key, value
+                # nb x nloc x a_nnei x a_nnei x a_nnei
+                attention_scores = torch.matmul(query, key.transpose(-2, -1)) / (
+                    query.size(-1) ** 0.5
+                )  # Scaled dot-product attention
+                # smooth
+                attention_scores = (attention_scores + 20.0) * a_sw[
+                    :, :, None, :, None
+                ] * a_sw[:, :, None, None, :] - 20.0
+                # nb x nloc x a_nnei x a_nnei x a_nnei
+                attention_weights = torch.softmax(
+                    attention_scores, dim=-1
+                )  # Normalize scores
+                # smooth
+                attention_weights = (
+                    attention_weights
+                    * a_sw[:, :, None, :, None]
+                    * a_sw[:, :, None, None, :]
+                )
+                # optional gates
+                if self.angle_self_attention_gate == "edge":
+                    # nb x nloc x a_nnei x 3
+                    h2_angle = h2[..., : self.a_sel, :]
+                    # normalize
+                    h2_angle = h2_angle / torch.linalg.norm(
+                        h2_angle, dim=-1, keepdim=True
+                    )
+                    # nb x nloc x a_nnei x 3
+                    h2_angle = torch.where(
+                        a_nlist_mask.unsqueeze(-1).expand([-1, -1, -1, 3]),
+                        h2_angle,
+                        0.0,
+                    )
+                    # nb x nloc x a_nnei x a_nnei
+                    h2h2t = torch.matmul(h2_angle, torch.transpose(h2_angle, -1, -2))
+                    # nb x nloc x a_nnei x a_nnei x a_nnei
+                    attention_weights = attention_weights * h2h2t[:, :, None, :, :]
+
+                # nb x nloc x a_nnei x a_nnei x a_dim
+                angle_ebd_attended = torch.matmul(
+                    attention_weights, value
+                )  # Apply attention weights to value
+                # nb x nloc x a_nnei x a_nnei x a_dim
+                angle_attention_updated = self.act(
+                    self.angle_attention_mlp_out(angle_ebd_attended)
+                )  # Apply attention output layer
+                a_update_list.append(angle_attention_updated)
 
             # dihedral update with fixed sel
             if self.update_dihedral and not self.use_dynamic_sel:
