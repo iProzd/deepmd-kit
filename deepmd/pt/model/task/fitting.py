@@ -62,7 +62,7 @@ class Fitting(torch.nn.Module, BaseFitting):
             return BaseFitting.__new__(BaseFitting, *args, **kwargs)
         return super().__new__(cls)
 
-    def share_params(self, base_class, shared_level, resume=False) -> None:
+    def share_params(self, base_class, shared_level, model_prob=1.0, resume=False) -> None:
         """
         Share the parameters of self to the base_class with shared_level during multitask training.
         If not start from checkpoint (resume is False),
@@ -74,13 +74,12 @@ class Fitting(torch.nn.Module, BaseFitting):
         if shared_level == 0:
             # only not share the bias_atom_e and the case_embd
             # link fparam buffers
-            if hasattr(self, "fparam_avg"):
-                assert self.numb_fparam > 0
+            if self.numb_fparam > 0:
                 if not resume:
                     base_fparam = base_class.stats["fparam"]
                     assert len(base_fparam) == self.numb_fparam
                     for ii in range(self.numb_fparam):
-                        base_fparam[ii] += self.get_stats()["fparam"][ii]
+                        base_fparam[ii] += self.get_stats()["fparam"][ii] * model_prob
                     fparam_avg = np.array([ii.compute_avg() for ii in base_fparam])
                     fparam_std = np.array([ii.compute_std() for ii in base_fparam])
                     fparam_inv_std = 1.0 / fparam_std
@@ -98,13 +97,12 @@ class Fitting(torch.nn.Module, BaseFitting):
                 self.fparam_inv_std = base_class.fparam_inv_std
 
             # link aparam buffers
-            if hasattr(self, "aparam_avg"):
-                assert self.numb_aparam > 0
+            if self.numb_aparam > 0:
                 if not resume:
                     base_aparam = base_class.stats["aparam"]
                     assert len(base_aparam) == self.numb_aparam
                     for ii in range(self.numb_aparam):
-                        base_aparam[ii] += self.get_stats()["aparam"][ii]
+                        base_aparam[ii] += self.get_stats()["aparam"][ii] * model_prob
                     aparam_avg = np.array([ii.compute_avg() for ii in base_aparam])
                     aparam_std = np.array([ii.compute_std() for ii in base_aparam])
                     aparam_inv_std = 1.0 / aparam_std
