@@ -6,6 +6,7 @@ from typing import (
 )
 
 import torch
+import numpy as np
 
 from deepmd.dpmodel import (
     FittingOutputDef,
@@ -310,6 +311,9 @@ class DPAtomicModel(BaseAtomicModel):
 
     def has_default_fparam(self) -> bool:
         return self.fitting_net.has_default_fparam()
+
+    def get_default_fparam(self) -> Optional[np.array]:
+        return self.fitting_net.get_default_fparam()
 
     def get_dim_aparam(self) -> int:
         """Get the number (dimension) of atomic parameters of this atomic model."""

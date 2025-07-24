@@ -1204,12 +1204,14 @@ class Trainer:
 def get_additional_data_requirement(_model):
     additional_data_requirement = []
     if _model.get_dim_fparam() > 0:
+        _fparam_default = _model.get_default_fparam() if _model.has_default_fparam() else 0.0
         fparam_requirement_items = [
             DataRequirementItem(
                 "fparam",
                 _model.get_dim_fparam(),
                 atomic=False,
                 must=not _model.has_default_fparam(),
+                default=_fparam_default,
             )
         ]
         additional_data_requirement += fparam_requirement_items
