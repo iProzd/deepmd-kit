@@ -62,7 +62,7 @@ class Fitting(torch.nn.Module, BaseFitting):
             return BaseFitting.__new__(BaseFitting, *args, **kwargs)
         return super().__new__(cls)
 
-    def share_params(self, base_class, shared_level, model_prob=1.0, resume=False) -> None:
+    def share_params(self, base_class, shared_level, model_prob=1.0, protection=1e-2, resume=False) -> None:
         """
         Share the parameters of self to the base_class with shared_level during multitask training.
         If not start from checkpoint (resume is False),
@@ -81,7 +81,7 @@ class Fitting(torch.nn.Module, BaseFitting):
                     for ii in range(self.numb_fparam):
                         base_fparam[ii] += self.get_stats()["fparam"][ii] * model_prob
                     fparam_avg = np.array([ii.compute_avg() for ii in base_fparam])
-                    fparam_std = np.array([ii.compute_std() for ii in base_fparam])
+                    fparam_std = np.array([ii.compute_std(protection=protection) for ii in base_fparam])
                     fparam_inv_std = 1.0 / fparam_std
                     base_class.fparam_avg.copy_(
                         torch.tensor(
@@ -104,7 +104,7 @@ class Fitting(torch.nn.Module, BaseFitting):
                     for ii in range(self.numb_aparam):
                         base_aparam[ii] += self.get_stats()["aparam"][ii] * model_prob
                     aparam_avg = np.array([ii.compute_avg() for ii in base_aparam])
-                    aparam_std = np.array([ii.compute_std() for ii in base_aparam])
+                    aparam_std = np.array([ii.compute_std(protection=protection) for ii in base_aparam])
                     aparam_inv_std = 1.0 / aparam_std
                     base_class.aparam_avg.copy_(
                         torch.tensor(

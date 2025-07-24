@@ -600,10 +600,13 @@ class Trainer:
 
         # Multi-task share params
         if shared_links is not None:
+            _data_stat_protect = np.array([model_params["model_dict"][ii].get("data_stat_protect", 1e-2) for ii in model_params["model_dict"]])
+            assert np.allclose(_data_stat_protect, _data_stat_protect[0]), f"Model key 'data_stat_protect' must be the same in each branch when multitask!"
             self.wrapper.share_params(
                 shared_links,
                 resume=(resuming and not self.finetune_update_stat) or self.rank != 0,
-                model_key_prob_map = dict(zip(self.model_keys, self.model_prob))
+                model_key_prob_map = dict(zip(self.model_keys, self.model_prob)),
+                data_stat_protect = _data_stat_protect[0]
             )
 
         if dist.is_available() and dist.is_initialized():
