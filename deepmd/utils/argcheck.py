@@ -1881,6 +1881,12 @@ def dpa3_repflow_args():
             optional=True,
             default="none",
         ),
+        Argument(
+            "rmsnorm_mode",
+            str,
+            optional=True,
+            default="none",
+        ),
     ]
 
 

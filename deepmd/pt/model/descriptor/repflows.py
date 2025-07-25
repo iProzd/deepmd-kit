@@ -160,6 +160,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         optim_update: bool = True,
         angle_self_attention: bool = False,
         angle_self_attention_gate: str = "none",
+        rmsnorm_mode: str = "none",
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -404,6 +405,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "edge",
                 "edge_feat",
             ], "angle_self_attention_gate must be 'none', 'edge' or 'edge_feat'"
+        self.rmsnorm_mode = rmsnorm_mode
 
         self.activation_function = activation_function
         self.update_style = update_style
@@ -517,6 +519,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     angle_use_node=self.angle_use_node,
                     angle_self_attention=self.angle_self_attention,
                     angle_self_attention_gate=self.angle_self_attention_gate,
+                    rmsnorm_mode=self.rmsnorm_mode,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )

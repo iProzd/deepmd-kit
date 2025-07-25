@@ -92,6 +92,7 @@ class RepFlowLayer(torch.nn.Module):
         angle_use_node: bool = True,
         angle_self_attention: bool = False,
         angle_self_attention_gate: str = "none",
+        rmsnorm_mode: str = "none",
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -188,6 +189,40 @@ class RepFlowLayer(torch.nn.Module):
             self.node_rmsnorm = RMSNorm(self.n_dim, precision=precision, trainable=True)
         else:
             self.node_rmsnorm = None
+
+        # add rms norm debug for each component, can be removed if not necessary
+        self.rmsnorm_mode = rmsnorm_mode
+        self.rmsnorm_mod_list = self.rmsnorm_mode.split(":")
+        # mode: ['NEM', 'ESM', 'EAM', 'ASM', 'E']
+        # node edge message
+        if "NEM" in self.rmsnorm_mod_list:
+            self.NEM_rmsnorm = RMSNorm(self.n_dim, precision=precision, trainable=True)
+        else:
+            self.NEM_rmsnorm = None
+
+        # edge self message
+        if "ESM" in self.rmsnorm_mod_list:
+            self.ESM_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
+        else:
+            self.ESM_rmsnorm = None
+
+        # edge angle message
+        if "EAM" in self.rmsnorm_mod_list:
+            self.EAM_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
+        else:
+            self.EAM_rmsnorm = None
+
+        # angle self message
+        if "ASM" in self.rmsnorm_mod_list:
+            self.ASM_rmsnorm = RMSNorm(self.a_dim, precision=precision, trainable=True)
+        else:
+            self.ASM_rmsnorm = None
+
+        # edge self
+        if "E" in self.rmsnorm_mod_list:
+            self.edge_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
+        else:
+            self.edge_rmsnorm = None
 
         self.angle_use_node = angle_use_node
         self.angle_self_attention = angle_self_attention
@@ -1320,6 +1355,10 @@ class RepFlowLayer(torch.nn.Module):
             )
         )
 
+        if "NEM" in self.rmsnorm_mod_list:
+            assert self.NEM_rmsnorm is not None
+            node_edge_update = self.NEM_rmsnorm(node_edge_update)
+
         if self.n_multi_edge_message > 1:
             # nb x nloc x h x n_dim
             node_edge_update_mul_head = node_edge_update.view(
@@ -1372,6 +1411,11 @@ class RepFlowLayer(torch.nn.Module):
         if self.edge_rbf_dot_message:
             assert edge_rbf is not None
             edge_self_update = edge_self_update * edge_rbf
+
+        if "ESM" in self.rmsnorm_mod_list:
+            assert self.ESM_rmsnorm is not None
+            edge_self_update = self.ESM_rmsnorm(edge_self_update)
+
         e_update_list.append(edge_self_update)
 
         # edge attention message
@@ -1561,11 +1605,15 @@ class RepFlowLayer(torch.nn.Module):
                 )
             if not self.use_slim_message:
                 assert self.edge_angle_linear2 is not None
-                e_update_list.append(
-                    self.act(self.edge_angle_linear2(padding_edge_angle_update))
+                padding_edge_angle_update = self.act(
+                    self.edge_angle_linear2(padding_edge_angle_update)
                 )
-            else:
-                e_update_list.append(padding_edge_angle_update)
+
+            if "EAM" in self.rmsnorm_mod_list:
+                assert self.EAM_rmsnorm is not None
+                padding_edge_angle_update = self.EAM_rmsnorm(padding_edge_angle_update)
+
+            e_update_list.append(padding_edge_angle_update)
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
 
@@ -1600,6 +1648,10 @@ class RepFlowLayer(torch.nn.Module):
                         "angle",
                     )
                 )
+            if "ASM" in self.rmsnorm_mod_list:
+                assert self.ASM_rmsnorm is not None
+                angle_self_update = self.ASM_rmsnorm(angle_self_update)
+
             a_update_list.append(angle_self_update)
 
             if self.angle_self_attention:
@@ -1828,6 +1880,10 @@ class RepFlowLayer(torch.nn.Module):
         if update_name == "node" and self.node_use_rmsnorm:
             assert self.node_rmsnorm is not None
             uu = self.node_rmsnorm(uu)
+
+        if update_name == "edge" and "E" in self.rmsnorm_mod_list:
+            assert self.edge_rmsnorm is not None
+            uu = self.edge_rmsnorm(uu)
         return uu
 
     @torch.jit.export

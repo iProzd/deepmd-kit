@@ -79,6 +79,7 @@ class RepFlowArgs:
         angle_use_node: bool = True,
         angle_self_attention: bool = False,
         angle_self_attention_gate: str = "none",
+        rmsnorm_mode: str = "none",
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -206,6 +207,7 @@ class RepFlowArgs:
         self.only_angle_gated_mlp = only_angle_gated_mlp
         self.angle_self_attention = angle_self_attention
         self.angle_self_attention_gate = angle_self_attention_gate
+        self.rmsnorm_mode = rmsnorm_mode
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."
