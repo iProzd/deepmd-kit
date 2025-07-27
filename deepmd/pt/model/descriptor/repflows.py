@@ -161,6 +161,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_self_attention: bool = False,
         angle_self_attention_gate: str = "none",
         rmsnorm_mode: str = "none",
+        edge_rbf_cat_message: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -314,6 +315,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.edge_use_esen_rbf = edge_use_esen_rbf
         self.edge_use_esen_atom_ebd = edge_use_esen_atom_ebd
         self.edge_use_esen_env = edge_use_esen_env
+        self.edge_rbf_cat_message = edge_rbf_cat_message
         if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
             assert self.edge_use_rbf or self.edge_use_concat_rbf, "rbf is not used"
         self.edge_embed_input_dim = 1
@@ -333,6 +335,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         elif self.edge_use_rbf:
             self.rbf = BesselBasis(self.e_rcut)
             self.edge_embed_input_dim = self.rbf.num_basis
+        elif self.edge_rbf_cat_message:
+            # edge can use dist itself
+            self.rbf = BesselBasis(self.e_rcut)
         else:
             self.rbf = None
 
@@ -378,6 +383,11 @@ class DescrptBlockRepflows(DescriptorBlock):
             assert (
                 not self.optim_update
             ), "optim_update must be False when angle_use_node is False"
+
+        if self.edge_rbf_cat_message:
+            assert (
+                not self.optim_update
+            ), "optim_update must be False when edge_rbf_cat_message is True"
 
         if self.edge_use_esen_atom_ebd:
             self.source_embedding = torch.nn.Embedding(self.ntypes, self.e_dim)
@@ -508,7 +518,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_attn_use_ln=self.edge_attn_use_ln,
                     edge_rbf_dot_self=self.edge_rbf_dot_self,
                     edge_rbf_dot_message=self.edge_rbf_dot_message,
-                    rbf_dim=self.edge_embed_input_dim,
+                    rbf_dim=self.edge_embed_input_dim
+                    if not self.edge_rbf_cat_message
+                    else self.rbf.num_basis,
                     residual_pref=self.residual_pref,
                     message_use_self_concat=self.message_use_self_concat,
                     use_slim_message=self.use_slim_message,
@@ -520,6 +532,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     angle_self_attention=self.angle_self_attention,
                     angle_self_attention_gate=self.angle_self_attention_gate,
                     rmsnorm_mode=self.rmsnorm_mode,
+                    edge_rbf_cat_message=self.edge_rbf_cat_message,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -934,7 +947,11 @@ class DescrptBlockRepflows(DescriptorBlock):
             edge_ebd = self.edge_embd(rbf_input)
         elif self.edge_use_dist:
             edge_ebd = self.edge_embd(edge_input)
-            rbf_ebd = None
+            if not self.edge_rbf_cat_message:
+                rbf_ebd = None
+            else:
+                assert self.rbf is not None
+                rbf_ebd = self.rbf(edge_input)
         elif self.edge_use_concat_rbf:
             assert self.rbf is not None
             rbf_ebd = torch.cat([dmatrix[..., :1], self.rbf(edge_input)], dim=-1)

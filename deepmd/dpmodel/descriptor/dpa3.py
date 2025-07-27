@@ -57,6 +57,7 @@ class RepFlowArgs:
         edge_attn_use_ln: bool = True,
         edge_rbf_dot_self: bool = False,
         edge_rbf_dot_message: bool = False,
+        edge_rbf_cat_message: bool = False,
         edge_use_esen_rbf: bool = False,
         edge_use_esen_atom_ebd: bool = False,
         edge_use_esen_env: bool = False,
@@ -208,6 +209,7 @@ class RepFlowArgs:
         self.angle_self_attention = angle_self_attention
         self.angle_self_attention_gate = angle_self_attention_gate
         self.rmsnorm_mode = rmsnorm_mode
+        self.edge_rbf_cat_message = edge_rbf_cat_message
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."

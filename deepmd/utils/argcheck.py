@@ -1750,6 +1750,12 @@ def dpa3_repflow_args():
             default=False,
         ),
         Argument(
+            "edge_rbf_cat_message",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "edge_use_esen_rbf",
             bool,
             optional=True,

@@ -217,6 +217,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             angle_self_attention=self.repflow_args.angle_self_attention,
             angle_self_attention_gate=self.repflow_args.angle_self_attention_gate,
             rmsnorm_mode=self.repflow_args.rmsnorm_mode,
+            edge_rbf_cat_message=self.repflow_args.edge_rbf_cat_message,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

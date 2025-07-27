@@ -93,6 +93,7 @@ class RepFlowLayer(torch.nn.Module):
         angle_self_attention: bool = False,
         angle_self_attention_gate: str = "none",
         rmsnorm_mode: str = "none",
+        edge_rbf_cat_message: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -168,6 +169,7 @@ class RepFlowLayer(torch.nn.Module):
         self.edge_attn_use_ln = edge_attn_use_ln
         self.edge_rbf_dot_self = edge_rbf_dot_self
         self.edge_rbf_dot_message = edge_rbf_dot_message
+        self.edge_rbf_cat_message = edge_rbf_cat_message
         self.rbf_dim = rbf_dim
         self.residual_pref = residual_pref
         self.residual_pref += [1.0] * 10
@@ -228,7 +230,11 @@ class RepFlowLayer(torch.nn.Module):
         self.angle_self_attention = angle_self_attention
         self.angle_self_attention_gate = angle_self_attention_gate
 
-        if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
+        if (
+            self.edge_rbf_dot_self
+            or self.edge_rbf_dot_message
+            or self.edge_rbf_cat_message
+        ):
             self.rbf_mlp = MLPLayer(
                 rbf_dim,
                 self.e_dim,
@@ -264,7 +270,11 @@ class RepFlowLayer(torch.nn.Module):
         self.e_residual = []
         self.a_residual = []
         self.d_residual = []
-        self.edge_info_dim = self.n_dim * 2 + self.e_dim
+        self.edge_info_dim = (
+            self.n_dim * 2 + self.e_dim
+            if not self.edge_rbf_cat_message
+            else self.n_dim * 2 + self.e_dim * 2
+        )
 
         # node self mlp
         self.node_self_mlp = MLPLayer(
@@ -1198,7 +1208,11 @@ class RepFlowLayer(torch.nn.Module):
         )
 
         # handle edge rbf
-        if self.edge_rbf_dot_self or self.edge_rbf_dot_message:
+        if (
+            self.edge_rbf_dot_self
+            or self.edge_rbf_dot_message
+            or self.edge_rbf_cat_message
+        ):
             assert rbf_ebd is not None
             assert self.rbf_mlp is not None
             edge_rbf = self.rbf_mlp(rbf_ebd)
@@ -1272,26 +1286,26 @@ class RepFlowLayer(torch.nn.Module):
         if not self.optim_update:
             if not self.use_dynamic_sel:
                 # nb x nloc x nnei x (n_dim * 2 + e_dim)
-                edge_info = torch.cat(
-                    [
-                        torch.tile(node_ebd.unsqueeze(-2), [1, 1, self.nnei, 1]),
-                        nei_node_ebd,
-                        edge_ebd,
-                    ],
-                    dim=-1,
-                )
+                edge_cat_list = [
+                    torch.tile(node_ebd.unsqueeze(-2), [1, 1, self.nnei, 1]),
+                    nei_node_ebd,
+                    edge_ebd,
+                ]
+                if self.edge_rbf_cat_message:
+                    assert edge_rbf is not None
+                    edge_cat_list += [edge_rbf]
+                edge_info = torch.cat(edge_cat_list, dim=-1)
             else:
                 # n_edge x (n_dim * 2 + e_dim)
-                edge_info = torch.cat(
-                    [
-                        torch.index_select(
-                            node_ebd.reshape(-1, self.n_dim), 0, n2e_index
-                        ),
-                        nei_node_ebd,
-                        edge_ebd,
-                    ],
-                    dim=-1,
-                )
+                edge_cat_list = [
+                    torch.index_select(node_ebd.reshape(-1, self.n_dim), 0, n2e_index),
+                    nei_node_ebd,
+                    edge_ebd,
+                ]
+                if self.edge_rbf_cat_message:
+                    assert edge_rbf is not None
+                    edge_cat_list += [edge_rbf]
+                edge_info = torch.cat(edge_cat_list, dim=-1)
             if self.use_ffn_node_edge_message or self.use_ffn_edge_edge_message:
                 assert self.edge_message_ffn1 is not None
                 edge_info_ffn = self.act(self.edge_message_ffn1(edge_info))
