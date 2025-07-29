@@ -94,6 +94,9 @@ class RepFlowLayer(torch.nn.Module):
         angle_self_attention_gate: str = "none",
         rmsnorm_mode: str = "none",
         edge_rbf_cat_message: bool = False,
+        edge_message_use_dropout: bool = False,
+        angle_message_use_dropout: bool = False,
+        dropout_rate: float = 0.1,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -225,6 +228,19 @@ class RepFlowLayer(torch.nn.Module):
             self.edge_rmsnorm = RMSNorm(self.e_dim, precision=precision, trainable=True)
         else:
             self.edge_rmsnorm = None
+
+        self.edge_message_use_dropout = edge_message_use_dropout
+        self.angle_message_use_dropout = angle_message_use_dropout
+        self.dropout_rate = dropout_rate
+        if self.edge_message_use_dropout:
+            self.edge_message_dropout = nn.Dropout(p=self.dropout_rate)
+        else:
+            self.edge_message_dropout = None
+
+        if self.angle_message_use_dropout:
+            self.angle_message_dropout = nn.Dropout(p=self.dropout_rate)
+        else:
+            self.angle_message_dropout = None
 
         self.angle_use_node = angle_use_node
         self.angle_self_attention = angle_self_attention
@@ -1315,6 +1331,12 @@ class RepFlowLayer(torch.nn.Module):
             edge_info = None
             edge_info_ffn = None
 
+        # edge message use dropout
+        if self.edge_message_use_dropout:
+            assert edge_info is not None
+            assert self.edge_message_dropout is not None
+            edge_info = self.edge_message_dropout(edge_info)
+
         # node edge message
         # nb x nloc x nnei x (h * n_dim)
         if not self.optim_update:
@@ -1522,6 +1544,12 @@ class RepFlowLayer(torch.nn.Module):
             else:
                 angle_info = None
                 angle_info_ffn = None
+
+            # angle message use dropout
+            if self.angle_message_use_dropout:
+                assert angle_info is not None
+                assert self.angle_message_dropout is not None
+                angle_info = self.angle_message_dropout(angle_info)
 
             # edge angle message
             # nb x nloc x a_nnei x a_nnei x e_dim [OR] n_angle x e_dim

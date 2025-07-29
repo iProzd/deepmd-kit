@@ -1893,6 +1893,24 @@ def dpa3_repflow_args():
             optional=True,
             default="none",
         ),
+        Argument(
+            "edge_message_use_dropout",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "angle_message_use_dropout",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "dropout_rate",
+            float,
+            optional=True,
+            default=0.1,
+        ),
     ]
 
 

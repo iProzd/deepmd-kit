@@ -81,6 +81,9 @@ class RepFlowArgs:
         angle_self_attention: bool = False,
         angle_self_attention_gate: str = "none",
         rmsnorm_mode: str = "none",
+        edge_message_use_dropout: bool = False,
+        angle_message_use_dropout: bool = False,
+        dropout_rate: float = 0.1,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -210,6 +213,9 @@ class RepFlowArgs:
         self.angle_self_attention_gate = angle_self_attention_gate
         self.rmsnorm_mode = rmsnorm_mode
         self.edge_rbf_cat_message = edge_rbf_cat_message
+        self.edge_message_use_dropout = edge_message_use_dropout
+        self.angle_message_use_dropout = angle_message_use_dropout
+        self.dropout_rate = dropout_rate
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."

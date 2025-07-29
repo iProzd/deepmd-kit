@@ -162,6 +162,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_self_attention_gate: str = "none",
         rmsnorm_mode: str = "none",
         edge_rbf_cat_message: bool = False,
+        edge_message_use_dropout: bool = False,
+        angle_message_use_dropout: bool = False,
+        dropout_rate: float = 0.1,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -416,6 +419,13 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "edge_feat",
             ], "angle_self_attention_gate must be 'none', 'edge' or 'edge_feat'"
         self.rmsnorm_mode = rmsnorm_mode
+        self.edge_message_use_dropout = edge_message_use_dropout
+        self.angle_message_use_dropout = angle_message_use_dropout
+        if self.edge_message_use_dropout or self.angle_message_use_dropout:
+            assert (
+                not self.optim_update
+            ), "optim_update must be False when using dropout"
+        self.dropout_rate = dropout_rate
 
         self.activation_function = activation_function
         self.update_style = update_style
@@ -533,6 +543,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     angle_self_attention_gate=self.angle_self_attention_gate,
                     rmsnorm_mode=self.rmsnorm_mode,
                     edge_rbf_cat_message=self.edge_rbf_cat_message,
+                    edge_message_use_dropout=self.edge_message_use_dropout,
+                    angle_message_use_dropout=self.angle_message_use_dropout,
+                    dropout_rate=self.dropout_rate,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
