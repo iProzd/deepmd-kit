@@ -3,7 +3,6 @@ from typing import (
     Optional,
 )
 
-import numpy as np
 import torch
 
 from deepmd.dpmodel import (
@@ -531,8 +530,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]):
         def has_default_fparam(self) -> bool:
             return self.atomic_model.has_default_fparam()
 
-        @torch.jit.export
-        def get_default_fparam(self) -> Optional[np.array]:
+        def get_default_fparam(self) -> Optional[torch.Tensor]:
             return self.atomic_model.get_default_fparam()
 
         @torch.jit.export
