@@ -117,6 +117,8 @@ class DeepEval(DeepEvalBackend):
                     head = model_keys[0]
                 if head is None and "Default" in model_keys:
                     head = "Default"
+                if head is None and "MP_traj_v024_alldata_mixu" in model_keys:
+                    head = "MP_traj_v024_alldata_mixu"
                 assert (
                     head is not None
                 ), f"Head must be set for multitask model! Available heads are: {model_keys}"
