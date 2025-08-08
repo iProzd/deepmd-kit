@@ -478,3 +478,86 @@ def xavier_normal_(
     std = gain * math.sqrt(2.0 / float(fan_in + fan_out))
 
     return _no_grad_normal_(tensor, 0.0, std, generator)
+
+
+def orthogonal_(
+    tensor,
+    gain=1,
+    generator: _Optional[torch.Generator] = None,
+):
+    r"""Fill the input `Tensor` with a (semi) orthogonal matrix.
+
+    Described in `Exact solutions to the nonlinear dynamics of learning in deep
+    linear neural networks` - Saxe, A. et al. (2013). The input tensor must have
+    at least 2 dimensions, and for tensors with more than 2 dimensions the
+    trailing dimensions are flattened.
+
+    Args:
+        tensor: an n-dimensional `torch.Tensor`, where :math:`n \geq 2`
+        gain: optional scaling factor
+        generator: the torch Generator to sample from (default: None)
+
+    Examples
+    --------
+        >>> # xdoctest: +REQUIRES(env:TORCH_DOCTEST_LAPACK)
+        >>> w = torch.empty(3, 5)
+        >>> nn.init.orthogonal_(w)
+    """
+    if tensor.ndimension() < 2:
+        raise ValueError("Only tensors with 2 or more dimensions are supported")
+
+    if tensor.numel() == 0:
+        # no-op
+        return tensor
+    rows = tensor.size(0)
+    cols = tensor.numel() // rows
+    flattened = tensor.new(rows, cols).normal_(0, 1, generator=generator)
+
+    if rows < cols:
+        flattened.t_()
+
+    # Compute the qr factorization
+    q, r = torch.linalg.qr(flattened)
+    # Make Q uniform according to https://arxiv.org/pdf/math-ph/0609050.pdf
+    d = torch.diag(r, 0)
+    ph = d.sign()
+    q *= ph
+
+    if rows < cols:
+        q.t_()
+
+    with torch.no_grad():
+        tensor.view_as(q).copy_(q)
+        tensor.mul_(gain)
+    return tensor
+
+
+def spectral_(
+    tensor,
+    target_sigma=1.0,
+    iters=10,
+    generator: _Optional[torch.Generator] = None,
+):
+    def power_iteration(weight, _iters=10):
+        W = weight.view(weight.size(0), -1)
+        u = torch.empty(W.size(0), dtype=W.dtype, device=W.device)
+        normal_(u, generator=generator)
+        v = torch.empty(W.size(0), dtype=W.dtype, device=W.device)
+        normal_(v, generator=generator)
+
+        u = u / (u.norm() + 1e-12)
+        v = v / (v.norm() + 1e-12)
+
+        for _ in range(_iters):
+            v = torch.mv(W.t(), u)
+            v = v / (v.norm() + 1e-12)
+            u = torch.mv(W, v)
+            u = u / (u.norm() + 1e-12)
+
+        _sigma = u @ (W @ v)
+        return _sigma.abs()
+
+    sigma = power_iteration(tensor, _iters=iters)
+    if sigma > 0:
+        with torch.no_grad():
+            tensor.mul_(float(target_sigma / sigma))

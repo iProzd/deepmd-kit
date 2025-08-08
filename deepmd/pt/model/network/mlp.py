@@ -30,6 +30,8 @@ from deepmd.pt.model.network.init import (
     kaiming_normal_,
     kaiming_uniform_,
     normal_,
+    orthogonal_,
+    spectral_,
     trunc_normal_,
     uniform_,
     xavier_uniform_,
@@ -134,6 +136,11 @@ class MLPLayer(nn.Module):
             self._kaiming_uniform_init(generator=random_generator)
         elif init == "final":
             self._zero_init(False)
+        elif init.split(":")[0] == "orthogonal":
+            gain = float(init.split(":")[1]) if len(init.split(":")) > 1 else 1.0
+            self._orthogonal_init(gain=gain, generator=random_generator)
+        elif init == "spectral":
+            self._spectral_init(bavg=bavg, stddev=stddev, generator=random_generator)
         else:
             raise ValueError(f"Unknown initialization method: {init}")
 
@@ -202,6 +209,23 @@ class MLPLayer(nn.Module):
             fan_in, _ = _calculate_fan_in_and_fan_out(self.matrix)
             bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
             uniform_(self.bias, -bound, bound)
+
+    def _orthogonal_init(
+        self, gain=1.0, generator: Optional[torch.Generator] = None
+    ) -> None:
+        orthogonal_(self.matrix, gain=gain, generator=generator)
+        if self.bias is not None:
+            with torch.no_grad():
+                self.bias.fill_(0.0)
+
+    def _spectral_init(
+        self,
+        bavg: float = 0.0,
+        stddev: float = 1.0,
+        generator: Optional[torch.Generator] = None,
+    ) -> None:
+        self._default_normal_init(bavg=bavg, stddev=stddev, generator=generator)
+        spectral_(self.matrix, generator=generator)
 
     def forward(
         self,
