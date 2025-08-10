@@ -66,6 +66,7 @@ from deepmd.pt.utils.env import (
 from deepmd.pt.utils.learning_rate import (
     LearningRateCosine,
     LearningRateExp,
+    LearningRateWSD,
 )
 from deepmd.pt.utils.stat import (
     make_stat_input,
@@ -282,6 +283,8 @@ class Trainer:
                 lr_schedule = LearningRateExp(**lr_params)
             elif lr_type == "cosine":
                 lr_schedule = LearningRateCosine(**lr_params)
+            elif lr_type == "wsd":
+                lr_schedule = LearningRateWSD(**lr_params)
             else:
                 raise ValueError(f"Not supported learning rate type '{lr_type}'!")
             return lr_schedule
