@@ -2908,6 +2908,18 @@ def learning_rate_cosine():
     return args
 
 
+def learning_rate_wsd():
+    doc_start_lr = "The learning rate at the start of the training."
+    doc_stop_lr = "The desired learning rate at the end of the training. "
+
+    args = [
+        Argument("start_lr", float, optional=True, default=1e-3, doc=doc_start_lr),
+        Argument("stop_lr", float, optional=True, default=1e-5, doc=doc_stop_lr),
+        Argument("decay_mode", str, optional=True, default="85:10:5"),
+    ]
+    return args
+
+
 def learning_rate_variant_type_args():
     doc_lr = "The type of the learning rate."
 
@@ -2916,6 +2928,7 @@ def learning_rate_variant_type_args():
         [
             Argument("exp", dict, learning_rate_exp()),
             Argument("cosine", dict, learning_rate_cosine()),
+            Argument("wsd", dict, learning_rate_wsd()),
         ],
         optional=True,
         default_tag="exp",
