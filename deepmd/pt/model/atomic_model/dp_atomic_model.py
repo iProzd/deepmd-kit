@@ -260,6 +260,7 @@ class DPAtomicModel(BaseAtomicModel):
                 mapping=mapping,
                 comm_dict=comm_dict,
                 force_embedding_input=force_embedding_input,
+                fparam=fparam,
             )
         else:
             descriptor, rot_mat, g2, h2, sw = self.descriptor(
@@ -268,6 +269,7 @@ class DPAtomicModel(BaseAtomicModel):
                 nlist,
                 mapping=mapping,
                 comm_dict=comm_dict,
+                fparam=fparam,
             )
         assert descriptor is not None
         if self.enable_eval_descriptor_hook:
