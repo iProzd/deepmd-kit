@@ -1391,6 +1391,12 @@ def descrpt_dpa3_args() -> list[Argument]:
             doc=doc_concat_output_tebd,
         ),
         Argument(
+            "add_chg_spin_ebd",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "activation_function",
             str,
             optional=True,
