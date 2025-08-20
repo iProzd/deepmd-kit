@@ -521,7 +521,7 @@ class AngleSH(nn.Module):
             P_list.append(Plp1)
 
         P = torch.concat(P_list, dim=-1)  # (..., L+1)
-        return P * self.norm
+        return P * self.norm.type(x.dtype)
 
 
 def find_normalization(name: str, dim: int | None = None) -> nn.Module | None:
