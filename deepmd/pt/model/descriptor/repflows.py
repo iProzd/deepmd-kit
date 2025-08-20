@@ -17,6 +17,7 @@ from deepmd.pt.model.descriptor.env_mat import (
     prod_env_mat,
 )
 from deepmd.pt.model.network.mlp import (
+    AngleSH,
     MLPLayer,
 )
 from deepmd.pt.model.network.utils import (
@@ -165,6 +166,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         edge_message_use_dropout: bool = False,
         angle_message_use_dropout: bool = False,
         dropout_rate: float = 0.1,
+        angle_use_sh_init: bool = False,
+        angle_sh_init_lmax: int = 3,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -291,6 +294,14 @@ class DescrptBlockRepflows(DescriptorBlock):
             )
         else:
             self.angle_multi_freq_list = None
+
+        self.angle_use_sh_init = angle_use_sh_init
+        self.angle_sh_init_lmax = angle_sh_init_lmax
+        if self.angle_use_sh_init:
+            self.angle_sh = AngleSH(self.angle_sh_init_lmax)
+        else:
+            self.angle_sh = None
+
         self.use_env_envelope = use_env_envelope
         self.use_new_sw = use_new_sw
         self.use_force_embedding = use_force_embedding
@@ -457,10 +468,17 @@ class DescrptBlockRepflows(DescriptorBlock):
                 self.e_dim,
             ]
             self.edge_embd = RadialMLP(edge_channels_list)
+        if not self.angle_use_sh_init:
+            angle_input_dim = (
+                len(self.angle_multi_freq_list_float) + 1
+                if not self.angle_init_use_sin
+                else 2 * (len(self.angle_multi_freq_list_float) + 1)
+            )
+        else:
+            angle_input_dim = self.angle_sh_init_lmax + 1
+
         self.angle_embd = MLPLayer(
-            len(self.angle_multi_freq_list_float) + 1
-            if not self.angle_init_use_sin
-            else 2 * (len(self.angle_multi_freq_list_float) + 1),
+            angle_input_dim,
             self.a_dim,
             precision=precision,
             bias=False,
@@ -976,6 +994,11 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             rbf_ebd = None
             edge_ebd = self.act(self.edge_embd(edge_input))
+
+        if self.angle_use_sh_init:
+            assert self.angle_sh is not None
+            # nf x nloc x a_nnei x a_nnei x sh_sim [OR] n_angle x sh_sim
+            angle_input = self.angle_sh(angle_input * (torch.pi**0.5))
 
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)

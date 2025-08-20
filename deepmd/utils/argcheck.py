@@ -1612,6 +1612,18 @@ def dpa3_repflow_args():
             default=None,
         ),
         Argument(
+            "angle_use_sh_init",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "angle_sh_init_lmax",
+            int,
+            optional=True,
+            default=3,
+        ),
+        Argument(
             "use_dynamic_sel",
             bool,
             optional=True,

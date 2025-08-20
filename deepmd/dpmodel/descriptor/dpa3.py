@@ -84,6 +84,8 @@ class RepFlowArgs:
         edge_message_use_dropout: bool = False,
         angle_message_use_dropout: bool = False,
         dropout_rate: float = 0.1,
+        angle_use_sh_init: bool = False,
+        angle_sh_init_lmax: int = 3,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -216,6 +218,8 @@ class RepFlowArgs:
         self.edge_message_use_dropout = edge_message_use_dropout
         self.angle_message_use_dropout = angle_message_use_dropout
         self.dropout_rate = dropout_rate
+        self.angle_use_sh_init = angle_use_sh_init
+        self.angle_sh_init_lmax = angle_sh_init_lmax
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."

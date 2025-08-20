@@ -503,6 +503,27 @@ class GatedMLP(nn.Module):
         return core * gate
 
 
+class AngleSH(nn.Module):
+    def __init__(self, L_max: int):
+        super().__init__()
+        self.L_max = L_max
+        l = torch.arange(L_max + 1, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=device)
+        norm = torch.sqrt((2 * l + 1) / (4 * torch.pi))
+        self.register_buffer("norm", norm)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        L = self.L_max
+        P0 = torch.ones_like(x)
+        P1 = x
+        P_list = [P0, P1]
+        for l in range(1, L):
+            Plp1 = ((2 * l + 1) * x * P_list[-1] - l * P_list[-2]) / (l + 1)
+            P_list.append(Plp1)
+
+        P = torch.concat(P_list, dim=-1)  # (..., L+1)
+        return P * self.norm
+
+
 def find_normalization(name: str, dim: int | None = None) -> nn.Module | None:
     """Return an normalization function using name."""
     if name is None:

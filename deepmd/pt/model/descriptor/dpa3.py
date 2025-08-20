@@ -223,6 +223,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             edge_message_use_dropout=self.repflow_args.edge_message_use_dropout,
             angle_message_use_dropout=self.repflow_args.angle_message_use_dropout,
             dropout_rate=self.repflow_args.dropout_rate,
+            angle_use_sh_init=self.repflow_args.angle_use_sh_init,
+            angle_sh_init_lmax=self.repflow_args.angle_sh_init_lmax,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
