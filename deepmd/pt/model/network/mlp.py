@@ -9,6 +9,7 @@ from typing import (
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from deepmd.pt.utils import (
     env,
@@ -522,6 +523,115 @@ class AngleSH(nn.Module):
 
         P = torch.concat(P_list, dim=-1)  # (..., L+1)
         return P * self.norm.type(x.dtype)
+
+
+class AnglePriorEncoder(nn.Module):
+    """
+    Smooth delta encoder for bond angles a ∈ [0, π] (radians).
+    - Fixed 10 prior centers (in radians) taken from common molecular/material geometries.
+    - Kernel: Gaussian RBF on linear difference (no periodic wrapping).
+    - Output: softmax-normalized similarity vector of length 10 (smooth one-hot).
+    - Optional: learnable global width (sigma).
+
+    Centers (degrees → radians):
+      1) 180.0  : linear (sp), also octahedral/trans positions
+      2) 120.0  : trigonal planar (sp2), graphene etc.
+      3) 109.47 : ideal tetrahedral (sp3)
+      4) 104.5  : water H-O-H
+      5) 106.7  : ammonia H-N-H (trigonal pyramidal)
+      6) 90.0   : square planar / octahedral adjacent
+      7) 180.0  : (duplicate center kept intentionally for prior emphasis)
+      8) 120.0  : trigonal bipyramidal equatorial-equatorial
+      9) 90.0   : trigonal bipyramidal axial-equatorial
+     10) 60.0   : cyclopropane strained angle
+    """
+
+    def __init__(
+        self,
+        sigma_deg: float = 6.0,  # initial Gaussian width in degrees
+        learn_sigma: bool = True,  # make sigma trainable if desired
+        normalize: Optional[str] = "softmax",
+        eps: float = 1e-9,
+    ):
+        super().__init__()
+        assert normalize in ("softmax", "l1", None)
+        self.normalize = normalize
+        self.eps = eps
+
+        # --- Fixed prior centers (degrees) ---
+        centers_deg = torch.tensor(
+            [180.0, 120.0, 109.47, 104.5, 106.7, 90.0, 180.0, 120.0, 90.0, 60.0],
+            dtype=env.GLOBAL_PT_FLOAT_PRECISION,
+            device=device,
+        )
+
+        # Convert to radians and store as buffer: shape (K,)
+        centers_rad = centers_deg * (torch.pi / 180.0)
+        self.register_buffer("centers", centers_rad)  # (10,)
+
+        # --- Width parameter (global sigma, radians) ---
+        sigma_rad = float(sigma_deg) * math.pi / 180.0
+
+        # Softplus parameterization to keep sigma > 0
+        def inv_softplus(x: float) -> float:
+            x = max(x, 1e-12)
+            return float(math.log(math.exp(x) - 1.0))
+
+        raw = torch.tensor(
+            inv_softplus(sigma_rad), dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=device
+        )
+        if learn_sigma:
+            self.raw_sigma = nn.Parameter(data=raw)
+        else:
+            self.register_buffer("raw_sigma", raw)
+
+    @property
+    def sigma(self) -> torch.Tensor:
+        """Current positive width (radians)."""
+        return F.softplus(self.raw_sigma) + 1e-12
+
+    # @torch.no_grad()
+    # def auto_sigma_from_centers(self, factor: float = 0.6, min_sigma_deg: float = 1.0):
+    #     """
+    #     Set a reasonable global sigma from center spacing on [0, π].
+    #     Uses median nearest-neighbor distance x factor, with a lower bound.
+    #     """
+    #     c = self.centers  # (K,)
+    #     # Pairwise |c_i - c_j|
+    #     dmat = torch.abs(c[:, None] - c[None, :])
+    #     # Ignore self-distance
+    #     dmat = dmat + torch.eye(c.numel(), dtype=c.dtype, device=c.device) * 1e6
+    #     dmin = dmat.min(dim=1).values  # nearest neighbor distance per center
+    #     # Use median spacing to get a single global sigma
+    #     sigma = torch.clamp(torch.median(dmin) * factor,
+    #                         min=min_sigma_deg * math.pi / 180.0)
+    #     # Write into raw_sigma (inverse softplus)
+    #     with torch.no_grad():
+    #         self.raw_sigma.copy_(torch.log(torch.exp(sigma) - 1.0))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        a: (...,) tensor of angles in radians, expected in [0, π].
+        returns: (..., 10) similarity/weight vector.
+        """
+        theta = torch.acos(x)
+        centers = self.centers.type(x.dtype)
+        s = self.sigma.type(x.dtype)
+        # Linear difference (no periodicity)
+        diff = theta - centers  # (..., K)
+        # Gaussian kernel
+        sims = torch.exp(-0.5 * (diff / s).pow(2))  # (..., K)
+
+        # Normalization
+        if self.normalize is None:
+            codes = sims
+        elif self.normalize == "softmax":
+            codes = F.softmax(torch.log(sims + self.eps), dim=-1)
+        elif self.normalize == "l1":
+            codes = sims / (sims.sum(dim=-1, keepdim=True) + self.eps)
+        else:
+            raise ValueError(f"Unknown normalization: {self.normalize}")
+        return torch.cat([x, codes], dim=-1)
 
 
 def find_normalization(name: str, dim: int | None = None) -> nn.Module | None:

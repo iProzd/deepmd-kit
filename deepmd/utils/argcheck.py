@@ -1624,6 +1624,12 @@ def dpa3_repflow_args():
             default=3,
         ),
         Argument(
+            "angle_use_fixed_gaussian",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "use_dynamic_sel",
             bool,
             optional=True,

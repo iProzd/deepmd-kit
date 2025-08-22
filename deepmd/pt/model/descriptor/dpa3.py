@@ -225,6 +225,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             dropout_rate=self.repflow_args.dropout_rate,
             angle_use_sh_init=self.repflow_args.angle_use_sh_init,
             angle_sh_init_lmax=self.repflow_args.angle_sh_init_lmax,
+            angle_use_fixed_gaussian=self.repflow_args.angle_use_fixed_gaussian,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,
