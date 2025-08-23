@@ -170,6 +170,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_use_sh_init: bool = False,
         angle_sh_init_lmax: int = 3,
         angle_use_fixed_gaussian: bool = False,
+        angle_fixed_gaussian_interpolate: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -305,9 +306,13 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.angle_sh = None
 
         self.angle_use_fixed_gaussian = angle_use_fixed_gaussian
+        self.angle_fixed_gaussian_interpolate = angle_fixed_gaussian_interpolate
         if self.angle_use_fixed_gaussian:
             self.angle_gaussian_encoder = AnglePriorEncoder(
-                sigma_deg=6.0, learn_sigma=False, normalize=None
+                sigma_deg=6.0,
+                learn_sigma=False,
+                normalize=None,
+                interpolate=self.angle_fixed_gaussian_interpolate,
             )
         else:
             self.angle_gaussian_encoder = None
@@ -481,7 +486,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         if self.angle_use_sh_init:
             angle_input_dim = self.angle_sh_init_lmax + 1
         elif self.angle_use_fixed_gaussian:
-            angle_input_dim = 10 + 1
+            angle_input_dim = (
+                10 + 1 if not self.angle_fixed_gaussian_interpolate else 12 + 1
+            )
         else:
             angle_input_dim = (
                 len(self.angle_multi_freq_list_float) + 1
@@ -1014,7 +1021,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         elif self.angle_use_fixed_gaussian:
             assert not self.angle_init_use_sin and not self.angle_use_multi_freq
             assert self.angle_gaussian_encoder is not None
-            # nf x nloc x a_nnei x a_nnei x 11 [OR] n_angle x 11
+            # nf x nloc x a_nnei x a_nnei x 11(13) [OR] n_angle x 11(13)
             angle_input = self.angle_gaussian_encoder(angle_input)
 
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim

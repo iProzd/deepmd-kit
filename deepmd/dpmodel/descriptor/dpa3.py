@@ -87,6 +87,7 @@ class RepFlowArgs:
         angle_use_sh_init: bool = False,
         angle_sh_init_lmax: int = 3,
         angle_use_fixed_gaussian: bool = False,
+        angle_fixed_gaussian_interpolate: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -222,6 +223,7 @@ class RepFlowArgs:
         self.angle_use_sh_init = angle_use_sh_init
         self.angle_sh_init_lmax = angle_sh_init_lmax
         self.angle_use_fixed_gaussian = angle_use_fixed_gaussian
+        self.angle_fixed_gaussian_interpolate = angle_fixed_gaussian_interpolate
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."

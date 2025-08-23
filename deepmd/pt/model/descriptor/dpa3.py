@@ -226,6 +226,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             angle_use_sh_init=self.repflow_args.angle_use_sh_init,
             angle_sh_init_lmax=self.repflow_args.angle_sh_init_lmax,
             angle_use_fixed_gaussian=self.repflow_args.angle_use_fixed_gaussian,
+            angle_fixed_gaussian_interpolate=self.repflow_args.angle_fixed_gaussian_interpolate,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

@@ -552,22 +552,39 @@ class AnglePriorEncoder(nn.Module):
         learn_sigma: bool = True,  # make sigma trainable if desired
         normalize: Optional[str] = "softmax",
         eps: float = 1e-9,
+        interpolate: bool = False,  # whether to interpolate the angles
     ):
         super().__init__()
         assert normalize in ("softmax", "l1", None)
         self.normalize = normalize
         self.eps = eps
+        self.interpolate = interpolate
 
         # --- Fixed prior centers (degrees) ---
         centers_deg = torch.tensor(
-            [180.0, 120.0, 109.47, 104.5, 106.7, 90.0, 180.0, 120.0, 90.0, 60.0],
+            [180.0, 120.0, 109.47, 104.5, 106.7, 90.0, 180.0, 120.0, 90.0, 60.0]
+            if not interpolate
+            else [
+                180.0,
+                160.0,
+                140.0,
+                120.0,
+                109.47,
+                104.5,
+                106.7,
+                90.0,
+                80.0,
+                60.0,
+                40.0,
+                20.0,
+            ],
             dtype=env.GLOBAL_PT_FLOAT_PRECISION,
             device=device,
         )
 
         # Convert to radians and store as buffer: shape (K,)
         centers_rad = centers_deg * (torch.pi / 180.0)
-        self.register_buffer("centers", centers_rad)  # (10,)
+        self.register_buffer("centers", centers_rad)  # (10 or 12,)
 
         # --- Width parameter (global sigma, radians) ---
         sigma_rad = float(sigma_deg) * math.pi / 180.0
