@@ -2809,6 +2809,20 @@ def standard_model_args() -> Argument:
     )
     return ca
 
+@model_args_plugin.register("esen")
+def esen_model_args() -> Argument:
+    ca = Argument(
+        "esen",
+        dict,
+        [
+            Argument(
+                "esen", dict,
+            ),
+        ],
+        doc="ESEN model.",
+    )
+    return ca
+
 
 @hybrid_model_args_plugin.register("pairwise_dprc")
 def pairwise_dprc() -> Argument:

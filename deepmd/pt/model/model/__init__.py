@@ -73,6 +73,7 @@ from .spin_model import (
     SpinEnergyModel,
     SpinModel,
 )
+from .esen_model import ESENModel
 
 
 def _get_standard_model_components(model_params, ntypes):
@@ -308,6 +309,8 @@ def get_model(model_params):
             return get_standard_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
+    elif model_type == "esen":
+        return ESENModel(model_params)
     else:
         return BaseModel.get_class_by_type(model_type).get_model(model_params)
 
