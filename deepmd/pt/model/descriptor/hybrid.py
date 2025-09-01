@@ -128,6 +128,17 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
         """Returns the number of element types."""
         return self.descrpt_list[0].get_ntypes()
 
+    def get_angle_dim(self) -> int:
+        """Returns the angle embedding dimension of this descriptor."""
+        return self.descrpt_list[0].get_angle_dim()
+
+    def get_norm_fact(self) -> list[float]:
+        """Returns the norm factor."""
+        return self.descrpt_list[0].get_norm_fact()
+
+    def get_additional_output_for_fitting(self) -> dict[str, Optional[torch.Tensor]]:
+        return self.descrpt_list[0].get_additional_output_for_fitting()
+
     def get_type_map(self) -> list[str]:
         """Get the name to each type of atoms."""
         return self.descrpt_list[0].get_type_map()
@@ -138,7 +149,7 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
 
     def get_dim_emb(self) -> int:
         """Returns the output dimension."""
-        return sum([descrpt.get_dim_emb() for descrpt in self.descrpt_list])
+        return self.descrpt_list[0].get_dim_emb()
 
     def mixed_types(self):
         """Returns if the descriptor requires a neighbor list that distinguish different
@@ -265,6 +276,7 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        fparam: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
@@ -326,6 +338,12 @@ class DescrptHybrid(BaseDescriptor, torch.nn.Module):
             out_descriptor.append(odescriptor)
             if gr is not None:
                 out_gr.append(gr)
+            if g2 is not None:
+                if out_g2 is None:
+                    out_g2 = g2
+            if sw is not None:
+                if out_sw is None:
+                    out_sw = sw
         out_descriptor = torch.cat(out_descriptor, dim=-1)
         out_gr = torch.cat(out_gr, dim=-2) if out_gr else None
         return out_descriptor, out_gr, out_g2, out_h2, out_sw

@@ -410,6 +410,7 @@ class DescrptSeTTebd(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        fparam: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 

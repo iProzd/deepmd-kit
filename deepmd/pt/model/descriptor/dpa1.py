@@ -660,6 +660,7 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
         force_embedding_input: Optional[torch.Tensor] = None,
+        fparam: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
