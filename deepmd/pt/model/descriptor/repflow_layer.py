@@ -395,6 +395,12 @@ class RepFlowLayer(torch.nn.Module):
                 precision=precision,
                 seed=child_seed(seed, 21),
             )
+            self.node_nga_mlp_out = MLPLayer(
+                n_dim,
+                n_dim,
+                precision=precision,
+                seed=child_seed(seed, 22),
+            )
             if self.update_style == "res_residual":
                 self.n_residual.append(
                     get_residual(
@@ -409,6 +415,7 @@ class RepFlowLayer(torch.nn.Module):
         else:
             self.edge_nga_mlp = None
             self.node_nga_mlp = None
+            self.node_nga_mlp_out = None
 
         # edge self message
         if not self.use_gated_mlp or self.only_angle_gated_mlp:
@@ -1451,6 +1458,7 @@ class RepFlowLayer(torch.nn.Module):
         if self.EN_use_NGA:
             assert self.node_nga_mlp is not None
             assert self.edge_nga_mlp is not None
+            assert self.node_nga_mlp_out is not None
             assert edge_cat_list is not None
             # nb, nloc, nnei, n_dim
             attention_weights_nga_i = self.edge_nga_mlp(edge_cat_list[2])
@@ -1459,13 +1467,17 @@ class RepFlowLayer(torch.nn.Module):
             ) - 20.0
             attention_weights_nga_i = torch.softmax(attention_weights_nga_i, dim=-2)
             # nb, nloc, nnei, n_dim
-            attention_value_nga = self.node_nga_mlp(
-                torch.cat(edge_cat_list[:2], dim=-1)
+            attention_value_nga = self.act(
+                self.node_nga_mlp(torch.cat(edge_cat_list[:2], dim=-1))
             )
 
             # updated value
             # nb, nloc, n_dim
-            update_node_nga = (attention_weights_nga_i * attention_value_nga).sum(-2)
+            update_node_nga = self.act(
+                self.node_nga_mlp_out(
+                    (attention_weights_nga_i * attention_value_nga).sum(-2)
+                )
+            )
             n_update_list.append(update_node_nga)
 
         # update node_ebd
