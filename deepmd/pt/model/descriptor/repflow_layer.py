@@ -96,6 +96,7 @@ class RepFlowLayer(torch.nn.Module):
         edge_rbf_cat_message: bool = False,
         edge_message_use_dropout: bool = False,
         angle_message_use_dropout: bool = False,
+        EN_use_NGA: bool = False,
         dropout_rate: float = 0.1,
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -146,6 +147,9 @@ class RepFlowLayer(torch.nn.Module):
         self.sel_reduce_factor = sel_reduce_factor
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
+        self.EN_use_NGA = EN_use_NGA
+        if self.EN_use_NGA:
+            assert not self.use_dynamic_sel, "NGA does not support dynamic selection!"
 
         self.update_dihedral = update_dihedral
         self.d_dim = d_dim
@@ -374,6 +378,35 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
                 residual_idx += 1
+
+        # node edge NGA
+        if self.EN_use_NGA:
+            self.edge_nga_mlp = MLPLayer(
+                e_dim,
+                n_dim,
+                precision=precision,
+                seed=child_seed(seed, 20),
+            )
+            self.node_nga_mlp = MLPLayer(
+                2 * n_dim,
+                n_dim,
+                precision=precision,
+                seed=child_seed(seed, 21),
+            )
+            if self.update_style == "res_residual":
+                self.n_residual.append(
+                    get_residual(
+                        n_dim,
+                        self.update_residual * self.residual_pref[residual_idx],
+                        self.update_residual_init,
+                        precision=precision,
+                        seed=child_seed(seed, 22),
+                    )
+                )
+                residual_idx += 1
+        else:
+            self.edge_nga_mlp = None
+            self.node_nga_mlp = None
 
         # edge self message
         if not self.use_gated_mlp or self.only_angle_gated_mlp:
@@ -1330,6 +1363,7 @@ class RepFlowLayer(torch.nn.Module):
         else:
             edge_info = None
             edge_info_ffn = None
+            edge_cat_list = None
 
         # edge message use dropout
         if self.edge_message_use_dropout:
@@ -1411,6 +1445,27 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
             n_update_list.append(node_edge_update)
+
+        if self.EN_use_NGA:
+            assert self.node_nga_mlp is not None
+            assert self.edge_nga_mlp is not None
+            assert edge_cat_list is not None
+            # nb, nloc, nnei, n_dim
+            attention_weights_nga_i = self.edge_nga_mlp(edge_cat_list[2])
+            attention_weights_nga_i = (attention_weights_nga_i + 20.0) * sw.unsqueeze(
+                -1
+            ) - 20.0
+            attention_weights_nga_i = torch.softmax(attention_weights_nga_i, dim=-2)
+            # nb, nloc, nnei, n_dim
+            attention_value_nga = self.node_nga_mlp(
+                torch.cat(edge_cat_list[:2], dim=-1)
+            )
+
+            # updated value
+            # nb, nloc, n_dim
+            update_node_nga = (attention_weights_nga_i * attention_value_nga).sum(-2)
+            n_update_list.append(update_node_nga)
+
         # update node_ebd
         n_updated = self.list_update(n_update_list, "node")
 

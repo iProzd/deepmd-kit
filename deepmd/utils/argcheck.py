@@ -1941,6 +1941,12 @@ def dpa3_repflow_args():
             optional=True,
             default=0.1,
         ),
+        Argument(
+            "EN_use_NGA",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
