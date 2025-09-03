@@ -149,7 +149,9 @@ class RepFlowLayer(torch.nn.Module):
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
         self.EN_use_NGA = EN_use_NGA
         if self.EN_use_NGA:
-            assert not self.use_dynamic_sel, "NGA does not support dynamic selection!"
+            assert (
+                not self.use_dynamic_sel and not self.optim_update
+            ), "NGA does not support dynamic selection or optim update!"
 
         self.update_dihedral = update_dihedral
         self.d_dim = d_dim
