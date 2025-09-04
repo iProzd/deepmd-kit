@@ -172,6 +172,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_use_fixed_gaussian: bool = False,
         angle_fixed_gaussian_interpolate: bool = False,
         EN_use_NGA: bool = False,
+        AE_use_NGA: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -318,6 +319,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         else:
             self.angle_gaussian_encoder = None
         self.EN_use_NGA = EN_use_NGA
+        self.AE_use_NGA = AE_use_NGA
         self.use_env_envelope = use_env_envelope
         self.use_new_sw = use_new_sw
         self.use_force_embedding = use_force_embedding
@@ -585,6 +587,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_message_use_dropout=self.edge_message_use_dropout,
                     angle_message_use_dropout=self.angle_message_use_dropout,
                     EN_use_NGA=self.EN_use_NGA,
+                    AE_use_NGA=self.AE_use_NGA,
                     dropout_rate=self.dropout_rate,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )

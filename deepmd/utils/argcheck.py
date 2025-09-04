@@ -1947,6 +1947,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "AE_use_NGA",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

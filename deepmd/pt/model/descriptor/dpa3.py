@@ -228,6 +228,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             angle_use_fixed_gaussian=self.repflow_args.angle_use_fixed_gaussian,
             angle_fixed_gaussian_interpolate=self.repflow_args.angle_fixed_gaussian_interpolate,
             EN_use_NGA=self.repflow_args.EN_use_NGA,
+            AE_use_NGA=self.repflow_args.AE_use_NGA,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

@@ -97,6 +97,7 @@ class RepFlowLayer(torch.nn.Module):
         edge_message_use_dropout: bool = False,
         angle_message_use_dropout: bool = False,
         EN_use_NGA: bool = False,
+        AE_use_NGA: bool = False,
         dropout_rate: float = 0.1,
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -148,7 +149,8 @@ class RepFlowLayer(torch.nn.Module):
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
         self.EN_use_NGA = EN_use_NGA
-        if self.EN_use_NGA:
+        self.AE_use_NGA = AE_use_NGA
+        if self.EN_use_NGA or self.AE_use_NGA:
             assert (
                 not self.use_dynamic_sel and not self.optim_update
             ), "NGA does not support dynamic selection or optim update!"
@@ -574,6 +576,42 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
                 residual_idx += 1
+
+            # edge angle NGA
+            if self.AE_use_NGA:
+                self.AE_angle_nga_mlp = MLPLayer(
+                    a_dim,
+                    e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 24),
+                )
+                self.AE_edge_nga_mlp = MLPLayer(
+                    2 * self.e_a_compress_dim,
+                    e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 25),
+                )
+                self.AE_edge_nga_mlp_out = MLPLayer(
+                    e_dim,
+                    e_dim,
+                    precision=precision,
+                    seed=child_seed(seed, 26),
+                )
+                if self.update_style == "res_residual":
+                    self.e_residual.append(
+                        get_residual(
+                            e_dim,
+                            self.update_residual * self.residual_pref[residual_idx],
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 27),
+                        )
+                    )
+                    residual_idx += 1
+            else:
+                self.AE_angle_nga_mlp = None
+                self.AE_edge_nga_mlp = None
+                self.AE_edge_nga_mlp_out = None
 
             # angle self message
             if not self.use_gated_mlp:
@@ -1455,6 +1493,7 @@ class RepFlowLayer(torch.nn.Module):
                 )
             n_update_list.append(node_edge_update)
 
+        # node edge nga
         if self.EN_use_NGA:
             assert self.node_nga_mlp is not None
             assert self.edge_nga_mlp is not None
@@ -1613,6 +1652,7 @@ class RepFlowLayer(torch.nn.Module):
             else:
                 angle_info = None
                 angle_info_ffn = None
+                angle_info_list = None
 
             # angle message use dropout
             if self.angle_message_use_dropout:
@@ -1725,6 +1765,44 @@ class RepFlowLayer(torch.nn.Module):
                 padding_edge_angle_update = self.EAM_rmsnorm(padding_edge_angle_update)
 
             e_update_list.append(padding_edge_angle_update)
+
+            # edge angle NGA
+            if self.AE_use_NGA:
+                assert self.AE_angle_nga_mlp is not None
+                assert self.AE_edge_nga_mlp is not None
+                assert self.AE_edge_nga_mlp_out is not None
+                assert angle_info_list is not None
+
+                # nb, nloc, a_nnei, a_nnei, e_dim
+                attention_weights_nga_i = self.AE_angle_nga_mlp(angle_info_list[0])
+                attention_weights_nga_i = (
+                    attention_weights_nga_i + 20.0
+                ) * a_sw.unsqueeze(-1).unsqueeze(-1) - 20.0
+                attention_weights_nga_i = torch.softmax(attention_weights_nga_i, dim=-2)
+                # nb, nloc, a_nnei, a_nnei, e_dim
+                attention_value_nga = self.act(self.AE_edge_nga_mlp(angle_info_list[2]))
+
+                # updated value
+                # nb, nloc, a_nnei, e_dim
+                reduce_edge_nga = (attention_weights_nga_i * attention_value_nga).sum(
+                    -2
+                )
+                # nb x nloc x nnei x e_dim
+                padding_edge_nga = torch.concat(
+                    [
+                        reduce_edge_nga,
+                        torch.zeros(
+                            [nb, nloc, self.nnei - self.a_sel, self.e_dim],
+                            dtype=edge_ebd.dtype,
+                            device=edge_ebd.device,
+                        ),
+                    ],
+                    dim=2,
+                )
+                # nb x nloc x nnei x e_dim
+                update_edge_nga = self.act(self.AE_edge_nga_mlp_out(padding_edge_nga))
+                e_update_list.append(update_edge_nga)
+
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
 
