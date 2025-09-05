@@ -343,7 +343,7 @@ class ESENModel(BaseModel):
             # use default fparam
             assert self.default_fparam_tensor is not None
             fparam = torch.tile(self.default_fparam_tensor.unsqueeze(0), [nf, 1])
-        atomic_number = self.atype_to_idx[atype.view(-1)].view(nf, nloc)
+        atomic_number = self.atype_to_idx[atype.view(-1)].view(nf, nloc) + 1
         tags = torch.zeros_like(atomic_number)
         pbc = torch.ones([3], dtype=torch.bool, device=coord.device)
         fixed_idx = torch.zeros_like(atomic_number)
@@ -368,12 +368,12 @@ class ESENModel(BaseModel):
         model_ret = self.model(batch)
 
         # apply energy bias
-        model_ret["energy"] = model_ret["energy"] + self.out_bias[0, :, 0][atype].sum(-1)
+        model_ret["energy"] = model_ret["energy"] * 0.8125 + self.out_bias[0, :, 0][atype].sum(-1)
 
         model_predict = {}
         model_predict["energy"] = model_ret["energy"]
-        model_predict["force"] = model_ret["forces"].view(nf, nloc, 3)
-        model_predict["virial"] = model_ret["virial"].view(nf, 9)
+        model_predict["force"] = model_ret["forces"].view(nf, nloc, 3)*0.8125
+        model_predict["virial"] = model_ret["virial"].view(nf, 9)*0.8125
         return model_predict
 
     @torch.jit.export
