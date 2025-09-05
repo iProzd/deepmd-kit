@@ -419,7 +419,7 @@ class SevennetNativeModelE0(BaseModel):
             KEY.CUEQUIVARIANCE_CONFIG: self.params["cuequivariance_config"],
         }
 
-        print(f"config_dict: {config_dict}")
+        # print(f"config_dict: {config_dict}")
         self.sevennet_model = build_E3_equivariant_model(config_dict)
         # set batch mode
         self.sevennet_model.set_is_batch_data(True)
@@ -588,6 +588,10 @@ class SevennetNativeModelE0(BaseModel):
         # sample_data = sampled_func() if callable(sampled_func) else sampled_func
         # if len(sample_data) > 0 and "force" in sample_data[0]:
         #    keys_to_compute.append("force")
+        if stat_file_path is not None and self.type_map is not None:
+            # descriptors and fitting net with different type_map
+            # should not share the same parameters
+            stat_file_path /= " ".join(self.type_map)
 
         bias_out, std_out = compute_output_stats(
             sampled_func,
@@ -597,7 +601,7 @@ class SevennetNativeModelE0(BaseModel):
             rcond=None,
             preset_bias=self.preset_out_bias,
         )
-        print("bias_out", bias_out)
+        # print("bias_out", bias_out)
         # print("std_out", std_out)
         # Set energy bias (e0) - this is the only bias correction we apply
         if "energy" in bias_out:
