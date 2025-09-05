@@ -2823,6 +2823,108 @@ def esen_model_args() -> Argument:
     )
     return ca
 
+@model_args_plugin.register("sevennet_native_e0")
+def sevennet_native_e0_model_args() -> Argument:
+    """Arguments for the SevenNet Native model."""
+    return _sevennet_model_args_common("sevennet_native_e0")
+
+
+def _sevennet_model_args_common(model_name: str) -> Argument:
+    """Arguments for the SevenNet model."""
+    doc_sel = "Maximum number of neighbor atoms"
+    doc_r_max = "distance cutoff (in Ang)"
+    doc_channel = "node feature multiplicity, controls model capacity"
+    doc_irreps_manual = "manually specify irreducible representations as a list of strings, None for auto"
+    doc_lmax = "maximum spherical harmonics order"
+    doc_lmax_edge = "maximum spherical harmonics order for edges (-1 means same as lmax)"
+    doc_lmax_node = "maximum spherical harmonics order for nodes (-1 means same as lmax)"
+    doc_is_parity = "Pairy True (E(3) group) or False (to SE(3) group)"
+    doc_num_convolution_layer = "number of convolution layers"
+    doc_radial_basis_name = "type of radial basis function"
+    doc_num_radial_basis = "number of radial basis functions"
+    # doc_cutoff_function = "cutoff function configuration"
+    doc_cutoff_function_name = "type of cutoff function"
+    doc_poly_cut_p = "polynomial cutoff p parameter"
+    doc_cutoff_on = "XPLOR cutoff function inner cutoff radius"
+    doc_activation_radial = "activation function for radial part"
+    doc_activation_scalar = "activation functions for scalar features"
+    doc_activation_gate = "activation functions for gates"
+    doc_weight_nn_hidden_neurons = "hidden neurons in convolution weight networks"
+    doc_conv_denominator = "Valid options are *avg_num_neigh*, or float"
+    doc_train_denominator = "Enable training for denominator in convolution layer"
+    doc_train_shift_scale = "Enable training for shift & scale in output layer"
+    doc_use_bias_in_linear = "whether to use bias in linear layers"
+    doc_use_modal_node_embedding = "whether to use modal node embedding"
+    doc_use_modal_self_inter_intro = "whether to use modal self-interaction intro"
+    doc_use_modal_self_inter_outro = "whether to use modal self-interaction outro"
+    doc_use_modal_output_block = "whether to use modal output block"
+    doc_readout_as_fcn = "whether to use readout as fully connected network"
+    doc_readout_fcn_hidden_neurons = "hidden neurons in readout FCN"
+    doc_readout_fcn_activation = "activation function in readout FCN"
+    doc_self_connection_type = "type of self-connection"
+    doc_interaction_type = "type of interaction"
+    doc_normalize_sph = "whether to normalize spherical harmonics"
+    doc_cuequivariance_config = "CuEquivariance configuration"
+    doc_precision = "Precision of the model, float32 or float64"
+    doc_shift = "Energy shift/bias configuration. Options: 'per_atom_energy_mean', 'elemwise_reference_energies', float, or list[float]"
+    doc_scale = "Energy scale configuration. Options: float, or list[float]"
+    doc_use_modal_wise_shift = "Enable modal-wise shift (advanced feature)"
+    doc_use_modal_wise_scale = "Enable modal-wise scale (advanced feature)"
+
+    return Argument(
+        model_name,
+        dict,
+        [
+            Argument("sel", [int, str], optional=False, doc=doc_sel),
+            Argument("r_max", float, optional=True, default=4.5, doc=doc_r_max),
+            Argument("channel", int, optional=True, default=32, doc=doc_channel),
+            Argument("irreps_manual", [list[str], type(None)], optional=True, default=None, doc=doc_irreps_manual),
+            Argument("lmax", int, optional=True, default=1, doc=doc_lmax),
+            Argument("lmax_edge", int, optional=True, default=-1, doc=doc_lmax_edge),
+            Argument("lmax_node", int, optional=True, default=-1, doc=doc_lmax_node),
+            Argument("is_parity", bool, optional=True, default=True, doc=doc_is_parity),
+            Argument("num_convolution_layer", int, optional=True, default=3, doc=doc_num_convolution_layer),
+            Argument("radial_basis_name", str, optional=True, default="bessel", doc=doc_radial_basis_name),
+            Argument("num_radial_basis", int, optional=True, default=8, doc=doc_num_radial_basis),
+            # Argument("cutoff_function", dict, optional=True, default={"cutoff_function_name": "poly_cut", "poly_cut_p_value": 6}, doc=doc_cutoff_function),
+            Argument("cutoff_function_name", str, optional=True, default="poly_cut", doc=doc_cutoff_function_name),
+            Argument("poly_cut_p", int, optional=True, default=6, doc=doc_poly_cut_p),
+            Argument("cutoff_on", float, optional=True, default=4.0, doc=doc_cutoff_on),
+            Argument("activation_radial", str, optional=True, default="silu", doc=doc_activation_radial),
+            Argument("activation_scalar", dict, optional=True, default={"e": "silu", "o": "tanh"},
+                     doc=doc_activation_scalar),
+            Argument("activation_gate", dict, optional=True, default={"e": "silu", "o": "tanh"},
+                     doc=doc_activation_gate),
+            Argument("weight_nn_hidden_neurons", list[int], optional=True, default=[64, 64],
+                     doc=doc_weight_nn_hidden_neurons),
+            Argument("conv_denominator", [str, float], optional=True, default="avg_num_neigh",
+                     doc=doc_conv_denominator),
+            Argument("train_denominator", bool, optional=True, default=False, doc=doc_train_denominator),
+            Argument("train_shift_scale", bool, optional=True, default=False, doc=doc_train_shift_scale),
+            Argument("use_bias_in_linear", bool, optional=True, default=False, doc=doc_use_bias_in_linear),
+            Argument("use_modal_node_embedding", bool, optional=True, default=False, doc=doc_use_modal_node_embedding),
+            Argument("use_modal_self_inter_intro", bool, optional=True, default=False,
+                     doc=doc_use_modal_self_inter_intro),
+            Argument("use_modal_self_inter_outro", bool, optional=True, default=False,
+                     doc=doc_use_modal_self_inter_outro),
+            Argument("use_modal_output_block", bool, optional=True, default=False, doc=doc_use_modal_output_block),
+            Argument("readout_as_fcn", bool, optional=True, default=False, doc=doc_readout_as_fcn),
+            Argument("readout_fcn_hidden_neurons", list[int], optional=True, default=[30, 30],
+                     doc=doc_readout_fcn_hidden_neurons),
+            Argument("readout_fcn_activation", str, optional=True, default="relu", doc=doc_readout_fcn_activation),
+            Argument("self_connection_type", str, optional=True, default="nequip", doc=doc_self_connection_type),
+            Argument("interaction_type", str, optional=True, default="nequip", doc=doc_interaction_type),
+            Argument("normalize_sph", bool, optional=True, default=True, doc=doc_normalize_sph),
+            # here, deepmd-kit, "normalize_sph" is "_normalize_sph" in sevennet.
+            Argument("cuequivariance_config", dict, optional=True, default={}, doc=doc_cuequivariance_config),
+            Argument("precision", str, optional=True, default="float32", doc=doc_precision),
+            Argument("shift", [str, float, list], optional=True, default=0.0, doc=doc_shift),
+            Argument("scale", [str, float, list], optional=True, default=1.0, doc=doc_scale),
+            Argument("use_modal_wise_shift", bool, optional=True, default=False, doc=doc_use_modal_wise_shift),
+            Argument("use_modal_wise_scale", bool, optional=True, default=False, doc=doc_use_modal_wise_scale),
+        ],
+        doc=f"{model_name.replace('_', ' ').title()} model",
+    )
 
 @hybrid_model_args_plugin.register("pairwise_dprc")
 def pairwise_dprc() -> Argument:

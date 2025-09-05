@@ -74,6 +74,7 @@ from .spin_model import (
     SpinModel,
 )
 from .esen_model import ESENModel
+from .sevennet_e0 import SevennetNativeModelE0
 
 
 def _get_standard_model_components(model_params, ntypes):
@@ -322,6 +323,7 @@ __all__ = [
     "DPZBLModel",
     "DipoleModel",
     "EnergyModel",
+    "SevennetNativeModelE0",
     "FrozenModel",
     "LinearEnergyModel",
     "PolarModel",
