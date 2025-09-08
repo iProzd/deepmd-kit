@@ -154,7 +154,7 @@ class LearningRateLinear:
             discrete updates every `decay_steps` steps (akin to treating each
             update as an "epoch").
         """
-        self.base_lr = float(start_lr)
+        self.start_lr = float(start_lr)
         self.start_factor = float(start_factor)
         self.end_factor = float(end_factor)
         self.stop_steps = int(stop_steps)
@@ -200,4 +200,4 @@ class LearningRateLinear:
             else:
                 factor = min(factor, self.end_factor)
 
-        return np.float64(self.base_lr * factor)
+        return np.float64(self.start_lr * factor)
