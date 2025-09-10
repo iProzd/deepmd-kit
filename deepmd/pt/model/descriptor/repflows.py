@@ -221,6 +221,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         sel_reduce_factor: float = 10.0,
         use_loc_mapping: bool = True,
         update_use_layernorm: bool = False,
+        use_gated_mlp: bool = False,
+        gated_mlp_norm: str = "none",
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
         trainable: bool = True,
@@ -287,6 +289,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
         self.update_use_layernorm = update_use_layernorm
+        self.use_gated_mlp = use_gated_mlp
+        self.gated_mlp_norm = gated_mlp_norm
 
         self.edge_embd = MLPLayer(
             1,
@@ -333,6 +337,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     sel_reduce_factor=self.sel_reduce_factor,
                     smooth_edge_update=self.smooth_edge_update,
                     update_use_layernorm=self.update_use_layernorm,
+                    use_gated_mlp=self.use_gated_mlp,
+                    gated_mlp_norm=self.gated_mlp_norm,
                     seed=child_seed(child_seed(seed, 1), ii),
                     trainable=trainable,
                 )
