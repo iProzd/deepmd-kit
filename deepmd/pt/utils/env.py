@@ -43,6 +43,8 @@ else:
     DEVICE = torch.device(f"cuda:{LOCAL_RANK}")
 
 JIT = False
+MLP_INIT = os.environ.get("MLP_INIT", "default")
+TEBD_INIT = os.environ.get("TEBD_INIT", "default")
 CACHE_PER_SYS = 5  # keep at most so many sets per sys in memory
 ENERGY_BIAS_TRAINABLE = True
 CUSTOM_OP_USE_JIT = False

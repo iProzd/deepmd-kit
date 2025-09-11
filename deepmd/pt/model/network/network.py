@@ -15,6 +15,9 @@ import torch.utils.checkpoint
 from deepmd.dpmodel.utils.type_embed import (
     get_econf_tebd,
 )
+from deepmd.pt.model.network.init import (
+    normal_,
+)
 from deepmd.pt.model.network.mlp import (
     EmbeddingNet,
 )
@@ -23,6 +26,7 @@ from deepmd.pt.utils import (
 )
 from deepmd.pt.utils.utils import (
     ActivationFn,
+    get_generator,
     to_torch_tensor,
 )
 from deepmd.utils.finetune import (
@@ -432,6 +436,10 @@ class TypeEmbedNetConsistent(nn.Module):
             self.seed,
             bias=self.use_tebd_bias,
         )
+        init = env.TEBD_INIT
+        if init == "normal":
+            random_generator = get_generator(seed)
+            normal_(self.embedding_net.layers[0].matrix, generator=random_generator)
         for param in self.parameters():
             param.requires_grad = trainable
 
