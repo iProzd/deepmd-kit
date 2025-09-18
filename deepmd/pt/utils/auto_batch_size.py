@@ -57,6 +57,7 @@ class AutoBatchSize(AutoBatchSizeBase):
                 or "cusolver error: CUSOLVER_STATUS_INTERNAL_ERROR" in e.args[0]
                 # https://github.com/deepmodeling/deepmd-kit/issues/4594
                 or "CUDA error: out of memory" in e.args[0]
+                or "nonzero is not supported" in e.args[0]
             )
         ) or isinstance(e, torch.cuda.OutOfMemoryError):
             # Release all unoccupied cached memory
