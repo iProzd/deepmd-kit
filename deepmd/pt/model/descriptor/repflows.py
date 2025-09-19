@@ -7,6 +7,15 @@ from typing import (
 
 import torch
 
+from e3nn.o3 import Irreps
+import sevenn.util as util
+from sevenn.nn.edge_embedding import (
+    SphericalEncoding,
+    # BesselBasis,
+    PolynomialCutoff,
+)
+import time
+from deepmd.pt.utils import env
 from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
@@ -171,6 +180,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_sh_init_lmax: int = 3,
         angle_use_fixed_gaussian: bool = False,
         angle_fixed_gaussian_interpolate: bool = False,
+        use_e3nn_conv: bool = False,
+        e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
+        use_e3nn_denominator: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -465,6 +477,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.precision = precision
         self.epsilon = 1e-4
         self.seed = seed
+        self.use_e3nn_conv = use_e3nn_conv
+        self.e3nn_conv_pattern = e3nn_conv_pattern
+        self.use_e3nn_denominator = use_e3nn_denominator
 
         if not self.edge_use_esen_rbf:
             self.edge_embd = MLPLayer(
@@ -521,7 +536,37 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.force_embedding_linear = None
 
         layers = []
+        irreps_x = Irreps(f'{self.n_dim}x0e')
+        self.lmax = int(e3nn_conv_pattern.split('+')[-1].split('x')[-1][0])
+        if self.use_e3nn_conv:
+            self.edge_rbf_embed = BesselBasis(self.e_rcut)
+            self.edge_env = PolynomialEnvelope(exponent=6)
+            self.edge_spherical_embd = SphericalEncoding(self.lmax, parity=1, normalize=True)
+            self.irreps_filter = self.edge_spherical_embd.irreps_out
+        else:
+            self.edge_rbf_embed = None
+            self.edge_env = None
+            self.edge_spherical_embd = None
+            self.irreps_filter = "0e"
+
         for ii in range(nlayers):
+            irreps_out = Irreps(self.e3nn_conv_pattern)
+            irreps_out_tp = util.infer_irreps_out(
+                irreps_x,  # type: ignore
+                self.irreps_filter,
+                irreps_out.lmax,  # type: ignore
+                'full',
+                False,
+            )
+            e3nn_conv_args = {
+                "irreps_x": irreps_x,
+                "irreps_filter": self.irreps_filter,
+                "irreps_out_tp": irreps_out_tp,
+                "irreps_out": irreps_out,
+                "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_e_sel / 4,
+                "train_denominator": True,
+            }
+            irreps_x = irreps_out
             layers.append(
                 RepFlowLayer(
                     e_rcut=self.e_rcut,
@@ -583,6 +628,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     edge_message_use_dropout=self.edge_message_use_dropout,
                     angle_message_use_dropout=self.angle_message_use_dropout,
                     dropout_rate=self.dropout_rate,
+                    use_e3nn_conv=self.use_e3nn_conv,
+                    e3nn_conv_pattern=self.e3nn_conv_pattern,
+                    e3nn_conv_args=e3nn_conv_args,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -739,6 +787,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             or self.edge_use_concat_rbf
             or self.edge_use_rbf
             or self.edge_use_dist
+            or self.use_e3nn_conv
         ):
             # nb x nloc x nnei x 1
             edge_dist = torch.linalg.norm(diff, dim=-1, keepdim=True)
@@ -930,6 +979,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             # flat all the tensors
             # n_edge x 1
             edge_input = edge_input[nlist_mask]
+            if edge_dist is not None:
+                edge_dist = edge_dist[nlist_mask]
             # n_edge x 3
             h2 = h2[nlist_mask]
             # n_edge
@@ -1109,6 +1160,22 @@ class DescrptBlockRepflows(DescriptorBlock):
         angle_ebd_k_in_ori_diff = angle_ebd
         angle_ebd_k_in_diff = angle_ebd
 
+        if self.use_e3nn_conv:
+            assert self.use_dynamic_sel, "e3nn conv must use dynamic sel"
+            assert self.edge_rbf_embed is not None
+            assert self.edge_env is not None
+            assert self.edge_spherical_embd is not None
+            assert edge_dist is not None
+            # n_edge x rbf
+            edge_rbf_ebd = self.edge_rbf_embed(edge_dist) * self.edge_env(edge_dist/self.e_rcut)
+            # n_edge x num_sph(16)
+            edge_sph = self.edge_spherical_embd(diff)
+            node_sph_embed = node_ebd
+        else:
+            edge_rbf_ebd = None
+            edge_sph = None
+            node_sph_embed = None
+
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
@@ -1182,7 +1249,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 # for jit
                 assert not self.use_rk_update
                 assert dihedral_ebd is not None
-                node_ebd, edge_ebd, angle_ebd, dihedral_ebd = ll.forward(
+                node_ebd, edge_ebd, angle_ebd, dihedral_ebd, ___ = ll.forward(
                     node_ebd_ext,
                     edge_ebd,
                     h2,
@@ -1205,7 +1272,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             else:
                 assert dihedral_ebd is None
                 if not self.use_rk_update:
-                    node_ebd, edge_ebd, angle_ebd, ___ = ll.forward(
+                    node_ebd, edge_ebd, angle_ebd, ___, node_sph_embed = ll.forward(
                         node_ebd_ext,
                         edge_ebd,
                         h2,
@@ -1224,6 +1291,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                         dihedral_ebd=None,
                         d_sw=d_sw,
                         rbf_ebd=rbf_ebd,
+                        edge_rbf_ebd=edge_rbf_ebd,
+                        edge_sph=edge_sph,
+                        node_sph_embed=node_sph_embed,
                     )
                 # may cause jit slow, todo fix
                 elif not self.rk_update_diff_layer:
@@ -1242,6 +1312,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                                 node_ebd_k1,
                                 edge_ebd_k1,
                                 angle_ebd_k1,
+                                ___,
                                 ___,
                             ) = ll.forward(
                                 node_ebd_k_in,

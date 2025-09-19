@@ -1941,6 +1941,24 @@ def dpa3_repflow_args():
             optional=True,
             default=0.1,
         ),
+        Argument(
+            "use_e3nn_conv",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "e3nn_conv_pattern",
+            str,
+            optional=True,
+            default="128x0e+64x1e+32x2e+32x3e",
+        ),
+        Argument(
+            "use_e3nn_denominator",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

@@ -88,6 +88,9 @@ class RepFlowArgs:
         angle_sh_init_lmax: int = 3,
         angle_use_fixed_gaussian: bool = False,
         angle_fixed_gaussian_interpolate: bool = False,
+        use_e3nn_conv: bool = False,
+        e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
+        use_e3nn_denominator: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -227,6 +230,9 @@ class RepFlowArgs:
         assert (
             fix_stat_std == 0.3
         ), "fix_stat_std is not implemented in this version, please use skip_stat instead."
+        self.use_e3nn_conv = use_e3nn_conv
+        self.e3nn_conv_pattern = e3nn_conv_pattern
+        self.use_e3nn_denominator = use_e3nn_denominator
 
     def __getitem__(self, key):
         if hasattr(self, key):
