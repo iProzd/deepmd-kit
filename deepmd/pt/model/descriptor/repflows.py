@@ -183,6 +183,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_e3nn_conv: bool = False,
         e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
         use_e3nn_denominator: bool = False,
+        e3nn_conv_l_max: int = 3,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -480,6 +481,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_e3nn_conv = use_e3nn_conv
         self.e3nn_conv_pattern = e3nn_conv_pattern
         self.use_e3nn_denominator = use_e3nn_denominator
+        self.e3nn_conv_l_max = e3nn_conv_l_max
 
         if not self.edge_use_esen_rbf:
             self.edge_embd = MLPLayer(
@@ -537,7 +539,8 @@ class DescrptBlockRepflows(DescriptorBlock):
 
         layers = []
         irreps_x = Irreps(f'{self.n_dim}x0e')
-        self.lmax = int(e3nn_conv_pattern.split('+')[-1].split('x')[-1][0])
+        self.lmax = e3nn_conv_l_max
+        self.e3nn_conv_pattern = Irreps("+".join(e3nn_conv_pattern.split("+")[:self.lmax+1]))
         if self.use_e3nn_conv:
             self.edge_rbf_embed = BesselBasis(self.e_rcut)
             self.edge_env = PolynomialEnvelope(exponent=6)

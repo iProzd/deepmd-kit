@@ -91,6 +91,7 @@ class RepFlowArgs:
         use_e3nn_conv: bool = False,
         e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
         use_e3nn_denominator: bool = False,
+        e3nn_conv_l_max: int = 3,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -233,6 +234,7 @@ class RepFlowArgs:
         self.use_e3nn_conv = use_e3nn_conv
         self.e3nn_conv_pattern = e3nn_conv_pattern
         self.use_e3nn_denominator = use_e3nn_denominator
+        self.e3nn_conv_l_max = e3nn_conv_l_max
 
     def __getitem__(self, key):
         if hasattr(self, key):

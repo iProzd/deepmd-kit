@@ -1959,6 +1959,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "e3nn_conv_l_max",
+            int,
+            optional=True,
+            default=3,
+        ),
     ]
 
 
