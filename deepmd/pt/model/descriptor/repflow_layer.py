@@ -104,6 +104,7 @@ class RepFlowLayer(torch.nn.Module):
         dropout_rate: float = 0.1,
         use_e3nn_conv: bool = False,
         e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
+        e3nn_use_edge_feat_weights: bool = False,
         e3nn_conv_args: dict = {},
         activation_function: str = "silu",
         update_style: str = "res_residual",
@@ -387,6 +388,7 @@ class RepFlowLayer(torch.nn.Module):
         self.use_e3nn_conv = use_e3nn_conv
         self.e3nn_conv_pattern = e3nn_conv_pattern
         self.e3nn_conv_args = e3nn_conv_args
+        self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
         if self.use_e3nn_conv:
             self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, weight_layer_act=self.activation_function)
             if self.update_style == "res_residual":
@@ -1450,7 +1452,8 @@ class RepFlowLayer(torch.nn.Module):
             assert edge_sph is not None
             assert edge_rbf_ebd is not None
             assert edge_index is not None
-            node_sph_embed = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_rbf_ebd, edge_index)
+            edge_weights = edge_rbf_ebd if not self.e3nn_use_edge_feat_weights else edge_ebd
+            node_sph_embed = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_weights, edge_index)
             # node_sph_embed = node_sph_embed
             sph_conv_update = node_sph_embed[:, :, :self.n_dim].clone()  # avoid following in-place op
             n_update_list.append(sph_conv_update)

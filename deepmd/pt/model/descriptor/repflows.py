@@ -184,6 +184,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
         use_e3nn_denominator: bool = False,
         e3nn_conv_l_max: int = 3,
+        e3nn_use_edge_feat_weights: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -482,6 +483,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.e3nn_conv_pattern = e3nn_conv_pattern
         self.use_e3nn_denominator = use_e3nn_denominator
         self.e3nn_conv_l_max = e3nn_conv_l_max
+        self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
 
         if not self.edge_use_esen_rbf:
             self.edge_embd = MLPLayer(
@@ -568,6 +570,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "irreps_out": irreps_out,
                 "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_e_sel / 4,
                 "train_denominator": True,
+                "weight_layer_input_to_hidden": [8, 64, 64] if not self.e3nn_use_edge_feat_weights else [self.e_dim],
             }
             irreps_x = irreps_out
             layers.append(
@@ -633,6 +636,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     dropout_rate=self.dropout_rate,
                     use_e3nn_conv=self.use_e3nn_conv,
                     e3nn_conv_pattern=self.e3nn_conv_pattern,
+                    e3nn_use_edge_feat_weights=self.e3nn_use_edge_feat_weights,
                     e3nn_conv_args=e3nn_conv_args,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )

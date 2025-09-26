@@ -1965,6 +1965,12 @@ def dpa3_repflow_args():
             optional=True,
             default=3,
         ),
+        Argument(
+            "e3nn_use_edge_feat_weights",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

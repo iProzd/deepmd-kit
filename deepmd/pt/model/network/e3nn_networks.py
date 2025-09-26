@@ -245,6 +245,7 @@ class IrrepsBlock(nn.Module):
             weight_layer_act="tanh",
             denominator: float = 1.0,
             train_denominator: bool = False,
+            weight_layer_input_to_hidden: list[int] = [8, 64, 64],
     ) -> None:
         super().__init__()
 
@@ -256,6 +257,7 @@ class IrrepsBlock(nn.Module):
             weight_layer_act=weight_layer_act,
             denominator=denominator,
             train_denominator=train_denominator,
+            weight_layer_input_to_hidden=weight_layer_input_to_hidden,
         )
 
         # 3. gate
