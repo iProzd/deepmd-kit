@@ -44,6 +44,7 @@ from deepmd.utils.version import (
 )
 from deepmd.pt.model.network.e3nn_networks import (
     IrrepsBlock,
+    IrrepsAngleBlock,
 )
 
 
@@ -106,6 +107,9 @@ class RepFlowLayer(torch.nn.Module):
         e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
         e3nn_use_edge_feat_weights: bool = False,
         e3nn_conv_args: dict = {},
+        e3nn_angle_conv_args: dict = {},
+        use_e3nn_angle_conv: bool = False,
+        e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -562,6 +566,26 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
                 residual_idx += 1
+
+            # for edge angle e3nn conv
+            self.use_e3nn_angle_conv = use_e3nn_angle_conv
+            self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
+            self.e3nn_angle_conv_args = e3nn_angle_conv_args
+            if self.use_e3nn_angle_conv:
+                self.e3nn_angle_conv_block = IrrepsAngleBlock(**self.e3nn_angle_conv_args, weight_layer_act=self.activation_function)
+                if self.update_style == "res_residual":
+                    self.e_residual.append(
+                        get_residual(
+                            e_dim,
+                            self.update_residual * self.residual_pref[residual_idx],
+                            self.update_residual_init,
+                            precision=precision,
+                            seed=child_seed(seed, 22),
+                        )
+                    )
+                    residual_idx += 1
+            else:
+                self.e3nn_angle_conv_block = None
 
             # angle self message
             if not self.use_gated_mlp:
@@ -1183,6 +1207,8 @@ class RepFlowLayer(torch.nn.Module):
         edge_rbf_ebd: Optional[torch.Tensor] = None,  # n_edge x num_basis
         edge_sph: Optional[torch.Tensor] = None,  # n_edge x num_sph
         node_sph_embed: Optional[torch.Tensor] = None,  # nf x nloc x num_sph_node
+        edge_angle_filter: Optional[torch.Tensor] = None,  # n_angle x num_sph
+        edge_sph_embed: Optional[torch.Tensor] = None,  # n_edge x num_sph
     ):
         """
         Parameters
@@ -1708,8 +1734,26 @@ class RepFlowLayer(torch.nn.Module):
                 padding_edge_angle_update = self.EAM_rmsnorm(padding_edge_angle_update)
 
             e_update_list.append(padding_edge_angle_update)
+
+            # for edge angle e3nn conv
+            if self.use_e3nn_angle_conv:
+                assert self.e3nn_angle_conv_block is not None
+                assert edge_sph_embed is not None
+                assert edge_angle_filter is not None
+                assert angle_index is not None
+                angle_weights = angle_ebd
+                edge_sph_embed = self.e3nn_angle_conv_block(edge_sph_embed, edge_angle_filter, angle_weights, angle_index, a_sw)
+                # node_sph_embed = node_sph_embed
+                edge_sph_conv_update = edge_sph_embed[:, :self.e_dim].clone()  # avoid following in-place op
+                e_update_list.append(edge_sph_conv_update)
+
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
+
+            # edge angle e3nn joint update
+            if self.use_e3nn_angle_conv:
+                assert edge_sph_embed is not None
+                edge_sph_embed[:, : self.e_dim] = e_updated
 
             # angle self message
             # nb x nloc x a_nnei x a_nnei x dim_a
@@ -1927,7 +1971,7 @@ class RepFlowLayer(torch.nn.Module):
 
         # update angle_ebd
         a_updated = self.list_update(a_update_list, "angle")
-        return n_updated, e_updated, a_updated, d_updated, node_sph_embed
+        return n_updated, e_updated, a_updated, d_updated, node_sph_embed, edge_sph_embed
 
     @torch.jit.export
     def list_update_res_avg(

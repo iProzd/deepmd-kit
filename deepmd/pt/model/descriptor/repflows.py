@@ -7,7 +7,8 @@ from typing import (
 
 import torch
 
-from e3nn.o3 import Irreps
+from e3nn.o3 import Irreps, Linear
+from e3nn.o3 import FullyConnectedTensorProduct as FCTP
 import sevenn.util as util
 from sevenn.nn.edge_embedding import (
     SphericalEncoding,
@@ -185,6 +186,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_e3nn_denominator: bool = False,
         e3nn_conv_l_max: int = 3,
         e3nn_use_edge_feat_weights: bool = False,
+        use_e3nn_angle_conv: bool = False,
+        e3nn_angle_conv_l_max: int = 2,
+        e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -484,6 +488,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_e3nn_denominator = use_e3nn_denominator
         self.e3nn_conv_l_max = e3nn_conv_l_max
         self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
+        self.use_e3nn_angle_conv = use_e3nn_angle_conv
+        self.e3nn_angle_conv_l_max = e3nn_angle_conv_l_max
+        self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
 
         if not self.edge_use_esen_rbf:
             self.edge_embd = MLPLayer(
@@ -540,6 +547,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.force_embedding_linear = None
 
         layers = []
+        # for node edge e3nn conv
         irreps_x = Irreps(f'{self.n_dim}x0e')
         self.lmax = e3nn_conv_l_max
         self.e3nn_conv_pattern = Irreps("+".join(e3nn_conv_pattern.split("+")[:self.lmax+1]))
@@ -554,7 +562,36 @@ class DescrptBlockRepflows(DescriptorBlock):
             self.edge_spherical_embd = None
             self.irreps_filter = "0e"
 
+        # for edge angle e3nn conv
+        irreps_edge = Irreps(f'{self.e_dim}x0e')
+        self.angle_lmax = e3nn_angle_conv_l_max
+        self.e3nn_angle_conv_pattern = Irreps("+".join(e3nn_angle_conv_pattern.split("+")[:self.angle_lmax+1]))
+        if self.use_e3nn_angle_conv:
+            self.edge_spherical_embd_for_angle = SphericalEncoding(self.angle_lmax, parity=1, normalize=True)
+            self.irreps_angle_filter = self.edge_spherical_embd_for_angle.irreps_out
+            self.angle_edge_filter_out = util.infer_irreps_out(
+                self.irreps_angle_filter,  # type: ignore
+                self.irreps_angle_filter,
+                self.angle_lmax,  # type: ignore
+                'full',
+                False,
+            )
+            # edge_i x edge_j --> linear --> angle_filter
+            self.edge_to_angle_filter_prod = FCTP(self.irreps_angle_filter, self.irreps_angle_filter, self.angle_edge_filter_out)
+            self.edge_to_angle_filter_linear = Linear(
+                irreps_in=self.angle_edge_filter_out,
+                irreps_out=self.irreps_angle_filter,
+                biases=False,
+            )
+        else:
+            self.edge_spherical_embd_for_angle = None
+            self.irreps_angle_filter = "0e"
+            self.edge_to_angle_filter_prod = None
+            self.edge_to_angle_filter_linear = None
+
+
         for ii in range(nlayers):
+            # for node edge e3nn conv
             irreps_out = Irreps(self.e3nn_conv_pattern)
             irreps_out_tp = util.infer_irreps_out(
                 irreps_x,  # type: ignore
@@ -573,6 +610,27 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "weight_layer_input_to_hidden": [8, 64, 64] if not self.e3nn_use_edge_feat_weights else [self.e_dim],
             }
             irreps_x = irreps_out
+
+            # for edge angle e3nn conv
+            irreps_edge_out = Irreps(self.e3nn_angle_conv_pattern)
+            irreps_out_tp = util.infer_irreps_out(
+                irreps_edge,  # type: ignore
+                self.irreps_angle_filter,
+                irreps_edge_out.lmax,  # type: ignore
+                'full',
+                False,
+            )
+            e3nn_angle_conv_args = {
+                "irreps_x": irreps_edge,
+                "irreps_filter": self.irreps_angle_filter,
+                "irreps_out_tp": irreps_out_tp,
+                "irreps_out": irreps_edge_out,
+                "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_a_sel / 4,
+                "train_denominator": True,
+                "weight_layer_input_to_hidden": [self.a_dim],
+            }
+            irreps_edge = irreps_edge_out
+
             layers.append(
                 RepFlowLayer(
                     e_rcut=self.e_rcut,
@@ -638,6 +696,9 @@ class DescrptBlockRepflows(DescriptorBlock):
                     e3nn_conv_pattern=self.e3nn_conv_pattern,
                     e3nn_use_edge_feat_weights=self.e3nn_use_edge_feat_weights,
                     e3nn_conv_args=e3nn_conv_args,
+                    use_e3nn_angle_conv=self.use_e3nn_angle_conv,
+                    e3nn_angle_conv_args=e3nn_angle_conv_args,
+                    e3nn_angle_conv_pattern=self.e3nn_angle_conv_pattern,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -1183,6 +1244,21 @@ class DescrptBlockRepflows(DescriptorBlock):
             edge_sph = None
             node_sph_embed = None
 
+        if self.use_e3nn_angle_conv:
+            assert self.use_dynamic_sel, "e3nn conv must use dynamic sel"
+            assert self.edge_spherical_embd_for_angle is not None
+            assert self.edge_to_angle_filter_prod is not None
+            assert self.edge_to_angle_filter_linear is not None
+            edge_sph_for_angle = self.edge_spherical_embd_for_angle(diff)
+            edge_i_index = angle_index[:, 1]
+            edge_j_index = angle_index[:, 2]
+            edge_angle_filter_tp = self.edge_to_angle_filter_prod(edge_sph_for_angle[edge_i_index], edge_sph_for_angle[edge_j_index])
+            edge_angle_filter = self.edge_to_angle_filter_linear(edge_angle_filter_tp)
+            edge_sph_embed = edge_ebd
+        else:
+            edge_angle_filter = None
+            edge_sph_embed = None
+
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
             # node_ebd_ext: nb x nall x n_dim [OR] nb x nloc x n_dim when not parrallel_mode
@@ -1256,7 +1332,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 # for jit
                 assert not self.use_rk_update
                 assert dihedral_ebd is not None
-                node_ebd, edge_ebd, angle_ebd, dihedral_ebd, ___ = ll.forward(
+                node_ebd, edge_ebd, angle_ebd, dihedral_ebd, ___, ___, = ll.forward(
                     node_ebd_ext,
                     edge_ebd,
                     h2,
@@ -1279,7 +1355,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             else:
                 assert dihedral_ebd is None
                 if not self.use_rk_update:
-                    node_ebd, edge_ebd, angle_ebd, ___, node_sph_embed = ll.forward(
+                    node_ebd, edge_ebd, angle_ebd, ___, node_sph_embed, edge_sph_embed = ll.forward(
                         node_ebd_ext,
                         edge_ebd,
                         h2,
@@ -1301,6 +1377,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                         edge_rbf_ebd=edge_rbf_ebd,
                         edge_sph=edge_sph,
                         node_sph_embed=node_sph_embed,
+                        edge_angle_filter=edge_angle_filter,
+                        edge_sph_embed=edge_sph_embed,
                     )
                 # may cause jit slow, todo fix
                 elif not self.rk_update_diff_layer:
@@ -1319,6 +1397,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                                 node_ebd_k1,
                                 edge_ebd_k1,
                                 angle_ebd_k1,
+                                ___,
                                 ___,
                                 ___,
                             ) = ll.forward(

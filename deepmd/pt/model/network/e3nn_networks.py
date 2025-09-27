@@ -140,6 +140,103 @@ class IrrepsConvolutionBlock(nn.Module):
         return x
 
 
+class IrrepsConvolutionAngleBlock(nn.Module):
+
+    def __init__(
+        self,
+        irreps_x: Irreps,
+        irreps_filter: Irreps,
+        irreps_out: Irreps,
+        weight_layer_input_to_hidden: list[int] = [8, 64, 64],
+        weight_layer_act="tanh",
+        denominator: float = 1.0,
+        train_denominator: bool = False,
+    ) -> None:
+        super().__init__()
+        self.denominator = nn.Parameter(
+            torch.FloatTensor([denominator]), requires_grad=train_denominator
+        )
+        instructions = []
+        irreps_mid = []
+        weight_numel = 0
+        for i, (mul_x, ir_x) in enumerate(irreps_x):
+            for j, (_, ir_filter) in enumerate(irreps_filter):
+                for ir_out in ir_x * ir_filter:
+                    if ir_out in irreps_out:  # here we drop l > lmax
+                        k = len(irreps_mid)
+                        weight_numel += mul_x * 1  # path shape
+                        irreps_mid.append((mul_x, ir_out))
+                        instructions.append((i, j, k, 'uvu', True))
+
+        irreps_mid = Irreps(irreps_mid)
+        irreps_mid, p, _ = irreps_mid.sort()  # type: ignore
+        instructions = [
+            (i_in1, i_in2, p[i_out], mode, train)
+            for i_in1, i_in2, i_out, mode, train in instructions
+        ]
+
+        # From v0.11.x, to compatible with cuEquivariance
+        self._instructions_before_sort = instructions
+        instructions = sorted(instructions, key=lambda x: x[2])
+
+        self.convolution_kwargs = dict(
+            irreps_in1=irreps_x,
+            irreps_in2=irreps_filter,
+            irreps_out=irreps_mid,
+            instructions=instructions,
+            shared_weights=False,
+            internal_weights=False,
+        )
+
+        self.weight_nn_kwargs = dict(
+            hs=weight_layer_input_to_hidden + [weight_numel],
+            act=ActivationFn(weight_layer_act)
+        )
+
+        self.convolution = None
+        self.weight_nn = None
+        self.convolution_cls = TensorProduct
+        self.weight_nn_cls = FullyConnectedNet
+
+        self.instantiate()
+        self._comm_size = irreps_x.dim  # used in parallel
+
+    def instantiate(self) -> None:
+        if self.convolution is not None:
+            raise ValueError('Convolution layer already exists')
+        if self.weight_nn is not None:
+            raise ValueError('Weight_nn layer already exists')
+
+        self.convolution = self.convolution_cls(**self.convolution_kwargs)
+        self.weight_nn = self.weight_nn_cls(**self.weight_nn_kwargs)
+
+    def forward(
+            self,
+            edge_sph_embed: torch.Tensor,
+            angle_sph: torch.Tensor,
+            angle_feat_ebd: torch.Tensor,
+            angle_index: torch.Tensor,
+            a_sw: torch.Tensor,
+    ):
+        assert self.convolution is not None, 'Convolution is not instantiated'
+        assert self.weight_nn is not None, 'Weight_nn is not instantiated'
+        weight = self.weight_nn(angle_feat_ebd)
+        nedge, edim = edge_sph_embed.shape
+        x = edge_sph_embed
+
+        # note that 2 -> src 1 -> dst
+        angle_src = angle_index[:, 2]
+        angle_dst = angle_index[:, 1]
+        # from IPython import embed
+        # embed()
+
+        message = self.convolution(x[angle_src], angle_sph, weight) * a_sw.unsqueeze(-1)
+
+        x = message_gather(x, angle_dst, message)
+        x = x.div(self.denominator)
+        return x
+
+
 # @compile_mode('script')
 class IrrepsLinear(nn.Module):
     """
@@ -296,3 +393,69 @@ class IrrepsBlock(nn.Module):
         # eqgate
         node_sph_embed = self.eq_gate(node_sph_embed)
         return node_sph_embed
+
+
+class IrrepsAngleBlock(nn.Module):
+    # conv + linear + eqgate
+    def __init__(
+            self,
+            irreps_x: Irreps,
+            irreps_filter: Irreps,
+            irreps_out_tp: Irreps,
+            irreps_out: Irreps,
+            weight_layer_act="tanh",
+            denominator: float = 1.0,
+            train_denominator: bool = False,
+            weight_layer_input_to_hidden: list[int] = [32],
+    ) -> None:
+        super().__init__()
+
+        # 1. conv
+        self.eq_conv = IrrepsConvolutionAngleBlock(
+            irreps_x=irreps_x,
+            irreps_filter=irreps_filter,
+            irreps_out=irreps_out_tp,
+            weight_layer_act=weight_layer_act,
+            denominator=denominator,
+            train_denominator=train_denominator,
+            weight_layer_input_to_hidden=weight_layer_input_to_hidden,
+        )
+
+        # 3. gate
+        self.gate_act_dict = {
+            "e": ActivationFn(weight_layer_act),
+            "o": ActivationFn('tanh'),
+        }
+
+        self.eq_gate = EquivariantGate(irreps_out, self.gate_act_dict, self.gate_act_dict)
+
+        # 2. linear
+        self.linear_after_conv = IrrepsLinear(
+            irreps_in=irreps_out_tp,
+            irreps_out=self.eq_gate.get_gate_irreps_in(),
+            biases=False,
+        )
+
+    def forward(
+            self,
+            edge_sph_embed: torch.Tensor,
+            angle_sph: torch.Tensor,
+            angle_feat_ebd: torch.Tensor,
+            angle_index: torch.Tensor,
+            a_sw: torch.Tensor,
+    ):
+        # conv
+        edge_sph_embed = self.eq_conv(
+            edge_sph_embed,
+            angle_sph,
+            angle_feat_ebd,
+            angle_index,
+            a_sw,
+        )
+
+        # linear
+        edge_sph_embed = self.linear_after_conv(edge_sph_embed)
+
+        # eqgate
+        edge_sph_embed = self.eq_gate(edge_sph_embed)
+        return edge_sph_embed

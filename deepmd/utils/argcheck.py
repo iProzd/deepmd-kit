@@ -1971,6 +1971,18 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "use_e3nn_angle_conv",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
+            "e3nn_angle_conv_l_max",
+            int,
+            optional=True,
+            default=2,
+        ),
     ]
 
 
