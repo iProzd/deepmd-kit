@@ -110,6 +110,7 @@ class RepFlowLayer(torch.nn.Module):
         e3nn_angle_conv_args: dict = {},
         use_e3nn_angle_conv: bool = False,
         e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
+        e3nn_angle_use_cross: bool = False,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -571,6 +572,7 @@ class RepFlowLayer(torch.nn.Module):
             self.use_e3nn_angle_conv = use_e3nn_angle_conv
             self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
             self.e3nn_angle_conv_args = e3nn_angle_conv_args
+            self.e3nn_angle_use_cross = e3nn_angle_use_cross
             if self.use_e3nn_angle_conv:
                 self.e3nn_angle_conv_block = IrrepsAngleBlock(**self.e3nn_angle_conv_args, weight_layer_act=self.activation_function)
                 if self.update_style == "res_residual":
@@ -1209,6 +1211,7 @@ class RepFlowLayer(torch.nn.Module):
         node_sph_embed: Optional[torch.Tensor] = None,  # nf x nloc x num_sph_node
         edge_angle_filter: Optional[torch.Tensor] = None,  # n_angle x num_sph
         edge_sph_embed: Optional[torch.Tensor] = None,  # n_edge x num_sph
+        angle_weights: Optional[torch.Tensor] = None,  # n_angle x 8
     ):
         """
         Parameters
@@ -1741,8 +1744,12 @@ class RepFlowLayer(torch.nn.Module):
                 assert edge_sph_embed is not None
                 assert edge_angle_filter is not None
                 assert angle_index is not None
-                angle_weights = angle_ebd
-                edge_sph_embed = self.e3nn_angle_conv_block(edge_sph_embed, edge_angle_filter, angle_weights, angle_index, a_sw)
+                if self.e3nn_angle_use_cross:
+                    assert angle_weights is not None
+                    angle_weights_input = angle_weights
+                else:
+                    angle_weights_input = angle_ebd
+                edge_sph_embed = self.e3nn_angle_conv_block(edge_sph_embed, edge_angle_filter, angle_weights_input, angle_index, a_sw)
                 # node_sph_embed = node_sph_embed
                 edge_sph_conv_update = edge_sph_embed[:, :self.e_dim].clone()  # avoid following in-place op
                 e_update_list.append(edge_sph_conv_update)

@@ -189,6 +189,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         use_e3nn_angle_conv: bool = False,
         e3nn_angle_conv_l_max: int = 2,
         e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
+        e3nn_angle_use_cross: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -491,6 +492,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_e3nn_angle_conv = use_e3nn_angle_conv
         self.e3nn_angle_conv_l_max = e3nn_angle_conv_l_max
         self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
+        self.e3nn_angle_use_cross = e3nn_angle_use_cross
 
         if not self.edge_use_esen_rbf:
             self.edge_embd = MLPLayer(
@@ -607,7 +609,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "irreps_out": irreps_out,
                 "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_e_sel / 4,
                 "train_denominator": True,
-                "weight_layer_input_to_hidden": [8, 64, 64] if not self.e3nn_use_edge_feat_weights else [self.e_dim],
+                "weight_layer_input_to_hidden": [8, 64, 64] if not self.e3nn_use_edge_feat_weights else [self.e_dim, 64, 64],
             }
             irreps_x = irreps_out
 
@@ -627,7 +629,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "irreps_out": irreps_edge_out,
                 "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_a_sel / 4,
                 "train_denominator": True,
-                "weight_layer_input_to_hidden": [self.a_dim],
+                "weight_layer_input_to_hidden": [8, 64, 64] if self.e3nn_angle_use_cross else [self.a_dim],
             }
             irreps_edge = irreps_edge_out
 
@@ -699,6 +701,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     use_e3nn_angle_conv=self.use_e3nn_angle_conv,
                     e3nn_angle_conv_args=e3nn_angle_conv_args,
                     e3nn_angle_conv_pattern=self.e3nn_angle_conv_pattern,
+                    e3nn_angle_use_cross=self.e3nn_angle_use_cross,
                     seed=child_seed(child_seed(seed, 1), ii),
                 )
             )
@@ -1249,15 +1252,28 @@ class DescrptBlockRepflows(DescriptorBlock):
             assert self.edge_spherical_embd_for_angle is not None
             assert self.edge_to_angle_filter_prod is not None
             assert self.edge_to_angle_filter_linear is not None
-            edge_sph_for_angle = self.edge_spherical_embd_for_angle(diff)
+            edge_sph_embed = edge_ebd
             edge_i_index = angle_index[:, 1]
             edge_j_index = angle_index[:, 2]
-            edge_angle_filter_tp = self.edge_to_angle_filter_prod(edge_sph_for_angle[edge_i_index], edge_sph_for_angle[edge_j_index])
-            edge_angle_filter = self.edge_to_angle_filter_linear(edge_angle_filter_tp)
-            edge_sph_embed = edge_ebd
+            if not self.e3nn_angle_use_cross:
+                edge_sph_for_angle = self.edge_spherical_embd_for_angle(diff)
+                edge_angle_filter_tp = self.edge_to_angle_filter_prod(edge_sph_for_angle[edge_i_index], edge_sph_for_angle[edge_j_index])
+                edge_angle_filter = self.edge_to_angle_filter_linear(edge_angle_filter_tp)
+                angle_weights = None
+            else:
+                angle_cross_vec = torch.cross(diff[edge_i_index], diff[edge_j_index], dim=-1)
+                edge_angle_filter = self.edge_spherical_embd_for_angle(angle_cross_vec)
+                # angle basis as weights
+                # 1 - 1e-6 for torch.acos stability
+                cosine_ij = cosine_ij[a_nlist_mask]
+                sine_ij = torch.sqrt(1 - cosine_ij ** 2)
+                theta = torch.acos(cosine_ij).unsqueeze(-1)
+                theta_list = torch.cat([theta*2, theta*4, theta*8], dim=-1)
+                angle_weights = torch.cat([cosine_ij.unsqueeze(-1), torch.cos(theta_list), sine_ij.unsqueeze(-1), torch.sin(theta_list)], dim=-1)
         else:
             edge_angle_filter = None
             edge_sph_embed = None
+            angle_weights = None
 
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
@@ -1379,6 +1395,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                         node_sph_embed=node_sph_embed,
                         edge_angle_filter=edge_angle_filter,
                         edge_sph_embed=edge_sph_embed,
+                        angle_weights=angle_weights,
                     )
                 # may cause jit slow, todo fix
                 elif not self.rk_update_diff_layer:

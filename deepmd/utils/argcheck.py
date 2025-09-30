@@ -1983,6 +1983,12 @@ def dpa3_repflow_args():
             optional=True,
             default=2,
         ),
+        Argument(
+            "e3nn_angle_use_cross",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
