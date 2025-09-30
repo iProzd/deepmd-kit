@@ -395,7 +395,7 @@ class RepFlowLayer(torch.nn.Module):
         self.e3nn_conv_args = e3nn_conv_args
         self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
         if self.use_e3nn_conv:
-            self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, weight_layer_act=self.activation_function)
+            self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, weight_layer_act="silu")
             if self.update_style == "res_residual":
                 self.n_residual.append(
                     get_residual(
@@ -574,7 +574,7 @@ class RepFlowLayer(torch.nn.Module):
             self.e3nn_angle_conv_args = e3nn_angle_conv_args
             self.e3nn_angle_use_cross = e3nn_angle_use_cross
             if self.use_e3nn_angle_conv:
-                self.e3nn_angle_conv_block = IrrepsAngleBlock(**self.e3nn_angle_conv_args, weight_layer_act=self.activation_function)
+                self.e3nn_angle_conv_block = IrrepsAngleBlock(**self.e3nn_angle_conv_args, weight_layer_act="silu")
                 if self.update_style == "res_residual":
                     self.e_residual.append(
                         get_residual(
