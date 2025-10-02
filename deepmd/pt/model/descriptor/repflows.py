@@ -190,6 +190,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         e3nn_angle_conv_l_max: int = 2,
         e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
         e3nn_angle_use_cross: bool = False,
+        e3nn_angle_only_single_angle: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -493,6 +494,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.e3nn_angle_conv_l_max = e3nn_angle_conv_l_max
         self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
         self.e3nn_angle_use_cross = e3nn_angle_use_cross
+        self.e3nn_angle_only_single_angle = e3nn_angle_only_single_angle
 
         if not self.edge_use_esen_rbf:
             self.edge_embd = MLPLayer(
@@ -629,7 +631,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "irreps_out": irreps_edge_out,
                 "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_a_sel / 4,
                 "train_denominator": True,
-                "weight_layer_input_to_hidden": [8, 64, 64] if self.e3nn_angle_use_cross else [self.a_dim],
+                "weight_layer_input_to_hidden": [8 if not self.e3nn_angle_only_single_angle else 2, 64, 64] if self.e3nn_angle_use_cross else [self.a_dim],
             }
             irreps_edge = irreps_edge_out
 
@@ -1267,9 +1269,12 @@ class DescrptBlockRepflows(DescriptorBlock):
                 # 1 - 1e-6 for torch.acos stability
                 cosine_ij = cosine_ij[a_nlist_mask]
                 sine_ij = torch.sqrt(1 - cosine_ij ** 2)
-                theta = torch.acos(cosine_ij).unsqueeze(-1)
-                theta_list = torch.cat([theta*2, theta*4, theta*8], dim=-1)
-                angle_weights = torch.cat([cosine_ij.unsqueeze(-1), torch.cos(theta_list), sine_ij.unsqueeze(-1), torch.sin(theta_list)], dim=-1)
+                if not self.e3nn_angle_only_single_angle:
+                    theta = torch.acos(cosine_ij).unsqueeze(-1)
+                    theta_list = torch.cat([theta*2, theta*4, theta*8], dim=-1)
+                    angle_weights = torch.cat([cosine_ij.unsqueeze(-1), torch.cos(theta_list), sine_ij.unsqueeze(-1), torch.sin(theta_list)], dim=-1)
+                else:
+                    angle_weights = torch.cat([cosine_ij.unsqueeze(-1), sine_ij.unsqueeze(-1)], dim=-1)
         else:
             edge_angle_filter = None
             edge_sph_embed = None

@@ -1989,6 +1989,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "e3nn_angle_only_single_angle",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

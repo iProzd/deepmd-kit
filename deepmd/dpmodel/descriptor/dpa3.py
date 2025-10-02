@@ -96,6 +96,7 @@ class RepFlowArgs:
         use_e3nn_angle_conv: bool = False,
         e3nn_angle_conv_l_max: int = 2,
         e3nn_angle_use_cross: bool = False,
+        e3nn_angle_only_single_angle: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -243,6 +244,7 @@ class RepFlowArgs:
         self.use_e3nn_angle_conv = use_e3nn_angle_conv
         self.e3nn_angle_conv_l_max = e3nn_angle_conv_l_max
         self.e3nn_angle_use_cross = e3nn_angle_use_cross
+        self.e3nn_angle_only_single_angle = e3nn_angle_only_single_angle
 
     def __getitem__(self, key):
         if hasattr(self, key):
