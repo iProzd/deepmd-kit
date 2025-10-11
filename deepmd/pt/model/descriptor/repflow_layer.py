@@ -106,6 +106,7 @@ class RepFlowLayer(torch.nn.Module):
         use_e3nn_conv: bool = False,
         e3nn_conv_pattern: str = "128x0e+64x1e+32x2e+32x3e",
         e3nn_use_edge_feat_weights: bool = False,
+        e3nn_conv_use_edge_sh_feat: bool = False,
         e3nn_conv_args: dict = {},
         e3nn_angle_conv_args: dict = {},
         use_e3nn_angle_conv: bool = False,
@@ -394,8 +395,9 @@ class RepFlowLayer(torch.nn.Module):
         self.e3nn_conv_pattern = e3nn_conv_pattern
         self.e3nn_conv_args = e3nn_conv_args
         self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
+        self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
         if self.use_e3nn_conv:
-            self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, weight_layer_act="silu")
+            self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, e3nn_conv_use_edge_sh_feat=e3nn_conv_use_edge_sh_feat, weight_layer_act="silu")
             if self.update_style == "res_residual":
                 self.n_residual.append(
                     get_residual(
@@ -575,6 +577,10 @@ class RepFlowLayer(torch.nn.Module):
             self.e3nn_angle_use_cross = e3nn_angle_use_cross
             if self.use_e3nn_angle_conv:
                 self.e3nn_angle_conv_block = IrrepsAngleBlock(**self.e3nn_angle_conv_args, weight_layer_act="silu")
+            else:
+                self.e3nn_angle_conv_block = None
+
+            if self.e3nn_conv_use_edge_sh_feat or self.use_e3nn_angle_conv:
                 if self.update_style == "res_residual":
                     self.e_residual.append(
                         get_residual(
@@ -586,8 +592,7 @@ class RepFlowLayer(torch.nn.Module):
                         )
                     )
                     residual_idx += 1
-            else:
-                self.e3nn_angle_conv_block = None
+
 
             # angle self message
             if not self.use_gated_mlp:
@@ -1482,7 +1487,11 @@ class RepFlowLayer(torch.nn.Module):
             assert edge_rbf_ebd is not None
             assert edge_index is not None
             edge_weights = edge_rbf_ebd if not self.e3nn_use_edge_feat_weights else edge_ebd
-            node_sph_embed = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_weights, edge_index)
+            node_sph_embed, edge_sph_update = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_weights, edge_index, edge_sph_embed)
+
+            if self.e3nn_conv_use_edge_sh_feat:
+                assert edge_sph_embed is not None
+                edge_sph_embed = edge_sph_embed + 0.1 * edge_sph_update
             # node_sph_embed = node_sph_embed
             sph_conv_update = node_sph_embed[:, :, :self.n_dim].clone()  # avoid following in-place op
             n_update_list.append(sph_conv_update)
@@ -1751,6 +1760,9 @@ class RepFlowLayer(torch.nn.Module):
                     angle_weights_input = angle_ebd
                 edge_sph_embed = self.e3nn_angle_conv_block(edge_sph_embed, edge_angle_filter, angle_weights_input, angle_index, a_sw)
                 # node_sph_embed = node_sph_embed
+
+            if self.use_e3nn_angle_conv or self.e3nn_conv_use_edge_sh_feat:
+                assert edge_sph_embed is not None
                 edge_sph_conv_update = edge_sph_embed[:, :self.e_dim].clone()  # avoid following in-place op
                 e_update_list.append(edge_sph_conv_update)
 
@@ -1758,7 +1770,7 @@ class RepFlowLayer(torch.nn.Module):
             e_updated = self.list_update(e_update_list, "edge")
 
             # edge angle e3nn joint update
-            if self.use_e3nn_angle_conv:
+            if self.use_e3nn_angle_conv or self.e3nn_conv_use_edge_sh_feat:
                 assert edge_sph_embed is not None
                 edge_sph_embed[:, : self.e_dim] = e_updated
 

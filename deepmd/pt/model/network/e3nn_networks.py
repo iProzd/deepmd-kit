@@ -5,6 +5,9 @@ from e3nn.o3 import Irreps, TensorProduct, Linear
 from deepmd.pt.utils.utils import (
     ActivationFn,
 )
+from typing import (
+    Optional,
+)
 
 
 def broadcast(
@@ -137,7 +140,7 @@ class IrrepsConvolutionBlock(nn.Module):
         # from IPython import embed
         # embed()
         x = x.div(self.denominator).reshape(nf, nall, -1)
-        return x
+        return x, message
 
 
 class IrrepsConvolutionAngleBlock(nn.Module):
@@ -342,20 +345,32 @@ class IrrepsBlock(nn.Module):
             weight_layer_act="tanh",
             denominator: float = 1.0,
             train_denominator: bool = False,
+            e3nn_conv_use_edge_sh_feat: bool = False,
             weight_layer_input_to_hidden: list[int] = [8, 64, 64],
     ) -> None:
         super().__init__()
+        self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
+        self.irreps_out_tp = irreps_out_tp
 
         # 1. conv
-        self.eq_conv = IrrepsConvolutionBlock(
-            irreps_x=irreps_x,
-            irreps_filter=irreps_filter,
-            irreps_out=irreps_out_tp,
-            weight_layer_act=weight_layer_act,
-            denominator=denominator,
-            train_denominator=train_denominator,
-            weight_layer_input_to_hidden=weight_layer_input_to_hidden,
-        )
+        if not self.e3nn_conv_use_edge_sh_feat:
+            self.eq_conv = IrrepsConvolutionBlock(
+                irreps_x=irreps_x,
+                irreps_filter=irreps_filter,
+                irreps_out=irreps_out_tp,
+                weight_layer_act=weight_layer_act,
+                denominator=denominator,
+                train_denominator=train_denominator,
+                weight_layer_input_to_hidden=weight_layer_input_to_hidden,
+            )
+            linear_in_dim = irreps_out_tp
+        else:
+            self.eq_conv = FullLInteractionsUUU(
+                irreps1_in=irreps_x,
+                denominator=denominator,
+                train_denominator=train_denominator,
+            )
+            linear_in_dim = self.eq_conv.irreps_cat
 
         # 3. gate
         self.gate_act_dict = {
@@ -367,7 +382,7 @@ class IrrepsBlock(nn.Module):
 
         # 2. linear
         self.linear_after_conv = IrrepsLinear(
-            irreps_in=irreps_out_tp,
+            irreps_in=linear_in_dim,
             irreps_out=self.eq_gate.get_gate_irreps_in(),
             biases=False,
         )
@@ -378,21 +393,30 @@ class IrrepsBlock(nn.Module):
             edge_sph: torch.Tensor,
             edge_rbf_ebd: torch.Tensor,
             edge_index: torch.Tensor,
+            edge_sph_embed: Optional[torch.Tensor] = None,
     ):
         # conv
-        node_sph_embed = self.eq_conv(
-            node_sph_embed,
-            edge_sph,
-            edge_rbf_ebd,
-            edge_index,
-        )
+        if not self.e3nn_conv_use_edge_sh_feat:
+            node_sph_embed, edge_sph_update = self.eq_conv(
+                node_sph_embed,
+                edge_sph,
+                edge_rbf_ebd,
+                edge_index,
+            )
+        else:
+            assert edge_sph_embed is not None
+            node_sph_embed, edge_sph_update = self.eq_conv(
+                node_sph_embed,
+                edge_sph_embed,
+                edge_index,
+            )
+
 
         # linear
         node_sph_embed = self.linear_after_conv(node_sph_embed)
-
         # eqgate
         node_sph_embed = self.eq_gate(node_sph_embed)
-        return node_sph_embed
+        return node_sph_embed, edge_sph_update
 
 
 class IrrepsAngleBlock(nn.Module):
@@ -459,3 +483,126 @@ class IrrepsAngleBlock(nn.Module):
         # eqgate
         edge_sph_embed = self.eq_gate(edge_sph_embed)
         return edge_sph_embed
+
+
+def _idx_l(irreps: Irreps, l: int):
+    for i, (_, ir) in enumerate(irreps):
+        if ir.l == l:
+            return i
+    return None
+
+
+class FullLInteractionsUUU(nn.Module):
+    """
+    - irrep1: "128x0e + 64x1e + 32x2e" 或 "128x0e"
+    - irreps2_base: 固定 "64x0e + 32x1e + 32x2e"
+    - 三份 kernel self-interaction:
+        k1: 128x0e + 128x1e + 128x2e   （用于 l1=0 组）
+        k2:  64x0e +  64x1e +  64x2e   （用于 l1=1 组）
+        k3:  32x0e +  32x1e +  32x2e   （用于 l1=2 组）
+    - 每组用 `uuu`，对 (l1, l2) 枚举所有 CG 允许的 l_out ∈ {0,1,2}。
+      `uuu` 逐通道：要求 in1[l1]、in2[l2] 与 out[l_out] 的 multiplicity 一致。
+      因此每组的输出在各阶的 multiplicity 取自 irrep1 对应阶。
+    """
+    def __init__(
+            self,
+            irreps1_in: Irreps,
+            l_max: int = 2,
+            denominator: float = 1.0,
+            train_denominator: bool = False,
+    ):
+        super().__init__()
+        self.ir1 = irreps1_in
+        self.l_max = l_max
+        self.ir2_base = Irreps("64x0e + 32x1e + 32x2e").simplify()  # edge feature irreps
+
+        # self-interactions on kernel
+        self.si1 = Linear(self.ir2_base, "128x0e + 128x1e + 128x2e")
+        self.si2 = Linear(self.ir2_base,  "64x0e +  64x1e +  64x2e")
+        self.si3 = Linear(self.ir2_base,  "32x0e +  32x1e +  32x2e")
+
+        # 三组 TP：分别针对 l1=0/1/2，输出阶数上限为 2
+        self.tp0 = self._build_tp_group(l1=0, ir2=self.si1.irreps_out)
+        self.tp1 = self._build_tp_group(l1=1, ir2=self.si2.irreps_out)
+        self.tp2 = self._build_tp_group(l1=2, ir2=self.si3.irreps_out)
+
+        # 拼接后的型谱
+        self.irreps_cat = (self.tp0.irreps_out + self.tp1.irreps_out + self.tp2.irreps_out).simplify()
+
+        self.denominator = nn.Parameter(
+            torch.FloatTensor([denominator]), requires_grad=train_denominator
+        )
+
+        # gate for edge
+        self.gate_act_dict = {
+            "e": ActivationFn("silu"),
+            "o": ActivationFn('tanh'),
+        }
+
+        self.eq_gate = EquivariantGate(self.ir2_base, self.gate_act_dict, self.gate_act_dict)
+
+        # linear
+        self.linear_after_conv_edge = IrrepsLinear(
+            irreps_in=self.irreps_cat,
+            irreps_out=self.eq_gate.get_gate_irreps_in(),
+            biases=False,
+        )
+
+    def _build_tp_group(self, l1: int, ir2: Irreps) -> TensorProduct:
+        if l1 >= len(self.ir1):
+            return TensorProduct(self.ir1, ir2, Irreps([]), instructions=[])
+        ir1_l1 = self.ir1[_idx_l(self.ir1, l1)]
+        ir1_mul = ir1_l1.mul
+        # ir1_l1 x "ir1_mul x 0e + ir1_mul x 1e + ir1_mul x 2e"
+        ir_out = Irreps([])
+        instr = []
+        for i, (mul, ir) in enumerate(ir2):
+            assert mul == ir1_mul
+            for ir_single_out in ir1_l1.ir * ir:
+                if ir_single_out.l <= self.l_max:
+                    ir_out += Irreps(f"{ir1_mul}x{ir_single_out.l}e")
+                    instr.append((_idx_l(self.ir1, l1), i, len(ir_out) - 1, "uuu", False))
+
+        ir_out, p, _ = ir_out.sort()  # type: ignore
+        instr = [
+            (i_in1, i_in2, p[i_out], mode, train)
+            for i_in1, i_in2, i_out, mode, train in instr
+        ]
+
+        return TensorProduct(
+            self.ir1, ir2, ir_out,
+            instructions=instr,
+            internal_weights=False,
+            shared_weights=True,
+        )
+
+    def forward(self, x1, x2, edge_index: torch.Tensor,):
+        """
+        x1: (..., self.ir1.dim)
+        x2: (..., self.ir2_base.dim)
+        return: y_cat with Irreps == self.irreps_cat
+        """
+        k1 = self.si1(x2)   # for l1=0
+        k2 = self.si2(x2)   # for l1=1
+        k3 = self.si3(x2)   # for l1=2
+
+        nf, nall, _ = x1.shape
+        x1 = x1.reshape(nf * nall, -1)
+
+        # note that 1 -> src 0 -> dst
+        edge_src = edge_index[:, 1]
+        edge_dst = edge_index[:, 0]
+
+        x1_src = x1[edge_src]
+
+        y0 = self.tp0(x1_src, k1)  # 包含 (0,0)->0; (0,1)->1; (0,2)->2
+        y1 = self.tp1(x1_src, k2)  # 包含 (1,0)->1; (1,1)->0,1,2; (1,2)->1,2
+        y2 = self.tp2(x1_src, k3)  # 包含 (2,0)->2; (2,1)->1,2; (2,2)->0,1,2（裁到≤2）
+        y = torch.cat([y0, y1, y2], dim=-1)
+
+        x1 = message_gather(x1, edge_dst, y)
+        x1 = x1.div(self.denominator).reshape(nf, nall, -1)
+
+        y = self.linear_after_conv_edge(y)
+        y = self.eq_gate(y)
+        return x1, y

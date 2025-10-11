@@ -1995,6 +1995,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "e3nn_conv_use_edge_sh_feat",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
