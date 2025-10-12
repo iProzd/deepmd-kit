@@ -347,6 +347,7 @@ class IrrepsBlock(nn.Module):
             train_denominator: bool = False,
             e3nn_conv_use_edge_sh_feat: bool = False,
             weight_layer_input_to_hidden: list[int] = [8, 64, 64],
+            edge_sh_feat_use_rbf_weights: bool = False,
     ) -> None:
         super().__init__()
         self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
@@ -369,6 +370,9 @@ class IrrepsBlock(nn.Module):
                 irreps1_in=irreps_x,
                 denominator=denominator,
                 train_denominator=train_denominator,
+                weight_layer_input_to_hidden=weight_layer_input_to_hidden,
+                use_rbf_weights=edge_sh_feat_use_rbf_weights,
+                weight_layer_act=weight_layer_act,
             )
             linear_in_dim = self.eq_conv.irreps_cat
 
@@ -409,6 +413,7 @@ class IrrepsBlock(nn.Module):
                 node_sph_embed,
                 edge_sph_embed,
                 edge_index,
+                edge_rbf_ebd=edge_rbf_ebd,
             )
 
 
@@ -510,11 +515,15 @@ class FullLInteractionsUUU(nn.Module):
             l_max: int = 2,
             denominator: float = 1.0,
             train_denominator: bool = False,
+            use_rbf_weights: bool = False,
+            weight_layer_input_to_hidden: list[int] = [8, 64, 64],
+            weight_layer_act="tanh",
     ):
         super().__init__()
         self.ir1 = irreps1_in
         self.l_max = l_max
         self.ir2_base = Irreps("64x0e + 32x1e + 32x2e").simplify()  # edge feature irreps
+        self.use_rbf_weights = use_rbf_weights
 
         # self-interactions on kernel
         self.si1 = Linear(self.ir2_base, "128x0e + 128x1e + 128x2e")
@@ -525,6 +534,14 @@ class FullLInteractionsUUU(nn.Module):
         self.tp0 = self._build_tp_group(l1=0, ir2=self.si1.irreps_out)
         self.tp1 = self._build_tp_group(l1=1, ir2=self.si2.irreps_out)
         self.tp2 = self._build_tp_group(l1=2, ir2=self.si3.irreps_out)
+
+        if self.use_rbf_weights:
+            self.tp_weight_linear = FullyConnectedNet(
+                weight_layer_input_to_hidden + [self.tp0.weight_numel + self.tp1.weight_numel + self.tp2.weight_numel],
+                act=ActivationFn(weight_layer_act),
+            )
+        else:
+            self.tp_weight_linear = None
 
         # 拼接后的型谱
         self.irreps_cat = (self.tp0.irreps_out + self.tp1.irreps_out + self.tp2.irreps_out).simplify()
@@ -550,7 +567,7 @@ class FullLInteractionsUUU(nn.Module):
 
     def _build_tp_group(self, l1: int, ir2: Irreps) -> TensorProduct:
         if l1 >= len(self.ir1):
-            return TensorProduct(self.ir1, ir2, Irreps([]), instructions=[])
+            return TensorProduct(self.ir1, ir2, Irreps([]), instructions=[], shared_weights=not self.use_rbf_weights, internal_weights=not self.use_rbf_weights,)
         ir1_l1 = self.ir1[_idx_l(self.ir1, l1)]
         ir1_mul = ir1_l1.mul
         # ir1_l1 x "ir1_mul x 0e + ir1_mul x 1e + ir1_mul x 2e"
@@ -561,7 +578,7 @@ class FullLInteractionsUUU(nn.Module):
             for ir_single_out in ir1_l1.ir * ir:
                 if ir_single_out.l <= self.l_max:
                     ir_out += Irreps(f"{ir1_mul}x{ir_single_out.l}e")
-                    instr.append((_idx_l(self.ir1, l1), i, len(ir_out) - 1, "uuu", False))
+                    instr.append((_idx_l(self.ir1, l1), i, len(ir_out) - 1, "uuu", True))
 
         ir_out, p, _ = ir_out.sort()  # type: ignore
         instr = [
@@ -572,11 +589,11 @@ class FullLInteractionsUUU(nn.Module):
         return TensorProduct(
             self.ir1, ir2, ir_out,
             instructions=instr,
-            internal_weights=False,
-            shared_weights=True,
+            internal_weights=not self.use_rbf_weights,
+            shared_weights=not self.use_rbf_weights,
         )
 
-    def forward(self, x1, x2, edge_index: torch.Tensor,):
+    def forward(self, x1, x2, edge_index: torch.Tensor, edge_rbf_ebd: Optional[torch.Tensor] = None):
         """
         x1: (..., self.ir1.dim)
         x2: (..., self.ir2_base.dim)
@@ -594,10 +611,19 @@ class FullLInteractionsUUU(nn.Module):
         edge_dst = edge_index[:, 0]
 
         x1_src = x1[edge_src]
+        k_weight = self.tp_weight_linear(edge_rbf_ebd) if self.tp_weight_linear is not None and edge_rbf_ebd is not None else None
+        if k_weight is not None:
+            k1_weight, k2_weight, k3_weight = torch.split(
+                k_weight,
+                [self.tp0.weight_numel, self.tp1.weight_numel, self.tp2.weight_numel],
+                dim=-1
+            )
+        else:
+            k1_weight = k2_weight = k3_weight = None
 
-        y0 = self.tp0(x1_src, k1)  # 包含 (0,0)->0; (0,1)->1; (0,2)->2
-        y1 = self.tp1(x1_src, k2)  # 包含 (1,0)->1; (1,1)->0,1,2; (1,2)->1,2
-        y2 = self.tp2(x1_src, k3)  # 包含 (2,0)->2; (2,1)->1,2; (2,2)->0,1,2（裁到≤2）
+        y0 = self.tp0(x1_src, k1, k1_weight)  # 包含 (0,0)->0; (0,1)->1; (0,2)->2
+        y1 = self.tp1(x1_src, k2, k2_weight)  # 包含 (1,0)->1; (1,1)->0,1,2; (1,2)->1,2
+        y2 = self.tp2(x1_src, k3, k3_weight)  # 包含 (2,0)->2; (2,1)->1,2; (2,2)->0,1,2（裁到≤2）
         y = torch.cat([y0, y1, y2], dim=-1)
 
         x1 = message_gather(x1, edge_dst, y)

@@ -2001,6 +2001,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "edge_sh_feat_use_rbf_weights",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 
