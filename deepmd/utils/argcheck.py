@@ -2007,6 +2007,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "e3nn_conv_use_vi",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

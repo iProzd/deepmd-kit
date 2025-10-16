@@ -348,10 +348,12 @@ class IrrepsBlock(nn.Module):
             e3nn_conv_use_edge_sh_feat: bool = False,
             weight_layer_input_to_hidden: list[int] = [8, 64, 64],
             edge_sh_feat_use_rbf_weights: bool = False,
+            e3nn_conv_use_vi: bool = False,
     ) -> None:
         super().__init__()
         self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
         self.irreps_out_tp = irreps_out_tp
+        self.e3nn_conv_use_vi = e3nn_conv_use_vi
 
         # 1. conv
         if not self.e3nn_conv_use_edge_sh_feat:
@@ -373,6 +375,7 @@ class IrrepsBlock(nn.Module):
                 weight_layer_input_to_hidden=weight_layer_input_to_hidden,
                 use_rbf_weights=edge_sh_feat_use_rbf_weights,
                 weight_layer_act=weight_layer_act,
+                e3nn_conv_use_vi=e3nn_conv_use_vi,
             )
             linear_in_dim = self.eq_conv.irreps_cat
 
@@ -518,12 +521,14 @@ class FullLInteractionsUUU(nn.Module):
             use_rbf_weights: bool = False,
             weight_layer_input_to_hidden: list[int] = [8, 64, 64],
             weight_layer_act="tanh",
+            e3nn_conv_use_vi: bool = False,
     ):
         super().__init__()
         self.ir1 = irreps1_in
         self.l_max = l_max
         self.ir2_base = Irreps("64x0e + 32x1e + 32x2e").simplify()  # edge feature irreps
         self.use_rbf_weights = use_rbf_weights
+        self.e3nn_conv_use_vi = e3nn_conv_use_vi
 
         # self-interactions on kernel
         self.si1 = Linear(self.ir2_base, "128x0e + 128x1e + 128x2e")
@@ -567,7 +572,7 @@ class FullLInteractionsUUU(nn.Module):
 
     def _build_tp_group(self, l1: int, ir2: Irreps) -> TensorProduct:
         if l1 >= len(self.ir1):
-            return TensorProduct(self.ir1, ir2, Irreps([]), instructions=[], shared_weights=not self.use_rbf_weights, internal_weights=not self.use_rbf_weights,)
+            return TensorProduct(self.ir1 if not self.e3nn_conv_use_vi else self.ir1 + self.ir1, ir2, Irreps([]), instructions=[], shared_weights=not self.use_rbf_weights, internal_weights=not self.use_rbf_weights,)
         ir1_l1 = self.ir1[_idx_l(self.ir1, l1)]
         ir1_mul = ir1_l1.mul
         # ir1_l1 x "ir1_mul x 0e + ir1_mul x 1e + ir1_mul x 2e"
@@ -579,6 +584,10 @@ class FullLInteractionsUUU(nn.Module):
                 if ir_single_out.l <= self.l_max:
                     ir_out += Irreps(f"{ir1_mul}x{ir_single_out.l}e")
                     instr.append((_idx_l(self.ir1, l1), i, len(ir_out) - 1, "uuu", True))
+                    if self.e3nn_conv_use_vi:
+                        # (ir1_l1_j + ir1_l1_i) x "ir1_mul x 0e + ir1_mul x 1e + ir1_mul x 2e"
+                        ir_out += Irreps(f"{ir1_mul}x{ir_single_out.l}e")
+                        instr.append((_idx_l(self.ir1, l1) + len(self.ir1), i, len(ir_out) - 1, "uuu", True))
 
         ir_out, p, _ = ir_out.sort()  # type: ignore
         instr = [
@@ -587,7 +596,9 @@ class FullLInteractionsUUU(nn.Module):
         ]
 
         return TensorProduct(
-            self.ir1, ir2, ir_out,
+            self.ir1 if not self.e3nn_conv_use_vi else self.ir1 + self.ir1,
+            ir2,
+            ir_out,
             instructions=instr,
             internal_weights=not self.use_rbf_weights,
             shared_weights=not self.use_rbf_weights,
@@ -610,7 +621,9 @@ class FullLInteractionsUUU(nn.Module):
         edge_src = edge_index[:, 1]
         edge_dst = edge_index[:, 0]
 
-        x1_src = x1[edge_src]
+        x1_input = x1[edge_src]
+        if self.e3nn_conv_use_vi:
+            x1_input = torch.cat([x1_input, x1[edge_dst]], dim=-1)
         k_weight = self.tp_weight_linear(edge_rbf_ebd) if self.tp_weight_linear is not None and edge_rbf_ebd is not None else None
         if k_weight is not None:
             k1_weight, k2_weight, k3_weight = torch.split(
@@ -621,9 +634,9 @@ class FullLInteractionsUUU(nn.Module):
         else:
             k1_weight = k2_weight = k3_weight = None
 
-        y0 = self.tp0(x1_src, k1, k1_weight)  # 包含 (0,0)->0; (0,1)->1; (0,2)->2
-        y1 = self.tp1(x1_src, k2, k2_weight)  # 包含 (1,0)->1; (1,1)->0,1,2; (1,2)->1,2
-        y2 = self.tp2(x1_src, k3, k3_weight)  # 包含 (2,0)->2; (2,1)->1,2; (2,2)->0,1,2（裁到≤2）
+        y0 = self.tp0(x1_input, k1, k1_weight)  # 包含 (0,0)->0; (0,1)->1; (0,2)->2
+        y1 = self.tp1(x1_input, k2, k2_weight)  # 包含 (1,0)->1; (1,1)->0,1,2; (1,2)->1,2
+        y2 = self.tp2(x1_input, k3, k3_weight)  # 包含 (2,0)->2; (2,1)->1,2; (2,2)->0,1,2（裁到≤2）
         y = torch.cat([y0, y1, y2], dim=-1)
 
         x1 = message_gather(x1, edge_dst, y)
