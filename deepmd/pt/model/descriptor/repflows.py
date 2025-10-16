@@ -1283,7 +1283,8 @@ class DescrptBlockRepflows(DescriptorBlock):
             assert self.edge_spherical_embd is not None
             assert edge_dist is not None
             # n_edge x rbf
-            edge_rbf_ebd = self.edge_rbf_embed(edge_dist) * self.edge_env(edge_dist/self.e_rcut)
+            edge_env = self.edge_env(edge_dist/self.e_rcut)
+            edge_rbf_ebd = self.edge_rbf_embed(edge_dist) * edge_env
             # n_edge x num_sph(16)
             edge_sph = self.edge_spherical_embd(diff)
             node_sph_embed = node_ebd
@@ -1291,6 +1292,7 @@ class DescrptBlockRepflows(DescriptorBlock):
             edge_rbf_ebd = None
             edge_sph = None
             node_sph_embed = None
+            edge_env = None
 
         if not self.e3nn_conv_use_edge_sh_feat:
             if self.use_e3nn_angle_conv:
@@ -1454,6 +1456,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                         edge_angle_filter=edge_angle_filter,
                         edge_sph_embed=edge_sph_embed,
                         angle_weights=angle_weights,
+                        edge_env=edge_env,
                     )
                 # may cause jit slow, todo fix
                 elif not self.rk_update_diff_layer:

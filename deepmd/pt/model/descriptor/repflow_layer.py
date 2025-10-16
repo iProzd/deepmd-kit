@@ -1221,6 +1221,7 @@ class RepFlowLayer(torch.nn.Module):
         edge_angle_filter: Optional[torch.Tensor] = None,  # n_angle x num_sph
         edge_sph_embed: Optional[torch.Tensor] = None,  # n_edge x num_sph
         angle_weights: Optional[torch.Tensor] = None,  # n_angle x 8
+        edge_env: Optional[torch.Tensor] = None,  # n_edge x 1
     ):
         """
         Parameters
@@ -1490,7 +1491,11 @@ class RepFlowLayer(torch.nn.Module):
             assert edge_sph is not None
             assert edge_rbf_ebd is not None
             assert edge_index is not None
-            edge_weights = edge_rbf_ebd if not self.e3nn_use_edge_feat_weights else edge_ebd
+            if not self.e3nn_use_edge_feat_weights:
+                edge_weights = edge_rbf_ebd
+            else:
+                assert edge_env is not None
+                edge_weights = edge_ebd * edge_env
             node_sph_embed, edge_sph_update = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_weights, edge_index, edge_sph_embed)
 
             if self.e3nn_conv_use_edge_sh_feat:
