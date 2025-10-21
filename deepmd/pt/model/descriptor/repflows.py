@@ -187,6 +187,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         e3nn_conv_use_edge_sh_feat: bool = False,
         edge_sh_feat_use_rbf_weights: bool = False,
         e3nn_conv_use_vi: bool = False,
+        e3nn_conv_weights_use_tebd: bool = False,
         e3nn_conv_l_max: int = 3,
         e3nn_use_edge_feat_weights: bool = False,
         use_e3nn_angle_conv: bool = False,
@@ -493,6 +494,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.use_e3nn_denominator = use_e3nn_denominator
         self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
         self.e3nn_conv_use_vi = e3nn_conv_use_vi
+        self.e3nn_conv_weights_use_tebd = e3nn_conv_weights_use_tebd
         if self.e3nn_conv_use_vi:
             assert e3nn_conv_use_edge_sh_feat, "e3nn_conv_use_edge_sh_feat must be True when e3nn_conv_use_vi is True"
         self.e3nn_conv_l_max = e3nn_conv_l_max
@@ -651,7 +653,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 "irreps_out": irreps_out,
                 "denominator": 1.0 if not self.use_e3nn_denominator else self.dynamic_e_sel / 4,
                 "train_denominator": True,
-                "weight_layer_input_to_hidden": [8, 64, 64] if not self.e3nn_use_edge_feat_weights else [self.e_dim, 64, 64],
+                "weight_layer_input_to_hidden": [8 if not self.e3nn_conv_weights_use_tebd else 8 + 2*self.n_dim, 64, 64] if not self.e3nn_use_edge_feat_weights else [self.e_dim, 64, 64],
             }
             irreps_x = irreps_out
 
@@ -1284,7 +1286,13 @@ class DescrptBlockRepflows(DescriptorBlock):
             assert edge_dist is not None
             # n_edge x rbf
             edge_env = self.edge_env(edge_dist/self.e_rcut)
-            edge_rbf_ebd = self.edge_rbf_embed(edge_dist) * edge_env
+            if not self.e3nn_conv_weights_use_tebd:
+                edge_rbf_ebd = self.edge_rbf_embed(edge_dist) * edge_env
+            else:
+                edge_src = edge_index[:, 1]
+                edge_dst = edge_index[:, 0]
+                atype_embd_reshape = atype_embd.reshape(nframes * nloc, -1)
+                edge_rbf_ebd = torch.cat([self.edge_rbf_embed(edge_dist), atype_embd_reshape[edge_dst], atype_embd_reshape[edge_src]], dim=-1) * edge_env
             # n_edge x num_sph(16)
             edge_sph = self.edge_spherical_embd(diff)
             node_sph_embed = node_ebd

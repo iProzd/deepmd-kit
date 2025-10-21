@@ -100,6 +100,7 @@ class RepFlowArgs:
         e3nn_conv_use_edge_sh_feat: bool = False,
         edge_sh_feat_use_rbf_weights: bool = False,
         e3nn_conv_use_vi: bool = False,
+        e3nn_conv_weights_use_tebd: bool = False,
     ) -> None:
         r"""The constructor for the RepFlowArgs class which defines the parameters of the repflow block in DPA3 descriptor.
 
@@ -251,6 +252,7 @@ class RepFlowArgs:
         self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
         self.edge_sh_feat_use_rbf_weights = edge_sh_feat_use_rbf_weights
         self.e3nn_conv_use_vi = e3nn_conv_use_vi
+        self.e3nn_conv_weights_use_tebd = e3nn_conv_weights_use_tebd
 
     def __getitem__(self, key):
         if hasattr(self, key):

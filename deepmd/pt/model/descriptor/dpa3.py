@@ -233,6 +233,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             e3nn_conv_use_edge_sh_feat=self.repflow_args.e3nn_conv_use_edge_sh_feat,
             edge_sh_feat_use_rbf_weights=self.repflow_args.edge_sh_feat_use_rbf_weights,
             e3nn_conv_use_vi=self.repflow_args.e3nn_conv_use_vi,
+            e3nn_conv_weights_use_tebd=self.repflow_args.e3nn_conv_weights_use_tebd,
             use_e3nn_angle_conv=self.repflow_args.use_e3nn_angle_conv,
             e3nn_angle_conv_l_max=self.repflow_args.e3nn_angle_conv_l_max,
             e3nn_use_edge_feat_weights=self.repflow_args.e3nn_use_edge_feat_weights,
