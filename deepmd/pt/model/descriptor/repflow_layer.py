@@ -11,9 +11,6 @@ from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
 from deepmd.pt.model.descriptor.repformer_layer import (
-    _apply_nlist_mask,
-    _apply_switch,
-    _make_nei_g1,
     get_residual,
 )
 from deepmd.pt.model.network.mlp import (
@@ -301,49 +298,6 @@ class RepFlowLayer(torch.nn.Module):
         self.a_residual = nn.ParameterList(self.a_residual)
 
     @staticmethod
-    def _cal_hg(
-        edge_ebd: torch.Tensor,
-        h2: torch.Tensor,
-        nlist_mask: torch.Tensor,
-        sw: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Calculate the transposed rotation matrix.
-
-        Parameters
-        ----------
-        edge_ebd
-            Neighbor-wise/Pair-wise edge embeddings, with shape nb x nloc x nnei x e_dim.
-        h2
-            Neighbor-wise/Pair-wise equivariant rep tensors, with shape nb x nloc x nnei x 3.
-        nlist_mask
-            Neighbor list mask, where zero means no neighbor, with shape nb x nloc x nnei.
-        sw
-            The switch function, which equals 1 within the rcut_smth range, smoothly decays from 1 to 0 between rcut_smth and rcut,
-            and remains 0 beyond rcut, with shape nb x nloc x nnei.
-
-        Returns
-        -------
-        hg
-            The transposed rotation matrix, with shape nb x nloc x 3 x e_dim.
-        """
-        # edge_ebd:  nb x nloc x nnei x e_dim
-        # h2:  nb x nloc x nnei x 3
-        # msk: nb x nloc x nnei
-        nb, nloc, nnei, _ = edge_ebd.shape
-        e_dim = edge_ebd.shape[-1]
-        # nb x nloc x nnei x e_dim
-        edge_ebd = _apply_nlist_mask(edge_ebd, nlist_mask)
-        edge_ebd = _apply_switch(edge_ebd, sw)
-        invnnei = torch.rsqrt(
-            float(nnei)
-            * torch.ones((nb, nloc, 1, 1), dtype=edge_ebd.dtype, device=edge_ebd.device)
-        )
-        # nb x nloc x 3 x e_dim
-        h2g2 = torch.matmul(torch.transpose(h2, -1, -2), edge_ebd) * invnnei
-        return h2g2
-
-    @staticmethod
     def _cal_hg_dynamic(
         flat_edge_ebd: torch.Tensor,
         flat_h2: torch.Tensor,
@@ -425,51 +379,6 @@ class RepFlowLayer(torch.nn.Module):
         g1_13 = g1_13.view(nb, nloc, axis_neuron * e_dim)
         return g1_13
 
-    def symmetrization_op(
-        self,
-        edge_ebd: torch.Tensor,
-        h2: torch.Tensor,
-        nlist_mask: torch.Tensor,
-        sw: torch.Tensor,
-        axis_neuron: int,
-    ) -> torch.Tensor:
-        """
-        Symmetrization operator to obtain atomic invariant rep.
-
-        Parameters
-        ----------
-        edge_ebd
-            Neighbor-wise/Pair-wise invariant rep tensors, with shape nb x nloc x nnei x e_dim.
-        h2
-            Neighbor-wise/Pair-wise equivariant rep tensors, with shape nb x nloc x nnei x 3.
-        nlist_mask
-            Neighbor list mask, where zero means no neighbor, with shape nb x nloc x nnei.
-        sw
-            The switch function, which equals 1 within the rcut_smth range, smoothly decays from 1 to 0 between rcut_smth and rcut,
-            and remains 0 beyond rcut, with shape nb x nloc x nnei.
-        axis_neuron
-            Size of the submatrix.
-
-        Returns
-        -------
-        grrg
-            Atomic invariant rep, with shape nb x nloc x (axis_neuron x e_dim)
-        """
-        # edge_ebd:  nb x nloc x nnei x e_dim
-        # h2:  nb x nloc x nnei x 3
-        # msk: nb x nloc x nnei
-        nb, nloc, nnei, _ = edge_ebd.shape
-        # nb x nloc x 3 x e_dim
-        h2g2 = self._cal_hg(
-            edge_ebd,
-            h2,
-            nlist_mask,
-            sw,
-        )
-        # nb x nloc x (axisxng2)
-        g1_13 = self._cal_grrg(h2g2, axis_neuron)
-        return g1_13
-
     def symmetrization_op_dynamic(
         self,
         flat_edge_ebd: torch.Tensor,
@@ -527,48 +436,6 @@ class RepFlowLayer(torch.nn.Module):
         grrg = self._cal_grrg(h2g2, axis_neuron)
         return grrg
 
-    def optim_angle_update(
-        self,
-        angle_ebd: torch.Tensor,
-        node_ebd: torch.Tensor,
-        edge_ebd: torch.Tensor,
-        feat: str = "edge",
-    ) -> torch.Tensor:
-        if feat == "edge":
-            assert self.edge_angle_linear1 is not None
-            matrix, bias = self.edge_angle_linear1.matrix, self.edge_angle_linear1.bias
-        elif feat == "angle":
-            assert self.angle_self_linear is not None
-            matrix, bias = self.angle_self_linear.matrix, self.angle_self_linear.bias
-        else:
-            raise NotImplementedError
-        assert bias is not None
-
-        angle_dim = angle_ebd.shape[-1]
-        node_dim = node_ebd.shape[-1]
-        edge_dim = edge_ebd.shape[-1]
-        # angle_dim, node_dim, edge_dim, edge_dim
-        sub_angle, sub_node, sub_edge_ik, sub_edge_ij = torch.split(
-            matrix, [angle_dim, node_dim, edge_dim, edge_dim]
-        )
-
-        # nf * nloc * a_sel * a_sel * angle_dim
-        sub_angle_update = torch.matmul(angle_ebd, sub_angle)
-        # nf * nloc * angle_dim
-        sub_node_update = torch.matmul(node_ebd, sub_node)
-        # nf * nloc * a_nnei * angle_dim
-        sub_edge_update_ik = torch.matmul(edge_ebd, sub_edge_ik)
-        sub_edge_update_ij = torch.matmul(edge_ebd, sub_edge_ij)
-
-        result_update = (
-            bias
-            + sub_node_update.unsqueeze(2).unsqueeze(3)
-            + sub_edge_update_ik.unsqueeze(2)
-            + sub_edge_update_ij.unsqueeze(3)
-            + sub_angle_update
-        )
-        return result_update
-
     def optim_angle_update_dynamic(
         self,
         flat_angle_ebd: torch.Tensor,
@@ -616,41 +483,6 @@ class RepFlowLayer(torch.nn.Module):
             + sub_edge_update_ik
             + sub_edge_update_ij
             + sub_angle_update
-        )
-        return result_update
-
-    def optim_edge_update(
-        self,
-        node_ebd: torch.Tensor,
-        node_ebd_ext: torch.Tensor,
-        edge_ebd: torch.Tensor,
-        nlist: torch.Tensor,
-        feat: str = "node",
-    ) -> torch.Tensor:
-        if feat == "node":
-            matrix, bias = self.node_edge_linear.matrix, self.node_edge_linear.bias
-        elif feat == "edge":
-            matrix, bias = self.edge_self_linear.matrix, self.edge_self_linear.bias
-        else:
-            raise NotImplementedError
-        assert bias is not None
-
-        node_dim = node_ebd.shape[-1]
-        edge_dim = edge_ebd.shape[-1]
-        # node_dim, node_dim, edge_dim
-        node, node_ext, edge = torch.split(matrix, [node_dim, node_dim, edge_dim])
-
-        # nf * nloc * node/edge_dim
-        sub_node_update = torch.matmul(node_ebd, node)
-        # nf * nall * node/edge_dim
-        sub_node_ext_update = torch.matmul(node_ebd_ext, node_ext)
-        # nf * nloc * nnei * node/edge_dim
-        sub_node_ext_update = _make_nei_g1(sub_node_ext_update, nlist)
-        # nf * nloc * nnei * node/edge_dim
-        sub_edge_update = torch.matmul(edge_ebd, edge)
-
-        result_update = (
-            bias + sub_node_update.unsqueeze(2) + sub_edge_update + sub_node_ext_update
         )
         return result_update
 
@@ -762,13 +594,7 @@ class RepFlowLayer(torch.nn.Module):
         nall = node_ebd_ext.shape[1]
         node_ebd = node_ebd_ext[:, :nloc, :]
         assert (nb, nloc) == node_ebd.shape[:2]
-        if not self.use_dynamic_sel:
-            assert (nb, nloc, nnei, 3) == h2.shape
-            n_edge = None
-        else:
-            # n_edge = int(nlist_mask.sum().item())
-            # assert (n_edge, 3) == h2.shape
-            n_edge = h2.shape[0]
+        n_edge = h2.shape[0]
         del a_nlist  # may be used in the future
 
         n2e_index, n_ext2e_index = edge_index[0], edge_index[1]
@@ -779,12 +605,8 @@ class RepFlowLayer(torch.nn.Module):
         )
 
         # nb x nloc x nnei x n_dim [OR] n_edge x n_dim
-        nei_node_ebd = (
-            _make_nei_g1(node_ebd_ext, nlist)
-            if not self.use_dynamic_sel
-            else torch.index_select(
-                node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
-            )
+        nei_node_ebd = torch.index_select(
+            node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
         )
 
         n_update_list: list[torch.Tensor] = [node_ebd]
@@ -798,15 +620,7 @@ class RepFlowLayer(torch.nn.Module):
         # node sym (grrg + drrd)
         node_sym_list: list[torch.Tensor] = []
         node_sym_list.append(
-            self.symmetrization_op(
-                edge_ebd,
-                h2,
-                nlist_mask,
-                sw,
-                self.axis_neuron,
-            )
-            if not self.use_dynamic_sel
-            else self.symmetrization_op_dynamic(
+            self.symmetrization_op_dynamic(
                 edge_ebd,
                 h2,
                 sw,
@@ -819,15 +633,7 @@ class RepFlowLayer(torch.nn.Module):
             )
         )
         node_sym_list.append(
-            self.symmetrization_op(
-                nei_node_ebd,
-                h2,
-                nlist_mask,
-                sw,
-                self.axis_neuron,
-            )
-            if not self.use_dynamic_sel
-            else self.symmetrization_op_dynamic(
+            self.symmetrization_op_dynamic(
                 nei_node_ebd,
                 h2,
                 sw,
@@ -843,28 +649,15 @@ class RepFlowLayer(torch.nn.Module):
         n_update_list.append(node_sym)
 
         if not self.optim_update:
-            if not self.use_dynamic_sel:
-                # nb x nloc x nnei x (n_dim * 2 + e_dim)
-                edge_info = torch.cat(
-                    [
-                        torch.tile(node_ebd.unsqueeze(-2), [1, 1, self.nnei, 1]),
-                        nei_node_ebd,
-                        edge_ebd,
-                    ],
-                    dim=-1,
-                )
-            else:
-                # n_edge x (n_dim * 2 + e_dim)
-                edge_info = torch.cat(
-                    [
-                        torch.index_select(
-                            node_ebd.reshape(-1, self.n_dim), 0, n2e_index
-                        ),
-                        nei_node_ebd,
-                        edge_ebd,
-                    ],
-                    dim=-1,
-                )
+            # n_edge x (n_dim * 2 + e_dim)
+            edge_info = torch.cat(
+                [
+                    torch.index_select(node_ebd.reshape(-1, self.n_dim), 0, n2e_index),
+                    nei_node_ebd,
+                    edge_ebd,
+                ],
+                dim=-1,
+            )
         else:
             edge_info = None
 
@@ -877,15 +670,7 @@ class RepFlowLayer(torch.nn.Module):
             ) * sw.unsqueeze(-1)
         else:
             node_edge_update = self.act(
-                self.optim_edge_update(
-                    node_ebd,
-                    node_ebd_ext,
-                    edge_ebd,
-                    nlist,
-                    "node",
-                )
-                if not self.use_dynamic_sel
-                else self.optim_edge_update_dynamic(
+                self.optim_edge_update_dynamic(
                     node_ebd,
                     node_ebd_ext,
                     edge_ebd,
@@ -895,28 +680,16 @@ class RepFlowLayer(torch.nn.Module):
                 )
             ) * sw.unsqueeze(-1)
         node_edge_update = (
-            (torch.sum(node_edge_update, dim=-2) / self.nnei)
-            if not self.use_dynamic_sel
-            else (
-                aggregate(
-                    node_edge_update,
-                    n2e_index,
-                    average=False,
-                    num_owner=nb * nloc,
-                ).reshape(nb, nloc, node_edge_update.shape[-1])
-                / self.dynamic_e_sel
-            )
+            aggregate(
+                node_edge_update,
+                n2e_index,
+                average=False,
+                num_owner=nb * nloc,
+            ).reshape(nb, nloc, node_edge_update.shape[-1])
+            / self.dynamic_e_sel
         )
 
-        if self.n_multi_edge_message > 1:
-            # nb x nloc x h x n_dim
-            node_edge_update_mul_head = node_edge_update.view(
-                nb, nloc, self.n_multi_edge_message, self.n_dim
-            )
-            for head_index in range(self.n_multi_edge_message):
-                n_update_list.append(node_edge_update_mul_head[..., head_index, :])
-        else:
-            n_update_list.append(node_edge_update)
+        n_update_list.append(node_edge_update)
         # update node_ebd
         n_updated = self.list_update(n_update_list, "node")
 
@@ -926,15 +699,7 @@ class RepFlowLayer(torch.nn.Module):
             edge_self_update = self.act(self.edge_self_linear(edge_info))
         else:
             edge_self_update = self.act(
-                self.optim_edge_update(
-                    node_ebd,
-                    node_ebd_ext,
-                    edge_ebd,
-                    nlist,
-                    "edge",
-                )
-                if not self.use_dynamic_sel
-                else self.optim_edge_update_dynamic(
+                self.optim_edge_update_dynamic(
                     node_ebd,
                     node_ebd_ext,
                     edge_ebd,
@@ -964,43 +729,21 @@ class RepFlowLayer(torch.nn.Module):
                 node_ebd_for_angle = node_ebd
                 edge_ebd_for_angle = edge_ebd
 
-            if not self.use_dynamic_sel:
-                # nb x nloc x a_nnei x e_dim
-                edge_ebd_for_angle = edge_ebd_for_angle[..., : self.a_sel, :]
-                # nb x nloc x a_nnei x e_dim
-                edge_ebd_for_angle = torch.where(
-                    a_nlist_mask.unsqueeze(-1), edge_ebd_for_angle, 0.0
-                )
             if not self.optim_update:
                 # nb x nloc x a_nnei x a_nnei x n_dim [OR] n_angle x n_dim
-                node_for_angle_info = (
-                    torch.tile(
-                        node_ebd_for_angle.unsqueeze(2).unsqueeze(2),
-                        (1, 1, self.a_sel, self.a_sel, 1),
-                    )
-                    if not self.use_dynamic_sel
-                    else torch.index_select(
-                        node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
-                        0,
-                        n2a_index,
-                    )
+                node_for_angle_info = torch.index_select(
+                    node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
+                    0,
+                    n2a_index,
                 )
 
                 # nb x nloc x (a_nnei) x a_nnei x e_dim [OR] n_angle x e_dim
-                edge_for_angle_k = (
-                    torch.tile(
-                        edge_ebd_for_angle.unsqueeze(2), (1, 1, self.a_sel, 1, 1)
-                    )
-                    if not self.use_dynamic_sel
-                    else torch.index_select(edge_ebd_for_angle, 0, eik2a_index)
+                edge_for_angle_k = torch.index_select(
+                    edge_ebd_for_angle, 0, eik2a_index
                 )
                 # nb x nloc x a_nnei x (a_nnei) x e_dim [OR] n_angle x e_dim
-                edge_for_angle_j = (
-                    torch.tile(
-                        edge_ebd_for_angle.unsqueeze(3), (1, 1, 1, self.a_sel, 1)
-                    )
-                    if not self.use_dynamic_sel
-                    else torch.index_select(edge_ebd_for_angle, 0, eij2a_index)
+                edge_for_angle_j = torch.index_select(
+                    edge_ebd_for_angle, 0, eij2a_index
                 )
                 # nb x nloc x a_nnei x a_nnei x (e_dim + e_dim) [OR] n_angle x (e_dim + e_dim)
                 edge_for_angle_info = torch.cat(
@@ -1023,14 +766,7 @@ class RepFlowLayer(torch.nn.Module):
                 edge_angle_update = self.act(self.edge_angle_linear1(angle_info))
             else:
                 edge_angle_update = self.act(
-                    self.optim_angle_update(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        "edge",
-                    )
-                    if not self.use_dynamic_sel
-                    else self.optim_angle_update_dynamic(
+                    self.optim_angle_update_dynamic(
                         angle_ebd,
                         node_ebd_for_angle,
                         edge_ebd_for_angle,
@@ -1041,61 +777,16 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
 
-            if not self.use_dynamic_sel:
-                # nb x nloc x a_nnei x a_nnei x e_dim
-                weighted_edge_angle_update = (
-                    a_sw.unsqueeze(-1).unsqueeze(-1)
-                    * a_sw.unsqueeze(-2).unsqueeze(-1)
-                    * edge_angle_update
-                )
-                # nb x nloc x a_nnei x e_dim
-                reduced_edge_angle_update = torch.sum(
-                    weighted_edge_angle_update, dim=-2
-                ) / (self.a_sel**0.5)
-                # nb x nloc x nnei x e_dim
-                padding_edge_angle_update = torch.concat(
-                    [
-                        reduced_edge_angle_update,
-                        torch.zeros(
-                            [nb, nloc, self.nnei - self.a_sel, self.e_dim],
-                            dtype=edge_ebd.dtype,
-                            device=edge_ebd.device,
-                        ),
-                    ],
-                    dim=2,
-                )
-            else:
-                # n_angle x e_dim
-                weighted_edge_angle_update = edge_angle_update * a_sw.unsqueeze(-1)
-                # n_edge x e_dim
-                padding_edge_angle_update = aggregate(
-                    weighted_edge_angle_update,
-                    eij2a_index,
-                    average=False,
-                    num_owner=n_edge,
-                ) / (self.dynamic_a_sel**0.5)
+            # n_angle x e_dim
+            weighted_edge_angle_update = edge_angle_update * a_sw.unsqueeze(-1)
+            # n_edge x e_dim
+            padding_edge_angle_update = aggregate(
+                weighted_edge_angle_update,
+                eij2a_index,
+                average=False,
+                num_owner=n_edge,
+            ) / (self.dynamic_a_sel**0.5)
 
-            if not self.smooth_edge_update:
-                # will be deprecated in the future
-                # not support dynamic index, will pass anyway
-                if self.use_dynamic_sel:
-                    raise NotImplementedError(
-                        "smooth_edge_update must be True when use_dynamic_sel is True!"
-                    )
-                full_mask = torch.concat(
-                    [
-                        a_nlist_mask,
-                        torch.zeros(
-                            [nb, nloc, self.nnei - self.a_sel],
-                            dtype=a_nlist_mask.dtype,
-                            device=a_nlist_mask.device,
-                        ),
-                    ],
-                    dim=-1,
-                )
-                padding_edge_angle_update = torch.where(
-                    full_mask.unsqueeze(-1), padding_edge_angle_update, edge_ebd
-                )
             e_update_list.append(
                 self.act(self.edge_angle_linear2(padding_edge_angle_update))
             )
@@ -1109,14 +800,7 @@ class RepFlowLayer(torch.nn.Module):
                 angle_self_update = self.act(self.angle_self_linear(angle_info))
             else:
                 angle_self_update = self.act(
-                    self.optim_angle_update(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        "angle",
-                    )
-                    if not self.use_dynamic_sel
-                    else self.optim_angle_update_dynamic(
+                    self.optim_angle_update_dynamic(
                         angle_ebd,
                         node_ebd_for_angle,
                         edge_ebd_for_angle,
