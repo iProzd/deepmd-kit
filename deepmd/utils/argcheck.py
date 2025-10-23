@@ -2019,6 +2019,12 @@ def dpa3_repflow_args():
             optional=True,
             default=False,
         ),
+        Argument(
+            "e3nn_weights_use_l_norm",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

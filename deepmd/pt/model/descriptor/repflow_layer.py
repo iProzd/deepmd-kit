@@ -46,6 +46,9 @@ from deepmd.pt.model.network.e3nn_networks import (
     IrrepsBlock,
     IrrepsAngleBlock,
 )
+from deepmd.pt.model.network.e3nn_norm import (
+    PowerSpectrumL2,
+)
 
 
 class RepFlowLayer(torch.nn.Module):
@@ -108,6 +111,7 @@ class RepFlowLayer(torch.nn.Module):
         e3nn_use_edge_feat_weights: bool = False,
         e3nn_conv_use_edge_sh_feat: bool = False,
         edge_sh_feat_use_rbf_weights: bool = False,
+        e3nn_weights_use_l_norm: bool = False,
         e3nn_conv_use_vi: bool = False,
         e3nn_conv_args: dict = {},
         e3nn_angle_conv_args: dict = {},
@@ -400,7 +404,14 @@ class RepFlowLayer(torch.nn.Module):
         self.e3nn_conv_use_edge_sh_feat = e3nn_conv_use_edge_sh_feat
         self.edge_sh_feat_use_rbf_weights = edge_sh_feat_use_rbf_weights
         self.e3nn_conv_use_vi = e3nn_conv_use_vi
+        self.e3nn_weights_use_l_norm = e3nn_weights_use_l_norm
         if self.use_e3nn_conv:
+            if self.e3nn_weights_use_l_norm:
+                self.edge_sph_norm = PowerSpectrumL2("64x0e + 32x1e + 32x2e")
+                self.e3nn_conv_args['weight_layer_input_to_hidden'][0] += self.edge_sph_norm.ir_out.simplify()[0].mul
+            else:
+                self.edge_sph_norm = None
+
             self.e3nn_conv_block = IrrepsBlock(**self.e3nn_conv_args, e3nn_conv_use_edge_sh_feat=e3nn_conv_use_edge_sh_feat, weight_layer_act="silu", edge_sh_feat_use_rbf_weights=edge_sh_feat_use_rbf_weights, e3nn_conv_use_vi=e3nn_conv_use_vi)
             if self.update_style == "res_residual":
                 self.n_residual.append(
@@ -1493,10 +1504,19 @@ class RepFlowLayer(torch.nn.Module):
             assert edge_index is not None
             if not self.e3nn_use_edge_feat_weights:
                 edge_weights = edge_rbf_ebd
+                if self.e3nn_weights_use_l_norm:
+                    assert self.e3nn_conv_use_edge_sh_feat
+                    assert self.edge_sph_norm is not None
+                    assert edge_env is not None
+                    assert edge_sph_embed is not None
+                    edge_l_norm = self.edge_sph_norm(edge_sph_embed) / 100.0 * edge_env  # for stable
+                    edge_weights = torch.cat([edge_weights, edge_l_norm], dim=-1)
             else:
                 assert edge_env is not None
                 edge_weights = edge_ebd * edge_env
             node_sph_embed, edge_sph_update = self.e3nn_conv_block(node_sph_embed, edge_sph, edge_weights, edge_index, edge_sph_embed)
+            # from IPython import embed
+            # embed()
 
             if self.e3nn_conv_use_edge_sh_feat:
                 assert edge_sph_embed is not None

@@ -195,6 +195,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         e3nn_angle_conv_pattern: str = "64x0e+32x1e+32x2e",
         e3nn_angle_use_cross: bool = False,
         e3nn_angle_only_single_angle: bool = False,
+        e3nn_weights_use_l_norm: bool = False,
         seed: Optional[Union[int, list[int]]] = None,
     ) -> None:
         r"""
@@ -500,6 +501,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.e3nn_conv_l_max = e3nn_conv_l_max
         self.e3nn_use_edge_feat_weights = e3nn_use_edge_feat_weights
         self.edge_sh_feat_use_rbf_weights = edge_sh_feat_use_rbf_weights
+        self.e3nn_weights_use_l_norm = e3nn_weights_use_l_norm
         self.use_e3nn_angle_conv = use_e3nn_angle_conv
         self.e3nn_angle_conv_l_max = e3nn_angle_conv_l_max
         self.e3nn_angle_conv_pattern = e3nn_angle_conv_pattern
@@ -744,6 +746,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     e3nn_conv_use_edge_sh_feat=self.e3nn_conv_use_edge_sh_feat,
                     edge_sh_feat_use_rbf_weights=self.edge_sh_feat_use_rbf_weights,
                     e3nn_conv_use_vi=self.e3nn_conv_use_vi,
+                    e3nn_weights_use_l_norm=self.e3nn_weights_use_l_norm,
                     e3nn_conv_args=e3nn_conv_args,
                     use_e3nn_angle_conv=self.use_e3nn_angle_conv,
                     e3nn_angle_conv_args=e3nn_angle_conv_args,
