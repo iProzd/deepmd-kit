@@ -123,6 +123,10 @@ class MLPLayer(nn.Module):
             self._default_normal_init(
                 bavg=bavg, stddev=stddev, generator=random_generator
             )
+        elif init.startswith("default"):
+            self._default_normal_init(
+                bavg=bavg, stddev=float(init.split(":")[-1]), generator=random_generator
+            )
         elif init == "trunc_normal":
             self._trunc_normal_init(1.0, generator=random_generator)
         elif init == "relu":
