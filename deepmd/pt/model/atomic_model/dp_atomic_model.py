@@ -340,11 +340,22 @@ class DPAtomicModel(BaseAtomicModel):
                 atom_exclude_types = self.atom_excl.get_exclude_types()
                 for sample in sampled:
                     sample["atom_exclude_types"] = list(atom_exclude_types)
+            if (
+                "find_fparam" not in sampled[0]
+                and "fparam" not in sampled[0]
+                and self.has_default_fparam()
+            ):
+                default_fparam = self.get_default_fparam()
+                for sample in sampled:
+                    nframe = sample["atype"].shape[0]
+                    sample["fparam"] = default_fparam.repeat(nframe, 1)
             return sampled
 
         self.descriptor.compute_input_stats(wrapped_sampler, stat_file_path)
         self.fitting_net.compute_input_stats(
-            wrapped_sampler, protection=self.data_stat_protect
+            wrapped_sampler,
+            protection=self.data_stat_protect,
+            stat_file_path=stat_file_path,
         )
         if compute_or_load_out_stat:
             self.compute_or_load_out_stat(wrapped_sampler, stat_file_path)
@@ -356,6 +367,9 @@ class DPAtomicModel(BaseAtomicModel):
     def has_default_fparam(self) -> bool:
         """Check if the model has default frame parameters."""
         return self.fitting_net.has_default_fparam()
+
+    def get_default_fparam(self) -> Optional[torch.Tensor]:
+        return self.fitting_net.get_default_fparam()
 
     def get_dim_aparam(self) -> int:
         """Get the number (dimension) of atomic parameters of this atomic model."""
