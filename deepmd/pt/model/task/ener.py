@@ -610,6 +610,7 @@ class EnergyFittingNetDirectHead(InvarFitting):
         # direct force
         assert diff is not None
         assert g2 is not None
+        assert sw is not None
 
         nf, nloc, _ = descriptor.shape
 
@@ -618,12 +619,12 @@ class EnergyFittingNetDirectHead(InvarFitting):
         # nf x nloc x nnei x d [OR] nedge x d
         edge_feature = g2
         # nf x nloc x nnei x 1 [OR] nedge x 1
-        edge_weight = self.force_embed.networks[0](edge_feature)
+        edge_weight = self.force_embed.networks[0](edge_feature) * sw.unsqueeze(-1)
         # nf x nloc x nnei x 3 [OR] nedge x 3
         fij = edge_weight * edge_vec
         if edge_index is not None:
             # use dynamic sel
-            n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+            n2e_index, n_ext2e_index = edge_index[0], edge_index[1]
             # nf x nloc x 3
             fi = aggregate(
                 fij,
@@ -639,12 +640,12 @@ class EnergyFittingNetDirectHead(InvarFitting):
 
         if self.additional_noise_head:
             assert self.noise_embed is not None
-            edge_weight = self.noise_embed.networks[0](edge_feature)
+            edge_weight = self.noise_embed.networks[0](edge_feature) * sw.unsqueeze(-1)
             # nf x nloc x nnei x 3 [OR] nedge x 3
             nij = edge_weight * edge_vec
             if edge_index is not None:
                 # use dynamic sel
-                n2e_index, n_ext2e_index = edge_index[:, 0], edge_index[:, 1]
+                n2e_index, n_ext2e_index = edge_index[0], edge_index[1]
                 # nf x nloc x 3
                 ni = aggregate(
                     nij,
