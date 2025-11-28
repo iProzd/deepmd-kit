@@ -2935,6 +2935,12 @@ def loss_ener() -> list[Argument]:
             optional=True,
             default=False,
         ),
+        Argument(
+            "learnable_pref",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

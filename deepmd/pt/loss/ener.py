@@ -60,6 +60,7 @@ class EnergyStdLoss(TaskLoss):
         huber_delta: float = 0.01,
         trimmed_factor: float = 0.0,
         adaptive_loss: bool = False,
+        learnable_pref: bool = False,
         **kwargs: Any,
     ) -> None:
         r"""Construct a layer to compute loss on energy, force and virial.
@@ -167,6 +168,17 @@ class EnergyStdLoss(TaskLoss):
             self.alpha_raw = None
             self.scale_raw = None
             self.epsilon = None
+        self.learnable_pref = learnable_pref
+        if self.learnable_pref:
+            self.pref_linear = torch.nn.Linear(
+                1, 1, dtype=torch.float64, device=env.DEVICE
+            )
+            initial_weight = -0.1
+            initial_bias = 5.0
+            # 1. 权重 W 必须是负值: 让 r^2 越大, logit (W*r^2 + b) 越小
+            torch.nn.init.constant_(self.pref_linear.weight, initial_weight)
+            # 2. 偏差 b 必须是正值: 确保 r^2 小时, logit > 0, sigmoid 接近 1
+            torch.nn.init.constant_(self.pref_linear.bias, initial_bias)
 
     def forward(
         self,
@@ -261,6 +273,19 @@ class EnergyStdLoss(TaskLoss):
                     nll_loss = loss_val + torch.log(scale)
                     nll_loss = torch.mean(nll_loss)
                     loss += atom_norm * (pref_e * nll_loss)
+                elif self.learnable_pref:
+                    assert self.pref_linear is not None
+                    l2_ener = torch.square(energy_pred - energy_label)
+                    r_sq_input = l2_ener.view(-1, 1)
+                    logit = self.pref_linear(r_sq_input)
+                    # 计算权重因子 (0 < weight_factor < 1)
+                    # 由于初始化时 W < 0, r^2 越大, logit 越小, weight_factor 越小, 实现了降权
+                    weight_factor = torch.sigmoid(logit / 1000) + 0.1  # 0.1防止都学为0
+                    weighted_err = weight_factor.view_as(l2_ener) * l2_ener
+                    weighted_l2 = torch.mean(weighted_err) + torch.sum(
+                        torch.abs(self.pref_linear.weight**2)
+                    )
+                    loss += atom_norm * (pref_e * weighted_l2)
                 else:
                     if not self.use_huber:
                         loss += atom_norm * (pref_e * l2_ener_loss)
@@ -358,6 +383,19 @@ class EnergyStdLoss(TaskLoss):
                         nll_loss = loss_val + torch.log(scale)
                         nll_loss = torch.mean(nll_loss)
                         loss += (pref_f * nll_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                    elif self.learnable_pref:
+                        assert self.pref_linear is not None
+                        l2_force = torch.square(diff_f)
+                        r_sq_input = l2_force.view(-1, 1)
+                        logit = self.pref_linear(r_sq_input)
+                        # 计算权重因子 (0 < weight_factor < 1)
+                        # 由于初始化时 W < 0, r^2 越大, logit 越小, weight_factor 越小, 实现了降权
+                        weight_factor = torch.sigmoid(logit) + 0.1  # 0.1防止都学为0
+                        weighted_err = weight_factor.view_as(l2_force) * l2_force
+                        weighted_l2 = torch.mean(weighted_err) + torch.sum(
+                            torch.abs(self.pref_linear.weight**2)
+                        )
+                        loss += (pref_f * weighted_l2).to(GLOBAL_PT_FLOAT_PRECISION)
                     else:
                         if not self.use_huber:
                             loss += (pref_f * l2_force_loss).to(
