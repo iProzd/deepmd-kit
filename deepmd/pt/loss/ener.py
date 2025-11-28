@@ -58,6 +58,7 @@ class EnergyStdLoss(TaskLoss):
         inference: bool = False,
         use_huber: bool = False,
         huber_delta: float = 0.01,
+        trimmed_factor: float = 0.0,
         **kwargs: Any,
     ) -> None:
         r"""Construct a layer to compute loss on energy, force and virial.
@@ -151,6 +152,7 @@ class EnergyStdLoss(TaskLoss):
             raise RuntimeError(
                 "Huber loss is not implemented for force with atom_pref, generalized force and relative force. "
             )
+        self.trimmed_factor = trimmed_factor
 
     def forward(
         self,
@@ -272,6 +274,16 @@ class EnergyStdLoss(TaskLoss):
             force_pred = model_pred["force"]
             force_label = label["force"]
             diff_f = (force_label - force_pred).reshape(-1)
+            force_pred_reshape = force_pred.reshape(-1)
+            force_label_reshape = force_label.reshape(-1)
+
+            if self.trimmed_factor > 0.0:
+                num_samples = diff_f.numel()
+                num_keep = int(num_samples * (1 - self.trimmed_factor))
+                keep_values, mask = torch.topk(diff_f.abs(), k=num_keep, largest=False)
+                diff_f = diff_f[mask]
+                force_pred_reshape = force_pred_reshape[mask]
+                force_label_reshape = force_label_reshape[mask]
 
             if self.relative_f is not None:
                 force_label_3 = force_label.reshape(-1, 3)
@@ -291,8 +303,8 @@ class EnergyStdLoss(TaskLoss):
                         loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
                     else:
                         l_huber_loss = custom_huber_loss(
-                            force_pred.reshape(-1),
-                            force_label.reshape(-1),
+                            force_pred_reshape,
+                            force_label_reshape,
                             delta=self.huber_delta,
                         )
                         loss += pref_f * l_huber_loss
@@ -301,7 +313,9 @@ class EnergyStdLoss(TaskLoss):
                         rmse_f.detach(), find_force
                     )
                 else:
-                    l1_force_loss = F.l1_loss(force_label, force_pred, reduction="none")
+                    l1_force_loss = F.l1_loss(
+                        force_label_reshape, force_pred_reshape, reduction="none"
+                    )
                     more_loss["mae_f"] = self.display_if_exist(
                         l1_force_loss.mean().detach(), find_force
                     )
