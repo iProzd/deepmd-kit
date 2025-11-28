@@ -2929,6 +2929,12 @@ def loss_ener() -> list[Argument]:
             optional=True,
             default=0.0,
         ),
+        Argument(
+            "adaptive_loss",
+            bool,
+            optional=True,
+            default=False,
+        ),
     ]
 
 

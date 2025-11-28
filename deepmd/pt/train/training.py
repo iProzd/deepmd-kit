@@ -693,15 +693,21 @@ class Trainer:
         # TODO add optimizers for multitask
         # author: iProzd
         if self.opt_type in ["Adam", "AdamW"]:
+            parameter_list = [
+                {"params": self.wrapper.model.parameters()},
+                {"params": self.wrapper.loss.parameters(), "lr": 1e-4},
+            ]
             if self.opt_type == "Adam":
                 self.optimizer = torch.optim.Adam(
-                    self.wrapper.parameters(),
+                    # self.wrapper.parameters(),
+                    parameter_list,
                     lr=self.lr_exp.start_lr,
                     fused=False if DEVICE.type == "cpu" else True,
                 )
             else:
                 self.optimizer = torch.optim.AdamW(
-                    self.wrapper.parameters(),
+                    # self.wrapper.parameters(),
+                    parameter_list,
                     lr=self.lr_exp.start_lr,
                     weight_decay=float(self.opt_param["weight_decay"]),
                     fused=False if DEVICE.type == "cpu" else True,

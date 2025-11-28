@@ -59,6 +59,7 @@ class EnergyStdLoss(TaskLoss):
         use_huber: bool = False,
         huber_delta: float = 0.01,
         trimmed_factor: float = 0.0,
+        adaptive_loss: bool = False,
         **kwargs: Any,
     ) -> None:
         r"""Construct a layer to compute loss on energy, force and virial.
@@ -153,6 +154,19 @@ class EnergyStdLoss(TaskLoss):
                 "Huber loss is not implemented for force with atom_pref, generalized force and relative force. "
             )
         self.trimmed_factor = trimmed_factor
+        self.adaptive_loss = adaptive_loss
+        if self.adaptive_loss:
+            self.alpha_raw = torch.nn.Parameter(
+                torch.tensor(2.0, dtype=torch.float32, device=env.DEVICE)
+            )
+            self.scale_raw = torch.nn.Parameter(
+                torch.tensor(1.0, dtype=torch.float32, device=env.DEVICE)
+            )
+            self.epsilon = 1e-6
+        else:
+            self.alpha_raw = None
+            self.scale_raw = None
+            self.epsilon = None
 
     def forward(
         self,
@@ -226,15 +240,37 @@ class EnergyStdLoss(TaskLoss):
                     more_loss["l2_ener_loss"] = self.display_if_exist(
                         l2_ener_loss.detach(), find_energy
                     )
-                if not self.use_huber:
-                    loss += atom_norm * (pref_e * l2_ener_loss)
-                else:
-                    l_huber_loss = custom_huber_loss(
-                        atom_norm * model_pred["energy"],
-                        atom_norm * label["energy"],
-                        delta=self.huber_delta,
+                if self.adaptive_loss:
+                    assert (
+                        self.alpha_raw is not None
+                        and self.scale_raw is not None
+                        and self.epsilon is not None
                     )
-                    loss += pref_e * l_huber_loss
+                    alpha = 2.0 * torch.sigmoid(self.alpha_raw)
+                    scale = torch.nn.functional.softplus(self.scale_raw) + self.epsilon
+                    residual = (energy_pred - energy_label).reshape(-1)
+                    # 标准化残差 (x / c)
+                    scaled_x = residual / scale
+                    # 平方项 (x/c)^2
+                    squared_scaled_x = scaled_x**2
+                    b = torch.abs(alpha - 2.0) + self.epsilon
+                    d = alpha + self.epsilon  # 避免 alpha=0
+                    loss_val = (b / d) * (
+                        torch.pow((squared_scaled_x / b) + 1, d / 2.0) - 1.0
+                    )
+                    nll_loss = loss_val + torch.log(scale)
+                    nll_loss = torch.mean(nll_loss)
+                    loss += atom_norm * (pref_e * nll_loss)
+                else:
+                    if not self.use_huber:
+                        loss += atom_norm * (pref_e * l2_ener_loss)
+                    else:
+                        l_huber_loss = custom_huber_loss(
+                            atom_norm * model_pred["energy"],
+                            atom_norm * label["energy"],
+                            delta=self.huber_delta,
+                        )
+                        loss += pref_e * l_huber_loss
                 rmse_e = l2_ener_loss.sqrt() * atom_norm
                 more_loss["rmse_e"] = self.display_if_exist(
                     rmse_e.detach(), find_energy
@@ -299,15 +335,41 @@ class EnergyStdLoss(TaskLoss):
                         more_loss["l2_force_loss"] = self.display_if_exist(
                             l2_force_loss.detach(), find_force
                         )
-                    if not self.use_huber:
-                        loss += (pref_f * l2_force_loss).to(GLOBAL_PT_FLOAT_PRECISION)
-                    else:
-                        l_huber_loss = custom_huber_loss(
-                            force_pred_reshape,
-                            force_label_reshape,
-                            delta=self.huber_delta,
+                    if self.adaptive_loss:
+                        assert (
+                            self.alpha_raw is not None
+                            and self.scale_raw is not None
+                            and self.epsilon is not None
                         )
-                        loss += pref_f * l_huber_loss
+                        alpha = 2.0 * torch.sigmoid(self.alpha_raw)
+                        scale = (
+                            torch.nn.functional.softplus(self.scale_raw) + self.epsilon
+                        )
+                        residual = diff_f
+                        # 标准化残差 (x / c)
+                        scaled_x = residual / scale
+                        # 平方项 (x/c)^2
+                        squared_scaled_x = scaled_x**2
+                        b = torch.abs(alpha - 2.0) + self.epsilon
+                        d = alpha + self.epsilon  # 避免 alpha=0
+                        loss_val = (b / d) * (
+                            torch.pow((squared_scaled_x / b) + 1, d / 2.0) - 1.0
+                        )
+                        nll_loss = loss_val + torch.log(scale)
+                        nll_loss = torch.mean(nll_loss)
+                        loss += (pref_f * nll_loss).to(GLOBAL_PT_FLOAT_PRECISION)
+                    else:
+                        if not self.use_huber:
+                            loss += (pref_f * l2_force_loss).to(
+                                GLOBAL_PT_FLOAT_PRECISION
+                            )
+                        else:
+                            l_huber_loss = custom_huber_loss(
+                                force_pred_reshape,
+                                force_label_reshape,
+                                delta=self.huber_delta,
+                            )
+                            loss += pref_f * l_huber_loss
                     rmse_f = l2_force_loss.sqrt()
                     more_loss["rmse_f"] = self.display_if_exist(
                         rmse_f.detach(), find_force
