@@ -168,7 +168,14 @@ class DeepEval(DeepEvalBackend):
             if not self.input_param.get("hessian_mode") and not no_jit:
                 model = torch.jit.script(model)
             self.dp = ModelWrapper(model)
-            self.dp.load_state_dict(state_dict)
+            try:
+                self.dp.load_state_dict(state_dict)
+            except RuntimeError:
+                state_dict_wo_loss = {"_extra_state": state_dict["_extra_state"]}
+                for item in state_dict:
+                    if "loss.Default." not in item and "_extra_state" not in item:
+                        state_dict_wo_loss[item] = state_dict[item].clone()
+                self.dp.load_state_dict(state_dict_wo_loss)
         elif str(self.model_path).endswith(".pth"):
             model = torch.jit.load(model_file, map_location=env.DEVICE)
             self.dp = ModelWrapper(model)
