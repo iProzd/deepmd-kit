@@ -693,10 +693,11 @@ class Trainer:
         # TODO add optimizers for multitask
         # author: iProzd
         if self.opt_type in ["Adam", "AdamW"]:
+            base_model = self._get_wrapper_module()
             parameter_list = [
-                {"params": self.wrapper.model.parameters()},
-                {"params": self.wrapper.loss.parameters(), "lr": 1e-4},
-            ]
+                {"params": base_model.model.parameters()},
+                {"params": base_model.loss.parameters(), "lr": 1e-4},
+            ]  # set a smaller lr for loss parameters
             if self.opt_type == "Adam":
                 self.optimizer = torch.optim.Adam(
                     # self.wrapper.parameters(),
@@ -1372,6 +1373,12 @@ class Trainer:
         print_str += f"   {cur_lr:8.1e}\n"
         fout.write(print_str)
         fout.flush()
+
+    def _get_wrapper_module(self) -> torch.nn.Module:
+        """Compatible with DDP and normal model."""
+        if isinstance(self.wrapper, DDP):
+            return self.wrapper.module
+        return self.wrapper
 
 
 def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
