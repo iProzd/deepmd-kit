@@ -2924,6 +2924,12 @@ def loss_ener() -> list[Argument]:
             doc=doc_huber_delta,
         ),
         Argument(
+            "huber_two_stage_delta",
+            float,
+            optional=True,
+            default=None,
+        ),
+        Argument(
             "trimmed_factor",
             float,
             optional=True,

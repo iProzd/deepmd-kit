@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import math
 from typing import (
     Any,
     Optional,
@@ -25,13 +26,21 @@ from deepmd.utils.version import (
 
 
 def custom_huber_loss(
-    predictions: torch.Tensor, targets: torch.Tensor, delta: float = 1.0
+    predictions: torch.Tensor,
+    targets: torch.Tensor,
+    delta: float = 1.0,
+    two_stage_delta: float = 1.0,
+    c_sq: float = 0.0,
+    k: float = 0.0,
 ) -> torch.Tensor:
     error = targets - predictions
     abs_error = torch.abs(error)
     quadratic_loss = 0.5 * torch.pow(error, 2)
     linear_loss = delta * (abs_error - 0.5 * delta)
     loss = torch.where(abs_error <= delta, quadratic_loss, linear_loss)
+    if two_stage_delta is not None and two_stage_delta > delta:
+        cauchy_loss = 0.5 * c_sq * torch.log1p(abs_error**2 / c_sq) + k
+        loss = torch.where(abs_error > two_stage_delta, cauchy_loss, loss)
     return torch.mean(loss)
 
 
@@ -58,6 +67,7 @@ class EnergyStdLoss(TaskLoss):
         inference: bool = False,
         use_huber: bool = False,
         huber_delta: float = 0.01,
+        huber_two_stage_delta: Optional[float] = None,
         trimmed_factor: float = 0.0,
         adaptive_loss: bool = False,
         learnable_pref: bool = False,
@@ -148,6 +158,30 @@ class EnergyStdLoss(TaskLoss):
         self.inference = inference
         self.use_huber = use_huber
         self.huber_delta = huber_delta
+        self.huber_two_stage_delta = huber_two_stage_delta
+        if self.use_huber and self.huber_two_stage_delta is not None:
+            assert huber_two_stage_delta >= huber_delta
+            # --- 保证 L1 -> Cauchy 连续性所需的参数计算 ---
+            # 1. 根据 C1 连续性 (梯度匹配) 求解 Cauchy 尺度 c^2
+            # 目标: dL/dr (L1) = delta1; dL/dr (Cauchy) = r / (1 + r^2/c^2)
+            # 匹配点 r=delta2: delta1 = delta2 / (1 + delta2^2/c^2)
+            c_sq = huber_two_stage_delta**2 / (
+                huber_two_stage_delta / huber_delta - 1.0
+            )
+            self.c_sq = c_sq
+            # 2. 计算 L2/L1 在 delta2 处的值 (C_match)
+            # C_match = delta1 * delta2 - 0.5 * delta1^2
+            L_L1_at_delta2 = huber_delta * huber_two_stage_delta - 0.5 * huber_delta**2
+            # 3. 计算 Cauchy 在 delta2 处的值 (L_Cauchy)
+            L_Cauchy_at_delta2 = (
+                0.5 * self.c_sq * math.log(1.0 + huber_two_stage_delta**2 / self.c_sq)
+            )
+            # 4. 计算偏移量 K (K = C_match - L_Cauchy)
+            # 保证 L3(r) = L_Cauchy(r) + K 在 delta2 处值连续
+            self.k = L_L1_at_delta2 - L_Cauchy_at_delta2
+        else:
+            self.c_sq = 0.0
+            self.k = 0.0
         if self.use_huber and (
             self.has_pf or self.has_gf or self.relative_f is not None
         ):
@@ -294,6 +328,9 @@ class EnergyStdLoss(TaskLoss):
                             atom_norm * model_pred["energy"],
                             atom_norm * label["energy"],
                             delta=self.huber_delta,
+                            two_stage_delta=self.huber_two_stage_delta,
+                            c_sq=self.c_sq,
+                            k=self.k,
                         )
                         loss += pref_e * l_huber_loss
                 rmse_e = l2_ener_loss.sqrt() * atom_norm
@@ -406,6 +443,9 @@ class EnergyStdLoss(TaskLoss):
                                 force_pred_reshape,
                                 force_label_reshape,
                                 delta=self.huber_delta,
+                                two_stage_delta=self.huber_two_stage_delta,
+                                c_sq=self.c_sq,
+                                k=self.k,
                             )
                             loss += pref_f * l_huber_loss
                     rmse_f = l2_force_loss.sqrt()
@@ -484,6 +524,9 @@ class EnergyStdLoss(TaskLoss):
                     atom_norm * model_pred["virial"].reshape(-1),
                     atom_norm * label["virial"].reshape(-1),
                     delta=self.huber_delta,
+                    two_stage_delta=self.huber_two_stage_delta,
+                    c_sq=self.c_sq,
+                    k=self.k,
                 )
                 loss += pref_v * l_huber_loss
             rmse_v = l2_virial_loss.sqrt() * atom_norm
@@ -513,6 +556,9 @@ class EnergyStdLoss(TaskLoss):
                     atom_ener_reshape,
                     atom_ener_label_reshape,
                     delta=self.huber_delta,
+                    two_stage_delta=self.huber_two_stage_delta,
+                    c_sq=self.c_sq,
+                    k=self.k,
                 )
                 loss += pref_ae * l_huber_loss
             rmse_ae = l2_atom_ener_loss.sqrt()
