@@ -380,7 +380,9 @@ class EnergyStdLoss(TaskLoss):
                             atom_norm * model_pred["energy"],
                             atom_norm * label["energy"],
                             delta=self.huber_delta[used_index],
-                            delta2=self.huber_two_stage_delta[used_index],
+                            delta2=self.huber_two_stage_delta[used_index]
+                            if self.huber_two_stage_delta is not None
+                            else None,
                             k1=self.k1[used_index],
                             k2=self.k2[used_index],
                             use_root=self.huber_two_stage_use_root,
@@ -498,7 +500,9 @@ class EnergyStdLoss(TaskLoss):
                                 force_pred_reshape,
                                 force_label_reshape,
                                 delta=self.huber_delta[used_index],
-                                delta2=self.huber_two_stage_delta[used_index],
+                                delta2=self.huber_two_stage_delta[used_index]
+                                if self.huber_two_stage_delta is not None
+                                else None,
                                 k1=self.k1[used_index],
                                 k2=self.k2[used_index],
                                 use_root=self.huber_two_stage_use_root,
@@ -582,7 +586,9 @@ class EnergyStdLoss(TaskLoss):
                     atom_norm * model_pred["virial"].reshape(-1),
                     atom_norm * label["virial"].reshape(-1),
                     delta=self.huber_delta[used_index],
-                    delta2=self.huber_two_stage_delta[used_index],
+                    delta2=self.huber_two_stage_delta[used_index]
+                    if self.huber_two_stage_delta is not None
+                    else None,
                     k1=self.k1[used_index],
                     k2=self.k2[used_index],
                     use_root=self.huber_two_stage_use_root,
@@ -617,7 +623,9 @@ class EnergyStdLoss(TaskLoss):
                     atom_ener_reshape,
                     atom_ener_label_reshape,
                     delta=self.huber_delta[used_index],
-                    delta2=self.huber_two_stage_delta[used_index],
+                    delta2=self.huber_two_stage_delta[used_index]
+                    if self.huber_two_stage_delta is not None
+                    else None,
                     k1=self.k1[used_index],
                     k2=self.k2[used_index],
                     use_root=self.huber_two_stage_use_root,
