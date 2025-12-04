@@ -230,8 +230,8 @@ class EnergyStdLoss(TaskLoss):
                 self.k1.append(k1)
                 self.k2.append(k2)
         else:
-            self.k1 = [0.0]
-            self.k2 = [0.0]
+            self.k1 = [0.0 for _ in self.huber_delta]
+            self.k2 = [0.0 for _ in self.huber_delta]
         if self.use_huber and (
             self.has_pf or self.has_gf or self.relative_f is not None
         ):
