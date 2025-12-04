@@ -2918,16 +2918,22 @@ def loss_ener() -> list[Argument]:
         ),
         Argument(
             "huber_delta",
-            float,
+            [float, list],
             optional=True,
             default=0.01,
             doc=doc_huber_delta,
         ),
         Argument(
             "huber_two_stage_delta",
-            float,
+            [float, list],
             optional=True,
             default=None,
+        ),
+        Argument(
+            "huber_two_stage_use_root",
+            bool,
+            optional=True,
+            default=False,
         ),
         Argument(
             "trimmed_factor",

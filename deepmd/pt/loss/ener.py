@@ -3,6 +3,7 @@ import math
 from typing import (
     Any,
     Optional,
+    Union,
 )
 
 import torch
@@ -29,19 +30,65 @@ def custom_huber_loss(
     predictions: torch.Tensor,
     targets: torch.Tensor,
     delta: float = 1.0,
-    two_stage_delta: float = 1.0,
-    c_sq: float = 0.0,
-    k: float = 0.0,
+    delta2: float = 1.0,
+    k1: float = 0.0,
+    k2: float = 0.0,
+    use_root: bool = False,
 ) -> torch.Tensor:
     error = targets - predictions
     abs_error = torch.abs(error)
     quadratic_loss = 0.5 * torch.pow(error, 2)
     linear_loss = delta * (abs_error - 0.5 * delta)
     loss = torch.where(abs_error <= delta, quadratic_loss, linear_loss)
-    if two_stage_delta is not None and two_stage_delta > delta:
-        cauchy_loss = 0.5 * c_sq * torch.log1p(abs_error**2 / c_sq) + k
-        loss = torch.where(abs_error > two_stage_delta, cauchy_loss, loss)
+    if delta2 is not None and delta2 > delta:
+        if not use_root:
+            stage2_loss = 0.5 * k1 * torch.log1p(abs_error**2 / k1) + k2
+        else:
+            stage2_loss = k1 * torch.sqrt(abs_error) + k2
+        loss = torch.where(abs_error > delta2, stage2_loss, loss)
     return torch.mean(loss)
+
+
+def cauchy_params_from_huber(
+    delta1: float,
+    delta2: float,
+) -> tuple[float, float]:
+    assert delta2 >= delta1
+    # --- 保证 L1 -> Cauchy 连续性所需的参数计算 ---
+    # 1. 根据 C1 连续性 (梯度匹配) 求解 Cauchy 尺度 c^2
+    # 目标: dL/dr (L1) = delta1; dL/dr (Cauchy) = r / (1 + r^2/c^2)
+    # 匹配点 r=delta2: delta1 = delta2 / (1 + delta2^2/c^2)
+    c_sq = delta2**2 / (delta2 / delta1 - 1.0)
+    # 2. 计算 L2/L1 在 delta2 处的值 (C_match)
+    # C_match = delta1 * delta2 - 0.5 * delta1^2
+    L_L1_at_delta2 = delta1 * delta2 - 0.5 * delta1**2
+    # 3. 计算 Cauchy 在 delta2 处的值 (L_Cauchy)
+    L_Cauchy_at_delta2 = 0.5 * c_sq * math.log(1.0 + delta2**2 / c_sq)
+    # 4. 计算偏移量 K (K = C_match - L_Cauchy)
+    # 保证 L3(r) = L_Cauchy(r) + K 在 delta2 处值连续
+    k = L_L1_at_delta2 - L_Cauchy_at_delta2
+    return c_sq, k
+
+
+def root_params_from_huber(
+    delta1: float,
+    delta2: float,
+) -> tuple[float, float]:
+    assert delta2 >= delta1
+    # 1. 计算 K1 (缩放系数) - 保证 C1 连续性 (梯度匹配)
+    # 目标梯度 dL/dr (L1) = delta1
+    # L0.5 梯度 dL/dr (L0.5) = 0.5 * K1 * r^(-0.5)
+    # 在 r=delta2 匹配: delta1 = 0.5 * K1 * delta2^(-0.5)
+    # 解得 K1 = 2 * delta1 * sqrt(delta2)
+    K1 = 2.0 * delta1 * math.sqrt(delta2)
+    # 2. 计算 L1 在 delta2 处的值 (L_L1)
+    L_L1_at_delta2 = delta1 * delta2 - 0.5 * delta1**2
+    # 3. 计算 K2 (偏移量) - 保证 C0 连续性 (值匹配)
+    # L_L1(delta2) = K1 * sqrt(delta2) + K2
+    # 解得 K2 = L_L1(delta2) - K1 * sqrt(delta2)
+    K2 = L_L1_at_delta2 - K1 * math.sqrt(delta2)
+    # 简化后: K2 = - delta1 * delta2 - 0.5 * delta1^2
+    return K1, K2
 
 
 class EnergyStdLoss(TaskLoss):
@@ -66,11 +113,12 @@ class EnergyStdLoss(TaskLoss):
         use_l1_all: bool = False,
         inference: bool = False,
         use_huber: bool = False,
-        huber_delta: float = 0.01,
-        huber_two_stage_delta: Optional[float] = None,
+        huber_delta: Union[float, list[float]] = 0.01,
+        huber_two_stage_delta: Optional[Union[float, list[float]]] = None,
         trimmed_factor: float = 0.0,
         adaptive_loss: bool = False,
         learnable_pref: bool = False,
+        huber_two_stage_use_root: bool = False,
         **kwargs: Any,
     ) -> None:
         r"""Construct a layer to compute loss on energy, force and virial.
@@ -157,31 +205,33 @@ class EnergyStdLoss(TaskLoss):
         self.use_l1_all = use_l1_all
         self.inference = inference
         self.use_huber = use_huber
-        self.huber_delta = huber_delta
-        self.huber_two_stage_delta = huber_two_stage_delta
+        self.huber_delta = (
+            [huber_delta] if isinstance(huber_delta, float) else huber_delta
+        )
+        self.huber_two_stage_delta = (
+            [huber_two_stage_delta]
+            if isinstance(huber_two_stage_delta, float)
+            else huber_two_stage_delta
+        )
+        self.huber_two_stage_use_root = huber_two_stage_use_root
         if self.use_huber and self.huber_two_stage_delta is not None:
-            assert huber_two_stage_delta >= huber_delta
-            # --- 保证 L1 -> Cauchy 连续性所需的参数计算 ---
-            # 1. 根据 C1 连续性 (梯度匹配) 求解 Cauchy 尺度 c^2
-            # 目标: dL/dr (L1) = delta1; dL/dr (Cauchy) = r / (1 + r^2/c^2)
-            # 匹配点 r=delta2: delta1 = delta2 / (1 + delta2^2/c^2)
-            c_sq = huber_two_stage_delta**2 / (
-                huber_two_stage_delta / huber_delta - 1.0
+            assert len(self.huber_two_stage_delta) == len(self.huber_delta), (
+                "When using two-stage Huber loss, the length of huber_two_stage_delta must match that of huber_delta."
             )
-            self.c_sq = c_sq
-            # 2. 计算 L2/L1 在 delta2 处的值 (C_match)
-            # C_match = delta1 * delta2 - 0.5 * delta1^2
-            L_L1_at_delta2 = huber_delta * huber_two_stage_delta - 0.5 * huber_delta**2
-            # 3. 计算 Cauchy 在 delta2 处的值 (L_Cauchy)
-            L_Cauchy_at_delta2 = (
-                0.5 * self.c_sq * math.log(1.0 + huber_two_stage_delta**2 / self.c_sq)
-            )
-            # 4. 计算偏移量 K (K = C_match - L_Cauchy)
-            # 保证 L3(r) = L_Cauchy(r) + K 在 delta2 处值连续
-            self.k = L_L1_at_delta2 - L_Cauchy_at_delta2
+            self.k1 = []
+            self.k2 = []
+            for i, delta in enumerate(self.huber_delta):
+                two_stage_delta = self.huber_two_stage_delta[i]
+                k1, k2 = (
+                    cauchy_params_from_huber(delta, two_stage_delta)
+                    if not self.huber_two_stage_use_root
+                    else root_params_from_huber(delta, two_stage_delta)
+                )
+                self.k1.append(k1)
+                self.k2.append(k2)
         else:
-            self.c_sq = 0.0
-            self.k = 0.0
+            self.k1 = [0.0]
+            self.k2 = [0.0]
         if self.use_huber and (
             self.has_pf or self.has_gf or self.relative_f is not None
         ):
@@ -259,6 +309,7 @@ class EnergyStdLoss(TaskLoss):
 
         loss = torch.zeros(1, dtype=env.GLOBAL_PT_FLOAT_PRECISION, device=env.DEVICE)[0]
         more_loss = {}
+        huber_index = 0
         # more_loss['log_keys'] = []  # showed when validation on the fly
         # more_loss['test_keys'] = []  # showed when doing dp test
         atom_norm = 1.0 / natoms
@@ -324,14 +375,17 @@ class EnergyStdLoss(TaskLoss):
                     if not self.use_huber:
                         loss += atom_norm * (pref_e * l2_ener_loss)
                     else:
+                        used_index = min(huber_index, len(self.huber_delta) - 1)
                         l_huber_loss = custom_huber_loss(
                             atom_norm * model_pred["energy"],
                             atom_norm * label["energy"],
-                            delta=self.huber_delta,
-                            two_stage_delta=self.huber_two_stage_delta,
-                            c_sq=self.c_sq,
-                            k=self.k,
+                            delta=self.huber_delta[used_index],
+                            delta2=self.huber_two_stage_delta[used_index],
+                            k1=self.k1[used_index],
+                            k2=self.k2[used_index],
+                            use_root=self.huber_two_stage_use_root,
                         )
+                        huber_index += 1
                         loss += pref_e * l_huber_loss
                 rmse_e = l2_ener_loss.sqrt() * atom_norm
                 more_loss["rmse_e"] = self.display_if_exist(
@@ -439,14 +493,17 @@ class EnergyStdLoss(TaskLoss):
                                 GLOBAL_PT_FLOAT_PRECISION
                             )
                         else:
+                            used_index = min(huber_index, len(self.huber_delta) - 1)
                             l_huber_loss = custom_huber_loss(
                                 force_pred_reshape,
                                 force_label_reshape,
-                                delta=self.huber_delta,
-                                two_stage_delta=self.huber_two_stage_delta,
-                                c_sq=self.c_sq,
-                                k=self.k,
+                                delta=self.huber_delta[used_index],
+                                delta2=self.huber_two_stage_delta[used_index],
+                                k1=self.k1[used_index],
+                                k2=self.k2[used_index],
+                                use_root=self.huber_two_stage_use_root,
                             )
+                            huber_index += 1
                             loss += pref_f * l_huber_loss
                     rmse_f = l2_force_loss.sqrt()
                     more_loss["rmse_f"] = self.display_if_exist(
@@ -520,14 +577,17 @@ class EnergyStdLoss(TaskLoss):
             if not self.use_huber:
                 loss += atom_norm * (pref_v * l2_virial_loss)
             else:
+                used_index = min(huber_index, len(self.huber_delta) - 1)
                 l_huber_loss = custom_huber_loss(
                     atom_norm * model_pred["virial"].reshape(-1),
                     atom_norm * label["virial"].reshape(-1),
-                    delta=self.huber_delta,
-                    two_stage_delta=self.huber_two_stage_delta,
-                    c_sq=self.c_sq,
-                    k=self.k,
+                    delta=self.huber_delta[used_index],
+                    delta2=self.huber_two_stage_delta[used_index],
+                    k1=self.k1[used_index],
+                    k2=self.k2[used_index],
+                    use_root=self.huber_two_stage_use_root,
                 )
+                huber_index += 1
                 loss += pref_v * l_huber_loss
             rmse_v = l2_virial_loss.sqrt() * atom_norm
             more_loss["rmse_v"] = self.display_if_exist(rmse_v.detach(), find_virial)
@@ -552,14 +612,17 @@ class EnergyStdLoss(TaskLoss):
             if not self.use_huber:
                 loss += (pref_ae * l2_atom_ener_loss).to(GLOBAL_PT_FLOAT_PRECISION)
             else:
+                used_index = min(huber_index, len(self.huber_delta) - 1)
                 l_huber_loss = custom_huber_loss(
                     atom_ener_reshape,
                     atom_ener_label_reshape,
-                    delta=self.huber_delta,
-                    two_stage_delta=self.huber_two_stage_delta,
-                    c_sq=self.c_sq,
-                    k=self.k,
+                    delta=self.huber_delta[used_index],
+                    delta2=self.huber_two_stage_delta[used_index],
+                    k1=self.k1[used_index],
+                    k2=self.k2[used_index],
+                    use_root=self.huber_two_stage_use_root,
                 )
+                huber_index += 1
                 loss += pref_ae * l_huber_loss
             rmse_ae = l2_atom_ener_loss.sqrt()
             more_loss["rmse_ae"] = self.display_if_exist(
