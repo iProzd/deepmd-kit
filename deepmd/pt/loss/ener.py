@@ -44,7 +44,7 @@ def custom_huber_loss(
         if not use_root:
             stage2_loss = 0.5 * k1 * torch.log1p(abs_error**2 / k1) + k2
         else:
-            stage2_loss = k1 * torch.sqrt(abs_error) + k2
+            stage2_loss = k1 * torch.sqrt(abs_error + 1e-5) + k2
         loss = torch.where(abs_error > delta2, stage2_loss, loss)
     return torch.mean(loss)
 
