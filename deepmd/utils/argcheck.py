@@ -2944,6 +2944,12 @@ def loss_ener() -> list[Argument]:
             doc=doc_use_huber,
         ),
         Argument(
+            "f_use_norm",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "huber_delta",
             [float, list],
             optional=True,

@@ -113,6 +113,7 @@ class EnergyStdLoss(TaskLoss):
         use_l1_all: bool = False,
         inference: bool = False,
         use_huber: bool = False,
+        f_use_norm: bool = False,
         huber_delta: Union[float, list[float]] = 0.01,
         huber_two_stage_delta: Optional[Union[float, list[float]]] = None,
         trimmed_factor: float = 0.0,
@@ -205,6 +206,9 @@ class EnergyStdLoss(TaskLoss):
         self.use_l1_all = use_l1_all
         self.inference = inference
         self.use_huber = use_huber
+        self.f_use_norm = f_use_norm
+        if self.f_use_norm:
+            assert self.use_huber, "f_use_norm can only be True when use_huber is True."
         self.huber_delta = (
             [huber_delta] if isinstance(huber_delta, float) else huber_delta
         )
@@ -496,9 +500,20 @@ class EnergyStdLoss(TaskLoss):
                             )
                         else:
                             used_index = min(huber_index, len(self.huber_delta) - 1)
+                            if not self.f_use_norm:
+                                huber_f_input1 = force_pred_reshape
+                                huber_f_input2 = force_label_reshape
+                            else:
+                                huber_f_input1 = torch.linalg.vector_norm(
+                                    (force_label - force_pred).reshape(-1, 3),
+                                    ord=2,
+                                    dim=1,
+                                    keepdim=True,
+                                )  # l2 norm mae
+                                huber_f_input2 = torch.zeros_like(huber_f_input1)
                             l_huber_loss = custom_huber_loss(
-                                force_pred_reshape,
-                                force_label_reshape,
+                                huber_f_input1,
+                                huber_f_input2,
                                 delta=self.huber_delta[used_index],
                                 delta2=self.huber_two_stage_delta[used_index]
                                 if self.huber_two_stage_delta is not None
