@@ -2716,6 +2716,12 @@ def loss_ener() -> list[Argument]:
             default=False,
         ),
         Argument(
+            "use_l1_all",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "huber_delta",
             float,
             optional=True,
