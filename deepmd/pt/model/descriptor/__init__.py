@@ -42,6 +42,9 @@ from .se_t_tebd import (
     DescrptBlockSeTTebd,
     DescrptSeTTebd,
 )
+from .se_zm_net import (
+    DescrptSeZMNet,
+)
 
 __all__ = [
     "BaseDescriptor",
@@ -59,6 +62,7 @@ __all__ = [
     "DescrptSeR",
     "DescrptSeT",
     "DescrptSeTTebd",
+    "DescrptSeZMNet",
     "make_default_type_embedding",
     "prod_env_mat",
 ]
