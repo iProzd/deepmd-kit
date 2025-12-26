@@ -139,6 +139,9 @@ class MLPLayer(nn.Module):
             self._normal_init(generator=random_generator)
         elif init == "kaiming_uniform":
             self._kaiming_uniform_init(generator=random_generator)
+        elif init.startswith("kaiming_uniform"):
+            prefactor = float(init.split(":")[-1])
+            self._kaiming_uniform_init(generator=random_generator, prefactor=prefactor)
         elif init == "final":
             self._zero_init(False)
         else:
@@ -202,7 +205,7 @@ class MLPLayer(nn.Module):
         kaiming_normal_(self.matrix, nonlinearity="linear", generator=generator)
 
     def _kaiming_uniform_init(
-        self, generator: Optional[torch.Generator] = None
+        self, generator: Optional[torch.Generator] = None, prefactor: float = 1.0
     ) -> None:
         kaiming_uniform_(
             self.matrix.t(), a=math.sqrt(5), generator=generator
@@ -211,7 +214,7 @@ class MLPLayer(nn.Module):
             fan_in, _ = _calculate_fan_in_and_fan_out(
                 self.matrix.t()
             )  # pay attention to .t()
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            bound = prefactor / math.sqrt(fan_in) if fan_in > 0 else 0
             uniform_(self.bias, -bound, bound)
 
     def forward(
