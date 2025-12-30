@@ -46,11 +46,11 @@ Text diagram (single forward pass):
 Inputs (extended_coord, extended_atype, nlist, mapping)
   └─ EdgeFeatureCache (built once)
        ├─ edges: (src, dst), edge_vec, edge_len, edge_unit
-       ├─ edge_envelop: C² envelope
+       ├─ edge_rbf: Bessel radial basis × C² envelope (trainable frequencies)
        ├─ edge_sw: DeePMD smooth weights in flattened edge layout
-       ├─ edge_rbf: Bessel radial basis (trainable frequencies)
        ├─ D_list[l], Dt_list[l]: Wigner-D blocks per l
-       └─ sw: DeePMD smooth weights for (nf, nloc, nnei, 1)
+       ├─ sw: DeePMD smooth weights for (nf, nloc, nnei, 1)
+       └─ inv_sqrt_deg: inverse sqrt degree for normalization
 
 Node init:
   ├─ l=0: Type embedding
@@ -58,12 +58,12 @@ Node init:
 
 Interaction blocks (pyramid schedule):
   for block i:
-    ├─ slice x to K(l_schedule[i]) (discard higher-l if needed)
-    ├─ SeparableRMSNorm (scalar / tensor separated)
+    ├─ slice x to ebed_dim(l_schedule[i]) (discard higher-l if needed)
+    ├─ SeparableRMSNorm (l=0/l>0 separated, per-l affine, l=0 centering)
     ├─ SO(2) Convolution (enabled for ALL lmax, including lmax=0)
     ├─ Residual
-    ├─ AnalyticGating (gate from l=0)
-    └─ Full Equivariant FFN (operates on ALL orders l=0..lmax, separable gating)
+    ├─ GatedActivation (per-l independent gates from l=0)
+    └─ Full Equivariant FFN (operates on ALL degrees l=0..lmax, per-l gating)
 
 Output:
   └─ return x(l=0) only: (nf, nloc, channels)
@@ -89,21 +89,79 @@ This allows the model to learn optimal radial basis spacing during training, fol
 - Stored in the model's configured precision (float64 or float32)
 - Included in serialization/deserialization
 
-### 2. Full Equivariant FFN (All Orders, Separable Gating)
+### 1.5 SeparableRMSNorm (Per-l Affine with Centering)
 
-The FFN operates on **ALL spherical harmonic orders** (l=0 to lmax), not just scalars. It uses a NequIP/eSEN-style gated FFN with separable gating:
+`SeparableRMSNorm` normalizes l=0 and l>0 features **separately** while supporting per-l affine scaling:
+
+```python
+# l=0: centering + RMS norm + per-channel affine
+x0 = x0 - mean(x0)  # centering (optional, default=True)
+x0 = x0 / rms(x0)
+x0 = x0 * weight[0] + bias  # affine with bias
+
+# l>0: RMS norm (no centering) + per-l affine (no bias)
+xt = xt / rms(xt)  # rms over all (D-1, C)
+xt = xt * weight[expand_index]  # per-l scale, expanded to all m
+```
+
+Key properties:
+
+- **Separable RMS**: l=0 and l>0 compute RMS independently
+- **Centering**: Only for l=0 (l>0 must remain zero-mean for equivariance)
+- **Per-l affine**: Weight shape `(lmax+1, C)`, with `expand_index` mapping to all m-components
+- **Bias**: Only for l=0 (when both `affine=True` and `centering=True`)
+
+### 2. Full Equivariant FFN (All Degrees, Per-l Gating)
+
+The FFN operates on **ALL spherical harmonic degrees** (l=0 to lmax), not just scalars. It uses a gated FFN with **per-l independent gates**:
 
 ```
 EquivariantFFN:
-  1. Per-order linear mixing (C → hidden)
-  2. Separable gating:
-     - l=0 content branch: SiLU applied to scalar hidden features
-     - l=0 gate branch: independent projection from scalar inputs produces sigmoid-activated gates
-  3. Per-order linear mixing (hidden → C)
+  1. Per-degree linear mixing (C → hidden)
+  2. GatedActivation:
+     - l=0: SiLU activation
+     - l>0: Each degree l has an independent gate derived from l=0 scalar features via gate_linear
+           Gates are expanded to all m components within each l-block
+  3. Per-degree linear mixing (hidden → C)
   4. Residual connection
 ```
 
-Separable gating avoids coupling gate gradients with the scalar content pathway while still gating all higher-order features (l>0).
+The `GatedActivation` module generates `lmax` independent gates from scalar features using a linear layer (`gate_linear: C → lmax*C`), then expands each per-l gate to all `2l+1` m-components using a precomputed `expand_index` buffer.
+
+### 3. PerDegreeLinearV2 (Vectorized Degree-wise Linear)
+
+`PerDegreeLinearV2` implements degree-wise linear self-interaction shared across all m components within each l-block, using vectorized operations for efficiency:
+
+```python
+# Per-l weight matrix: (lmax+1, C, C)
+# Each l has an independent C x C linear transformation shared across 2l+1 m components.
+weight = nn.Parameter(torch.randn(lmax + 1, C, C))
+bias = nn.Parameter(torch.zeros(C))  # Only for l=0
+
+# expand_index: maps each (l,m) position to its l value
+expand_index = [0, 1, 1, 1, 2, 2, 2, 2, 2, ...]  # length = (lmax+1)^2
+
+# Forward pass (vectorized):
+weight_expanded = index_select(weight, dim=0, index=expand_index)  # (D, C, C)
+out = einsum("bmi,mci->bmc", x, weight_expanded)  # (N, D, C)
+out[:, 0, :] += bias  # Add bias only to l=0
+```
+
+Key properties:
+
+- **Vectorized**: Uses `einsum` + `index_select` instead of Python for-loops
+- **Per-l weights**: Each degree l has an independent (C, C) transformation
+- **Weight sharing**: Within each l-block, the same weight is shared across all 2l+1 m components
+- **Bias only for l=0**: Only scalar components have additive bias (preserves equivariance for l>0)
+- **expand_index buffer**: Precomputed mapping from packed (l,m) positions to l values
+
+Compared to `PerDegreeLinear` (which uses `nn.ModuleList` with per-l `nn.Linear`), V2:
+
+- Avoids Python for-loops
+- Uses a single combined `weight` parameter instead of `lmax+1` separate weights
+- Has identical numerical output (tested in unit tests)
+
+### 4. Multi-layer SO(2) Convolution
 
 ---
 
@@ -113,10 +171,10 @@ Separable gating avoids coupling gate gradients with the scalar content pathway 
 
 The core tensor is:
 
-- `x`: `torch.Tensor` with shape `(N, K, C)`
+- `x`: `torch.Tensor` with shape `(N, D, C)`
   - `N = nf * nloc`
   - `C = channels`
-  - `K = (lmax + 1)^2 = sum_{l=0..lmax} (2l + 1)`
+  - `D = ebed_dim = (lmax + 1)^2 = sum_{l=0..lmax} (2l + 1)` is the SO(3) embedding dimension
 
 Packing convention:
 
@@ -143,11 +201,11 @@ Let `E` be the number of valid edges:
 - `edge_vec`: `(E, 3)` in Å
 - `edge_len`: `(E, 1)` in Å
 - `edge_unit`: `(E, 3)` unit vector
-- `edge_envelop`: `(E, 1)` C² envelope
+- `edge_rbf`: `(E, n_radial)` Bessel radial basis × C² envelope (trainable frequencies)
 - `edge_sw`: `(E, 1)` DeePMD smooth weight flattened to valid edges
-- `edge_rbf`: `(E, n_radial)` raw Bessel basis (no envelope baked in)
 - `D_list[l]`: `(E, 2l+1, 2l+1)` real-basis Wigner-D block
 - `Dt_list[l]`: transpose of `D_list[l]`
+- `inv_sqrt_deg`: `(N, 1, 1)` inverse sqrt degree for graph-style normalization
 
 ---
 
@@ -160,43 +218,51 @@ Purpose: Seed `l>0` features at layer 0 to reduce the number of blocks required.
 Definition:
 
 - `x(l=0)` comes **only** from type embedding.
-- For `l>0`, compute per-`l` zonal seeds via cached Wigner-D columns and radial MLP.
+- For `l>0`, compute per-`l` zonal seeds via the cached `Dt_list[l][:, :, m=0]` column
+  (local->global) and a radial MLP.
 
 ### SO(2) Convolution (linearized)
 
 For each edge `(src -> dst)`:
 
-1. **Rotate to local frame**: apply `Dt_list[l]` per order (l)
+1. **Rotate to local frame**: apply `D_list[l]` per degree (l)
 2. **Radial interaction**: radial MLP outputs per-`l` weights and modulates local features
-3. **Strict smooth cutoff**: multiply by `edge_envelop * edge_sw` (all terms vanish at `rcut`)
-4. **SO(2) mixing**: group by `|m|`, shared linear maps for `+m` and `-m`
-   - Any additive scalar bias is also modulated by radial weights and cutoff to preserve strict smoothness.
-5. **Rotate back**: apply `D_list[l]`
-6. **Aggregate**: scatter-sum by `dst`
+3. **Strict smooth cutoff**: multiply by `edge_sw` (all terms vanish at `rcut`, envelope already baked into `edge_rbf`)
+4. **Multi-layer SO(2) mixing**: for each layer in `so2_linears`:
+   - Apply `SO2Linear` (group by `|m|`):
+     - `m=0`: standard linear with additive bias (modulated by radial weights and cutoff to preserve strict smoothness on first layer)
+     - `|m|>0`: 2x2 complex mixing on `(-m, +m)` pairs treated as `(Re, Im)`
+   - Apply `GatedActivation` between layers (not after the last):
+     - l=0: SiLU activation
+     - l>0: sigmoid(l=0) gate
+5. **Rotate back**: apply `Dt_list[l]`
+6. **Aggregate with normalization**: scatter-sum by `dst`, then multiply by `inv_sqrt_deg`
 
 ### Full Equivariant FFN
 
 The `EquivariantFFN` class implements:
 
 ```python
-# Input projection (per-order)
+# Input projection (per-degree)
 h = linear_in[l](x[:, l_slice, :])  # for each l
 
-# Separable gating
-h0 = SiLU(h[:, 0:1, :])  # scalar activation
-gate_input = x[:, 0, :]  # scalar inputs
-gates = sigmoid(gate_linear(gate_input))  # gates from scalar branch
-ht = h[:, 1:, :] * gates_expanded  # gate l>0 features
+# GatedActivation with per-l independent gates
+h0 = SiLU(h[:, 0:1, :])  # l=0: scalar activation
+gating_scalars = sigmoid(gate_linear(h[:, 0, :]))  # (N, lmax * C)
+gating_scalars = gating_scalars.view(N, lmax, C)
+gates = index_select(gating_scalars, expand_index)  # (N, D-1, C)
+ht = h[:, 1:, :] * gates  # gate l>0 features with per-l gates
 h = torch.cat([h0, ht], dim=1)
 
-# Output projection (per-order)
+# Output projection (per-degree)
 out = linear_out[l](h[:, l_slice, :])  # for each l
 ```
 
 Key properties:
 
 - Bias only on l=0 (scalar) components
-- Gates are shared across `m` within each `l`
+- Each `l` has an independent gate, expanded to all `m` within that `l`
+- `expand_index` maps per-l gates to all `2l+1` m-components
 - Residual connection: `x = x + ffn(x)`
 
 ---
@@ -211,9 +277,9 @@ SeZM-Net supports:
 Rules:
 
 - `l_schedule` must be **non-increasing**
-- final entry must be **0** to fully drop higher-order components
+- final entry must be **0** to fully drop higher-degree components
 - when schedule decreases, higher-`l` channels are **physically discarded**
-- later blocks operate on smaller `K`, reducing compute
+- later blocks operate on smaller `ebed_dim`, reducing compute
 
 ---
 
@@ -226,17 +292,19 @@ Key arguments:
 - `rcut: float` — Cutoff radius in Å
 - `rcut_smth: float` — Smooth weight start in Å
 - `sel: list[int] | int` — Maximum neighbors per type
-- `lmax: int` — Maximum order (only if `l_schedule` is None)
+- `lmax: int` — Maximum degree (only if `l_schedule` is None)
 - `l_schedule: list[int] | None` — Pyramid schedule
 - `channels: int` — Channels per (l,m) coefficient
 - `n_radial: int` — Number of radial basis functions
 - `radial_mlp: list[int]` — Hidden sizes for radial networks
 - `n_blocks: int` — Number of blocks (only if `l_schedule` is None)
+- `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neuron: list[int]` — Hidden sizes for equivariant FFN (first element used as hidden_channels)
-- `neighbor_norm: bool` — Normalize by inverse sqrt node degree
-- `wigner_parallel: bool` — If True, use block-diagonal parallel Wigner-D (`O(E * K^2)` memory, faster for small `E`)
+- `wigner_parallel: bool` — If True, use block-diagonal parallel Wigner-D (`O(E * D^2)` memory, faster for small `E`)
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
+
+Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 
 Output:
 
@@ -253,7 +321,6 @@ Output:
 - **radial basis with trainable frequencies**
 - block sub-networks:
   - `EquivariantFFN` (full equivariant FFN with separable gating: `gate_linear`)
-  - `AnalyticGating`
   - `SO2Convolution` (radial net + SO2Linear)
   - `PerDegreeLinear`
 - `davg` / `dstd` statistics buffers
@@ -275,7 +342,8 @@ For `x = r / rcut`:
 - `E(x) = 1 - 10 x^3 + 15 x^4 - 6 x^5` for `x in [0, 1]`
 - `E(x) = 0` for `x >= 1`
 
-All edge messages are multiplied by `edge_envelop` and the DeePMD smooth weight `edge_sw`, guaranteeing:
+The C² envelope is multiplied directly into the radial basis functions in `RadialBasis.forward()`.
+All edge messages are then multiplied by the DeePMD smooth weight `edge_sw`, guaranteeing:
 
 - message is 0 at `rcut`
 - d(message)/dr is 0 at `rcut`
@@ -295,27 +363,27 @@ and the edge-aligned local frame.
 
 Two implementations are provided in `deepmd/pt/model/descriptor/wigner_d.py`:
 
-| Class                 | Description               | Memory                 | Speed                   |
-| --------------------- | ------------------------- | ---------------------- | ----------------------- |
-| `WignerDCalc`         | Per-l loop implementation | O(n_edge × max(2l+1)²) | Moderate                |
-| `WignerDCalcParallel` | Block-diagonal parallel   | O(n_edge × dim_full²)  | Faster for small n_edge |
+| Class                 | Description               | Memory                  | Speed                    |
+| --------------------- | ------------------------- | ----------------------- | ------------------------ |
+| `WignerDCalc`         | Per-l loop implementation | O(n_edges × max(2l+1)²) | Moderate                 |
+| `WignerDCalcParallel` | Block-diagonal parallel   | O(n_edges × dim_full²)  | Faster for small n_edges |
 
-where `dim_full = (lmax+1)²`.
+where `dim_full = (lmax+1)² = ebed_dim`.
 
 **Recommendation**:
 
-- Use `WignerDCalc` (default) for large `n_edge` to avoid memory issues.
-- Use `WignerDCalcParallel` for small `n_edge` where dispatch overhead dominates.
+- Use `WignerDCalc` (default) for large `n_edges` to avoid memory issues.
+- Use `WignerDCalcParallel` for small `n_edges` where dispatch overhead dominates.
 
 #### Conventions
 
 - `rot_mat` is a global->local transform for 3D vectors:
   - `v_local = rot_mat @ v_global`
-  - It is built by `init_edge_rot_mat(edge_vec)` so that `rot_mat @ edge_unit = (0, 0, 1)`.
+  - It is built by either `init_edge_rot_mat(edge_vec)` (Gram-Schmidt with a reference-axis switch) or `init_edge_rot_mat_frisvad(edge_vec)` (Frisvad ONB with a strict cross-product fallback near `-Z`) so that `rot_mat @ edge_unit = (0, 0, 1)`.
 - For each degree `l`, real SH channels are ordered by `m=-l..+l` (index `i = m + l`).
 - `D_list[l]` / `Dt_list[l]` are real-basis Wigner-D blocks:
-  - `D_list[l]`: `(E, 2l+1, 2l+1)`
-  - `Dt_list[l] = D_list[l]^T`: inverse blocks (orthogonal matrices).
+  - `D_list[l]`: `(E, 2l+1, 2l+1)` and represents the same global->local rotation as `rot_mat`.
+  - `Dt_list[l] = D_list[l]^T`: inverse blocks (local->global).
 
 #### Key identities
 
@@ -381,7 +449,7 @@ dispatch overhead (significant when `lmax <= 10`).
 
 **Z matrix construction** (`_build_z_rotation`):
 
-1. Initialize zeros `(n_edge, dim_full, dim_full)`.
+1. Initialize zeros `(n_edges, dim_full, dim_full)`.
 2. Set `m=0` diagonal elements to 1 using `_m0_indices`.
 3. Compute `cos(m*theta)` and `sin(m*theta)` for all `(l, m)` pairs in one vectorized op.
 4. Fill 2×2 rotation blocks using precomputed indices:
@@ -405,12 +473,12 @@ dispatch overhead (significant when `lmax <= 10`).
 
 **`WignerDCalc` (per-l loop)**:
 
-- Z rotation: `_build_z_rotation(angle, l)` builds `(n_edge, 2l+1, 2l+1)` per block.
+- Z rotation: `_build_z_rotation(angle, l)` builds `(n_edges, 2l+1, 2l+1)` per block.
 - J matrices stored as `_J_{l}` and `_Jt_{l}` for each `l`.
 
 **`WignerDCalcParallel` (block-diagonal)**:
 
-- Z rotation: `_build_z_rotation(angle)` builds full `(n_edge, dim_full, dim_full)`.
+- Z rotation: `_build_z_rotation(angle)` builds full `(n_edges, dim_full, dim_full)`.
 - J matrices stored as `_J_full` and `_Jt_full` block-diagonal.
 - Index precomputation: `_precompute_z_indices()` builds `_m0_indices`, `_pos_indices`, `_neg_indices`, `_m_values`.
 
@@ -418,8 +486,8 @@ dispatch overhead (significant when `lmax <= 10`).
 
 SeZM blocks apply the cached rotations as:
 
-- rotate to local: `x_local^{(l)} = Dt_list[l] @ x_global^{(l)}`
-- rotate back: `x_global^{(l)} = D_list[l] @ x_local^{(l)}`
+- rotate to local: `x_local^{(l)} = D_list[l] @ x_global^{(l)}`
+- rotate back: `x_global^{(l)} = Dt_list[l] @ x_local^{(l)}`
 
 ### Padded neighbor safety
 
@@ -432,7 +500,7 @@ SeZM blocks apply the cached rotations as:
 - All submodules use `dtype: torch.dtype` (not `precision: str`) for constructor parameter.
 - Device is obtained from global `env.DEVICE` at runtime; submodules store `self.device = env.DEVICE` only as a convenience reference, not for serialization.
 - Each submodule stores `self.precision = RESERVED_PRECISION_DICT[dtype]` for serialization compatibility.
-- The `_safe_norm` function automatically infers epsilon from input dtype instead of accepting an external `eps` parameter.
+- The `safe_norm` function automatically infers epsilon from input dtype instead of accepting an external `eps` parameter.
 
 ---
 

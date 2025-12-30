@@ -66,7 +66,7 @@ from .se_zm_block import (
     PerDegreeLinear,
     SeZMInteractionBlock,
     SO2Convolution,
-    _k_of_lmax,
+    _so3_dim_of_lmax,
 )
 from .wigner_d import (
     WignerDCalc,
@@ -101,7 +101,7 @@ def _as_int_list(value: list[int] | int, *, ntypes: int | None) -> list[int]:
     return [int(x) for x in value]
 
 
-def _safe_norm(x: torch.Tensor) -> torch.Tensor:
+def safe_norm(x: torch.Tensor) -> torch.Tensor:
     """
     Compute vector norm with an epsilon lower bound.
 
@@ -153,16 +153,16 @@ def init_edge_rot_mat(edge_vec: torch.Tensor) -> torch.Tensor:
     Parameters
     ----------
     edge_vec
-        Edge vectors with shape (n_edge, 3).
+        Edge vectors with shape (n_edges, 3).
 
     Returns
     -------
     torch.Tensor
-        Rotation matrices with shape (n_edge, 3, 3).
+        Rotation matrices with shape (n_edges, 3, 3).
     """
     # === Step 1. Normalize edge direction (local z) ===
     # z_hat is the unit edge direction (center -> neighbor).
-    z_hat = edge_vec / _safe_norm(edge_vec)
+    z_hat = edge_vec / safe_norm(edge_vec)
 
     # === Step 2. Construct x-axis by Gram-Schmidt against a reference ===
     # Choose a reference axis that is not nearly parallel to z_hat to avoid
@@ -175,12 +175,104 @@ def init_edge_rot_mat(edge_vec: torch.Tensor) -> torch.Tensor:
     # Remove the component along z_hat to obtain a vector orthogonal to z_hat.
     proj = torch.sum(ref * z_hat, dim=-1, keepdim=True) * z_hat
     x_hat = ref - proj
-    x_hat = x_hat / _safe_norm(x_hat)
+    x_hat = x_hat / safe_norm(x_hat)
 
     # === Step 3. Construct y-axis (right-handed) ===
     # Cross product enforces a right-handed frame: (x_hat, y_hat, z_hat).
     y_hat = torch.cross(z_hat, x_hat, dim=-1)
-    y_hat = y_hat / _safe_norm(y_hat)
+    y_hat = y_hat / safe_norm(y_hat)
+
+    # === Step 4. Stack rows to form global->local rotation ===
+    # Row-stacking ensures v_local = R @ v_global.
+    return torch.stack([x_hat, y_hat, z_hat], dim=-2)
+
+
+def init_edge_rot_mat_frisvad(edge_vec: torch.Tensor) -> torch.Tensor:
+    """
+    Compute rotation matrices that align each edge to the local + Z axis.
+
+    The returned rotation is a global->local transform: ``v_local = R @ v_global``.
+    So, for unit edge direction vector ``u``, ``R @ u = (0, 0, 1)``.
+
+    Notes
+    -----
+    This routine constructs an orthonormal right-handed frame (x_hat, y_hat, z_hat)
+    per edge using the Frisvad method (closed-form ONB from a unit vector).
+
+    The Frisvad closed-form is singular at ``z_hat = (0, 0, -1)``, due to the
+    ``1 / (1 + nz)`` denominator. For the singular neighborhood near ``-Z``, the
+    basis must NOT fall back to fixed axes, otherwise x_hat/y_hat may not be
+    exactly perpendicular to the current ``z_hat``. Instead, we build a strict
+    orthonormal pair from the current ``z_hat`` via cross products, guaranteeing
+    that the returned matrix is a proper rotation and that ``R @ z_hat = (0,0,1)``
+    up to floating-point error.
+
+    Given unit vector z_hat = (nx, ny, nz), for nz > -1, define::
+
+        a = 1 / (1 + nz)
+        b = -nx * ny * a
+        x_hat = (1 - nx ^ 2 * a, b, -nx)
+        y_hat = (b, 1 - ny ^ 2 * a, -ny)
+
+    This yields an orthonormal basis with x_hat ⟂ z_hat, y_hat ⟂ z_hat and
+    x_hat X y_hat = z_hat (right-handed). For nz close to -1, we fall back to a
+    strict cross-product basis built from the current z_hat.
+
+    The rotation matrix stacks these basis vectors as rows::
+
+        R = [x_hat^T; y_hat^T; z_hat^T]
+
+    This makes ``R`` a global->local transform, because each row computes the
+    dot product with the corresponding local basis vector.
+
+    Parameters
+    ----------
+    edge_vec
+        Edge vectors with shape (n_edges, 3).
+
+    Returns
+    -------
+    torch.Tensor
+        Rotation matrices with shape (n_edges, 3, 3).
+    """
+    # === Step 1. Normalize edge direction (local z) ===
+    # z_hat is the unit edge direction (center -> neighbor).
+    z_hat = edge_vec / safe_norm(edge_vec)
+    nx = z_hat[..., 0:1]
+    ny = z_hat[..., 1:2]
+    nz = z_hat[..., 2:3]
+
+    # === Step 2. Frisvad closed-form orthonormal basis (non-singular) ===
+    # The closed-form uses a = 1 / (1 + nz), which is singular at nz = -1.
+    # Compute it with a safe denominator, then select by a singular mask.
+    eps = 1.0e-6
+    singular = nz < (-1.0 + eps)
+
+    denom = 1.0 + nz
+    denom_safe = torch.where(singular, torch.ones_like(denom), denom)
+    a = 1.0 / denom_safe
+    b = -nx * ny * a
+
+    x_main = torch.cat([1.0 - nx * nx * a, b, -nx], dim=-1)
+    y_main = torch.cat([b, 1.0 - ny * ny * a, -ny], dim=-1)
+
+    # === Step 3. Strict fallback for the singular neighborhood (z_hat ~= -Z) ===
+    # Build x_hat/y_hat from the current z_hat so that:
+    #   x_hat ⟂ z_hat, y_hat ⟂ z_hat, and (x_hat, y_hat, z_hat) is right-handed.
+    # In the singular neighborhood near -Z, ref = +X is guaranteed not parallel to z_hat.
+    ref = edge_vec.new_tensor([1.0, 0.0, 0.0]).expand_as(edge_vec)
+    x_fb = torch.cross(ref, z_hat, dim=-1)
+    x_fb = x_fb / safe_norm(x_fb)
+    y_fb = torch.cross(z_hat, x_fb, dim=-1)
+    y_fb = y_fb / safe_norm(y_fb)
+
+    mask3 = singular.expand_as(edge_vec)
+    x_hat = torch.where(mask3, x_fb, x_main)
+    y_hat = torch.where(mask3, y_fb, y_main)
+
+    # Normalize to protect against numerical drift (and to match your existing style).
+    x_hat = x_hat / safe_norm(x_hat)
+    y_hat = y_hat / safe_norm(y_hat)
 
     # === Step 4. Stack rows to form global->local rotation ===
     # Row-stacking ensures v_local = R @ v_global.
@@ -221,7 +313,7 @@ class C2CutoffEnvelope(nn.Module):
 
 class RadialBasis(nn.Module):
     """
-    Spherical Bessel radial basis with explicit envelope output.
+    Spherical Bessel radial basis with C^2 cutoff envelope.
 
     Frequencies are trainable nn.Parameter, allowing the model
     to learn optimal radial basis spacing during training.
@@ -241,9 +333,8 @@ class RadialBasis(nn.Module):
 
         lim_{r->0} sin(w_n * r) / r = w_n
 
-    The C^2 cutoff envelope is returned separately (not baked into ``rbf``) so the
-    caller can apply it together with other smooth factors (e.g. DeePMD smooth
-    weight) to preserve strict smoothness at ``rcut``.
+    The C^2 cutoff envelope is multiplied directly into the output to ensure
+    strict smoothness at ``rcut``.
 
     Parameters
     ----------
@@ -284,7 +375,7 @@ class RadialBasis(nn.Module):
 
         self.envelope = C2CutoffEnvelope(self.rcut)
 
-    def forward(self, r: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -293,10 +384,9 @@ class RadialBasis(nn.Module):
 
         Returns
         -------
-        rbf
-            Radial basis with shape (..., n_radial).
-        envelope
-            C^2 cutoff envelope with shape (..., 1).
+        torch.Tensor
+            Radial basis multiplied by C^2 cutoff envelope with shape (..., n_radial).
+            The output is smoothly truncated to zero at r = rcut.
         """
         # === Step 1. Avoid division by zero (preserve r->0 limit) ===
         rr = r.clamp(min=self.eps)
@@ -306,9 +396,9 @@ class RadialBasis(nn.Module):
         # r->0 limit: sin(w r)/r -> w
         raw = torch.sin(rr * self.freqs) / rr
 
-        # === Step 3. Compute the explicit C^2 envelope ===
+        # === Step 3. Apply C^2 envelope for smooth cutoff ===
         envelope = self.envelope(rr)
-        return raw, envelope
+        return raw * envelope
 
     def serialize(self) -> dict[str, Any]:
         """Serialize RadialBasis including trainable frequencies."""
@@ -352,21 +442,21 @@ class EdgeFeatureCache:
     Invariants
     ----------
     - all edges are valid (no padding, no excluded type pair, within rcut)
-    - all edge-dependent tensors are aligned on the same edge axis (n_edge)
+    - all edge-dependent tensors are aligned on the same edge axis (n_edges)
+    - edge_rbf already includes the C^2 cutoff envelope for smoothness
     """
 
-    src: torch.Tensor  # (n_edge,)
-    dst: torch.Tensor  # (n_edge,)
-    edge_vec: torch.Tensor  # (n_edge, 3)
-    edge_len: torch.Tensor  # (n_edge, 1)
-    edge_unit: torch.Tensor  # (n_edge, 3)
-    edge_envelop: torch.Tensor  # (n_edge, 1)
-    edge_rbf: torch.Tensor  # (n_edge, n_rbf)
-    edge_sw: torch.Tensor  # (n_edge, 1)
-    D_list: list[torch.Tensor]  # D_list[l] : (n_edge, 2l+1, 2l+1)
+    src: torch.Tensor  # (n_edges,)
+    dst: torch.Tensor  # (n_edges,)
+    edge_vec: torch.Tensor  # (n_edges, 3)
+    edge_len: torch.Tensor  # (n_edges, 1)
+    edge_unit: torch.Tensor  # (n_edges, 3)
+    edge_rbf: torch.Tensor  # (n_edges, n_rbf)
+    edge_sw: torch.Tensor  # (n_edges, 1)
+    D_list: list[torch.Tensor]  # D_list[l] : (n_edges, 2l+1, 2l+1)
     Dt_list: list[torch.Tensor]  # transpose/inverse blocks
     sw: torch.Tensor  # (nf, nloc, nnei, 1)
-    inv_sqrt_deg: torch.Tensor | None  # (N, 1, 1) or None
+    inv_sqrt_deg: torch.Tensor  # (N, 1, 1)
 
     @property
     def num_edges(self) -> int:
@@ -374,7 +464,20 @@ class EdgeFeatureCache:
 
 
 class GeometricInitialEmbedding(nn.Module):
-    """Zonal (m=0) geometric initial embedding using cached Wigner-D."""
+    """
+    Geometric initial embedding that adds zonal (m=0) rotated features.
+
+    This module computes radial-transformed features for each degree l >= 1 and
+    rotates them using the zonal (m=0) column of the cached inverse Wigner-D blocks
+    (local->global).
+    The l=0 component is not computed here since it comes from type embedding.
+
+    Notes
+    -----
+    The radial network outputs `lmax * channels` features,
+    corresponding to l = 1, 2, ..., lmax. In the forward pass, indexing uses `l-1`
+    to map from degree l to the radial feature array.
+    """
 
     def __init__(
         self,
@@ -387,21 +490,20 @@ class GeometricInitialEmbedding(nn.Module):
         dtype: torch.dtype,
         seed: int | list[int] | None,
         trainable: bool,
-        neighbor_norm: bool,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
         self.channels = int(channels)
         self.n_radial = int(n_radial)
-        self.K = _k_of_lmax(self.lmax)
-        self.neighbor_norm = bool(neighbor_norm)
+        self.ebed_dim = _so3_dim_of_lmax(self.lmax)
         self.dtype = dtype
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
 
+        # Output only for l >= 1, since l=0 comes from type embedding.
         self.radial_net = EmbeddingNet(
             self.n_radial,
-            [*radial_hidden, (self.lmax + 1) * self.channels],
+            [*radial_hidden, self.lmax * self.channels],
             activation_function=activation_function,
             precision=self.precision,
             resnet_dt=False,
@@ -421,12 +523,12 @@ class GeometricInitialEmbedding(nn.Module):
         Returns
         -------
         torch.Tensor
-            Initial features to add with shape (N, K, C). l=0 is guaranteed zero.
+            Initial features to add with shape (N, D, C). l=0 is guaranteed zero.
         """
         if edge_cache.num_edges == 0:
             return torch.zeros(
                 n_nodes,
-                self.K,
+                self.ebed_dim,
                 self.channels,
                 device=edge_cache.edge_vec.device,
                 dtype=edge_cache.edge_vec.dtype,
@@ -434,13 +536,15 @@ class GeometricInitialEmbedding(nn.Module):
 
         device = edge_cache.edge_vec.device
         dtype = edge_cache.edge_vec.dtype
-        edge_weight = edge_cache.edge_envelop * edge_cache.edge_sw  # (n_edge, 1)
-        rad = self.radial_net(edge_cache.edge_rbf).view(
-            edge_cache.num_edges, self.lmax + 1, self.channels
+        edge_sw = edge_cache.edge_sw  # (n_edges, 1)
+        # Output shape: (n_edges, lmax, channels) for l=1..lmax
+        radial = self.radial_net(edge_cache.edge_rbf).view(
+            edge_cache.num_edges, self.lmax, self.channels
         )
-        rad[:, 0, :] = 0.0  # l=0 remains from type embedding only
 
-        out = torch.zeros(n_nodes, self.K, self.channels, device=device, dtype=dtype)
+        out = torch.zeros(
+            n_nodes, self.ebed_dim, self.channels, device=device, dtype=dtype
+        )
 
         start = 0
         for l in range(self.lmax + 1):
@@ -449,15 +553,15 @@ class GeometricInitialEmbedding(nn.Module):
                 start += dim
                 continue
             m0 = l  # packed index of m=0 inside this l-block
-            d_col = edge_cache.D_list[l][:, :, m0]  # (n_edge, 2l+1)
-            msg_global = d_col.unsqueeze(-1) * rad[:, l, :].unsqueeze(1)
-            msg_global = msg_global * edge_weight.unsqueeze(-1)
+            d_col = edge_cache.Dt_list[l][:, :, m0]  # (n_edges, 2l+1)
+            msg_global = d_col.unsqueeze(-1) * radial[:, l - 1, :].unsqueeze(1)
+            msg_global = msg_global * edge_sw.unsqueeze(-1)  # (n_edges, 2l+1, channels)
 
             out[:, start : start + dim, :].index_add_(0, edge_cache.dst, msg_global)
             start += dim
 
-        if self.neighbor_norm and edge_cache.inv_sqrt_deg is not None:
-            out = out * edge_cache.inv_sqrt_deg
+        # Apply neighbor normalization (graph-style degree normalization).
+        out = out * edge_cache.inv_sqrt_deg
 
         return out
 
@@ -490,8 +594,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Number of blocks (only used when `l_schedule` is None).
     ffn_neuron
         Hidden sizes for the l=0 FFN in each block.
-    neighbor_norm
-        If True, normalize aggregated messages by inverse sqrt node degree.
     wigner_parallel
         If True, use the block-diagonal parallel Wigner-D implementation.
     set_davg_zero
@@ -526,15 +628,15 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         l_schedule: list[int] | None = None,
         channels: int = 96,
         n_radial: int = 8,
-        radial_mlp: list[int] | None = None,
+        radial_mlp: list[int] = [64, 64],
         n_blocks: int = 4,
-        ffn_neuron: list[int] | None = None,
-        neighbor_norm: bool = False,
+        so2_layers: int = 2,
+        ffn_neuron: list[int] = [128],
         wigner_parallel: bool = False,
         set_davg_zero: bool = False,
         activation_function: str = "silu",
         precision: str = "float64",
-        exclude_types: list[tuple[int, int]] | None = None,
+        exclude_types: list[tuple[int, int]] = [],
         env_protection: float = 0.0,
         trainable: bool = True,
         seed: int | list[int] | None = None,
@@ -544,13 +646,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     ) -> None:
         del kwargs
         super().__init__()
-
-        if exclude_types is None:
-            exclude_types = []
-        if radial_mlp is None:
-            radial_mlp = [64, 64]
-        if ffn_neuron is None:
-            ffn_neuron = [128]
 
         self.rcut = float(rcut)
         self.rcut_smth = float(rcut_smth)
@@ -565,8 +660,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.channels = int(channels)
         self.n_radial = int(n_radial)
         self.radial_mlp = list(radial_mlp)
+        self.so2_layers = int(so2_layers)
         self.ffn_neuron = list(ffn_neuron)
-        self.neighbor_norm = bool(neighbor_norm)
         self.wigner_parallel = bool(wigner_parallel)
 
         self.set_davg_zero = bool(set_davg_zero)
@@ -623,7 +718,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             self.n_radial,
             dtype=self.dtype,
         )
-        wigner_lmax = max(self.l_schedule)
+        wigner_lmax = self.l_schedule[0]
         if self.wigner_parallel:
             self.wigner_calc: WignerDCalcBase = WignerDCalcParallel(
                 lmax=wigner_lmax, dtype=self.dtype
@@ -631,9 +726,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         else:
             self.wigner_calc = WignerDCalc(lmax=wigner_lmax, dtype=self.dtype)
 
-        if max(self.l_schedule) > 0:
+        if self.l_schedule[0] > 0:
             self.gie = GeometricInitialEmbedding(
-                lmax=max(self.l_schedule),
+                lmax=self.l_schedule[0],
                 channels=self.channels,
                 n_radial=self.n_radial,
                 radial_hidden=self.radial_mlp,
@@ -641,7 +736,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 dtype=self.dtype,
                 seed=self.seed,
                 trainable=self.trainable,
-                neighbor_norm=self.neighbor_norm,
             )
         else:
             self.gie = None
@@ -654,12 +748,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     channels=self.channels,
                     n_radial=self.n_radial,
                     radial_hidden=self.radial_mlp,
+                    so2_layers=self.so2_layers,
                     ffn_neuron=self.ffn_neuron,
                     activation_function=self.activation_function,
                     dtype=self.dtype,
                     seed=self.seed,
                     trainable=self.trainable,
-                    neighbor_norm=self.neighbor_norm,
                 )
             )
         self.blocks = nn.ModuleList(blocks)
@@ -819,7 +913,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
           ``edge_envelop`` (kept separate for strict smoothness)
         - per-edge radial basis: ``edge_rbf`` (raw, without envelope)
         - per-edge rotation blocks: real-basis Wigner-D matrices ``D_list`` and ``Dt_list``
-        - optional destination-node normalization: ``inv_sqrt_deg`` for neighbor norm
+        - destination-node normalization: ``inv_sqrt_deg`` for neighbor norm
 
         Notes
         -----
@@ -903,17 +997,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             empty_rbf = torch.empty(
                 0, self.radial_basis.n_radial, dtype=dtype, device=device
             )
-            empty_env = torch.empty(0, 1, dtype=dtype, device=device)
-            inv_sqrt_deg = None
-            if self.neighbor_norm:
-                inv_sqrt_deg = torch.ones(n_nodes, 1, 1, dtype=dtype, device=device)
+            inv_sqrt_deg = torch.ones(n_nodes, 1, 1, dtype=dtype, device=device)
             return EdgeFeatureCache(
                 src=empty_long,
                 dst=empty_long,
                 edge_vec=empty_vec,
                 edge_len=empty_len,
                 edge_unit=empty_vec,
-                edge_envelop=empty_env,
                 edge_rbf=empty_rbf,
                 edge_sw=torch.empty(0, 1, dtype=dtype, device=device),
                 D_list=[torch.empty(0, 1, 1, dtype=dtype, device=device)],
@@ -947,7 +1037,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         src_ok = (src_local >= 0) & (src_local < nloc)
         if not bool(src_ok.all()):
             # Drop edges that map outside the local range (e.g. broken mapping or ghost-only neighbor).
-            edge_idx = edge_idx[src_ok]  # (n_edge,)
+            edge_idx = edge_idx[src_ok]  # (n_edges,)
             valid_f_idx = valid_f_idx[src_ok]
             valid_loc_idx = valid_loc_idx[src_ok]
             dst = dst[src_ok]
@@ -961,28 +1051,25 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
         diff_flat = diff.reshape(-1, 3)
         length_flat = length.reshape(-1, 1)
-        edge_vec = diff_flat[edge_idx]  # (n_edge, 3)
-        edge_len = length_flat[edge_idx]  # (n_edge, 1)
+        edge_vec = diff_flat[edge_idx]  # (n_edges, 3)
+        edge_len = length_flat[edge_idx]  # (n_edges, 1)
 
-        # Unit edge direction. _safe_norm avoids division-by-zero NaNs.
-        edge_unit = edge_vec / _safe_norm(edge_vec)
+        # Unit edge direction. safe_norm avoids division-by-zero NaNs.
+        edge_unit = edge_vec / safe_norm(edge_vec)
 
-        # === Step 6. Radial basis + envelope ===
-        rbf_raw, edge_envelop = self.radial_basis(edge_len)
+        # === Step 6. Radial basis (envelope already baked in) ===
+        edge_rbf = self.radial_basis(edge_len)  # (n_edges, n_rbf)
 
         # === Step 7. Wigner-D blocks ===
         rot_mat = init_edge_rot_mat(edge_vec)
         D_list, Dt_list = self.wigner_calc(rot_mat)
 
-        inv_sqrt_deg = None
-        if self.neighbor_norm:
-            # === Step 8. Optional neighbor normalization (destination degree) ===
-            # Degree is counted on destination nodes; inv_sqrt_deg is used to optionally
-            # normalize aggregated messages (graph-style normalization).
-            deg = torch.bincount(dst, minlength=n_nodes).to(
-                dtype=edge_vec.dtype, device=edge_vec.device
-            )
-            inv_sqrt_deg = torch.rsqrt(deg.clamp(min=1)).view(n_nodes, 1, 1)
+        # === Step 8. Neighbor normalization (destination degree) ===
+        # Compute inverse sqrt degree for graph-style message normalization.
+        deg = torch.bincount(dst, minlength=n_nodes).to(
+            dtype=edge_vec.dtype, device=edge_vec.device
+        )
+        inv_sqrt_deg = torch.rsqrt(deg.clamp(min=1)).view(n_nodes, 1, 1)
 
         return EdgeFeatureCache(
             src=src,
@@ -990,8 +1077,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             edge_vec=edge_vec,
             edge_len=edge_len,
             edge_unit=edge_unit,
-            edge_envelop=edge_envelop,
-            edge_rbf=rbf_raw,
+            edge_rbf=edge_rbf,
             edge_sw=edge_sw,
             D_list=D_list,
             Dt_list=Dt_list,
@@ -1067,21 +1153,18 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         x0 = self.type_embedding(atype_loc).reshape(n_nodes, self.channels)
         x0 = self._apply_zbl_gating_hook(x0, edge_cache)
 
-        lmax0 = max(self.l_schedule)
-        K0 = _k_of_lmax(lmax0)
-        x = x0.new_zeros(n_nodes, K0, self.channels)
+        lmax_0 = self.l_schedule[0]
+        ebed_dim_0 = _so3_dim_of_lmax(lmax_0)  # (lmax+1)^2
+        x = x0.new_zeros(n_nodes, ebed_dim_0, self.channels)
         x[:, 0, :] = x0
 
-        # === Step 5. Geometric Initial Embedding (optional) ===
+        # === Step 5. Geometric Initial Embedding ===
         if self.gie is not None and edge_cache.num_edges > 0:
             x = x + self.gie(n_nodes=n_nodes, edge_cache=edge_cache)
 
         # === Step 6. Blocks with pyramid l-schedule slicing ===
-        current_lmax = lmax0
         for blk_lmax, block in zip(self.l_schedule, self.blocks):
-            if blk_lmax < current_lmax:
-                x = x[:, : _k_of_lmax(blk_lmax), :]
-                current_lmax = blk_lmax
+            x = x[:, : _so3_dim_of_lmax(blk_lmax), :]
             x = block(x, edge_cache)
 
         # === Step 7. Output l=0 only ===
@@ -1098,7 +1181,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         return {
             "@class": "Descriptor",
             "type": "se_zm_net",
-            "@version": 1,  # keep 1 at devel stage
+            "@version": 1,
             "rcut": self.rcut,
             "rcut_smth": self.rcut_smth,
             "sel": self.sel,
@@ -1108,8 +1191,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "channels": self.channels,
             "n_radial": self.n_radial,
             "radial_mlp": self.radial_mlp,
+            "so2_layers": self.so2_layers,
             "ffn_neuron": self.ffn_neuron,
-            "neighbor_norm": self.neighbor_norm,
             "wigner_parallel": self.wigner_parallel,
             "set_davg_zero": self.set_davg_zero,
             "activation_function": self.activation_function,

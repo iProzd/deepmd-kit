@@ -2,9 +2,9 @@
 """Wigner-D utilities for SO(3) equivariant descriptors (PyTorch backend).
 
 Two implementations are provided:
-- ``WignerDCalc``: Per-l loop implementation, memory efficient for large n_edge.
-- ``WignerDCalcParallel``: Block-diagonal parallel implementation, faster for small n_edge
-  but requires O(n_edge * dim_full^2) memory where dim_full = (lmax+1)^2.
+- ``WignerDCalc``: Per-l loop implementation, memory efficient for large n_edges.
+- ``WignerDCalcParallel``: Block-diagonal parallel implementation, faster for small n_edges
+  but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2.
 """
 
 from __future__ import (
@@ -32,7 +32,7 @@ class WignerDCalcBase(nn.Module, ABC):
     Parameters
     ----------
     lmax : int
-        Maximum angular momentum order.
+        Maximum angular momentum degree.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
     """
@@ -56,14 +56,14 @@ class WignerDCalcBase(nn.Module, ABC):
         Parameters
         ----------
         rot_mat : torch.Tensor
-            Rotation matrices with shape (n_edge, 3, 3), global->local.
+            Rotation matrices with shape (n_edges, 3, 3), global->local.
 
         Returns
         -------
         D_list : list[torch.Tensor]
-            List of D^l blocks, ``D_list[l]`` has shape (n_edge, 2l+1, 2l+1).
+            List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         Dt_list : list[torch.Tensor]
-            Transpose blocks, ``Dt_list[l]`` has shape (n_edge, 2l+1, 2l+1).
+            Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         """
         raise NotImplementedError
 
@@ -328,7 +328,7 @@ class WignerDCalc(WignerDCalcBase):
     -----
     **Conventions**
 
-    - ``rot_mat`` is a batch of 3x3 rotation matrices with shape ``(n_edge, 3, 3)``.
+    - ``rot_mat`` is a batch of 3x3 rotation matrices with shape ``(n_edges, 3, 3)``.
       It is a global->local transform for 3D vectors::
 
         v_local = rot_mat @ v_global
@@ -382,17 +382,18 @@ class WignerDCalc(WignerDCalcBase):
 
     **Outputs and Usage**
 
-    - ``D_list[l]`` has shape ``(n_edge, 2l+1, 2l+1)`` and is orthogonal.
+    - ``D_list[l]`` has shape ``(n_edges, 2l+1, 2l+1)`` and is orthogonal. It
+      represents the same global->local rotation as ``rot_mat``.
     - ``Dt_list[l] = D_list[l].transpose(-1, -2)`` is its inverse.
-    - The rest of the codebase applies::
+    - Apply blocks to per-degree features as::
 
-        x_local^{(l)}  = Dt_list[l] @ x_global^{(l)}
-        x_global^{(l)} = D_list[l]  @ x_local^{(l)}
+        x_local^{(l)}  = D_list[l]  @ x_global^{(l)}
+        x_global^{(l)} = Dt_list[l] @ x_local^{(l)}
 
     Parameters
     ----------
     lmax : int
-        Maximum angular momentum order.
+        Maximum angular momentum degree.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
     """
@@ -417,14 +418,14 @@ class WignerDCalc(WignerDCalcBase):
         Parameters
         ----------
         rot_mat : torch.Tensor
-            Rotation matrices with shape (n_edge, 3, 3), global->local.
+            Rotation matrices with shape (n_edges, 3, 3), global->local.
 
         Returns
         -------
         D_list : list[torch.Tensor]
-            List of D^l blocks, ``D_list[l]`` has shape (n_edge, 2l+1, 2l+1).
+            List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         Dt_list : list[torch.Tensor]
-            Transpose blocks, ``Dt_list[l]`` has shape (n_edge, 2l+1, 2l+1).
+            Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         """
         # === Step 1. Extract ZYZ Euler angles ===
         # Convention: rot_mat = Rz(alpha) @ Ry(beta) @ Rz(gamma)
@@ -532,9 +533,9 @@ class WignerDCalcParallel(WignerDCalcBase):
 
     This implementation assembles all D^l blocks into a single block-diagonal matrix
     and computes them in one batched matmul chain. This reduces Python dispatch overhead
-    but requires O(n_edge * dim_full^2) memory where dim_full = (lmax+1)^2.
+    but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2.
 
-    For large n_edge, use ``WignerDCalc`` instead which processes each l separately.
+    For large n_edges, use ``WignerDCalc`` instead which processes each l separately.
 
     Notes
     -----
@@ -565,7 +566,7 @@ class WignerDCalcParallel(WignerDCalcBase):
     Parameters
     ----------
     lmax : int
-        Maximum angular momentum order.
+        Maximum angular momentum degree.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
     """
@@ -603,21 +604,21 @@ class WignerDCalcParallel(WignerDCalcBase):
         Parameters
         ----------
         rot_mat : torch.Tensor
-            Rotation matrices with shape (n_edge, 3, 3), global->local.
+            Rotation matrices with shape (n_edges, 3, 3), global->local.
 
         Returns
         -------
         D_list : list[torch.Tensor]
-            List of D^l blocks, ``D_list[l]`` has shape (n_edge, 2l+1, 2l+1).
+            List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         Dt_list : list[torch.Tensor]
-            Transpose blocks, ``Dt_list[l]`` has shape (n_edge, 2l+1, 2l+1).
+            Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         """
         # === Step 1. Extract ZYZ Euler angles ===
         # Convention: rot_mat = Rz(alpha) @ Ry(beta) @ Rz(gamma)
         alpha, beta, gamma = self._extract_zyz_euler(rot_mat)
 
         # === Step 2. Build block-diagonal Z matrices ===
-        # Each Z_full has shape (n_edge, dim_full, dim_full)
+        # Each Z_full has shape (n_edges, dim_full, dim_full)
         Za_full = self._build_z_rotation(alpha)
         Zb_full = self._build_z_rotation(beta)
         Zc_full = self._build_z_rotation(gamma)
@@ -658,16 +659,20 @@ class WignerDCalcParallel(WignerDCalcBase):
         Parameters
         ----------
         angle : torch.Tensor
-            Rotation angles with shape (n_edge,).
+            Rotation angles with shape (n_edges,).
 
         Returns
         -------
         torch.Tensor
-            Block-diagonal rotation matrices with shape (n_edge, dim_full, dim_full).
+            Block-diagonal rotation matrices with shape (n_edges, dim_full, dim_full).
         """
-        n_edge = angle.shape[0]
+        n_edges = angle.shape[0]
         Z = torch.zeros(
-            n_edge, self.dim_full, self.dim_full, dtype=angle.dtype, device=angle.device
+            n_edges,
+            self.dim_full,
+            self.dim_full,
+            dtype=angle.dtype,
+            device=angle.device,
         )
 
         # === Step 1. Set m=0 diagonal elements to 1 ===
@@ -682,8 +687,8 @@ class WignerDCalcParallel(WignerDCalcBase):
             neg_indices: torch.Tensor = getattr(self, "_neg_indices")
 
             # Compute cos(m*angle) and sin(m*angle) for all (l,m) pairs
-            # angles_m: (n_edge, n_blocks) where n_blocks = total (l,m) pairs with m>0
-            angles_m = angle[:, None] * m_values[None, :]  # (n_edge, n_blocks)
+            # angles_m: (n_edges, n_blocks) where n_blocks = total (l,m) pairs with m>0
+            angles_m = angle[:, None] * m_values[None, :]  # (n_edges, n_blocks)
             c = torch.cos(angles_m)
             s = torch.sin(angles_m)
 
