@@ -19,6 +19,7 @@ from __future__ import (
 import math
 from typing import (
     Any,
+    cast,
 )
 
 import torch
@@ -43,6 +44,8 @@ from deepmd.pt.utils.utils import (
     get_generator,
     to_numpy_array,
 )
+
+from .sel_zm_helper import EdgeFeatureCache  # noqa: TC001
 
 
 def _so3_dim_of_lmax(lmax: int) -> int:
@@ -158,7 +161,7 @@ class GatedActivation(nn.Module):
             self.register_buffer("expand_index", expand_index, persistent=True)
 
             # Linear to generate lmax independent gates from scalar features
-            self.gate_linear: MLPLayer | None = MLPLayer(
+            self.gate_linear: nn.Module = MLPLayer(
                 self.channels,
                 self.lmax * self.channels,
                 bias=True,
@@ -173,7 +176,7 @@ class GatedActivation(nn.Module):
                 torch.zeros(0, dtype=torch.long, device=self.device),
                 persistent=True,
             )
-            self.gate_linear = None
+            self.gate_linear = nn.Identity()
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -223,7 +226,9 @@ class GatedActivation(nn.Module):
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "activation_function": self.scalar_act.activation,
             "gate_linear": (
-                self.gate_linear.serialize() if self.gate_linear is not None else None
+                cast("MLPLayer", self.gate_linear).serialize()
+                if self.lmax > 0
+                else None
             ),
         }
 
@@ -249,7 +254,7 @@ class GatedActivation(nn.Module):
             seed=None,
         )
         gate_linear_data = data["gate_linear"]
-        if gate_linear_data is not None and obj.gate_linear is not None:
+        if gate_linear_data is not None and obj.lmax > 0:
             obj.gate_linear = MLPLayer.deserialize(gate_linear_data)
         return obj
 
@@ -270,6 +275,8 @@ class SeparableRMSNorm(nn.Module):
         Whether to apply per-l learnable scale and bias.
     centering
         Whether to apply mean centering for l=0 features.
+    eps
+        Small epsilon for numerical stability.
     dtype
         Parameter dtype.
     trainable
@@ -283,6 +290,7 @@ class SeparableRMSNorm(nn.Module):
         affine: bool = True,
         centering: bool = True,
         *,
+        eps: float = 1e-10,
         dtype: torch.dtype,
         trainable: bool,
     ) -> None:
@@ -293,7 +301,7 @@ class SeparableRMSNorm(nn.Module):
         self.centering = centering
         self.dtype = dtype
         self.device = env.DEVICE
-        self.eps = 1e-8 + torch.finfo(self.dtype).eps
+        self.eps = float(eps)
 
         if self.affine:
             # Per-l affine weights: (lmax+1, C)
@@ -379,6 +387,7 @@ class SeparableRMSNorm(nn.Module):
             "channels": self.channels,
             "affine": self.affine,
             "centering": self.centering,
+            "eps": self.eps,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "weight": to_numpy_array(self.weight) if self.weight is not None else None,
             "bias": to_numpy_array(self.bias) if self.bias is not None else None,
@@ -401,6 +410,7 @@ class SeparableRMSNorm(nn.Module):
             channels=int(data["channels"]),
             affine=bool(data["affine"]),
             centering=bool(data["centering"]),
+            eps=float(data.get("eps", 0.0)),
             dtype=dtype,
             trainable=True,
         )
@@ -701,6 +711,8 @@ class SO2Linear(nn.Module):
     ----------
     lmax
         Maximum spherical harmonic degree.
+    mmax
+        Maximum SO(2) order (|m|) to mix. If None, defaults to `lmax`.
     in_channels
         Number of input channels per (l, m) coefficient.
     out_channels
@@ -717,6 +729,7 @@ class SO2Linear(nn.Module):
         self,
         *,
         lmax: int,
+        mmax: int | None = None,
         in_channels: int,
         out_channels: int,
         dtype: torch.dtype,
@@ -725,36 +738,19 @@ class SO2Linear(nn.Module):
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
+        self.mmax = int(self.lmax if mmax is None else mmax)
+        if self.mmax < 0:
+            raise ValueError("`mmax` must be non-negative")
+        if self.mmax > self.lmax:
+            raise ValueError("`mmax` must be <= `lmax`")
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
         self.dtype = dtype
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
 
-        # === Step 1. Precompute packed indices (buffers) ===
-        m0 = [l * l + l for l in range(self.lmax + 1)]
-        self.register_buffer(
-            "m0_idx",
-            torch.tensor(m0, device=self.device, dtype=torch.long),
-            persistent=True,
-        )
-
-        for m in range(1, self.lmax + 1):
-            pos_idx = [l * l + l + m for l in range(m, self.lmax + 1)]
-            neg_idx = [l * l + l - m for l in range(m, self.lmax + 1)]
-            self.register_buffer(
-                f"pos_idx_{m}",
-                torch.tensor(pos_idx, device=self.device, dtype=torch.long),
-                persistent=True,
-            )
-            self.register_buffer(
-                f"neg_idx_{m}",
-                torch.tensor(neg_idx, device=self.device, dtype=torch.long),
-                persistent=True,
-            )
-
-        # === Step 2. Mixing per |m| group, cross-l allowed, bias only for scalar index ===
-        num_m0 = len(m0)
+        # === Step 1. Mixing per |m| group, cross-l allowed, bias only for scalar index ===
+        num_m0 = self.lmax + 1
         self.linear_m0 = MLPLayer(
             num_m0 * self.in_channels,
             num_m0 * self.out_channels,
@@ -771,7 +767,7 @@ class SO2Linear(nn.Module):
         # For |m|>0, SO(2) equivariance requires 2x2 block structure on (Re, Im) pairs.
         # Output dimension is doubled for complex mixing: (a, -b; b, a) constraint.
         self.linears_m: nn.ModuleList = nn.ModuleList()
-        for m in range(1, self.lmax + 1):
+        for m in range(1, self.mmax + 1):
             num_l = self.lmax - m + 1
             fc = MLPLayer(
                 num_l * self.in_channels,
@@ -793,64 +789,69 @@ class SO2Linear(nn.Module):
         """
         Parameters
         ----------
-        x
-            Input with shape (..., D, Cin).
+        x : torch.Tensor
+            Input with shape (N, D, Cin), where N is the number of atoms,
+            D is the SO(3) dimension (lmax+1)^2, and Cin is input channels.
 
         Returns
         -------
         torch.Tensor
-            Output with shape (..., D, Cout).
+            Output with shape (N, D, Cout), where Cout is output channels.
         """
-        *lead, ebed_dim, Cin = x.shape
-        batch = math.prod(lead) if lead else 1
-        x2 = x.reshape(batch, ebed_dim, Cin)
-        out = x2.new_zeros(batch, ebed_dim, self.out_channels)
+        n_atom, ebed_dim, Cin = x.shape
+        out = x.new_zeros(n_atom, ebed_dim, self.out_channels)
 
-        # m = 0 group
-        m0_idx = self.m0_idx
-        x_m0 = x2[:, m0_idx, :].reshape(batch, -1)
-        y_m0 = self.linear_m0(x_m0).reshape(batch, m0_idx.numel(), self.out_channels)
+        # === Step 1. Build packed indices on-the-fly (TorchScript-friendly) ===
+        # Packed index mapping is: idx(l, m) = l*l + l + m, with m in [-l, l].
+        l_values_m0 = torch.arange(0, self.lmax + 1, device=x.device, dtype=torch.long)
+        m0_idx = l_values_m0 * l_values_m0 + l_values_m0
+
+        # === Step 2. m = 0 group ===
+        x_m0 = x[:, m0_idx, :].reshape(n_atom, -1)
+        y_m0 = self.linear_m0(x_m0).reshape(n_atom, m0_idx.numel(), self.out_channels)
         out[:, m0_idx, :] = y_m0
         out[:, 0, :] = out[:, 0, :] + self.bias0
 
-        # |m| > 0 groups: complex mixing via 2x2 block structure
+        # === Step 3. |m| > 0 groups (complex mixing via 2x2 block structure) ===
         for m, linear in enumerate(self.linears_m, start=1):
-            pos_idx = getattr(self, f"pos_idx_{m}")
-            neg_idx = getattr(self, f"neg_idx_{m}")
+            l_values = torch.arange(m, self.lmax + 1, device=x.device, dtype=torch.long)
+            pos_idx = l_values * l_values + l_values + m
+            neg_idx = l_values * l_values + l_values - m
             num_l = pos_idx.numel()
 
             # Treat (neg, pos) as (Re, Im) complex pair
-            x_neg = x2[:, neg_idx, :].reshape(batch, -1)  # (batch, num_l * Cin)
-            x_pos = x2[:, pos_idx, :].reshape(batch, -1)
-            x_pair = torch.stack([x_neg, x_pos], dim=1)  # (batch, 2, num_l * Cin)
+            x_neg = x[:, neg_idx, :].reshape(n_atom, -1)  # (n_atom, num_l * Cin)
+            x_pos = x[:, pos_idx, :].reshape(n_atom, -1)
+            x_pair = torch.stack([x_neg, x_pos], dim=1)  # (n_atom, 2, num_l * Cin)
 
-            # Linear: (batch, 2, num_l * Cin) -> (batch, 2, 2 * num_l * Cout)
+            # Linear: (n_atom, 2, num_l * Cin) -> (n_atom, 2, 2 * num_l * Cout)
             x_pair = linear(x_pair)
 
             # Split into 4 components for complex mixing
             out_half = num_l * self.out_channels
-            x_pair = x_pair.view(batch, 4, out_half)
+            x_pair = x_pair.view(n_atom, 4, out_half)
             x_r_0, x_i_0, x_r_1, x_i_1 = x_pair.unbind(dim=1)
 
             # Complex multiplication formula: y_r = a*x_r - b*x_i, y_i = b*x_r + a*x_i
             # With learned (a, b) encoded in linear weights:
-            y_r = x_r_0 - x_i_1  # (batch, out_half)
+            y_r = x_r_0 - x_i_1  # (n_atom, out_half)
             y_i = x_r_1 + x_i_0
 
-            # Reshape back to (batch, num_l, Cout)
-            y_neg = y_r.view(batch, num_l, self.out_channels)
-            y_pos = y_i.view(batch, num_l, self.out_channels)
+            # Reshape back to (n_atom, num_l, Cout)
+            y_neg = y_r.view(n_atom, num_l, self.out_channels)
+            y_pos = y_i.view(n_atom, num_l, self.out_channels)
 
             out[:, neg_idx, :] = y_neg
             out[:, pos_idx, :] = y_pos
 
-        return out.reshape(*lead, ebed_dim, self.out_channels)
+        return out  # shape already (n_atom, ebed_dim, self.out_channels)
 
     def serialize(self) -> dict[str, Any]:
         return {
             "@class": "SO2Linear",
             "@version": 1,
             "lmax": self.lmax,
+            "mmax": self.mmax,
             "in_channels": self.in_channels,
             "out_channels": self.out_channels,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
@@ -870,12 +871,14 @@ class SO2Linear(nn.Module):
             raise ValueError(f"Unsupported SO2Linear version: {version}")
 
         lmax = int(data["lmax"])
+        mmax = int(data["mmax"])
         in_channels = int(data["in_channels"])
         out_channels = int(data["out_channels"])
         precision = data["precision"]
         dtype = PRECISION_DICT[precision]
         obj = cls(
             lmax=lmax,
+            mmax=mmax,
             in_channels=in_channels,
             out_channels=out_channels,
             dtype=dtype,
@@ -909,6 +912,7 @@ class SO2Convolution(nn.Module):
         self,
         *,
         lmax: int,
+        mmax: int | None = None,
         channels: int,
         n_radial: int,
         radial_hidden: list[int],
@@ -920,6 +924,11 @@ class SO2Convolution(nn.Module):
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
+        self.mmax = int(self.lmax if mmax is None else mmax)
+        if self.mmax < 0:
+            raise ValueError("`mmax` must be non-negative")
+        if self.mmax > self.lmax:
+            raise ValueError("`mmax` must be <= `lmax`")
         self.channels = int(channels)
         self.n_radial = int(n_radial)
         self.so2_layers = int(so2_layers)
@@ -935,6 +944,7 @@ class SO2Convolution(nn.Module):
             [
                 SO2Linear(
                     lmax=self.lmax,
+                    mmax=self.mmax,
                     in_channels=self.channels,
                     out_channels=self.channels,
                     dtype=self.dtype,
@@ -946,21 +956,19 @@ class SO2Convolution(nn.Module):
         )
 
         # === Step 2. Non-linearity Operators (for layers 2+) ===
-        if self.so2_layers > 1:
-            self.non_linearities = nn.ModuleList(
-                [
-                    GatedActivation(
-                        lmax=self.lmax,
-                        channels=self.channels,
-                        dtype=self.dtype,
-                        trainable=trainable,
-                        seed=child_seed(seed, self.so2_layers + i),
-                    )
-                    for i in range(self.so2_layers - 1)
-                ]
+        non_linearities: list[nn.Module] = []
+        for i in range(max(0, self.so2_layers - 1)):
+            non_linearities.append(
+                GatedActivation(
+                    lmax=self.lmax,
+                    channels=self.channels,
+                    dtype=self.dtype,
+                    trainable=trainable,
+                    seed=child_seed(seed, self.so2_layers + i),
+                )
             )
-        else:
-            self.non_linearities = None
+        non_linearities.append(nn.Identity())
+        self.non_linearities = nn.ModuleList(non_linearities)
 
         # === Step 3. Radial weights per l and output channel: (E, (lmax+1)*C) ===
         self.radial_net = EmbeddingNet(
@@ -979,7 +987,7 @@ class SO2Convolution(nn.Module):
             persistent=True,
         )
 
-    def forward(self, x: torch.Tensor, edge_cache: Any) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge_cache: EdgeFeatureCache) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -993,7 +1001,8 @@ class SO2Convolution(nn.Module):
         torch.Tensor
             Message updates with shape (N, D, C).
         """
-        if edge_cache.num_edges == 0:
+        num_edges = edge_cache.src.size(0)
+        if num_edges == 0:
             return torch.zeros_like(x)
 
         src, dst = edge_cache.src, edge_cache.dst
@@ -1013,21 +1022,26 @@ class SO2Convolution(nn.Module):
 
         # === Step 2. Radial interaction (per-l) + strict smooth cutoff ===
         # With atom type embeddings as additional edge features.
+        src_type_feat = edge_cache.node_type_feat.index_select(0, src)
+        dst_type_feat = edge_cache.node_type_feat.index_select(0, dst)
         rad_in = torch.cat(
-            [edge_cache.edge_rbf, edge_cache.src_type_feat, edge_cache.dst_type_feat],
+            [edge_cache.edge_rbf, src_type_feat, dst_type_feat],
             dim=-1,
         )  # (E, n_rbf + 2C)
         rad = self.radial_net(rad_in)  # (E, (lmax+1)*C)
-        rad = rad.view(edge_cache.num_edges, self.lmax + 1, self.channels)
+        rad = rad.view(num_edges, self.lmax + 1, self.channels)
         degree_idx = self.degree_index[: self.ebed_dim]  # for pyramid l_schedule
         rad_expanded = rad[:, degree_idx, :]  # (E, D, C)
 
         # Apply smooth weight.
         edge_sw = edge_cache.edge_sw
-        x_local = x_local * rad_expanded * edge_sw.unsqueeze(1)
+        rad_feat = rad_expanded * edge_sw.unsqueeze(1)  # (E, D, C)
+        x_local = x_local * rad_feat  # (E, D, C)
 
         # === Step 3. Multi-layer SO(2) mixing ===
-        for layer_idx, so2_linear in enumerate(self.so2_linears):
+        for layer_idx, (so2_linear, non_linear) in enumerate(
+            zip(self.so2_linears, self.non_linearities)
+        ):
             x_local = so2_linear(x_local)
 
             # Bias correction for first layer to preserve strict smoothness at rcut.
@@ -1038,9 +1052,9 @@ class SO2Convolution(nn.Module):
                     + so2_linear.bias0 * rad_expanded[:, 0, :] * edge_sw
                 )
 
-            # Apply non-linearity between SO2 layers (not after the last).
-            if layer_idx < self.so2_layers - 1 and self.non_linearities is not None:
-                x_local = self.non_linearities[layer_idx](x_local)
+            # Apply non-linearity between SO2 layers
+            # The last non-linearity is Identity by construction.
+            x_local = non_linear(x_local)
 
         # === Step 4. Rotate back to global frame (block-wise) ===
         x_global_parts: list[torch.Tensor] = []
@@ -1065,13 +1079,14 @@ class SO2Convolution(nn.Module):
             "@class": "SO2Convolution",
             "@version": 1,
             "lmax": self.lmax,
+            "mmax": self.mmax,
             "channels": self.channels,
             "n_radial": self.n_radial,
             "so2_layers": self.so2_layers,
             "so2_linears": [net.serialize() for net in self.so2_linears],
             "non_linearities": (
-                [act.serialize() for act in self.non_linearities]
-                if self.non_linearities is not None
+                [act.serialize() for act in self.non_linearities[:-1]]
+                if self.so2_layers > 1
                 else None
             ),
             "radial_net": self.radial_net.serialize(),
@@ -1092,6 +1107,7 @@ class SO2Convolution(nn.Module):
         dtype = PRECISION_DICT[precision]
         obj = cls(
             lmax=int(data["lmax"]),
+            mmax=int(data["mmax"]),
             channels=int(data["channels"]),
             n_radial=int(data["n_radial"]),
             so2_layers=int(data.get("so2_layers", 1)),
@@ -1116,8 +1132,8 @@ class SO2Convolution(nn.Module):
 
         # Restore non-linearity operators
         non_linearities_data = data.get("non_linearities")
-        if non_linearities_data is not None and obj.non_linearities is not None:
-            for act, state in zip(obj.non_linearities, non_linearities_data):
+        if non_linearities_data is not None:
+            for act, state in zip(obj.non_linearities[:-1], non_linearities_data):
                 restored = GatedActivation.deserialize(state)
                 act.load_state_dict(restored.state_dict())
 
@@ -1308,6 +1324,8 @@ class SeZMInteractionBlock(nn.Module):
     ----------
     lmax
         Maximum spherical harmonic degree.
+    mmax
+        Maximum SO(2) order (|m|) mixed inside SO(2) convolution.
     channels
         Number of channels per (l, m) coefficient.
     n_radial
@@ -1320,6 +1338,8 @@ class SeZMInteractionBlock(nn.Module):
         Hidden layer sizes for FFN.
     activation_function
         Activation function for l=0 components.
+    eps
+        Small epsilon for numerical stability.
     dtype
         Parameter dtype.
     seed
@@ -1332,25 +1352,51 @@ class SeZMInteractionBlock(nn.Module):
         self,
         *,
         lmax: int,
+        mmax: int | None = None,
         channels: int,
         n_radial: int,
         radial_hidden: list[int],
         so2_layers: int = 2,
         ffn_neuron: list[int],
         activation_function: str,
+        eps: float = 1e-10,
         dtype: torch.dtype,
         seed: int | list[int] | None,
         trainable: bool,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
+        self.mmax = int(self.lmax if mmax is None else mmax)
+        if self.mmax < 0:
+            raise ValueError("`mmax` must be non-negative")
+        if self.mmax > self.lmax:
+            raise ValueError("`mmax` must be <= `lmax`")
         self.channels = int(channels)
         self.so2_layers = int(so2_layers)
         self.dtype = dtype
         self.precision = RESERVED_PRECISION_DICT[dtype]
 
+        # === Step 0. Truncation mask for |m| > mmax ===
+        # The packed layout is l-primary: for each l, coefficients are ordered by m=-l..+l.
+        # When mmax < lmax, coefficients with |m| > mmax are physically discarded.
+        ebed_dim = _so3_dim_of_lmax(self.lmax)
+        m_mask = torch.ones(ebed_dim, device=env.DEVICE, dtype=self.dtype)
+        if self.mmax < self.lmax:
+            start = 0
+            for l in range(self.lmax + 1):
+                dim = 2 * l + 1
+                m = torch.arange(-l, l + 1, device=env.DEVICE, dtype=torch.long)
+                keep = (m.abs() <= self.mmax).to(dtype=self.dtype)
+                m_mask[start : start + dim] = keep
+                start += dim
+        self.register_buffer("m_mask", m_mask.view(1, -1, 1), persistent=True)
+
         self.norm = SeparableRMSNorm(
-            self.lmax, self.channels, dtype=dtype, trainable=trainable
+            self.lmax,
+            self.channels,
+            eps=eps,
+            dtype=dtype,
+            trainable=trainable,
         )
         self.gating = GatedActivation(
             lmax=self.lmax,
@@ -1371,6 +1417,7 @@ class SeZMInteractionBlock(nn.Module):
 
         self.conv = SO2Convolution(
             lmax=self.lmax,
+            mmax=self.mmax,
             channels=self.channels,
             n_radial=n_radial,
             radial_hidden=radial_hidden,
@@ -1392,7 +1439,7 @@ class SeZMInteractionBlock(nn.Module):
             seed=child_seed(seed, 3),
         )
 
-    def forward(self, x: torch.Tensor, edge_cache: Any) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge_cache: EdgeFeatureCache) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -1406,10 +1453,12 @@ class SeZMInteractionBlock(nn.Module):
         torch.Tensor
             Updated features with shape (N, D, C).
         """
+        if self.mmax < self.lmax:
+            x = x * self.m_mask
         x_norm = self.norm(x)
         x_norm = self.per_l_linear(x_norm)
 
-        if edge_cache.num_edges > 0:
+        if edge_cache.src.numel() > 0:
             x = x + self.conv(x_norm, edge_cache)
 
         x = self.gating(x)
@@ -1421,6 +1470,7 @@ class SeZMInteractionBlock(nn.Module):
             "@class": "SeZMInteractionBlock",
             "@version": 1,
             "lmax": self.lmax,
+            "mmax": self.mmax,
             "channels": self.channels,
             "n_radial": self.conv.n_radial,
             "so2_layers": self.so2_layers,
@@ -1449,6 +1499,7 @@ class SeZMInteractionBlock(nn.Module):
         activation_function = data.get("activation_function", "silu")
         obj = cls(
             lmax=int(data["lmax"]),
+            mmax=int(data["mmax"]),
             channels=int(data["channels"]),
             n_radial=int(data["n_radial"]),
             radial_hidden=[],

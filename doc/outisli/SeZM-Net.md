@@ -1,4 +1,4 @@
-# SeZM-Net — Speed-First SO(2) Equivariant Descriptor for DeePMD-kit (PyTorch)
+# SeZM-Net: Smooth equivariant ZBL Message-passing Network
 
 SeZM-Net is a small-`l` equivariant message passing descriptor designed for molecular dynamics (MD) workloads where **inference speed** and **physical correctness** (conservative forces + smooth PES) dominate.
 
@@ -285,6 +285,26 @@ Rules:
 
 ---
 
+## Pyramid `m_schedule`
+
+SeZM-Net supports:
+
+1. constant `mmax` (default None): if `mmax is None`, `m_schedule[i] = l_schedule[i]`, otherwise `m_schedule[i] = min(mmax, l_schedule[i])`
+2. explicit pyramid: `m_schedule = [2, 2, 1, 0]` (example)
+
+Rules:
+
+- must satisfy `m_schedule[i] <= l_schedule[i]` for every block
+- a non-increasing schedule is recommended but not required
+- within a block, SO(2) mixing only processes `|m| <= mmax`
+  - coefficients with `|m| > mmax` are forced to **exact zeros** after SO(2) mixing
+  - this reduces compute and parameters in `SO2Linear` (high-|m| groups are skipped)
+
+Note: unlike `l_schedule`, `m_schedule` does NOT change the tensor `ebed_dim` layout. It controls
+which `(l, m)` components are actively generated/mixed inside the local SO(2) operator.
+
+---
+
 ## Public API and Hyperparameters
 
 Constructor: `DescrptSeZMNet(...)`
@@ -293,9 +313,11 @@ Key arguments:
 
 - `rcut: float` — Cutoff radius in Å
 - `rcut_smth: float` — Smooth weight start in Å
-- `sel: list[int] | int` — Maximum neighbors per type
+- `sel: list[int] | int` — Maximum neighbors (int: total count, list[int]: per-type counts)
 - `lmax: int` — Maximum degree (only if `l_schedule` is None)
 - `l_schedule: list[int] | None` — Pyramid schedule
+- `mmax: int | None` — Maximum SO(2) order (only if `m_schedule` is None)
+- `m_schedule: list[int] | None` — Pyramid schedule (must satisfy `m_schedule[i] <= l_schedule[i]`)
 - `channels: int` — Channels per (l,m) coefficient
 - `n_radial: int` — Number of radial basis functions
 - `radial_mlp: list[int]` — Hidden sizes for radial networks
@@ -313,7 +335,6 @@ Note: Neighbor normalization (graph-style degree normalization) is always enable
 SeZM-Net uses `_ENV_DIM = 1` (se_r style) for `EnvMatStatSe` compatibility. This means:
 
 - `ndescrpt = nnei * 1` (only radial statistics are collected)
-- The `env_protection` parameter is kept for interface compatibility but is not actively used
 - `mean` and `stddev` statistics are maintained but not used in the forward pass (SeZM-Net uses radial basis functions directly instead of traditional env_mat)
 
 ### Multi-layer SO(2) Convolution
@@ -335,7 +356,7 @@ Output:
 
 `serialize()` captures:
 
-- hyperparameters including `l_schedule`
+- hyperparameters including `l_schedule` and `m_schedule`
 - type embedding parameters
 - **radial basis with trainable frequencies**
 - block sub-networks:
@@ -457,14 +478,14 @@ dispatch overhead (significant when `lmax <= 10`).
 
 **Precomputed buffers**:
 
-| Buffer         | Shape                  | Description                                   |
-| -------------- | ---------------------- | --------------------------------------------- |
-| `_J_full`      | `(dim_full, dim_full)` | Block-diagonal `J` matrix                     |
-| `_Jt_full`     | `(dim_full, dim_full)` | Transpose of `_J_full`                        |
-| `_m0_indices`  | `(lmax+1,)`            | Global indices for `m=0` elements             |
-| `_pos_indices` | `(n_blocks,)`          | Global indices for `+m` positions             |
-| `_neg_indices` | `(n_blocks,)`          | Global indices for `-m` positions             |
-| `_m_values`    | `(n_blocks,)`          | Corresponding `m` values for trig computation |
+| Buffer        | Shape                  | Description                                   |
+| ------------- | ---------------------- | --------------------------------------------- |
+| `J_full`      | `(dim_full, dim_full)` | Block-diagonal `J` matrix                     |
+| `Jt_full`     | `(dim_full, dim_full)` | Transpose of `J_full`                         |
+| `m0_indices`  | `(lmax+1,)`            | Global indices for `m=0` elements             |
+| `pos_indices` | `(n_blocks,)`          | Global indices for `+m` positions             |
+| `neg_indices` | `(n_blocks,)`          | Global indices for `-m` positions             |
+| `m_values`    | `(n_blocks,)`          | Corresponding `m` values for trig computation |
 
 **Z matrix construction** (`_build_z_rotation`):
 
@@ -492,14 +513,14 @@ dispatch overhead (significant when `lmax <= 10`).
 
 **`WignerDCalc` (per-l loop)**:
 
-- Z rotation: `_build_z_rotation(angle, l)` builds `(n_edges, 2l+1, 2l+1)` per block.
-- J matrices stored as `_J_{l}` and `_Jt_{l}` for each `l`.
+- Z rotation: `_build_z_rotation(angle, l)` builds `(n_edges, 2l+1, 2l+1)` per block (scalar-indexed fill for TorchScript).
+- J matrices stored as a per-`l` `ModuleList` of `(J, J^T)` buffer pairs.
 
 **`WignerDCalcParallel` (block-diagonal)**:
 
 - Z rotation: `_build_z_rotation(angle)` builds full `(n_edges, dim_full, dim_full)`.
-- J matrices stored as `_J_full` and `_Jt_full` block-diagonal.
-- Index precomputation: `_precompute_z_indices()` builds `_m0_indices`, `_pos_indices`, `_neg_indices`, `_m_values`.
+- J matrices stored as `J_full` and `Jt_full` block-diagonal.
+- Index precomputation: `_precompute_z_indices()` builds `m0_indices`, `pos_indices`, `neg_indices`, `m_values`.
 
 #### Usage in message passing
 
@@ -519,7 +540,7 @@ SeZM blocks apply the cached rotations as:
 - All submodules use `dtype: torch.dtype` (not `precision: str`) for constructor parameter.
 - Device is obtained from global `env.DEVICE` at runtime; submodules store `self.device = env.DEVICE` only as a convenience reference, not for serialization.
 - Each submodule stores `self.precision = RESERVED_PRECISION_DICT[dtype]` for serialization compatibility.
-- The `safe_norm` function automatically infers epsilon from input dtype instead of accepting an external `eps` parameter.
+- The `env_protection` parameter (stored as `self.eps`) is used for numerical stability in division and normalization. If 0.0 is passed, it defaults to `1e-10`.
 
 ---
 

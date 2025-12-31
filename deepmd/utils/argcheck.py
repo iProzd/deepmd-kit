@@ -52,7 +52,10 @@ doc_se_a_tpe = "Used by the smooth edition of Deep Potential. The full relative 
 doc_se_atten = "Used by the smooth edition of Deep Potential. The full relative coordinates are used to construct the descriptor. Attention mechanism will be used by this descriptor."
 doc_se_atten_v2 = "Used by the smooth edition of Deep Potential. The full relative coordinates are used to construct the descriptor. Attention mechanism with new modifications will be used by this descriptor."
 doc_se_a_mask = "Used by the smooth edition of Deep Potential. It can accept a variable number of atoms in a frame (Non-PBC system). *aparam* are required as an indicator matrix for the real/virtual sign of input atoms."
-doc_hybrid = "Concatenates a list of descriptors into a new descriptor."
+doc_hybrid = "Concatenate of a list of descriptors as a new descriptor."
+doc_se_zm_net = (
+    "SeZM-Net: Smooth equivariant ZBL Message-passing Network (PyTorch backend)."
+)
 # fitting
 doc_ener = "Fit an energy model (potential energy surface)."
 doc_dos = "Fit a density of states model. The total density of states / site-projected density of states labels should be provided by `dos.npy` or `atom_dos.npy` in each data system. The file has a number of frames (rows) and a number of energy-grid columns (multiplied by the number of atoms in `atom_dos.npy`). See `loss` parameter."
@@ -336,6 +339,108 @@ def descrpt_se_a_args() -> list[Argument]:
         ),
         Argument(
             "set_davg_zero", bool, optional=True, default=False, doc=doc_set_davg_zero
+        ),
+    ]
+
+
+@descrpt_args_plugin.register(
+    "se_zm_net", alias=["se_zm"], doc=doc_only_pt_supported + doc_se_zm_net
+)
+def descrpt_se_zm_net_args() -> list[Argument]:
+    doc_sel = 'The maximum number of neighbors. It can be:\n\n\
+    - `int`: the total maximum number of neighbors within `rcut` (all types combined)\n\n\
+    - `list[int]`: sel[i] specifies the maximum number of type-i neighbors within `rcut`\n\n\
+    - `str`: Can be "auto:factor" or "auto". "factor" is a float number larger than 1. This option will automatically determine the `sel`. In detail it counts the maximal number of neighbors with in the cutoff radius for each type of neighbor, then multiply the maximum by the "factor". Finally the number is wrapped up to 4 divisible. The option "auto" is equivalent to "auto:1.1".'
+    doc_rcut = "The cut-off radius."
+    doc_rcut_smth = "Where to start smoothing. For example the 1/r term is smoothed from `rcut` to `rcut_smth`"
+    doc_lmax = "Maximum order, only used when `l_schedule` is None."
+    doc_l_schedule = "Pyramid schedule of lmax per block. Must be non-increasing."
+    doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
+    doc_m_schedule = (
+        "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`."
+    )
+    doc_channels = "Channels per (l,m) coefficient."
+    doc_n_radial = "Number of radial basis functions."
+    doc_radial_mlp = "Hidden sizes for radial networks."
+    doc_n_blocks = "Number of interaction blocks (only used when `l_schedule` is None)."
+    doc_so2_layers = "Number of SO(2) mixing layers per block."
+    doc_ffn_neuron = (
+        "Hidden sizes for equivariant FFN (first element used as hidden_channels)."
+    )
+    doc_use_parallel = (
+        "If True, use parallel Wigner-D implementation (higher memory usage)."
+    )
+    doc_set_davg_zero = "Set the normalization average to zero."
+    doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
+    doc_trainable = "If the parameters in the descriptor are trainable."
+    doc_seed = "Random seed for parameter initialization."
+    doc_exclude_types = "The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1."
+    doc_env_protection = "Protection parameter to prevent division by zero errors during environment matrix calculations."
+
+    return [
+        Argument(
+            "sel", [int, list[int], str], optional=True, default="auto", doc=doc_sel
+        ),
+        Argument("rcut", float, optional=True, default=6.0, doc=doc_rcut),
+        Argument("rcut_smth", float, optional=True, default=0.5, doc=doc_rcut_smth),
+        Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
+        Argument(
+            "l_schedule", list[int], optional=True, default=None, doc=doc_l_schedule
+        ),
+        Argument(
+            "mmax",
+            [int, None],
+            optional=True,
+            default=None,
+            doc=doc_mmax,
+        ),
+        Argument(
+            "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
+        ),
+        Argument("channels", int, optional=True, default=96, doc=doc_channels),
+        Argument("n_radial", int, optional=True, default=8, doc=doc_n_radial),
+        Argument(
+            "radial_mlp",
+            list[int],
+            optional=True,
+            default=[64, 64],
+            doc=doc_radial_mlp,
+        ),
+        Argument("n_blocks", int, optional=True, default=4, doc=doc_n_blocks),
+        Argument("so2_layers", int, optional=True, default=2, doc=doc_so2_layers),
+        Argument(
+            "ffn_neuron", list[int], optional=True, default=[128], doc=doc_ffn_neuron
+        ),
+        Argument(
+            "use_parallel", bool, optional=True, default=False, doc=doc_use_parallel
+        ),
+        Argument(
+            "set_davg_zero", bool, optional=True, default=False, doc=doc_set_davg_zero
+        ),
+        Argument(
+            "activation_function",
+            str,
+            optional=True,
+            default="silu",
+            doc=doc_activation_function,
+        ),
+        Argument("precision", str, optional=True, default="float32", doc=doc_precision),
+        Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
+        Argument("seed", [int, None], optional=True, doc=doc_seed),
+        Argument(
+            "exclude_types",
+            list[list[int]],
+            optional=True,
+            default=[],
+            doc=doc_exclude_types,
+        ),
+        Argument(
+            "env_protection",
+            float,
+            optional=True,
+            default=0.0,
+            doc=doc_only_pt_supported + doc_env_protection,
         ),
     ]
 

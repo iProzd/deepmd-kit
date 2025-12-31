@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Wigner-D utilities for SO(3) equivariant descriptors (PyTorch backend).
-
-Two implementations are provided:
-- ``WignerDCalc``: Per-l loop implementation, memory efficient for large n_edges.
-- ``WignerDCalcParallel``: Block-diagonal parallel implementation, faster for small n_edges
-  but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2.
 """
+Helper utilities for SeZM-Net PyTorch descriptor.
 
-from __future__ import (
-    annotations,
-)
+This module contains:
+- ``EdgeFeatureCache``: Shared data structure for edge features
+- ``WignerDCalcBase``: Abstract base class for Wigner-D calculators
+- ``WignerDCalc``: Per-l loop implementation, memory efficient for large n_edges
+- ``WignerDCalcParallel``: Block-diagonal parallel implementation, faster for small n_edges
+  but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2
+"""
 
 import math
 from abc import (
@@ -18,6 +17,7 @@ from abc import (
 )
 from typing import (
     Any,
+    NamedTuple,
 )
 
 import torch
@@ -28,6 +28,46 @@ from deepmd.pt.utils import (
 )
 
 
+class EdgeFeatureCache(NamedTuple):
+    """
+    Global edge feature cache created once per forward().
+
+    All tensors are aligned on the same edge axis (E = number of valid edges).
+
+    Parameters
+    ----------
+    src
+        Source node indices with shape (E,).
+    dst
+        Destination node indices with shape (E,).
+    node_type_feat
+        Per-node type embeddings with shape (N, C).
+    edge_vec
+        Edge vectors with shape (E, 3) in Å.
+    edge_rbf
+        Radial basis with shape (E, n_radial).
+        The C^2 cutoff envelope is already baked in.
+    edge_sw
+        DeePMD smooth weights with shape (E, 1).
+    D_list
+        Wigner-D blocks per degree. `D_list[l]` has shape (E, 2l+1, 2l+1).
+    Dt_list
+        Transposed blocks per degree. `Dt_list[l]` has shape (E, 2l+1, 2l+1).
+    inv_sqrt_deg
+        Destination degree normalization with shape (N, 1, 1).
+    """
+
+    src: torch.Tensor
+    dst: torch.Tensor
+    node_type_feat: torch.Tensor
+    edge_vec: torch.Tensor
+    edge_rbf: torch.Tensor
+    edge_sw: torch.Tensor
+    D_list: list[torch.Tensor]
+    Dt_list: list[torch.Tensor]
+    inv_sqrt_deg: torch.Tensor
+
+
 class WignerDCalcBase(nn.Module, ABC):
     """
     Abstract base class for Wigner-D matrix calculators.
@@ -36,18 +76,20 @@ class WignerDCalcBase(nn.Module, ABC):
     ----------
     lmax : int
         Maximum angular momentum degree.
+    eps : float
+        Small epsilon for numerical stability.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
     """
 
-    def __init__(self, lmax: int, *, dtype: torch.dtype) -> None:
+    def __init__(self, lmax: int, *, eps: float = 1e-10, dtype: torch.dtype) -> None:
         super().__init__()
         self.lmax = int(lmax)
         if self.lmax < 0:
             raise ValueError("`lmax` must be non-negative")
         self.dtype = dtype
         self.device = env.DEVICE
-        self.eps = torch.finfo(self.dtype).eps
+        self.eps = float(eps)
 
     @abstractmethod
     def forward(
@@ -138,20 +180,13 @@ class WignerDCalcBase(nn.Module, ABC):
         threshold = math.sqrt(self.eps)
         not_singular = sin_beta > threshold
 
-        # === Step 3. Define a safe atan2 for autograd ===
+        # === Step 3. Non-singular extraction (sin(beta) > 0) ===
         # torch.atan2(y, x) has undefined gradient at (y, x) = (0, 0).
-        # Perturbing x by eps when ||(x,y)|| is tiny avoids NaNs without
-        # affecting non-degenerate rotations.
-        def safe_atan2(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-            mag2 = x * x + y * y
-            x_safe = x + (mag2 < self.eps).to(dtype=x.dtype) * self.eps
-            return torch.atan2(y, x_safe)
+        # We use a safe variant that perturbs x by eps when ||(x,y)|| is tiny.
+        alpha = self._safe_atan2(rot_mat[..., 1, 2], rot_mat[..., 0, 2])
+        gamma = self._safe_atan2(rot_mat[..., 2, 1], -rot_mat[..., 2, 0])
 
-        # === Step 4. Non-singular extraction (sin(beta) > 0) ===
-        alpha = safe_atan2(rot_mat[..., 1, 2], rot_mat[..., 0, 2])
-        gamma = safe_atan2(rot_mat[..., 2, 1], -rot_mat[..., 2, 0])
-
-        # === Step 5. Singular extraction (gimbal lock) ===
+        # === Step 4. Singular extraction (gimbal lock) ===
         # When sin(beta) -> 0, alpha and gamma are not individually identifiable.
         # Two singular manifolds exist:
         #   (1) beta -> 0:  R = Rz(alpha) @ I @ Rz(gamma) = Rz(alpha + gamma)
@@ -160,13 +195,36 @@ class WignerDCalcBase(nn.Module, ABC):
         #
         # We fix the gauge by setting gamma = 0 and folding the residual z-rotation
         # into alpha, using stable atan2 formulas on the (x,y) block.
-        alpha_beta0 = safe_atan2(rot_mat[..., 1, 0], rot_mat[..., 0, 0])
-        alpha_betapi = safe_atan2(-rot_mat[..., 1, 0], -rot_mat[..., 0, 0])
+        alpha_beta0 = self._safe_atan2(rot_mat[..., 1, 0], rot_mat[..., 0, 0])
+        alpha_betapi = self._safe_atan2(-rot_mat[..., 1, 0], -rot_mat[..., 0, 0])
         alpha_singular = torch.where(cos_beta > 0.0, alpha_beta0, alpha_betapi)
 
         alpha = torch.where(not_singular, alpha, alpha_singular)
         gamma = torch.where(not_singular, gamma, torch.zeros_like(gamma))
         return alpha, beta, gamma
+
+    def _safe_atan2(self, y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        """
+        Safe atan2 that avoids NaN gradients at (y, x) = (0, 0).
+
+        Perturbing x by eps when ||(x,y)|| is tiny avoids NaNs without
+        affecting non-degenerate rotations.
+
+        Parameters
+        ----------
+        y : torch.Tensor
+            Numerator with shape (...).
+        x : torch.Tensor
+            Denominator with shape (...).
+
+        Returns
+        -------
+        torch.Tensor
+            arctan(y, x) with shape (...).
+        """
+        mag2 = x * x + y * y
+        x_safe = x + (mag2 < self.eps).to(dtype=x.dtype) * self.eps
+        return torch.atan2(y, x_safe)
 
     def _compute_j_matrix(self, l: int) -> torch.Tensor:
         """
@@ -397,20 +455,31 @@ class WignerDCalc(WignerDCalcBase):
     ----------
     lmax : int
         Maximum angular momentum degree.
+    eps : float
+        Small epsilon for numerical stability.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
     """
 
-    def __init__(self, lmax: int, *, dtype: torch.dtype) -> None:
-        super().__init__(lmax, dtype=dtype)
+    class _JMatrixPair(nn.Module):
+        """Store per-degree constant J and J^T as buffers."""
+
+        def __init__(self, J: torch.Tensor) -> None:
+            super().__init__()
+            self.register_buffer("J", J.contiguous(), persistent=True)
+            self.register_buffer(
+                "Jt", J.transpose(-1, -2).contiguous(), persistent=True
+            )
+
+    def __init__(self, lmax: int, *, eps: float = 1e-10, dtype: torch.dtype) -> None:
+        super().__init__(lmax, eps=eps, dtype=dtype)
 
         # Precompute J_l = D^{(l)}(Rx(pi/2)) on CPU, then move to target device
         # Also cache J_l^T (the transpose in real basis equals the inverse)
+        self.j_mats: nn.ModuleList = nn.ModuleList()
         for l in range(self.lmax + 1):
             J = self._compute_j_matrix(l).to(device=self.device)
-            Jt = J.transpose(-1, -2).contiguous()
-            self.register_buffer(f"_J_{l}", J, persistent=True)
-            self.register_buffer(f"_Jt_{l}", Jt, persistent=True)
+            self.j_mats.append(self._JMatrixPair(J))
 
     def forward(
         self, rot_mat: torch.Tensor
@@ -439,9 +508,9 @@ class WignerDCalc(WignerDCalcBase):
         D_list: list[torch.Tensor] = []
         Dt_list: list[torch.Tensor] = []
 
-        for l in range(self.lmax + 1):
-            J: torch.Tensor = getattr(self, f"_J_{l}")
-            Jt: torch.Tensor = getattr(self, f"_Jt_{l}")
+        for l, pair in enumerate(self.j_mats):
+            J: torch.Tensor = pair.J
+            Jt: torch.Tensor = pair.Jt
 
             Za = self._build_z_rotation(alpha, l)
             Zb = self._build_z_rotation(beta, l)
@@ -502,52 +571,43 @@ class WignerDCalc(WignerDCalcBase):
         Parameters
         ----------
         angle : torch.Tensor
-            Rotation angles with shape (...,).
+            Rotation angles with shape (n_edges,).
         l : int
             Angular momentum order.
 
         Returns
         -------
         torch.Tensor
-            Rotation matrices with shape (..., 2l+1, 2l+1).
+            Rotation matrices with shape (n_edges, 2l+1, 2l+1).
         """
+        n_edges = angle.shape[0]
         # === Step 1. Handle l=0 Special Case ===
         if l == 0:
-            return torch.ones(
-                (*angle.shape, 1, 1), dtype=angle.dtype, device=angle.device
-            )
-
+            return torch.ones(n_edges, 1, 1, dtype=angle.dtype, device=angle.device)
         dim = 2 * l + 1
-        Z = torch.zeros(
-            (*angle.shape, dim, dim), dtype=angle.dtype, device=angle.device
-        )
+        Z = torch.zeros(n_edges, dim, dim, dtype=angle.dtype, device=angle.device)
 
-        # === Step 2. Vectorized m Generation ===
-        # m_idx: [1, 2, ..., l] for indexing
-        # m_float: same values as float for computation
+        # === Step 2. Fill m=0 element ===
+        Z[:, l, l] = 1.0
+
+        # === Step 3. Fill 2x2 blocks for |m|>0 (vectorized over m) ===
         m_idx = torch.arange(1, l + 1, device=angle.device, dtype=torch.long)
         m_float = m_idx.to(dtype=angle.dtype)
 
-        # === Step 3. Batched Trigonometric Computation ===
-        # angle: (...,) -> (..., l) via broadcasting with m_float
-        angles_m = angle.unsqueeze(-1) * m_float
-        c = torch.cos(angles_m)  # (..., l)
-        s = torch.sin(angles_m)  # (..., l)
+        angles_m = angle.unsqueeze(-1) * m_float  # (n_edges, l)
+        c = torch.cos(angles_m)
+        s = torch.sin(angles_m)
 
-        # === Step 4. Set Center Element ===
-        Z[..., l, l] = 1.0
+        idx_pos = l + m_idx  # (l,)
+        idx_neg = l - m_idx  # (l,)
 
-        # === Step 5. Advanced Indexing for Parallel Fill ===
-        idx_pos = l + m_idx  # l + m
-        idx_neg = l - m_idx  # l - m
-
-        # Each 2x2 block in ordered subspace [m=-m, m=+m]:
+        # 2x2 blocks in ordered subspace [m=-m, m=+m]:
         #   [[ cos(mθ), -sin(mθ)],
         #    [ sin(mθ),  cos(mθ)]]
-        Z[..., idx_pos, idx_pos] = c
-        Z[..., idx_neg, idx_neg] = c
-        Z[..., idx_pos, idx_neg] = s
-        Z[..., idx_neg, idx_pos] = -s
+        Z[:, idx_pos, idx_pos] = c
+        Z[:, idx_neg, idx_neg] = c
+        Z[:, idx_pos, idx_neg] = s
+        Z[:, idx_neg, idx_pos] = -s
 
         return Z
 
@@ -592,12 +652,14 @@ class WignerDCalcParallel(WignerDCalcBase):
     ----------
     lmax : int
         Maximum angular momentum degree.
+    eps : float
+        Small epsilon for numerical stability.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
     """
 
-    def __init__(self, lmax: int, *, dtype: torch.dtype) -> None:
-        super().__init__(lmax, dtype=dtype)
+    def __init__(self, lmax: int, *, eps: float = 0.0, dtype: torch.dtype) -> None:
+        super().__init__(lmax, eps=eps, dtype=dtype)
 
         # === Step 1. Compute block dimension ===
         # dim_full = sum_{l=0..lmax}(2l+1) = (lmax+1)^2
@@ -614,8 +676,8 @@ class WignerDCalcParallel(WignerDCalcBase):
             start, end = l * l, (l + 1) * (l + 1)
             J_full[start:end, start:end] = J_l
 
-        self.register_buffer("_J_full", J_full, persistent=True)
-        self.register_buffer("_Jt_full", J_full.T.contiguous(), persistent=True)
+        self.register_buffer("J_full", J_full, persistent=True)
+        self.register_buffer("Jt_full", J_full.T.contiguous(), persistent=True)
 
         # === Step 3. Precompute indices for Z_full construction ===
         self._precompute_z_indices()
@@ -650,8 +712,8 @@ class WignerDCalcParallel(WignerDCalcBase):
 
         # === Step 3. Compute D_full via single matmul chain ===
         # D^{(l)}(R) = Z(alpha) @ J^T @ Z(beta) @ J @ Z(gamma)
-        J_full: torch.Tensor = getattr(self, "_J_full")
-        Jt_full: torch.Tensor = getattr(self, "_Jt_full")
+        J_full: torch.Tensor = self.J_full
+        Jt_full: torch.Tensor = self.Jt_full
         D_full = Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full
 
         # === Step 4. Slice D_full into per-l blocks ===
@@ -723,14 +785,14 @@ class WignerDCalcParallel(WignerDCalcBase):
 
         # === Step 1. Set m=0 diagonal elements to 1 ===
         # Z[:, m0_idx, m0_idx] = 1 for each l's center element
-        m0_indices: torch.Tensor = getattr(self, "_m0_indices")
+        m0_indices: torch.Tensor = self.m0_indices
         Z[:, m0_indices, m0_indices] = 1.0
 
         # === Step 2. Fill m>0 rotation blocks ===
-        m_values: torch.Tensor = getattr(self, "_m_values")
+        m_values: torch.Tensor = self.m_values
         if m_values.numel() > 0:
-            pos_indices: torch.Tensor = getattr(self, "_pos_indices")
-            neg_indices: torch.Tensor = getattr(self, "_neg_indices")
+            pos_indices: torch.Tensor = self.pos_indices
+            neg_indices: torch.Tensor = self.neg_indices
 
             # Compute cos(m*angle) and sin(m*angle) for all (l,m) pairs
             # angles_m: (n_edges, n_blocks) where n_blocks = total (l,m) pairs with m>0
@@ -773,7 +835,7 @@ class WignerDCalcParallel(WignerDCalcBase):
             dtype=torch.long,
             device=self.device,
         )
-        self.register_buffer("_m0_indices", m0_indices, persistent=True)
+        self.register_buffer("m0_indices", m0_indices, persistent=True)
 
         # === Step 2. Indices for m>0 rotation blocks ===
         pos_indices: list[int] = []
@@ -790,17 +852,17 @@ class WignerDCalcParallel(WignerDCalcBase):
                 m_values.append(m)
 
         self.register_buffer(
-            "_pos_indices",
+            "pos_indices",
             torch.tensor(pos_indices, dtype=torch.long, device=self.device),
             persistent=True,
         )
         self.register_buffer(
-            "_neg_indices",
+            "neg_indices",
             torch.tensor(neg_indices, dtype=torch.long, device=self.device),
             persistent=True,
         )
         self.register_buffer(
-            "_m_values",
+            "m_values",
             torch.tensor(m_values, dtype=self.dtype, device=self.device),
             persistent=True,
         )

@@ -22,7 +22,7 @@ from deepmd.pt.model.descriptor.se_zm_net import (
     DescrptSeZMNet,
     init_edge_rot_mat_frisvad,
 )
-from deepmd.pt.model.descriptor.wigner_d import (
+from deepmd.pt.model.descriptor.sel_zm_helper import (
     WignerDCalc,
     WignerDCalcParallel,
 )
@@ -93,6 +93,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 rcut=3.0,
                 rcut_smth=2.5,
                 sel=[1, 1],
+                ntypes=2,
                 l_schedule=[1, 0],
                 channels=8,
                 n_radial=4,
@@ -128,6 +129,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 rcut=3.0,
                 rcut_smth=2.5,
                 sel=[1, 1],
+                ntypes=2,
                 l_schedule=[1, 0],
                 channels=4,
                 n_radial=3,
@@ -155,6 +157,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 rcut=3.0,
                 rcut_smth=2.5,
                 sel=[1, 1],
+                ntypes=2,
                 l_schedule=[1, 0],
                 channels=8,
                 n_radial=4,
@@ -172,7 +175,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 nlist, dtype=torch.bool, device=self.device
             )
 
-            edge_cache, sw = model._build_edge_cache(
+            edge_cache, sw = model.build_edge_cache(
                 x0=x0,
                 extended_coord=extended_coord.to(dtype=model.dtype),
                 extended_atype=atype,
@@ -185,14 +188,15 @@ class TestDescrptSeZMNet(unittest.TestCase):
             self.assertEqual(edge_cache.node_type_feat.dtype, model.dtype)
             self.assertEqual(edge_cache.node_type_feat.shape, x0.shape)
             torch.testing.assert_close(edge_cache.node_type_feat, x0)
-            self.assertEqual(
-                edge_cache.src_type_feat.shape, (edge_cache.num_edges, model.channels)
-            )
-            self.assertEqual(
-                edge_cache.dst_type_feat.shape, (edge_cache.num_edges, model.channels)
-            )
-            torch.testing.assert_close(edge_cache.src_type_feat, x0[edge_cache.src])
-            torch.testing.assert_close(edge_cache.dst_type_feat, x0[edge_cache.dst])
+            num_edges = edge_cache.src.shape[0]
+            self.assertEqual(edge_cache.src.shape, (num_edges,))
+            self.assertEqual(edge_cache.dst.shape, (num_edges,))
+            src_type_feat = edge_cache.node_type_feat[edge_cache.src]
+            dst_type_feat = edge_cache.node_type_feat[edge_cache.dst]
+            self.assertEqual(src_type_feat.shape, (num_edges, model.channels))
+            self.assertEqual(dst_type_feat.shape, (num_edges, model.channels))
+            torch.testing.assert_close(src_type_feat, x0[edge_cache.src])
+            torch.testing.assert_close(dst_type_feat, x0[edge_cache.dst])
             self.assertFalse(hasattr(edge_cache, "edge_len"))
             self.assertFalse(hasattr(edge_cache, "edge_unit"))
             self.assertFalse(hasattr(edge_cache, "sw"))
@@ -211,6 +215,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 rcut=3.0,
                 rcut_smth=2.5,
                 sel=[1, 1],
+                ntypes=2,
                 l_schedule=[1, 1, 0],
                 channels=8,
                 n_radial=4,
@@ -270,6 +275,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 rcut=3.0,
                 rcut_smth=2.5,
                 sel=[1, 1],
+                ntypes=2,
                 l_schedule=[1, 1, 0],
                 channels=8,
                 n_radial=4,
@@ -286,6 +292,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 rcut=3.0,
                 rcut_smth=2.5,
                 sel=[1, 1],
+                ntypes=2,
                 l_schedule=[1, 1, 0],
                 channels=8,
                 n_radial=4,
@@ -804,6 +811,51 @@ class TestSO2LinearEquivariance(unittest.TestCase):
                 msg=f"SO2Linear equivariance failed for dtype={dtype}, lmax={lmax}",
             )
 
+    def test_mmax_truncation_zeros_high_m(self) -> None:
+        """Test that SO2Linear with mmax < lmax zeros out |m| > mmax components."""
+        for dtype in [torch.float64, torch.float32]:
+            lmax = 3
+            mmax = 1
+            batch = 8
+            channels_in = 5
+            channels_out = 7
+            ebed_dim = (lmax + 1) ** 2
+
+            so2_linear = SO2Linear(
+                lmax=lmax,
+                mmax=mmax,
+                in_channels=channels_in,
+                out_channels=channels_out,
+                dtype=dtype,
+                seed=123,
+                trainable=True,
+            )
+
+            x = torch.randn(
+                batch, ebed_dim, channels_in, device=self.device, dtype=dtype
+            )
+            y = so2_linear(x)
+
+            high_m_idx: list[int] = []
+            for l in range(lmax + 1):
+                for m in range(-l, l + 1):
+                    if abs(m) > mmax:
+                        high_m_idx.append(l * l + l + m)
+
+            idx = torch.tensor(high_m_idx, device=self.device, dtype=torch.long)
+            torch.testing.assert_close(
+                y[:, idx, :],
+                torch.zeros(
+                    batch,
+                    idx.numel(),
+                    channels_out,
+                    device=self.device,
+                    dtype=dtype,
+                ),
+                atol=0.0,
+                rtol=0.0,
+            )
+
 
 class TestPerDegreeLinearV2(unittest.TestCase):
     """Test PerDegreeLinearV2 correctness and consistency with PerDegreeLinear."""
@@ -903,6 +955,190 @@ class TestPerDegreeLinearV2(unittest.TestCase):
                 rtol=rtol,
                 msg=f"PerDegreeLinearV2 output mismatch for dtype={dtype}, lmax={lmax}",
             )
+
+
+class TestJITScript(unittest.TestCase):
+    """Test torch.jit.script compatibility for SeZM-Net descriptor."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+    def _tiny_system(
+        self, *, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Create a minimal two-atom system for testing."""
+        coord = torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=self.device,
+        ).view(1, -1, 3)
+        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
+        nlist = torch.tensor(
+            [[[1, -1], [0, -1]]], dtype=torch.int64, device=self.device
+        )
+        return coord, atype, nlist
+
+    def _get_tols(self, dtype: torch.dtype) -> tuple[float, float]:
+        if dtype == torch.float32:
+            return 5e-5, 5e-5
+        return 1e-10, 1e-10
+
+    def test_jit_script_basic(self) -> None:
+        """Test that DescrptSeZMNet can be scripted with torch.jit.script."""
+        for prec, use_parallel in itertools.product(
+            ["float64", "float32"], [False, True]
+        ):
+            dtype = PRECISION_DICT[prec]
+            atol, rtol = self._get_tols(dtype)
+            coord, atype, nlist = self._tiny_system(dtype=dtype)
+            extended_coord = coord.reshape(1, -1)
+
+            # Create and script the model
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                rcut_smth=2.5,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=4,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neuron=[8],
+                use_parallel=use_parallel,
+                precision=prec,
+                trainable=True,
+            )
+
+            # Get reference output before scripting
+            model.eval()
+            with torch.no_grad():
+                desc_ref, _, _, _, sw_ref = model(
+                    extended_coord, atype, nlist, mapping=None, comm_dict=None
+                )
+
+            # Script the model
+            try:
+                scripted_model = torch.jit.script(model)
+            except Exception as e:
+                self.fail(
+                    f"torch.jit.script failed for {prec}, use_parallel={use_parallel}: {e}"
+                )
+
+            # Get output from scripted model
+            with torch.no_grad():
+                desc_script, _, _, _, sw_script = scripted_model(
+                    extended_coord, atype, nlist, mapping=None, comm_dict=None
+                )
+
+            # Verify outputs match
+            torch.testing.assert_close(
+                desc_script,
+                desc_ref,
+                atol=atol,
+                rtol=rtol,
+                msg=f"Descriptor output mismatch after scripting (prec={prec}, parallel={use_parallel})",
+            )
+            torch.testing.assert_close(
+                sw_script,
+                sw_ref,
+                atol=atol,
+                rtol=rtol,
+                msg=f"Smooth weight mismatch after scripting (prec={prec}, parallel={use_parallel})",
+            )
+
+    def test_jit_script_serialize(self) -> None:
+        """Test that scripted model handles serialization correctly."""
+        dtype = torch.float64
+        coord, atype, nlist = self._tiny_system(dtype=dtype)
+        extended_coord = coord.reshape(1, -1)
+
+        # Create model with serialization
+        model1 = DescrptSeZMNet(
+            rcut=3.0,
+            rcut_smth=2.5,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 0],
+            channels=4,
+            n_radial=3,
+            radial_mlp=[6],
+            ffn_neuron=[8],
+            use_parallel=False,
+            precision="float64",
+            trainable=True,
+        )
+
+        # Serialize and deserialize
+        data = model1.serialize()
+        model2 = DescrptSeZMNet.deserialize(data)
+
+        # Script both original and deserialized models
+        try:
+            scripted1 = torch.jit.script(model1)
+            scripted2 = torch.jit.script(model2)
+        except Exception as e:
+            self.fail(f"torch.jit.script failed for serialized models: {e}")
+
+        # Compare outputs
+        model1.eval()
+        model2.eval()
+        with torch.no_grad():
+            desc1, _, _, _, sw1 = scripted1(extended_coord, atype, nlist)
+            desc2, _, _, _, sw2 = scripted2(extended_coord, atype, nlist)
+
+        torch.testing.assert_close(
+            desc1,
+            desc2,
+            atol=1e-10,
+            rtol=1e-10,
+            msg="Serialized model output mismatch after scripting",
+        )
+        torch.testing.assert_close(
+            sw1,
+            sw2,
+            atol=1e-10,
+            rtol=1e-10,
+            msg="Serialized model smooth weight mismatch after scripting",
+        )
+
+    def test_jit_script_forward_pass(self) -> None:
+        """Test that scripted model can execute forward pass correctly."""
+        dtype = torch.float64
+        coord, atype, nlist = self._tiny_system(dtype=dtype)
+        extended_coord = coord.reshape(1, -1)
+
+        model = DescrptSeZMNet(
+            rcut=3.0,
+            rcut_smth=2.5,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 1, 0],
+            channels=8,
+            n_radial=4,
+            radial_mlp=[8],
+            so2_layers=2,
+            ffn_neuron=[16],
+            use_parallel=False,
+            precision="float64",
+            trainable=True,
+        )
+
+        # Script the model
+        scripted_model = torch.jit.script(model)
+
+        # Execute forward pass
+        desc, rot_mat, g2, h2, sw = scripted_model(
+            extended_coord, atype, nlist, mapping=None, comm_dict=None
+        )
+
+        # Verify output shapes and types
+        self.assertEqual(desc.shape, (1, 2, 8))
+        self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
+        self.assertIsNone(rot_mat)
+        self.assertIsNone(g2)
+        self.assertIsNone(h2)
+        self.assertEqual(sw.shape, (1, 2, 2, 1))
+        self.assertEqual(sw.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
 
 
 if __name__ == "__main__":
