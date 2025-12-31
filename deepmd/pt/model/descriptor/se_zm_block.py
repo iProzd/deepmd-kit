@@ -24,8 +24,12 @@ from typing import (
 import torch
 import torch.nn as nn
 
+from deepmd.dpmodel.utils.seed import (
+    child_seed,
+)
 from deepmd.pt.model.network.mlp import (
     EmbeddingNet,
+    MLPLayer,
 )
 from deepmd.pt.utils import (
     env,
@@ -35,6 +39,8 @@ from deepmd.pt.utils.env import (
     RESERVED_PRECISION_DICT,
 )
 from deepmd.pt.utils.utils import (
+    ActivationFn,
+    get_generator,
     to_numpy_array,
 )
 
@@ -43,7 +49,10 @@ def _so3_dim_of_lmax(lmax: int) -> int:
     """
     Return SO(3) representation dimension for given lmax.
 
-    The dimension equals sum_{l<=lmax} (2l+1) = (lmax+1)^2,
+    The dimension equals::
+
+        sum_{l<=lmax} (2l+1) = (lmax+1)^2
+
     which is the number of spherical harmonics basis functions.
 
     Parameters
@@ -59,7 +68,7 @@ def _so3_dim_of_lmax(lmax: int) -> int:
     return int((int(lmax) + 1) ** 2)
 
 
-def _build_degree_index(lmax: int, *, device: torch.device) -> torch.Tensor:
+def _map_degree_idx(lmax: int, *, device: torch.device) -> torch.Tensor:
     """
     Build degree (l) index for each position in the packed (l, m) layout.
 
@@ -101,7 +110,7 @@ class GatedActivation(nn.Module):
     """
     Gated activation for SO(3) equivariant features with per-l independent gates.
 
-    - l=0: SiLU activation
+    - l=0: Uses the specified activation function
     - l>0: Each degree l has an independent gate derived from the l=0 scalar features.
            The gate for each l is expanded to all m components within that l-block.
 
@@ -113,6 +122,12 @@ class GatedActivation(nn.Module):
         Number of channels per (l, m) coefficient.
     dtype
         Parameter dtype.
+    activation_function
+        Activation function for l=0 components (e.g., "silu", "tanh", "gelu").
+    trainable
+        Whether parameters are trainable.
+    seed
+        Random seed for weight initialization.
     """
 
     def __init__(
@@ -121,40 +136,36 @@ class GatedActivation(nn.Module):
         lmax: int,
         channels: int,
         dtype: torch.dtype,
+        activation_function: str = "silu",
+        trainable: bool,
+        seed: int | list[int] | None = None,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
         self.channels = int(channels)
         self.dtype = dtype
         self.device = env.DEVICE
+        self.precision = RESERVED_PRECISION_DICT[dtype]
 
-        self.scalar_act = torch.nn.SiLU()
+        self.scalar_act = ActivationFn(activation_function)
         self.gate_act = torch.nn.Sigmoid()
 
         # === Build expand_index for mapping per-l gates to all m components ===
         if self.lmax > 0:
             # expand_index[k] = l-1 for the k-th component in the l>0 portion
             # This maps each (l, m) component to its corresponding gate index
-            num_components = 0
-            for l in range(1, self.lmax + 1):
-                num_components += 2 * l + 1  # all m from -l to l
-            expand_index = torch.zeros(
-                num_components, dtype=torch.long, device=self.device
-            )
-            start_idx = 0
-            for l in range(1, self.lmax + 1):
-                length = 2 * l + 1
-                expand_index[start_idx : start_idx + length] = l - 1
-                start_idx += length
+            expand_index = _map_degree_idx(self.lmax, device=self.device)[1:] - 1
             self.register_buffer("expand_index", expand_index, persistent=True)
 
             # Linear to generate lmax independent gates from scalar features
-            self.gate_linear: nn.Linear | None = nn.Linear(
+            self.gate_linear: MLPLayer | None = MLPLayer(
                 self.channels,
                 self.lmax * self.channels,
                 bias=True,
-                device=self.device,
-                dtype=self.dtype,
+                activation_function="linear",
+                precision=self.precision,
+                seed=seed,
+                trainable=trainable,
             )
         else:
             self.register_buffer(
@@ -163,6 +174,9 @@ class GatedActivation(nn.Module):
                 persistent=True,
             )
             self.gate_linear = None
+
+        for p in self.parameters():
+            p.requires_grad = trainable
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -190,7 +204,7 @@ class GatedActivation(nn.Module):
 
         # Reshape to (N, lmax, C) then expand to (N, D-1, C)
         gating_scalars = gating_scalars.view(x.shape[0], self.lmax, -1)
-        expand_idx = self.expand_index.to(device=x.device)
+        expand_idx = self.expand_index
         gates = torch.index_select(
             gating_scalars, dim=1, index=expand_idx
         )  # (N, D-1, C)
@@ -200,14 +214,66 @@ class GatedActivation(nn.Module):
 
         return torch.cat([x0, xt], dim=1)
 
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "GatedActivation",
+            "@version": 1,
+            "lmax": self.lmax,
+            "channels": self.channels,
+            "precision": RESERVED_PRECISION_DICT[self.dtype],
+            "activation_function": self.scalar_act.activation,
+            "gate_linear": (
+                self.gate_linear.serialize() if self.gate_linear is not None else None
+            ),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> GatedActivation:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "GatedActivation":
+            raise ValueError(f"Invalid class for GatedActivation: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported GatedActivation version: {version}")
+
+        precision = data["precision"]
+        dtype = PRECISION_DICT[precision]
+        activation_function = data.get("activation_function", "silu")
+        obj = cls(
+            lmax=int(data["lmax"]),
+            channels=int(data["channels"]),
+            dtype=dtype,
+            activation_function=activation_function,
+            trainable=True,
+            seed=None,
+        )
+        gate_linear_data = data["gate_linear"]
+        if gate_linear_data is not None and obj.gate_linear is not None:
+            obj.gate_linear = MLPLayer.deserialize(gate_linear_data)
+        return obj
+
 
 class SeparableRMSNorm(nn.Module):
     """
     Separable RMSNorm for scalar (l=0) and non-scalar (l>0) features.
 
     - l=0 and l>0 compute RMS separately (separable design).
-    - affine: per-l learnable scale for all degrees.
-    - centering: subtract mean for l=0 only (l>0 must remain zero-mean for equivariance).
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+    channels
+        Number of channels per (l, m) coefficient.
+    affine
+        Whether to apply per-l learnable scale and bias.
+    centering
+        Whether to apply mean centering for l=0 features.
+    dtype
+        Parameter dtype.
+    trainable
+        Whether parameters are trainable.
     """
 
     def __init__(
@@ -218,6 +284,7 @@ class SeparableRMSNorm(nn.Module):
         centering: bool = True,
         *,
         dtype: torch.dtype,
+        trainable: bool,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -226,7 +293,7 @@ class SeparableRMSNorm(nn.Module):
         self.centering = centering
         self.dtype = dtype
         self.device = env.DEVICE
-        self.eps = torch.finfo(self.dtype).eps
+        self.eps = 1e-8 + torch.finfo(self.dtype).eps
 
         if self.affine:
             # Per-l affine weights: (lmax+1, C)
@@ -245,15 +312,7 @@ class SeparableRMSNorm(nn.Module):
 
             # Build expand_index for l>0 portion
             if self.lmax > 0:
-                num_components = (self.lmax + 1) ** 2 - 1  # D - 1
-                expand_index = torch.zeros(
-                    num_components, dtype=torch.long, device=self.device
-                )
-                start_idx = 0
-                for l in range(1, self.lmax + 1):
-                    length = 2 * l + 1
-                    expand_index[start_idx : start_idx + length] = l
-                    start_idx += length
+                expand_index = _map_degree_idx(self.lmax, device=self.device)[1:]
                 self.register_buffer("expand_index", expand_index, persistent=True)
             else:
                 self.register_buffer(
@@ -269,6 +328,9 @@ class SeparableRMSNorm(nn.Module):
                 torch.zeros(0, dtype=torch.long, device=self.device),
                 persistent=True,
             )
+
+        for p in self.parameters():
+            p.requires_grad = trainable
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -309,9 +371,74 @@ class SeparableRMSNorm(nn.Module):
 
         return torch.cat([x0, xt], dim=1)
 
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "SeparableRMSNorm",
+            "@version": 1,
+            "lmax": self.lmax,
+            "channels": self.channels,
+            "affine": self.affine,
+            "centering": self.centering,
+            "precision": RESERVED_PRECISION_DICT[self.dtype],
+            "weight": to_numpy_array(self.weight) if self.weight is not None else None,
+            "bias": to_numpy_array(self.bias) if self.bias is not None else None,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> SeparableRMSNorm:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "SeparableRMSNorm":
+            raise ValueError(f"Invalid class for SeparableRMSNorm: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported SeparableRMSNorm version: {version}")
+
+        precision = data["precision"]
+        dtype = PRECISION_DICT[precision]
+        obj = cls(
+            lmax=int(data["lmax"]),
+            channels=int(data["channels"]),
+            affine=bool(data["affine"]),
+            centering=bool(data["centering"]),
+            dtype=dtype,
+            trainable=True,
+        )
+        if obj.weight is not None and data["weight"] is not None:
+            obj.weight.data.copy_(
+                torch.as_tensor(data["weight"], device=obj.device, dtype=obj.dtype)
+            )
+        if obj.bias is not None and data["bias"] is not None:
+            obj.bias.data.copy_(
+                torch.as_tensor(data["bias"], device=obj.device, dtype=obj.dtype)
+            )
+        return obj
+
 
 class PerDegreeLinear(nn.Module):
-    """Degree-wise linear self-interaction shared across m within each l-block."""
+    """
+    Degree-wise linear self-interaction shared across m within each l-block.
+
+    NOTE
+    ----
+    - Each degree l has an independent C x C linear transformation.
+    - Within each l-block, the same linear transformation is shared across all 2l+1 m components.
+    - Bias is only applied to l=0 (scalar) components to preserve equivariance.
+    - Uses Python loop over l, less efficient than PerDegreeLinearV2 but memory friendly.
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+    channels
+        Number of channels per (l, m) coefficient.
+    dtype
+        Parameter dtype.
+    trainable
+        Whether parameters are trainable.
+    seed
+        Random seed for weight initialization.
+    """
 
     def __init__(
         self,
@@ -320,6 +447,7 @@ class PerDegreeLinear(nn.Module):
         channels: int,
         dtype: torch.dtype,
         trainable: bool,
+        seed: int | list[int] | None = None,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -328,16 +456,18 @@ class PerDegreeLinear(nn.Module):
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
 
-        linears: list[nn.Linear] = []
+        linears: list[MLPLayer] = []
         for l in range(self.lmax + 1):
             bias = l == 0
             linears.append(
-                nn.Linear(
+                MLPLayer(
                     self.channels,
                     self.channels,
                     bias=bias,
-                    device=self.device,
-                    dtype=self.dtype,
+                    activation_function="linear",
+                    precision=self.precision,
+                    seed=child_seed(seed, l),
+                    trainable=trainable,
                 )
             )
         self.linears = nn.ModuleList(linears)
@@ -369,19 +499,11 @@ class PerDegreeLinear(nn.Module):
     def serialize(self) -> dict[str, Any]:
         return {
             "@class": "PerDegreeLinear",
-            "@version": 1,  # keep 1 at devel stage
+            "@version": 1,
             "lmax": self.lmax,
             "channels": self.channels,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
-            "weights": [
-                {
-                    "weight": to_numpy_array(layer.weight),
-                    "bias": to_numpy_array(layer.bias)
-                    if layer.bias is not None
-                    else None,
-                }
-                for layer in self.linears
-            ],
+            "weights": [layer.serialize() for layer in self.linears],
         }
 
     @classmethod
@@ -404,16 +526,11 @@ class PerDegreeLinear(nn.Module):
             channels=int(data["channels"]),
             dtype=dtype,
             trainable=True,
+            seed=None,
         )
-        weight_data = data["weights"]
-        for layer, state in zip(obj.linears, weight_data):
-            layer.weight.data.copy_(
-                torch.as_tensor(state["weight"], device=obj.device, dtype=obj.dtype)
-            )
-            if state["bias"] is not None and layer.bias is not None:
-                layer.bias.data.copy_(
-                    torch.as_tensor(state["bias"], device=obj.device, dtype=obj.dtype)
-                )
+        obj.linears = nn.ModuleList(
+            [MLPLayer.deserialize(state) for state in data["weights"]]
+        )
         return obj
 
 
@@ -425,13 +542,26 @@ class PerDegreeLinearV2(nn.Module):
     by using torch.einsum and index_select. The key insight is that weights
     are shared across all m components within each l-block.
 
-    Design notes
-    ------------
+    NOTE
+    ----
     - weight shape: (lmax+1, C, C) - per-l linear transformation
     - bias shape: (C,) - only applied to l=0 (scalar) components
     - expand_index: maps each (l,m) position to its l value for weight lookup
     - Uses einsum 'bmi, lci -> blmc' pattern for batched per-l matmul
     - Avoids Python for-loops and torch.cat operations
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+    channels
+        Number of channels per (l, m) coefficient.
+    dtype
+        Parameter dtype.
+    trainable
+        Whether parameters are trainable.
+    seed
+        Random seed for weight initialization.
     """
 
     def __init__(
@@ -441,6 +571,7 @@ class PerDegreeLinearV2(nn.Module):
         channels: int,
         dtype: torch.dtype,
         trainable: bool,
+        seed: int | list[int] | None = None,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -463,7 +594,8 @@ class PerDegreeLinearV2(nn.Module):
                 device=self.device,
             )
         )
-        nn.init.uniform_(self.weight, -bound, bound)
+        generator = get_generator(seed)
+        nn.init.uniform_(self.weight, -bound, bound, generator=generator)
 
         # === Step 2. Bias only for l=0 (scalar components) ===
         self.bias = nn.Parameter(
@@ -474,8 +606,8 @@ class PerDegreeLinearV2(nn.Module):
         # expand_index[i] = l for position i in the packed (l,m) layout
         # This maps each (l,m) component to its corresponding weight index.
         self.register_buffer(
-            "_expand_index",
-            _build_degree_index(self.lmax, device=self.device),
+            "expand_index",
+            _map_degree_idx(self.lmax, device=self.device),
             persistent=True,
         )
 
@@ -497,7 +629,7 @@ class PerDegreeLinearV2(nn.Module):
         # === Step 1. Expand weight: (lmax+1, C, C) -> (D, C, C) ===
         # Use index_select to duplicate each weight matrix to all m components.
         weight_expanded = torch.index_select(
-            self.weight, dim=0, index=self._expand_index
+            self.weight, dim=0, index=self.expand_index
         )  # (D, C, C)
 
         # === Step 2. Batched per-l matmul using einsum ===
@@ -546,6 +678,7 @@ class PerDegreeLinearV2(nn.Module):
             channels=int(data["channels"]),
             dtype=dtype,
             trainable=True,
+            seed=None,
         )
         obj.weight.data.copy_(
             torch.as_tensor(data["weight"], device=obj.device, dtype=obj.dtype)
@@ -563,6 +696,21 @@ class SO2Linear(nn.Module):
     Layout invariant:
     - input and output are packed by (l,m) with m=-l..l per l-block
     - mixing respects SO(2) symmetry: parameters are shared between +m and -m
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+    in_channels
+        Number of input channels per (l, m) coefficient.
+    out_channels
+        Number of output channels per (l, m) coefficient.
+    dtype
+        Parameter dtype.
+    seed
+        Random seed for weight initialization.
+    trainable
+        Whether parameters are trainable.
     """
 
     def __init__(
@@ -586,7 +734,7 @@ class SO2Linear(nn.Module):
         # === Step 1. Precompute packed indices (buffers) ===
         m0 = [l * l + l for l in range(self.lmax + 1)]
         self.register_buffer(
-            "_m0_idx",
+            "m0_idx",
             torch.tensor(m0, device=self.device, dtype=torch.long),
             persistent=True,
         )
@@ -595,25 +743,26 @@ class SO2Linear(nn.Module):
             pos_idx = [l * l + l + m for l in range(m, self.lmax + 1)]
             neg_idx = [l * l + l - m for l in range(m, self.lmax + 1)]
             self.register_buffer(
-                f"_pos_idx_{m}",
+                f"pos_idx_{m}",
                 torch.tensor(pos_idx, device=self.device, dtype=torch.long),
                 persistent=True,
             )
             self.register_buffer(
-                f"_neg_idx_{m}",
+                f"neg_idx_{m}",
                 torch.tensor(neg_idx, device=self.device, dtype=torch.long),
                 persistent=True,
             )
-        del seed
 
         # === Step 2. Mixing per |m| group, cross-l allowed, bias only for scalar index ===
         num_m0 = len(m0)
-        self.linear_m0 = nn.Linear(
+        self.linear_m0 = MLPLayer(
             num_m0 * self.in_channels,
             num_m0 * self.out_channels,
             bias=False,
-            device=self.device,
-            dtype=self.dtype,
+            activation_function="linear",
+            precision=self.precision,
+            seed=child_seed(seed, 0),
+            trainable=trainable,
         )
         self.bias0 = nn.Parameter(
             torch.zeros(self.out_channels, device=self.device, dtype=self.dtype)
@@ -624,14 +773,17 @@ class SO2Linear(nn.Module):
         self.linears_m: nn.ModuleList = nn.ModuleList()
         for m in range(1, self.lmax + 1):
             num_l = self.lmax - m + 1
-            fc = nn.Linear(
+            fc = MLPLayer(
                 num_l * self.in_channels,
                 2 * num_l * self.out_channels,
                 bias=False,
-                device=self.device,
-                dtype=self.dtype,
+                activation_function="linear",
+                precision=self.precision,
+                seed=child_seed(seed, m),
+                trainable=trainable,
             )
-            fc.weight.data.mul_(1.0 / math.sqrt(2.0))
+            # Apply scaling for SO(2) equivariance
+            fc.matrix.data.mul_(1.0 / math.sqrt(2.0))
             self.linears_m.append(fc)
 
         for p in self.parameters():
@@ -655,7 +807,7 @@ class SO2Linear(nn.Module):
         out = x2.new_zeros(batch, ebed_dim, self.out_channels)
 
         # m = 0 group
-        m0_idx = self._m0_idx.to(device=x.device)
+        m0_idx = self.m0_idx
         x_m0 = x2[:, m0_idx, :].reshape(batch, -1)
         y_m0 = self.linear_m0(x_m0).reshape(batch, m0_idx.numel(), self.out_channels)
         out[:, m0_idx, :] = y_m0
@@ -663,8 +815,8 @@ class SO2Linear(nn.Module):
 
         # |m| > 0 groups: complex mixing via 2x2 block structure
         for m, linear in enumerate(self.linears_m, start=1):
-            pos_idx = getattr(self, f"_pos_idx_{m}").to(device=x.device)
-            neg_idx = getattr(self, f"_neg_idx_{m}").to(device=x.device)
+            pos_idx = getattr(self, f"pos_idx_{m}")
+            neg_idx = getattr(self, f"neg_idx_{m}")
             num_l = pos_idx.numel()
 
             # Treat (neg, pos) as (Re, Im) complex pair
@@ -697,18 +849,14 @@ class SO2Linear(nn.Module):
     def serialize(self) -> dict[str, Any]:
         return {
             "@class": "SO2Linear",
-            "@version": 1,  # keep 1 at devel stage
+            "@version": 1,
             "lmax": self.lmax,
             "in_channels": self.in_channels,
             "out_channels": self.out_channels,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "bias0": to_numpy_array(self.bias0),
-            "linear_m0": {
-                "weight": to_numpy_array(self.linear_m0.weight),
-            },
-            "linears_m": [
-                {"weight": to_numpy_array(net.weight)} for net in self.linears_m
-            ],
+            "linear_m0": self.linear_m0.serialize(),
+            "linears_m": [net.serialize() for net in self.linears_m],
         }
 
     @classmethod
@@ -734,18 +882,13 @@ class SO2Linear(nn.Module):
             seed=None,
             trainable=True,
         )
-        obj.linear_m0.weight.data.copy_(
-            torch.as_tensor(
-                data["linear_m0"]["weight"], device=obj.device, dtype=obj.dtype
-            )
-        )
+        obj.linear_m0 = MLPLayer.deserialize(data["linear_m0"])
         obj.bias0.data.copy_(
             torch.as_tensor(data["bias0"], device=obj.device, dtype=obj.dtype)
         )
-        for net, state in zip(obj.linears_m, data["linears_m"]):
-            net.weight.data.copy_(
-                torch.as_tensor(state["weight"], device=obj.device, dtype=obj.dtype)
-            )
+        obj.linears_m = nn.ModuleList(
+            [MLPLayer.deserialize(state) for state in data["linears_m"]]
+        )
         return obj
 
 
@@ -795,40 +938,44 @@ class SO2Convolution(nn.Module):
                     in_channels=self.channels,
                     out_channels=self.channels,
                     dtype=self.dtype,
-                    seed=seed,
+                    seed=child_seed(seed, i),
                     trainable=trainable,
                 )
-                for _ in range(self.so2_layers)
+                for i in range(self.so2_layers)
             ]
         )
 
-        # === Step 2. Intermediate activation (for layers 2+) ===
+        # === Step 2. Non-linearity Operators (for layers 2+) ===
         if self.so2_layers > 1:
-            self.intermediate_activations = nn.ModuleList(
+            self.non_linearities = nn.ModuleList(
                 [
                     GatedActivation(
-                        lmax=self.lmax, channels=self.channels, dtype=self.dtype
+                        lmax=self.lmax,
+                        channels=self.channels,
+                        dtype=self.dtype,
+                        trainable=trainable,
+                        seed=child_seed(seed, self.so2_layers + i),
                     )
-                    for _ in range(self.so2_layers - 1)
+                    for i in range(self.so2_layers - 1)
                 ]
             )
         else:
-            self.intermediate_activations = None
+            self.non_linearities = None
 
         # === Step 3. Radial weights per l and output channel: (E, (lmax+1)*C) ===
         self.radial_net = EmbeddingNet(
-            self.n_radial,
+            self.n_radial + 2 * self.channels,
             [*radial_hidden, (self.lmax + 1) * self.channels],
             activation_function=activation_function,
             precision=self.precision,
             resnet_dt=False,
-            seed=seed,
+            seed=child_seed(seed, 2 * self.so2_layers),
             trainable=trainable,
         )
 
         self.register_buffer(
-            "_degree_index",
-            _build_degree_index(self.lmax, device=self.device),
+            "degree_index",
+            _map_degree_idx(self.lmax, device=self.device),
             persistent=True,
         )
 
@@ -865,9 +1012,14 @@ class SO2Convolution(nn.Module):
         x_local = torch.cat(x_local_parts, dim=1)  # (E, D, C)
 
         # === Step 2. Radial interaction (per-l) + strict smooth cutoff ===
-        rad = self.radial_net(edge_cache.edge_rbf)  # (E, (lmax+1)*C)
+        # With atom type embeddings as additional edge features.
+        rad_in = torch.cat(
+            [edge_cache.edge_rbf, edge_cache.src_type_feat, edge_cache.dst_type_feat],
+            dim=-1,
+        )  # (E, n_rbf + 2C)
+        rad = self.radial_net(rad_in)  # (E, (lmax+1)*C)
         rad = rad.view(edge_cache.num_edges, self.lmax + 1, self.channels)
-        degree_idx = self._degree_index.to(device=x.device)[: self.ebed_dim]
+        degree_idx = self.degree_index[: self.ebed_dim]  # for pyramid l_schedule
         rad_expanded = rad[:, degree_idx, :]  # (E, D, C)
 
         # Apply smooth weight.
@@ -887,11 +1039,8 @@ class SO2Convolution(nn.Module):
                 )
 
             # Apply non-linearity between SO2 layers (not after the last).
-            if (
-                layer_idx < self.so2_layers - 1
-                and self.intermediate_activations is not None
-            ):
-                x_local = self.intermediate_activations[layer_idx](x_local)
+            if layer_idx < self.so2_layers - 1 and self.non_linearities is not None:
+                x_local = self.non_linearities[layer_idx](x_local)
 
         # === Step 4. Rotate back to global frame (block-wise) ===
         x_global_parts: list[torch.Tensor] = []
@@ -920,6 +1069,11 @@ class SO2Convolution(nn.Module):
             "n_radial": self.n_radial,
             "so2_layers": self.so2_layers,
             "so2_linears": [net.serialize() for net in self.so2_linears],
+            "non_linearities": (
+                [act.serialize() for act in self.non_linearities]
+                if self.non_linearities is not None
+                else None
+            ),
             "radial_net": self.radial_net.serialize(),
             "precision": RESERVED_PRECISION_DICT[self.dtype],
         }
@@ -960,6 +1114,13 @@ class SO2Convolution(nn.Module):
                 restored = SO2Linear.deserialize(data["so2_linear"])
                 obj.so2_linears[0].load_state_dict(restored.state_dict())
 
+        # Restore non-linearity operators
+        non_linearities_data = data.get("non_linearities")
+        if non_linearities_data is not None and obj.non_linearities is not None:
+            for act, state in zip(obj.non_linearities, non_linearities_data):
+                restored = GatedActivation.deserialize(state)
+                act.load_state_dict(restored.state_dict())
+
         obj.radial_net = EmbeddingNet.deserialize(data["radial_net"])
         return obj
 
@@ -972,7 +1133,7 @@ class EquivariantFFN(nn.Module):
 
     GatedActivation serves as the unified "activation" for equivariant networks,
     analogous to SiLU in standard MLPs, but respecting SO(3) equivariance:
-    - l=0: SiLU activation
+    - l=0: Uses the specified activation function
     - l>0: sigmoid gate from l=0 scalar features
 
     Parameters
@@ -985,8 +1146,12 @@ class EquivariantFFN(nn.Module):
         Hidden dimension for the FFN.
     dtype
         Parameter dtype.
+    activation_function
+        Activation function for l=0 components (e.g., "silu", "tanh", "gelu").
     trainable
         Whether parameters are trainable.
+    seed
+        Random seed for weight initialization.
     """
 
     def __init__(
@@ -996,7 +1161,9 @@ class EquivariantFFN(nn.Module):
         channels: int,
         hidden_channels: int,
         dtype: torch.dtype,
+        activation_function: str = "silu",
         trainable: bool,
+        seed: int | list[int] | None = None,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -1004,35 +1171,45 @@ class EquivariantFFN(nn.Module):
         self.hidden_channels = int(hidden_channels)
         self.dtype = dtype
         self.device = env.DEVICE
+        self.precision = RESERVED_PRECISION_DICT[dtype]
 
         # === Per-degree input projection: C -> hidden ===
         self.linear_in = nn.ModuleList()
         for l in range(self.lmax + 1):
             self.linear_in.append(
-                nn.Linear(
+                MLPLayer(
                     self.channels,
                     self.hidden_channels,
                     bias=(l == 0),
-                    device=self.device,
-                    dtype=self.dtype,
+                    activation_function="linear",
+                    precision=self.precision,
+                    seed=child_seed(seed, l),
+                    trainable=trainable,
                 )
             )
 
         # === Equivariant activation ===
         self.act = GatedActivation(
-            lmax=self.lmax, channels=self.hidden_channels, dtype=self.dtype
+            lmax=self.lmax,
+            channels=self.hidden_channels,
+            dtype=dtype,
+            activation_function=activation_function,
+            trainable=trainable,
+            seed=child_seed(seed, self.lmax + 1),
         )
 
         # === Per-degree output projection: hidden -> C ===
         self.linear_out = nn.ModuleList()
         for l in range(self.lmax + 1):
             self.linear_out.append(
-                nn.Linear(
+                MLPLayer(
                     self.hidden_channels,
                     self.channels,
                     bias=(l == 0),
-                    device=self.device,
-                    dtype=self.dtype,
+                    activation_function="linear",
+                    precision=self.precision,
+                    seed=child_seed(seed, self.lmax + 1 + l),
+                    trainable=trainable,
                 )
             )
 
@@ -1075,7 +1252,6 @@ class EquivariantFFN(nn.Module):
         return out
 
     def serialize(self) -> dict[str, Any]:
-        """Serialize EquivariantFFN parameters."""
         return {
             "@class": "EquivariantFFN",
             "@version": 1,
@@ -1083,35 +1259,14 @@ class EquivariantFFN(nn.Module):
             "channels": self.channels,
             "hidden_channels": self.hidden_channels,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
-            "linear_in": [
-                {
-                    "weight": to_numpy_array(layer.weight),
-                    "bias": to_numpy_array(layer.bias)
-                    if layer.bias is not None
-                    else None,
-                }
-                for layer in self.linear_in
-            ],
-            "linear_out": [
-                {
-                    "weight": to_numpy_array(layer.weight),
-                    "bias": to_numpy_array(layer.bias)
-                    if layer.bias is not None
-                    else None,
-                }
-                for layer in self.linear_out
-            ],
-            "gate_linear": {
-                "weight": to_numpy_array(self.act.gate_linear.weight),
-                "bias": to_numpy_array(self.act.gate_linear.bias),
-            }
-            if self.act.gate_linear is not None
-            else None,
+            "activation_function": self.act.scalar_act.activation,
+            "linear_in": [layer.serialize() for layer in self.linear_in],
+            "linear_out": [layer.serialize() for layer in self.linear_out],
+            "act": self.act.serialize(),
         }
 
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> EquivariantFFN:
-        """Deserialize EquivariantFFN parameters."""
         data = data.copy()
         data_cls = data.pop("@class")
         if data_cls != "EquivariantFFN":
@@ -1121,48 +1276,24 @@ class EquivariantFFN(nn.Module):
             raise ValueError(f"Unsupported EquivariantFFN version: {version}")
 
         precision = data["precision"]
+        activation_function = data.get("activation_function", "silu")
         obj = cls(
             lmax=int(data["lmax"]),
             channels=int(data["channels"]),
             hidden_channels=int(data["hidden_channels"]),
             dtype=PRECISION_DICT[precision],
+            activation_function=activation_function,
             trainable=True,
+            seed=None,
         )
 
-        for layer, state in zip(obj.linear_in, data["linear_in"]):
-            layer.weight.data.copy_(
-                torch.as_tensor(state["weight"], device=obj.device, dtype=obj.dtype)
-            )
-            if state["bias"] is not None and layer.bias is not None:
-                layer.bias.data.copy_(
-                    torch.as_tensor(state["bias"], device=obj.device, dtype=obj.dtype)
-                )
-
-        for layer, state in zip(obj.linear_out, data["linear_out"]):
-            layer.weight.data.copy_(
-                torch.as_tensor(state["weight"], device=obj.device, dtype=obj.dtype)
-            )
-            if state["bias"] is not None and layer.bias is not None:
-                layer.bias.data.copy_(
-                    torch.as_tensor(state["bias"], device=obj.device, dtype=obj.dtype)
-                )
-
-        gate_linear_data = data["gate_linear"]
-        if (gate_linear_data is None) != (obj.act.gate_linear is None):
-            raise ValueError("EquivariantFFN gate_linear mismatch")
-
-        if obj.act.gate_linear is not None:
-            obj.act.gate_linear.weight.data.copy_(
-                torch.as_tensor(
-                    gate_linear_data["weight"], device=obj.device, dtype=obj.dtype
-                )
-            )
-            obj.act.gate_linear.bias.data.copy_(
-                torch.as_tensor(
-                    gate_linear_data["bias"], device=obj.device, dtype=obj.dtype
-                )
-            )
-
+        obj.linear_in = nn.ModuleList(
+            [MLPLayer.deserialize(state) for state in data["linear_in"]]
+        )
+        obj.linear_out = nn.ModuleList(
+            [MLPLayer.deserialize(state) for state in data["linear_out"]]
+        )
+        obj.act = GatedActivation.deserialize(data["act"])
         return obj
 
 
@@ -1172,6 +1303,29 @@ class SeZMInteractionBlock(nn.Module):
 
     The FFN operates on ALL degrees (l=0 to lmax), using a gated activation where
     scalar features (l=0) control the gating of higher-degree features (l>0).
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+    channels
+        Number of channels per (l, m) coefficient.
+    n_radial
+        Number of radial basis functions.
+    radial_hidden
+        Hidden layer sizes for radial network.
+    so2_layers
+        Number of SO(2) mixing layers.
+    ffn_neuron
+        Hidden layer sizes for FFN.
+    activation_function
+        Activation function for l=0 components.
+    dtype
+        Parameter dtype.
+    seed
+        Random seed for weight initialization.
+    trainable
+        Whether parameters are trainable.
     """
 
     def __init__(
@@ -1192,11 +1346,19 @@ class SeZMInteractionBlock(nn.Module):
         self.lmax = int(lmax)
         self.channels = int(channels)
         self.so2_layers = int(so2_layers)
+        self.dtype = dtype
         self.precision = RESERVED_PRECISION_DICT[dtype]
 
-        self.norm = SeparableRMSNorm(self.lmax, self.channels, dtype=dtype)
+        self.norm = SeparableRMSNorm(
+            self.lmax, self.channels, dtype=dtype, trainable=trainable
+        )
         self.gating = GatedActivation(
-            lmax=self.lmax, channels=self.channels, dtype=dtype
+            lmax=self.lmax,
+            channels=self.channels,
+            dtype=dtype,
+            activation_function=activation_function,
+            trainable=trainable,
+            seed=child_seed(seed, 0),
         )
 
         self.per_l_linear = PerDegreeLinearV2(
@@ -1204,6 +1366,7 @@ class SeZMInteractionBlock(nn.Module):
             channels=self.channels,
             dtype=dtype,
             trainable=trainable,
+            seed=child_seed(seed, 1),
         )
 
         self.conv = SO2Convolution(
@@ -1214,7 +1377,7 @@ class SeZMInteractionBlock(nn.Module):
             so2_layers=self.so2_layers,
             activation_function=activation_function,
             dtype=dtype,
-            seed=seed,
+            seed=child_seed(seed, 2),
             trainable=trainable,
         )
 
@@ -1224,7 +1387,9 @@ class SeZMInteractionBlock(nn.Module):
             channels=self.channels,
             hidden_channels=hidden_channels,
             dtype=dtype,
+            activation_function=activation_function,
             trainable=trainable,
+            seed=child_seed(seed, 3),
         )
 
     def forward(self, x: torch.Tensor, edge_cache: Any) -> torch.Tensor:
@@ -1241,12 +1406,63 @@ class SeZMInteractionBlock(nn.Module):
         torch.Tensor
             Updated features with shape (N, D, C).
         """
-        x = self.norm(x)
-        x = self.per_l_linear(x)
+        x_norm = self.norm(x)
+        x_norm = self.per_l_linear(x_norm)
 
         if edge_cache.num_edges > 0:
-            x = x + self.conv(x, edge_cache)
+            x = x + self.conv(x_norm, edge_cache)
 
         x = self.gating(x)
         x = x + self.ffn(x)
         return x
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "SeZMInteractionBlock",
+            "@version": 1,
+            "lmax": self.lmax,
+            "channels": self.channels,
+            "n_radial": self.conv.n_radial,
+            "so2_layers": self.so2_layers,
+            "ffn_neuron": [self.ffn.hidden_channels],
+            "activation_function": self.gating.scalar_act.activation,
+            "precision": RESERVED_PRECISION_DICT[self.dtype],
+            "norm": self.norm.serialize(),
+            "gating": self.gating.serialize(),
+            "per_l_linear": self.per_l_linear.serialize(),
+            "conv": self.conv.serialize(),
+            "ffn": self.ffn.serialize(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> SeZMInteractionBlock:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "SeZMInteractionBlock":
+            raise ValueError(f"Invalid class for SeZMInteractionBlock: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported SeZMInteractionBlock version: {version}")
+
+        precision = data["precision"]
+        dtype = PRECISION_DICT[precision]
+        activation_function = data.get("activation_function", "silu")
+        obj = cls(
+            lmax=int(data["lmax"]),
+            channels=int(data["channels"]),
+            n_radial=int(data["n_radial"]),
+            radial_hidden=[],
+            so2_layers=int(data["so2_layers"]),
+            ffn_neuron=data["ffn_neuron"],
+            activation_function=activation_function,
+            dtype=dtype,
+            seed=None,
+            trainable=True,
+        )
+
+        obj.norm = SeparableRMSNorm.deserialize(data["norm"])
+        obj.gating = GatedActivation.deserialize(data["gating"])
+        obj.per_l_linear = PerDegreeLinearV2.deserialize(data["per_l_linear"])
+        obj.conv = SO2Convolution.deserialize(data["conv"])
+        obj.ffn = EquivariantFFN.deserialize(data["ffn"])
+        return obj

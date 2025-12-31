@@ -25,7 +25,7 @@ This document is the **final spec** for the `se_zm_net` PyTorch descriptor imple
 4. **Speed mandate: single geometry/Wigner pass**
    - Edge geometry and Wigner-D rotation blocks are computed **once per `forward()`** and reused by all blocks.
    - No interaction block is allowed to recompute:
-     - `edge_vec / edge_len / edge_unit`
+     - `edge_vec`
      - envelope / radial basis
      - edge-aligned rotation matrices
      - Wigner-D blocks
@@ -45,11 +45,11 @@ Text diagram (single forward pass):
 ```
 Inputs (extended_coord, extended_atype, nlist, mapping)
   └─ EdgeFeatureCache (built once)
-       ├─ edges: (src, dst), edge_vec, edge_len, edge_unit
+       ├─ edges: (src, dst), edge_vec
+       ├─ node_type_feat: type embedding for nodes
        ├─ edge_rbf: Bessel radial basis × C² envelope (trainable frequencies)
        ├─ edge_sw: DeePMD smooth weights in flattened edge layout
        ├─ D_list[l], Dt_list[l]: Wigner-D blocks per l
-       ├─ sw: DeePMD smooth weights for (nf, nloc, nnei, 1)
        └─ inv_sqrt_deg: inverse sqrt degree for normalization
 
 Node init:
@@ -198,9 +198,8 @@ Edge cache holds **only valid edges**:
 Let `E` be the number of valid edges:
 
 - `src`, `dst`: `(E,)` flattened node indices in `[0, N)`
+- `node_type_feat`: `(N, C)` type embeddings for nodes (used to derive per-edge type features by indexing)
 - `edge_vec`: `(E, 3)` in Å
-- `edge_len`: `(E, 1)` in Å
-- `edge_unit`: `(E, 3)` unit vector
 - `edge_rbf`: `(E, n_radial)` Bessel radial basis × C² envelope (trainable frequencies)
 - `edge_sw`: `(E, 1)` DeePMD smooth weight flattened to valid edges
 - `D_list[l]`: `(E, 2l+1, 2l+1)` real-basis Wigner-D block
@@ -226,7 +225,10 @@ Definition:
 For each edge `(src -> dst)`:
 
 1. **Rotate to local frame**: apply `D_list[l]` per degree (l)
-2. **Radial interaction**: radial MLP outputs per-`l` weights and modulates local features
+2. **Radial interaction**: radial MLP outputs per-`l` weights and modulates local features.
+   The radial MLP takes edge invariants plus type priors as input:
+   - `rad_in = concat(edge_rbf, src_type_feat, dst_type_feat)` with shape `(E, n_radial + 2C)`
+   - `rad = radial_net(rad_in)` with shape `(E, (lmax+1) * C)`
 3. **Strict smooth cutoff**: multiply by `edge_sw` (all terms vanish at `rcut`, envelope already baked into `edge_rbf`)
 4. **Multi-layer SO(2) mixing**: for each layer in `so2_linears`:
    - Apply `SO2Linear` (group by `|m|`):
@@ -271,13 +273,13 @@ Key properties:
 
 SeZM-Net supports:
 
-1. constant `lmax` (legacy style): `l_schedule = [lmax] * n_blocks`
+1. constant `lmax` (default): `l_schedule = [lmax] * n_blocks`
 2. explicit pyramid: `l_schedule = [2, 2, 1, 0]` (example)
 
 Rules:
 
 - `l_schedule` must be **non-increasing**
-- final entry must be **0** to fully drop higher-degree components
+- final entry does NOT need to be 0 (output always extracts only l=0 features)
 - when schedule decreases, higher-`l` channels are **physically discarded**
 - later blocks operate on smaller `ebed_dim`, reducing compute
 
@@ -300,11 +302,28 @@ Key arguments:
 - `n_blocks: int` — Number of blocks (only if `l_schedule` is None)
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neuron: list[int]` — Hidden sizes for equivariant FFN (first element used as hidden_channels)
-- `wigner_parallel: bool` — If True, use block-diagonal parallel Wigner-D (`O(E * D^2)` memory, faster for small `E`)
+- `use_parallel: bool` — If True, use the parallel operations, which requires more memory. For example, use block-diagonal parallel Wigner-D (`O(E * D^2)` memory, faster for small `E`)
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
+
+### Interface Compatibility Notes
+
+SeZM-Net uses `_ENV_DIM = 1` (se_r style) for `EnvMatStatSe` compatibility. This means:
+
+- `ndescrpt = nnei * 1` (only radial statistics are collected)
+- The `env_protection` parameter is kept for interface compatibility but is not actively used
+- `mean` and `stddev` statistics are maintained but not used in the forward pass (SeZM-Net uses radial basis functions directly instead of traditional env_mat)
+
+### Multi-layer SO(2) Convolution
+
+The `SO2Convolution` module supports multiple `SO2Linear` layers with intermediate `GatedActivation`:
+
+- `so2_layers=1`: Single `SO2Linear` layer
+- `so2_layers>=2`: `SO2Linear` -> (`GatedActivation` -> `SO2Linear`) x (so2_layers-1)
+
+The intermediate activations are properly serialized/deserialized to ensure model state consistency.
 
 Output:
 
@@ -379,7 +398,7 @@ where `dim_full = (lmax+1)² = ebed_dim`.
 
 - `rot_mat` is a global->local transform for 3D vectors:
   - `v_local = rot_mat @ v_global`
-  - It is built by either `init_edge_rot_mat(edge_vec)` (Gram-Schmidt with a reference-axis switch) or `init_edge_rot_mat_frisvad(edge_vec)` (Frisvad ONB with a strict cross-product fallback near `-Z`) so that `rot_mat @ edge_unit = (0, 0, 1)`.
+  - It is built by either `init_edge_rot_mat(edge_vec)` (Gram-Schmidt with a reference-axis switch) or `init_edge_rot_mat_frisvad(edge_vec)` (Frisvad ONB with a strict cross-product fallback near `-Z`) so that `rot_mat @ (edge_vec / ||edge_vec||) = (0, 0, 1)`.
 - For each degree `l`, real SH channels are ordered by `m=-l..+l` (index `i = m + l`).
 - `D_list[l]` / `Dt_list[l]` are real-basis Wigner-D blocks:
   - `D_list[l]`: `(E, 2l+1, 2l+1)` and represents the same global->local rotation as `rot_mat`.
@@ -521,3 +540,40 @@ What is cached:
 What is not cached:
 
 - Block-specific radial MLP outputs (depend on block parameters).
+
+---
+
+## DeePMD Interface Compatibility
+
+SeZM-Net follows the **new-style descriptor interface** (same as `dpa3`), using `extended_coord` / `extended_atype` parameter names (instead of `coord_ext` / `atype_ext` used by older descriptors like `se_a` and `se_r`).
+
+### Implemented abstract methods
+
+All required `BaseDescriptor` abstract methods are implemented:
+
+- `get_rcut()` / `get_rcut_smth()` — Return cutoff radii
+- `get_sel()` / `get_ntypes()` / `get_nsel()` / `get_nnei()` — Return neighbor selection info
+- `get_type_map()` — Return type name mapping
+- `get_dim_out()` / `get_dim_emb()` — Return output dimensions
+- `mixed_types()` — Returns `False` (uses type-distinguished neighbor list)
+- `has_message_passing()` — Returns `True` (uses edge message passing)
+- `need_sorted_nlist_for_lower()` — Returns `False`
+- `get_env_protection()` — Return protection parameter
+- `set_stat_mean_and_stddev()` / `get_stat_mean_and_stddev()` — Statistics accessors
+- `forward()` — Core descriptor computation
+- `serialize()` / `deserialize()` — Model persistence
+- `update_sel()` — Classmethod for neighbor statistics
+- `compute_input_stats()` — Compute env_mat statistics via `EnvMatStatSe`
+- `reinit_exclude()` — Update excluded type pairs
+- `__setitem__()` / `__getitem__()` — Dict-like access for `davg`/`dstd`
+
+### Not implemented (raises NotImplementedError)
+
+- `share_params()` — Multi-task parameter sharing not implemented yet
+- `change_type_map()` — Type map changing not implemented yet
+
+### Interface notes
+
+1. **`_ENV_DIM = 1`** — Uses `se_r` style (radial only) for `EnvMatStatSe` compatibility
+2. **Precision handling** — Submodules accept `dtype: torch.dtype` parameter and store both `self.dtype` and `self.precision = RESERVED_PRECISION_DICT[dtype]` for serialization
+3. **Statistics buffers** — `mean`/`stddev` are maintained for interface compatibility but not actively used in forward (SeZM-Net uses radial basis functions directly)

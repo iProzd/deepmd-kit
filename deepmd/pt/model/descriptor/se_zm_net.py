@@ -62,10 +62,7 @@ from .base_descriptor import (
     BaseDescriptor,
 )
 from .se_zm_block import (
-    EquivariantFFN,
-    PerDegreeLinear,
     SeZMInteractionBlock,
-    SO2Convolution,
     _so3_dim_of_lmax,
 )
 from .wigner_d import (
@@ -81,9 +78,6 @@ if TYPE_CHECKING:
 
     from deepmd.utils.data_system import (
         DeepmdDataSystem,
-    )
-    from deepmd.utils.env_mat_stat import (
-        StatItem,
     )
     from deepmd.utils.path import (
         DPPath,
@@ -153,12 +147,12 @@ def init_edge_rot_mat(edge_vec: torch.Tensor) -> torch.Tensor:
     Parameters
     ----------
     edge_vec
-        Edge vectors with shape (n_edges, 3).
+        Edge vectors with shape (E, 3).
 
     Returns
     -------
     torch.Tensor
-        Rotation matrices with shape (n_edges, 3, 3).
+        Rotation matrices with shape (E, 3, 3).
     """
     # === Step 1. Normalize edge direction (local z) ===
     # z_hat is the unit edge direction (center -> neighbor).
@@ -228,12 +222,12 @@ def init_edge_rot_mat_frisvad(edge_vec: torch.Tensor) -> torch.Tensor:
     Parameters
     ----------
     edge_vec
-        Edge vectors with shape (n_edges, 3).
+        Edge vectors with shape (E, 3).
 
     Returns
     -------
     torch.Tensor
-        Rotation matrices with shape (n_edges, 3, 3).
+        Rotation matrices with shape (E, 3, 3).
     """
     # === Step 1. Normalize edge direction (local z) ===
     # z_hat is the unit edge direction (center -> neighbor).
@@ -385,7 +379,7 @@ class RadialBasis(nn.Module):
         Returns
         -------
         torch.Tensor
-            Radial basis multiplied by C^2 cutoff envelope with shape (..., n_radial).
+            Radial basis multiplied by C^2 cutoff envelope with shape (..., n_rbf).
             The output is smoothly truncated to zero at r = rcut.
         """
         # === Step 1. Avoid division by zero (preserve r->0 limit) ===
@@ -446,21 +440,43 @@ class EdgeFeatureCache:
     - edge_rbf already includes the C^2 cutoff envelope for smoothness
     """
 
-    src: torch.Tensor  # (n_edges,)
-    dst: torch.Tensor  # (n_edges,)
-    edge_vec: torch.Tensor  # (n_edges, 3)
-    edge_len: torch.Tensor  # (n_edges, 1)
-    edge_unit: torch.Tensor  # (n_edges, 3)
-    edge_rbf: torch.Tensor  # (n_edges, n_rbf)
-    edge_sw: torch.Tensor  # (n_edges, 1)
-    D_list: list[torch.Tensor]  # D_list[l] : (n_edges, 2l+1, 2l+1)
-    Dt_list: list[torch.Tensor]  # transpose/inverse blocks
-    sw: torch.Tensor  # (nf, nloc, nnei, 1)
+    src: torch.Tensor  # (E,)
+    dst: torch.Tensor  # (E,)
+    node_type_feat: torch.Tensor  # (N, C)
+    edge_vec: torch.Tensor  # (E, 3)
+    edge_rbf: torch.Tensor  # (E, n_rbf)
+    edge_sw: torch.Tensor  # (E, 1)
+    D_list: list[torch.Tensor]  # D_list[l] : (E, 2l+1, 2l+1)
+    Dt_list: list[torch.Tensor]  # transposed/inversed D_list, i.e D^-1
     inv_sqrt_deg: torch.Tensor  # (N, 1, 1)
 
     @property
     def num_edges(self) -> int:
         return int(self.src.numel())
+
+    @property
+    def src_type_feat(self) -> torch.Tensor:
+        """
+        Return per-edge source type features.
+
+        Returns
+        -------
+        torch.Tensor
+            Type features with shape (E, C).
+        """
+        return self.node_type_feat[self.src]
+
+    @property
+    def dst_type_feat(self) -> torch.Tensor:
+        """
+        Return per-edge destination type features.
+
+        Returns
+        -------
+        torch.Tensor
+            Type features with shape (E, C).
+        """
+        return self.node_type_feat[self.dst]
 
 
 class GeometricInitialEmbedding(nn.Module):
@@ -536,8 +552,8 @@ class GeometricInitialEmbedding(nn.Module):
 
         device = edge_cache.edge_vec.device
         dtype = edge_cache.edge_vec.dtype
-        edge_sw = edge_cache.edge_sw  # (n_edges, 1)
-        # Output shape: (n_edges, lmax, channels) for l=1..lmax
+        edge_sw = edge_cache.edge_sw  # (E, 1)
+        # Output shape: (E, lmax, C) for l=1..lmax
         radial = self.radial_net(edge_cache.edge_rbf).view(
             edge_cache.num_edges, self.lmax, self.channels
         )
@@ -553,9 +569,9 @@ class GeometricInitialEmbedding(nn.Module):
                 start += dim
                 continue
             m0 = l  # packed index of m=0 inside this l-block
-            d_col = edge_cache.Dt_list[l][:, :, m0]  # (n_edges, 2l+1)
+            d_col = edge_cache.Dt_list[l][:, :, m0]  # (E, 2l+1)
             msg_global = d_col.unsqueeze(-1) * radial[:, l - 1, :].unsqueeze(1)
-            msg_global = msg_global * edge_sw.unsqueeze(-1)  # (n_edges, 2l+1, channels)
+            msg_global = msg_global * edge_sw.unsqueeze(-1)  # (E, 2l+1, C)
 
             out[:, start : start + dim, :].index_add_(0, edge_cache.dst, msg_global)
             start += dim
@@ -564,6 +580,44 @@ class GeometricInitialEmbedding(nn.Module):
         out = out * edge_cache.inv_sqrt_deg
 
         return out
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "GeometricInitialEmbedding",
+            "@version": 1,
+            "lmax": self.lmax,
+            "channels": self.channels,
+            "n_radial": self.n_radial,
+            "precision": RESERVED_PRECISION_DICT[self.dtype],
+            "radial_net": self.radial_net.serialize(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> GeometricInitialEmbedding:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "GeometricInitialEmbedding":
+            raise ValueError(f"Invalid class for GeometricInitialEmbedding: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(
+                f"Unsupported GeometricInitialEmbedding version: {version}"
+            )
+
+        precision = data["precision"]
+        dtype = PRECISION_DICT[precision]
+        obj = cls(
+            lmax=int(data["lmax"]),
+            channels=int(data["channels"]),
+            n_radial=int(data["n_radial"]),
+            radial_hidden=[],
+            activation_function="silu",
+            dtype=dtype,
+            seed=None,
+            trainable=True,
+        )
+        obj.radial_net = EmbeddingNet.deserialize(data["radial_net"])
+        return obj
 
 
 @BaseDescriptor.register("se_zm_net")
@@ -594,8 +648,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Number of blocks (only used when `l_schedule` is None).
     ffn_neuron
         Hidden sizes for the l=0 FFN in each block.
-    wigner_parallel
-        If True, use the block-diagonal parallel Wigner-D implementation.
+    use_parallel
+        If True, use the parallel operations, which requires more memory. For example, use block-diagonal parallel Wigner-D (`O(E * D^2)` memory, faster for small `E`).
     set_davg_zero
         If True, keep mean at zeros when computing stats.
     activation_function
@@ -605,7 +659,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     exclude_types
         List of excluded type pairs.
     env_protection
-        Protection parameter for DeePMD env-mat stat (kept for compatibility).
+        Protection parameter (kept for interface compatibility, not actively used).
     trainable
         Whether parameters are trainable.
     seed
@@ -614,9 +668,16 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Number of element types.
     type_map
         Type names.
+
+    Notes
+    -----
+    SeZM-Net does not use the traditional environment matrix (r, a_x, a_y, a_z).
+    Instead, it uses radial basis functions and spherical harmonics directly.
+    The env_protection and mean/stddev statistics are kept for interface
+    compatibility but are not actively used in the forward pass.
     """
 
-    _ENV_DIM: int = 4
+    _ENV_DIM: int = 1  # Use se_r style (radial only) for EnvMatStatSe compatibility
 
     def __init__(
         self,
@@ -632,15 +693,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         n_blocks: int = 4,
         so2_layers: int = 2,
         ffn_neuron: list[int] = [128],
-        wigner_parallel: bool = False,
+        use_parallel: bool = False,
         set_davg_zero: bool = False,
         activation_function: str = "silu",
-        precision: str = "float64",
+        precision: str = "float32",
         exclude_types: list[tuple[int, int]] = [],
         env_protection: float = 0.0,
         trainable: bool = True,
         seed: int | list[int] | None = None,
-        ntypes: int | None = None,
         type_map: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
@@ -651,7 +711,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.rcut_smth = float(rcut_smth)
         self.env_protection = float(env_protection)
 
-        self.sel = _as_int_list(sel, ntypes=ntypes)
+        self.sel = _as_int_list(sel, ntypes=len(sel) if isinstance(sel, list) else None)
         self.ntypes = len(self.sel)
         self.type_map = type_map
         self.nnei = int(sum(self.sel))
@@ -662,7 +722,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.radial_mlp = list(radial_mlp)
         self.so2_layers = int(so2_layers)
         self.ffn_neuron = list(ffn_neuron)
-        self.wigner_parallel = bool(wigner_parallel)
+        self.use_parallel = bool(use_parallel)
 
         self.set_davg_zero = bool(set_davg_zero)
         self.activation_function = str(activation_function)
@@ -675,6 +735,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 1. L schedule ===
         if l_schedule is None:
+            # Default: all blocks use lmax
+            # e.g., lmax=2, n_blocks=4 -> [2, 2, 2, 2]
             self.l_schedule = [int(lmax)] * int(n_blocks)
         else:
             self.l_schedule = [int(x) for x in l_schedule]
@@ -687,8 +749,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             for i in range(len(self.l_schedule) - 1)
         ):
             raise ValueError("`l_schedule` must be non-increasing (pyramid schedule)")
-        if self.l_schedule[-1] != 0:
-            raise ValueError("`l_schedule` must end at 0 for stable cutoff handling")
 
         self.lmax = int(self.l_schedule[0])
 
@@ -698,7 +758,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         stddev = torch.ones(_shape, dtype=self.dtype, device=self.device)
         self.register_buffer("mean", mean)
         self.register_buffer("stddev", stddev)
-        self.stats: dict[str, StatItem] | None = None
+        self.stats: dict[str, Any] | None = None
 
         # === Step 3. Excluded type pairs ===
         self.reinit_exclude(exclude_types)
@@ -719,7 +779,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             dtype=self.dtype,
         )
         wigner_lmax = self.l_schedule[0]
-        if self.wigner_parallel:
+        if self.use_parallel:
             self.wigner_calc: WignerDCalcBase = WignerDCalcParallel(
                 lmax=wigner_lmax, dtype=self.dtype
             )
@@ -798,10 +858,43 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     def get_env_protection(self) -> float:
         return self.env_protection
 
+    @property
+    def dim_out(self) -> int:
+        return self.get_dim_out()
+
+    @property
+    def dim_emb(self) -> int:
+        return self.get_dim_emb()
+
     def share_params(
         self, base_class: Any, shared_level: int, resume: bool = False
     ) -> None:
         raise NotImplementedError("share_params is not supported for se_zm_net")
+
+    def enable_compression(
+        self,
+        min_nbor_dist: float,
+        table_extrapolate: float = 5,
+        table_stride_1: float = 0.01,
+        table_stride_2: float = 0.1,
+        check_frequency: int = -1,
+    ) -> None:
+        """Receive the statistics (distance, max_nbor_size and env_mat_range) of the training data.
+
+        Parameters
+        ----------
+        min_nbor_dist
+            The nearest distance between atoms
+        table_extrapolate
+            The scale of model extrapolation
+        table_stride_1
+            The uniform stride of the first table
+        table_stride_2
+            The uniform stride of the second table
+        check_frequency
+            The overflow check frequency
+        """
+        raise NotImplementedError("Compression is unsupported for se_zm_net.")
 
     def change_type_map(
         self, type_map: list[str], model_with_new_type_stat: Any | None = None
@@ -826,13 +919,33 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         return self.mean, self.stddev
 
     def compute_input_stats(
-        self, merged: Callable[[], list[dict]] | list[dict], path: DPPath | None = None
+        self,
+        merged: Callable[[], list[dict]] | list[dict],
+        path: DPPath | None = None,
     ) -> None:
+        """
+        Compute the input statistics (e.g. mean and stddev) for the descriptors from packed data.
+
+        Parameters
+        ----------
+        merged : Callable[[], list[dict]] | list[dict]
+            - list[dict]: A list of data samples from various data systems.
+                Each element, `merged[i]`, is a data dictionary containing `keys`: `torch.Tensor`
+                originating from the `i`-th data system.
+            - Callable[[], list[dict]]: A lazy function that returns data samples in the above format
+                only when needed. Since the sampling process can be slow and memory-intensive,
+                the lazy function helps by only sampling once.
+        path : Optional[DPPath]
+            The path to the stat file.
+        """
         env_mat_stat = EnvMatStatSe(self)
         if path is not None:
             path = path / env_mat_stat.get_hash()
         if path is None or not path.is_dir():
-            sampled = merged() if callable(merged) else merged
+            if callable(merged):
+                sampled = merged()
+            else:
+                sampled = merged
         else:
             sampled = []
         env_mat_stat.load_or_compute_stats(sampled, path)
@@ -840,34 +953,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         mean, stddev = env_mat_stat()
         if not self.set_davg_zero:
             self.mean.copy_(
-                torch.tensor(mean, device=self.device, dtype=self.mean.dtype)
+                torch.tensor(mean, device=env.DEVICE, dtype=self.mean.dtype)
             )
         self.stddev.copy_(
-            torch.tensor(stddev, device=self.device, dtype=self.stddev.dtype)
+            torch.tensor(stddev, device=env.DEVICE, dtype=self.stddev.dtype)
         )
-
-    def get_stats(self) -> dict[str, StatItem]:
-        if self.stats is None:
-            raise RuntimeError(
-                "The statistics of the descriptor has not been computed."
-            )
-        return self.stats
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        if key in ("avg", "data_avg", "davg"):
-            self.mean = value
-            return
-        if key in ("std", "data_std", "dstd"):
-            self.stddev = value
-            return
-        raise KeyError(key)
-
-    def __getitem__(self, key: str) -> Any:
-        if key in ("avg", "data_avg", "davg"):
-            return self.mean
-        if key in ("std", "data_std", "dstd"):
-            return self.stddev
-        raise KeyError(key)
 
     def _apply_zbl_gating_hook(
         self, x0: torch.Tensor, edge_cache: EdgeFeatureCache
@@ -893,12 +983,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     def _build_edge_cache(
         self,
         *,
+        x0: torch.Tensor,
         extended_coord: torch.Tensor,
         extended_atype: torch.Tensor,
         nlist: torch.Tensor,
         mapping: torch.Tensor | None,
         pair_keep_mask: torch.Tensor,
-    ) -> EdgeFeatureCache:
+    ) -> tuple[EdgeFeatureCache, torch.Tensor]:
         """
         Build the global edge cache from DeePMD padded neighbor list.
 
@@ -908,10 +999,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         The resulting cache contains:
 
-        - per-edge geometry: ``edge_vec``, ``edge_len``, ``edge_unit``
-        - per-edge smooth weights: DeePMD smooth weight ``edge_sw`` and C^2 envelope
-          ``edge_envelop`` (kept separate for strict smoothness)
-        - per-edge radial basis: ``edge_rbf`` (raw, without envelope)
+        - per-edge endpoints: ``src``, ``dst`` and node type embeddings ``node_type_feat``
+          (per-edge type features are derived via indexing)
+        - per-edge geometry: ``edge_vec``
+        - per-edge smooth weights: DeePMD smooth weight ``edge_sw``
+        - per-edge radial basis: ``edge_rbf`` (envelope already baked in)
         - per-edge rotation blocks: real-basis Wigner-D matrices ``D_list`` and ``Dt_list``
         - destination-node normalization: ``inv_sqrt_deg`` for neighbor norm
 
@@ -931,6 +1023,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         Parameters
         ----------
+        x0
+            Per-node type embedding with shape (N, C), where N=nf*nloc.
         extended_coord
             Extended coordinates with shape (nf, nall*3).
         extended_atype
@@ -942,6 +1036,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             Mapping from extended indices to local indices with shape (nf, nall), or None.
         pair_keep_mask
             Pair keep mask from `PairExcludeMask` with shape (nf, nloc, nnei). True means keep.
+
+        Returns
+        -------
+        EdgeFeatureCache
+            Per-edge cache.
+        sw
+            Smooth weight with shape (nf, nloc, nnei, 1).
         """
         nf, nloc, nnei = nlist.shape
         n_nodes = int(nf * nloc)
@@ -988,29 +1089,27 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         edge_sw = sw.reshape(-1, 1)[edge_idx]
 
         if edge_idx.numel() == 0:
-            # No edges -> empty cache, but sw is still returned for compatibility.
+            # No edges -> empty cache.
             device = extended_coord.device
             dtype = extended_coord.dtype
             empty_long = torch.empty(0, dtype=torch.long, device=device)
             empty_vec = torch.empty(0, 3, dtype=dtype, device=device)
-            empty_len = torch.empty(0, 1, dtype=dtype, device=device)
             empty_rbf = torch.empty(
                 0, self.radial_basis.n_radial, dtype=dtype, device=device
             )
             inv_sqrt_deg = torch.ones(n_nodes, 1, 1, dtype=dtype, device=device)
-            return EdgeFeatureCache(
+            cache = EdgeFeatureCache(
                 src=empty_long,
                 dst=empty_long,
+                node_type_feat=x0,
                 edge_vec=empty_vec,
-                edge_len=empty_len,
-                edge_unit=empty_vec,
                 edge_rbf=empty_rbf,
                 edge_sw=torch.empty(0, 1, dtype=dtype, device=device),
                 D_list=[torch.empty(0, 1, 1, dtype=dtype, device=device)],
                 Dt_list=[torch.empty(0, 1, 1, dtype=dtype, device=device)],
-                sw=sw,
                 inv_sqrt_deg=inv_sqrt_deg,
             )
+            return cache, sw
 
         # === Step 4. Build flat edge indices and map to (src, dst) nodes ===
         # edge_idx indexes the flattened (nf, nloc, nnei) axis in row-major order.
@@ -1037,7 +1136,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         src_ok = (src_local >= 0) & (src_local < nloc)
         if not bool(src_ok.all()):
             # Drop edges that map outside the local range (e.g. broken mapping or ghost-only neighbor).
-            edge_idx = edge_idx[src_ok]  # (n_edges,)
+            edge_idx = edge_idx[src_ok]  # (E,)
             valid_f_idx = valid_f_idx[src_ok]
             valid_loc_idx = valid_loc_idx[src_ok]
             dst = dst[src_ok]
@@ -1051,14 +1150,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
         diff_flat = diff.reshape(-1, 3)
         length_flat = length.reshape(-1, 1)
-        edge_vec = diff_flat[edge_idx]  # (n_edges, 3)
-        edge_len = length_flat[edge_idx]  # (n_edges, 1)
-
-        # Unit edge direction. safe_norm avoids division-by-zero NaNs.
-        edge_unit = edge_vec / safe_norm(edge_vec)
+        edge_vec = diff_flat[edge_idx]  # (E, 3)
+        edge_len = length_flat[edge_idx]  # (E, 1)
 
         # === Step 6. Radial basis (envelope already baked in) ===
-        edge_rbf = self.radial_basis(edge_len)  # (n_edges, n_rbf)
+        edge_rbf = self.radial_basis(edge_len)  # (E, n_rbf)
 
         # === Step 7. Wigner-D blocks ===
         rot_mat = init_edge_rot_mat(edge_vec)
@@ -1071,19 +1167,18 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         )
         inv_sqrt_deg = torch.rsqrt(deg.clamp(min=1)).view(n_nodes, 1, 1)
 
-        return EdgeFeatureCache(
+        cache = EdgeFeatureCache(
             src=src,
             dst=dst,
+            node_type_feat=x0,
             edge_vec=edge_vec,
-            edge_len=edge_len,
-            edge_unit=edge_unit,
             edge_rbf=edge_rbf,
             edge_sw=edge_sw,
             D_list=D_list,
             Dt_list=Dt_list,
-            sw=sw,
             inv_sqrt_deg=inv_sqrt_deg,
         )
+        return cache, sw
 
     def forward(
         self,
@@ -1139,8 +1234,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 nlist, dtype=torch.bool, device=self.device
             )
 
-        # === Step 3. Build edge cache once (geometry + RBF + Wigner-D) ===
-        edge_cache = self._build_edge_cache(
+        # === Step 3. Type embedding (l=0) ===
+        atype_loc = extended_atype[:, :nloc]
+        x0 = self.type_embedding(atype_loc).reshape(n_nodes, self.channels)
+
+        # === Step 4. Build edge cache once (geometry + RBF + Wigner-D) ===
+        edge_cache, sw = self._build_edge_cache(
+            x0=x0,
             extended_coord=extended_coord,
             extended_atype=extended_atype,
             nlist=nlist,
@@ -1148,9 +1248,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             pair_keep_mask=pair_keep_mask,
         )
 
-        # === Step 4. Initial embedding: l=0 from type embedding ===
-        atype_loc = extended_atype[:, :nloc]
-        x0 = self.type_embedding(atype_loc).reshape(n_nodes, self.channels)
+        # === Step 5. Optional short-range gating hook ===
         x0 = self._apply_zbl_gating_hook(x0, edge_cache)
 
         lmax_0 = self.l_schedule[0]
@@ -1158,23 +1256,23 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         x = x0.new_zeros(n_nodes, ebed_dim_0, self.channels)
         x[:, 0, :] = x0
 
-        # === Step 5. Geometric Initial Embedding ===
+        # === Step 6. Geometric Initial Embedding ===
         if self.gie is not None and edge_cache.num_edges > 0:
             x = x + self.gie(n_nodes=n_nodes, edge_cache=edge_cache)
 
-        # === Step 6. Blocks with pyramid l-schedule slicing ===
+        # === Step 7. Blocks with pyramid l-schedule slicing ===
         for blk_lmax, block in zip(self.l_schedule, self.blocks):
             x = x[:, : _so3_dim_of_lmax(blk_lmax), :]
             x = block(x, edge_cache)
 
-        # === Step 7. Output l=0 only ===
+        # === Step 8. Output l=0 only ===
         descriptor = x[:, 0, :].view(nf, nloc, self.channels)
         return (
             descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
             None,
             None,
             None,
-            edge_cache.sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            sw.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
         )
 
     def serialize(self) -> dict[str, Any]:
@@ -1193,7 +1291,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "radial_mlp": self.radial_mlp,
             "so2_layers": self.so2_layers,
             "ffn_neuron": self.ffn_neuron,
-            "wigner_parallel": self.wigner_parallel,
+            "use_parallel": self.use_parallel,
             "set_davg_zero": self.set_davg_zero,
             "activation_function": self.activation_function,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
@@ -1203,16 +1301,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "seed": self.seed,
             "type_embedding": self.type_embedding.embedding.serialize(),
             "radial_basis": self.radial_basis.serialize(),
-            "blocks": [
-                {
-                    "lmax": blk.lmax,
-                    "conv": blk.conv.serialize() if blk.conv is not None else None,
-                    "ffn": blk.ffn.serialize(),
-                    "gate": blk.gating.gate.serialize(),
-                    "pre_linear": blk.pre_linear.serialize(),
-                }
-                for blk in self.blocks
-            ],
+            "gie": self.gie.serialize() if self.gie is not None else None,
+            "blocks": [blk.serialize() for blk in self.blocks],
             "env_mat": DPEnvMat(
                 self.rcut, self.rcut_smth, self.env_protection
             ).serialize(),
@@ -1235,23 +1325,22 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         data.pop("env_mat")
         type_embedding = data.pop("type_embedding")
         radial_basis_data = data.pop("radial_basis")
+        gie_data = data.pop("gie", None)
         blocks_data = data.pop("blocks")
 
         obj = cls(**data)
         obj.type_embedding.embedding = TypeEmbedNetConsistent.deserialize(
             type_embedding
         )
-
         obj.radial_basis = RadialBasis.deserialize(radial_basis_data)
 
-        for blk, blk_data in zip(obj.blocks, blocks_data):
-            blk.ffn = EquivariantFFN.deserialize(blk_data["ffn"])
-            blk.gating.gate = EmbeddingNet.deserialize(blk_data["gate"])
-            if blk_data["conv"] is not None:
-                blk.conv = SO2Convolution.deserialize(blk_data["conv"])
-            else:
-                blk.conv = None
-            blk.pre_linear = PerDegreeLinear.deserialize(blk_data["pre_linear"])
+        # Restore gie
+        if gie_data is not None:
+            obj.gie = GeometricInitialEmbedding.deserialize(gie_data)
+
+        obj.blocks = nn.ModuleList(
+            [SeZMInteractionBlock.deserialize(blk_data) for blk_data in blocks_data]
+        )
 
         obj.mean = torch.as_tensor(
             stats["davg"], dtype=obj.mean.dtype, device=env.DEVICE

@@ -16,6 +16,9 @@ from abc import (
     ABC,
     abstractmethod,
 )
+from typing import (
+    Any,
+)
 
 import torch
 import torch.nn as nn
@@ -454,6 +457,28 @@ class WignerDCalc(WignerDCalcBase):
 
         return D_list, Dt_list
 
+    def serialize(self) -> dict[str, Any]:
+        """Serialize WignerDCalc (lmax and dtype are stored by parent)."""
+        return {
+            "@class": "WignerDCalc",
+            "@version": 1,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> WignerDCalcBase:
+        """Deserialize WignerDCalc - parent handles lmax/dtype reconstruction."""
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls not in ("WignerDCalc", "WignerDCalcParallel"):
+            raise ValueError(f"Invalid class for WignerDCalc: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported WignerDCalc version: {version}")
+        # Parent must reconstruct with actual lmax and dtype
+        raise NotImplementedError(
+            "WignerDCalc.deserialize should be called by parent with lmax/dtype"
+        )
+
     def _build_z_rotation(self, angle: torch.Tensor, l: int) -> torch.Tensor:
         """
         Build z-rotation matrix in the real spherical harmonics basis.
@@ -641,6 +666,27 @@ class WignerDCalcParallel(WignerDCalcBase):
             Dt_list.append(D_l.transpose(-1, -2).contiguous())
 
         return D_list, Dt_list
+
+    def serialize(self) -> dict[str, Any]:
+        """Serialize WignerDCalcParallel (lmax and dtype are stored by parent)."""
+        return {
+            "@class": "WignerDCalcParallel",
+            "@version": 1,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> WignerDCalcBase:
+        """Deserialize WignerDCalcParallel - parent handles lmax/dtype reconstruction."""
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls not in ("WignerDCalc", "WignerDCalcParallel"):
+            raise ValueError(f"Invalid class for WignerDCalcParallel: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported WignerDCalcParallel version: {version}")
+        raise NotImplementedError(
+            "WignerDCalcParallel.deserialize should be called by parent with lmax/dtype"
+        )
 
     def _build_z_rotation(self, angle: torch.Tensor) -> torch.Tensor:
         """
