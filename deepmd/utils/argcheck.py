@@ -439,7 +439,7 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             "env_protection",
             float,
             optional=True,
-            default=0.0,
+            default=1e-7,
             doc=doc_only_pt_supported + doc_env_protection,
         ),
     ]

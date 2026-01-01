@@ -128,9 +128,9 @@ EquivariantFFN:
 
 The `GatedActivation` module generates `lmax` independent gates from scalar features using a linear layer (`gate_linear: C → lmax*C`), then expands each per-l gate to all `2l+1` m-components using a precomputed `expand_index` buffer.
 
-### 3. PerDegreeLinearV2 (Vectorized Degree-wise Linear)
+### 3. SO3LinearV2 (Vectorized Degree-wise Linear)
 
-`PerDegreeLinearV2` implements degree-wise linear self-interaction shared across all m components within each l-block, using vectorized operations for efficiency:
+`SO3LinearV2` implements degree-wise linear self-interaction shared across all m components within each l-block, using vectorized operations for efficiency:
 
 ```python
 # Per-l weight matrix: (lmax+1, C, C)
@@ -155,7 +155,7 @@ Key properties:
 - **Bias only for l=0**: Only scalar components have additive bias (preserves equivariance for l>0)
 - **expand_index buffer**: Precomputed mapping from packed (l,m) positions to l values
 
-Compared to `PerDegreeLinear` (which uses `nn.ModuleList` with per-l `nn.Linear`), V2:
+Compared to `SO3Linear` (which uses `nn.ModuleList` with per-l `nn.Linear`), V2:
 
 - Avoids Python for-loops
 - Uses a single combined `weight` parameter instead of `lmax+1` separate weights
@@ -362,7 +362,7 @@ Output:
 - block sub-networks:
   - `EquivariantFFN` (full equivariant FFN with separable gating: `gate_linear`)
   - `SO2Convolution` (radial net + SO2Linear)
-  - `PerDegreeLinear`
+  - `SO3LinearV2`
 - `davg` / `dstd` statistics buffers
 
 `deserialize()` reconstructs the model and restores all parameters including trainable frequencies.
@@ -393,6 +393,7 @@ All edge messages are then multiplied by the DeePMD smooth weight `edge_sw`, gua
 
 - Edge rotations are computed from `edge_vec` without detach.
 - Wigner-D blocks are computed from those rotations and remain differentiable.
+- Vector normalizations clamp squared norms before `sqrt` (e.g. `sqrt(clamp(||x||^2, eps^2))`) to avoid NaN gradients at zero vectors, even in masked branches.
 
 ### Wigner-D blocks (real SH basis)
 
@@ -505,7 +506,7 @@ dispatch overhead (significant when `lmax <= 10`).
 **Common to both implementations**:
 
 - Euler extraction: `_extract_zyz_euler(rot_mat)`
-  - Uses stable matrix-entry formulas.
+  - `beta` uses `atan2(sin_beta, cos_beta)` with `sin_beta = sqrt(R[0,2]^2 + R[1,2]^2)` and an epsilon floor to avoid non-finite gradients at `beta = 0` / `pi`.
   - Singular cases `beta -> 0` / `beta -> pi` use `gamma = 0` and fold the residual z-rotation into `alpha`.
 - Constant `J_l`: `_compute_j_matrix(l)`
   - Built once per `l` in float64 on CPU.
@@ -540,7 +541,7 @@ SeZM blocks apply the cached rotations as:
 - All submodules use `dtype: torch.dtype` (not `precision: str`) for constructor parameter.
 - Device is obtained from global `env.DEVICE` at runtime; submodules store `self.device = env.DEVICE` only as a convenience reference, not for serialization.
 - Each submodule stores `self.precision = RESERVED_PRECISION_DICT[dtype]` for serialization compatibility.
-- The `env_protection` parameter (stored as `self.eps`) is used for numerical stability in division and normalization. If 0.0 is passed, it defaults to `1e-10`.
+- The `env_protection` parameter (stored as `self.eps`) is used for numerical stability in division and normalization. If 0.0 is passed, it defaults to `1e-7`.
 
 ---
 

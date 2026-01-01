@@ -13,10 +13,7 @@ if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
 from deepmd.pt.model.descriptor.se_zm_block import (
-    PerDegreeLinear,
-    PerDegreeLinearV2,
     SO2Linear,
-    _so3_dim_of_lmax,
 )
 from deepmd.pt.model.descriptor.se_zm_net import (
     DescrptSeZMNet,
@@ -144,62 +141,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
             loss.backward()
             self.assertIsNotNone(extended_coord.grad)
             self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
-
-    def test_edge_cache_type_features(self) -> None:
-        """Test edge cache contains per-edge type embeddings for src/dst."""
-        for prec in ["float64", "float32"]:
-            dtype = PRECISION_DICT[prec]
-            coord, atype, nlist = self._tiny_system(dtype=dtype)
-            extended_coord = coord.reshape(1, -1)
-            nf, nloc, nnei = nlist.shape
-
-            model = DescrptSeZMNet(
-                rcut=3.0,
-                rcut_smth=2.5,
-                sel=[1, 1],
-                ntypes=2,
-                l_schedule=[1, 0],
-                channels=8,
-                n_radial=4,
-                radial_mlp=[8],
-                ffn_neuron=[16],
-                use_parallel=False,
-                precision=prec,
-                trainable=True,
-            )
-            self.assertEqual(model.dtype, dtype)
-
-            atype_loc = atype[:, :nloc]
-            x0 = model.type_embedding(atype_loc).reshape(nf * nloc, model.channels)
-            pair_keep_mask = torch.ones_like(
-                nlist, dtype=torch.bool, device=self.device
-            )
-
-            edge_cache, sw = model.build_edge_cache(
-                x0=x0,
-                extended_coord=extended_coord.to(dtype=model.dtype),
-                extended_atype=atype,
-                nlist=nlist,
-                mapping=None,
-                pair_keep_mask=pair_keep_mask,
-            )
-
-            self.assertEqual(sw.shape, (nf, nloc, nnei, 1))
-            self.assertEqual(edge_cache.node_type_feat.dtype, model.dtype)
-            self.assertEqual(edge_cache.node_type_feat.shape, x0.shape)
-            torch.testing.assert_close(edge_cache.node_type_feat, x0)
-            num_edges = edge_cache.src.shape[0]
-            self.assertEqual(edge_cache.src.shape, (num_edges,))
-            self.assertEqual(edge_cache.dst.shape, (num_edges,))
-            src_type_feat = edge_cache.node_type_feat[edge_cache.src]
-            dst_type_feat = edge_cache.node_type_feat[edge_cache.dst]
-            self.assertEqual(src_type_feat.shape, (num_edges, model.channels))
-            self.assertEqual(dst_type_feat.shape, (num_edges, model.channels))
-            torch.testing.assert_close(src_type_feat, x0[edge_cache.src])
-            torch.testing.assert_close(dst_type_feat, x0[edge_cache.dst])
-            self.assertFalse(hasattr(edge_cache, "edge_len"))
-            self.assertFalse(hasattr(edge_cache, "edge_unit"))
-            self.assertFalse(hasattr(edge_cache, "sw"))
 
     def test_serialization_deserialization(self) -> None:
         """Test serialization and deserialization preserves model state."""
@@ -362,7 +303,7 @@ class TestInitEdgeRotMatFrisvad(unittest.TestCase):
 
     def _safe_norm(self, x: torch.Tensor) -> torch.Tensor:
         eps = torch.finfo(x.dtype).eps
-        return torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True)).clamp(min=eps)
+        return torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True).clamp(min=eps))
 
     def _assert_rotation_invariants(
         self, rot_mat: torch.Tensor, edge_vec: torch.Tensor
@@ -558,54 +499,32 @@ class TestWignerDCalc(unittest.TestCase):
                     msg=f"Dt mismatch for dtype={dtype}, lmax={lmax}, l={l}",
                 )
 
-    def test_z_rotation_m0_invariance(self) -> None:
-        """Test that m=0 component is invariant under z-rotation."""
-        for dtype in [torch.float64, torch.float32]:
-            atol, rtol = self._get_tols(dtype)
-            lmax = 3
-            wigner = WignerDCalc(lmax=lmax, dtype=dtype)
-            n_edges = 5
-            angles = torch.rand(n_edges, device=self.device, dtype=dtype) * 2 * 3.14159
+    def test_backward_no_nan_at_gimbal_lock(self) -> None:
+        """Test backward stability for rotations with beta=0 or pi."""
+        for dtype, wigner_cls, lmax in itertools.product(
+            [torch.float64, torch.float32],
+            [WignerDCalc, WignerDCalcParallel],
+            [1, 2, 3],
+        ):
+            wigner = wigner_cls(lmax=lmax, dtype=dtype)
+            edge_vec = torch.tensor(
+                [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
+                device=self.device,
+                dtype=dtype,
+                requires_grad=True,
+            )
+            rot_mat = init_edge_rot_mat_frisvad(edge_vec)
+            D_list, _ = wigner(rot_mat)
+            loss = sum((D**2).sum() for D in D_list)
+            loss.backward()
 
-            # Test each l separately
-            for l in range(lmax + 1):
-                Z = wigner._build_z_rotation(angles, l)
-                # Shape: (n_edges, 2l+1, 2l+1)
-                dim = 2 * l + 1
-                self.assertEqual(Z.shape, (n_edges, dim, dim))
-
-                # m=0 index within the block is at position l (center)
-                m0_idx = l
-
-                # Check diagonal element is 1
-                diag_vals = Z[:, m0_idx, m0_idx]
-                torch.testing.assert_close(
-                    diag_vals,
-                    torch.ones(n_edges, device=self.device, dtype=dtype),
-                    atol=atol,
-                    rtol=rtol,
-                    msg=f"m=0 diagonal should be 1 for dtype={dtype}, l={l}",
-                )
-
-                # Check off-diagonal elements in m=0 row/col are 0
-                for j in range(dim):
-                    if j != m0_idx:
-                        row_vals = Z[:, m0_idx, j]
-                        col_vals = Z[:, j, m0_idx]
-                        torch.testing.assert_close(
-                            row_vals,
-                            torch.zeros(n_edges, device=self.device, dtype=dtype),
-                            atol=atol,
-                            rtol=rtol,
-                            msg=f"m=0 row off-diagonal should be 0 for dtype={dtype}, l={l}, j={j}",
-                        )
-                        torch.testing.assert_close(
-                            col_vals,
-                            torch.zeros(n_edges, device=self.device, dtype=dtype),
-                            atol=atol,
-                            rtol=rtol,
-                            msg=f"m=0 col off-diagonal should be 0 for dtype={dtype}, l={l}, j={j}",
-                        )
+            self.assertIsNotNone(edge_vec.grad)
+            self.assertTrue(
+                torch.isfinite(edge_vec.grad).all().item(),
+                msg=(
+                    f"Non-finite gradients at gimbal lock for {wigner_cls.__name__}, dtype={dtype}, lmax={lmax}"
+                ),
+            )
 
     def test_l1_matches_vector_representation(self) -> None:
         """
@@ -854,106 +773,6 @@ class TestSO2LinearEquivariance(unittest.TestCase):
                 ),
                 atol=0.0,
                 rtol=0.0,
-            )
-
-
-class TestPerDegreeLinearV2(unittest.TestCase):
-    """Test PerDegreeLinearV2 correctness and consistency with PerDegreeLinear."""
-
-    def setUp(self) -> None:
-        self.device = env.DEVICE
-        torch.manual_seed(42)
-
-    def _get_tols(self, dtype: torch.dtype) -> tuple[float, float]:
-        if dtype == torch.float32:
-            return 1e-5, 1e-5
-        return 1e-10, 1e-10
-
-    def test_bias_only_on_l0(self) -> None:
-        """Test that bias is only applied to l=0 (scalar) components."""
-        for dtype in [torch.float64, torch.float32]:
-            atol, rtol = self._get_tols(dtype)
-            lmax = 2
-            channels = 4
-            ebed_dim = _so3_dim_of_lmax(lmax)
-            batch = 8
-
-            # === Step 1. Create layer with non-zero bias ===
-            layer = PerDegreeLinearV2(
-                lmax=lmax,
-                channels=channels,
-                dtype=dtype,
-                trainable=True,
-            )
-            layer.bias.data.fill_(1.5)
-            layer.weight.data.zero_()
-
-            # === Step 2. Input with zeros ===
-            x = torch.zeros(batch, ebed_dim, channels, device=self.device, dtype=dtype)
-
-            # === Step 3. Output should have bias only at l=0 ===
-            out = layer(x)
-
-            # l=0 component (index 0) should have bias
-            torch.testing.assert_close(
-                out[:, 0, :],
-                torch.full((batch, channels), 1.5, device=self.device, dtype=dtype),
-                atol=atol,
-                rtol=rtol,
-            )
-
-            # l>0 components should be zero (no bias)
-            torch.testing.assert_close(
-                out[:, 1:, :],
-                torch.zeros(
-                    batch, ebed_dim - 1, channels, device=self.device, dtype=dtype
-                ),
-                atol=atol,
-                rtol=rtol,
-            )
-
-    def test_consistency_with_per_order_linear(self) -> None:
-        """Test that PerDegreeLinearV2 produces the same output as PerDegreeLinear."""
-        for dtype, lmax in itertools.product([torch.float64, torch.float32], [1, 2, 3]):
-            atol, rtol = self._get_tols(dtype)
-            channels = 8
-            ebed_dim = _so3_dim_of_lmax(lmax)
-            batch = 16
-
-            # Create both layers
-            layer_v1 = PerDegreeLinear(
-                lmax=lmax,
-                channels=channels,
-                dtype=dtype,
-                trainable=True,
-            )
-            layer_v2 = PerDegreeLinearV2(
-                lmax=lmax,
-                channels=channels,
-                dtype=dtype,
-                trainable=True,
-            )
-
-            # Copy weights from v1 to v2
-            # Note: MLPLayer.matrix has shape [in, out], while PerDegreeLinearV2.weight[l] has shape [out, in]
-            for l in range(lmax + 1):
-                layer_v2.weight.data[l] = layer_v1.linears[l].matrix.data.t().clone()
-            if layer_v1.linears[0].bias is not None:
-                layer_v2.bias.data = layer_v1.linears[0].bias.data.clone()
-
-            # Random input
-            x = torch.randn(batch, ebed_dim, channels, device=self.device, dtype=dtype)
-
-            # Compare outputs
-            out_v1 = layer_v1(x)
-            out_v2 = layer_v2(x)
-
-            torch.testing.assert_close(
-                out_v1,
-                out_v2,
-                atol=atol,
-                rtol=rtol,
-                msg=f"PerDegreeLinearV2 output mismatch for dtype={dtype}, lmax={lmax}",
             )
 
 

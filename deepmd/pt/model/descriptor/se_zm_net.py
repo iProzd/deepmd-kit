@@ -80,7 +80,7 @@ if TYPE_CHECKING:
     )
 
 
-def safe_norm(x: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
+def safe_norm(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """
     Compute vector norm with an epsilon lower bound.
 
@@ -89,14 +89,14 @@ def safe_norm(x: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
     x : torch.Tensor
         Input tensor with shape (N, 3), where N is the number of vectors.
     eps : float
-        Minimum value for clamping.
+        Lower bound for the norm.
 
     Returns
     -------
     torch.Tensor
         Norm with shape (N, 1), clamped to be >= eps.
     """
-    return torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True)).clamp(min=eps)
+    return torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True).clamp(min=eps**2))
 
 
 def init_edge_rot_mat(edge_vec: torch.Tensor) -> torch.Tensor:
@@ -170,7 +170,7 @@ def init_edge_rot_mat(edge_vec: torch.Tensor) -> torch.Tensor:
 
 
 def init_edge_rot_mat_frisvad(
-    edge_vec: torch.Tensor, eps: float = 1e-10
+    edge_vec: torch.Tensor, eps: float = 1e-7
 ) -> torch.Tensor:
     """
     Compute rotation matrices that align each edge to the local + Z axis.
@@ -342,7 +342,7 @@ class RadialBasis(nn.Module):
         rcut: float,
         n_radial: int,
         *,
-        eps: float = 1e-10,
+        eps: float = 1e-7,
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
@@ -661,7 +661,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         activation_function: str = "silu",
         precision: str = "float32",
         exclude_types: list[tuple[int, int]] | None = None,
-        env_protection: float = 1e-10,
+        env_protection: float = 1e-7,
         trainable: bool = True,
         seed: int | list[int] | None = None,
         type_map: list[str] | None = None,
@@ -1124,7 +1124,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         edge_rbf = self.radial_basis(edge_len)  # (E, n_rbf)
 
         # === Step 7. Wigner-D blocks ===
-        rot_mat = init_edge_rot_mat_frisvad(edge_vec)
+        rot_mat = init_edge_rot_mat_frisvad(edge_vec, eps=self.eps)
         D_list, Dt_list = self.wigner_calc(rot_mat)
 
         # === Step 8. Neighbor normalization (destination degree) ===

@@ -290,7 +290,7 @@ class SeparableRMSNorm(nn.Module):
         affine: bool = True,
         centering: bool = True,
         *,
-        eps: float = 1e-10,
+        eps: float = 1e-7,
         dtype: torch.dtype,
         trainable: bool,
     ) -> None:
@@ -425,7 +425,7 @@ class SeparableRMSNorm(nn.Module):
         return obj
 
 
-class PerDegreeLinear(nn.Module):
+class SO3Linear(nn.Module):
     """
     Degree-wise linear self-interaction shared across m within each l-block.
 
@@ -434,7 +434,7 @@ class PerDegreeLinear(nn.Module):
     - Each degree l has an independent C x C linear transformation.
     - Within each l-block, the same linear transformation is shared across all 2l+1 m components.
     - Bias is only applied to l=0 (scalar) components to preserve equivariance.
-    - Uses Python loop over l, less efficient than PerDegreeLinearV2 but memory friendly.
+    - Uses Python loop over l, less efficient than SO3LinearV2 but memory friendly.
 
     Parameters
     ----------
@@ -508,7 +508,7 @@ class PerDegreeLinear(nn.Module):
 
     def serialize(self) -> dict[str, Any]:
         return {
-            "@class": "PerDegreeLinear",
+            "@class": "SO3Linear",
             "@version": 1,
             "lmax": self.lmax,
             "channels": self.channels,
@@ -517,17 +517,17 @@ class PerDegreeLinear(nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> PerDegreeLinear:
+    def deserialize(cls, data: dict[str, Any]) -> SO3Linear:
         data = data.copy()
         data_cls = data.pop("@class")
         if data_cls not in (
-            "PerDegreeLinear",
+            "SO3Linear",
             "PerOrderLinear",
         ):  # Accept both for transition
-            raise ValueError(f"Invalid class for PerDegreeLinear: {data_cls}")
+            raise ValueError(f"Invalid class for SO3Linear: {data_cls}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported PerDegreeLinear version: {version}")
+            raise ValueError(f"Unsupported SO3Linear version: {version}")
 
         precision = data["precision"]
         dtype = PRECISION_DICT[precision]
@@ -544,11 +544,11 @@ class PerDegreeLinear(nn.Module):
         return obj
 
 
-class PerDegreeLinearV2(nn.Module):
+class SO3LinearV2(nn.Module):
     """
     Degree-wise linear self-interaction using einsum for efficiency.
 
-    This is a vectorized version of PerDegreeLinear that avoids Python loops
+    This is a vectorized version of SO3Linear that avoids Python loops
     by using torch.einsum and index_select. The key insight is that weights
     are shared across all m components within each l-block.
 
@@ -659,7 +659,7 @@ class PerDegreeLinearV2(nn.Module):
 
     def serialize(self) -> dict[str, Any]:
         return {
-            "@class": "PerDegreeLinearV2",
+            "@class": "SO3LinearV2",
             "@version": 1,
             "lmax": self.lmax,
             "channels": self.channels,
@@ -669,17 +669,17 @@ class PerDegreeLinearV2(nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> PerDegreeLinearV2:
+    def deserialize(cls, data: dict[str, Any]) -> SO3LinearV2:
         data = data.copy()
         data_cls = data.pop("@class")
         if data_cls not in (
-            "PerDegreeLinearV2",
+            "SO3LinearV2",
             "PerOrderLinearV2",
         ):  # Accept both for transition
-            raise ValueError(f"Invalid class for PerDegreeLinearV2: {data_cls}")
+            raise ValueError(f"Invalid class for SO3LinearV2: {data_cls}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported PerDegreeLinearV2 version: {version}")
+            raise ValueError(f"Unsupported SO3LinearV2 version: {version}")
 
         precision = data["precision"]
         dtype = PRECISION_DICT[precision]
@@ -1045,12 +1045,14 @@ class SO2Convolution(nn.Module):
             x_local = so2_linear(x_local)
 
             # Bias correction for first layer to preserve strict smoothness at rcut.
+            # Avoid inplace modification by using torch.cat to reassemble the tensor.
             if layer_idx == 0:
-                x_local[:, 0, :] = (
-                    x_local[:, 0, :]
-                    - so2_linear.bias0
+                bias_correction = (
+                    -so2_linear.bias0
                     + so2_linear.bias0 * rad_expanded[:, 0, :] * edge_sw
                 )
+                x0_corrected = x_local[:, 0:1, :] + bias_correction.unsqueeze(1)
+                x_local = torch.cat([x0_corrected, x_local[:, 1:, :]], dim=1)
 
             # Apply non-linearity between SO2 layers
             # The last non-linearity is Identity by construction.
@@ -1359,7 +1361,7 @@ class SeZMInteractionBlock(nn.Module):
         so2_layers: int = 2,
         ffn_neuron: list[int],
         activation_function: str,
-        eps: float = 1e-10,
+        eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
         trainable: bool,
@@ -1407,7 +1409,7 @@ class SeZMInteractionBlock(nn.Module):
             seed=child_seed(seed, 0),
         )
 
-        self.per_l_linear = PerDegreeLinearV2(
+        self.per_l_linear = SO3LinearV2(
             lmax=self.lmax,
             channels=self.channels,
             dtype=dtype,
@@ -1455,14 +1457,32 @@ class SeZMInteractionBlock(nn.Module):
         """
         if self.mmax < self.lmax:
             x = x * self.m_mask
-        x_norm = self.norm(x)
-        x_norm = self.per_l_linear(x_norm)
+        x_res = x
 
+        # === Step 1. Pre-Norm ===
+        x = self.norm(x)
+
+        # === Step 2. Per-degree Linear Mixing ===
+        x = self.per_l_linear(x)
+
+        # === Step 2.5 Residual connection ===
+        x = x + x_res
+        x_res = x
+
+        # === Step 3. SO(2) convolution ===
         if edge_cache.src.numel() > 0:
-            x = x + self.conv(x_norm, edge_cache)
+            x = self.conv(x, edge_cache)
 
-        x = self.gating(x)
-        x = x + self.ffn(x)
+        # === Step 3.5 Residual connection ===
+        x = x + x_res
+        x_res = x
+
+        # x = self.gating(x)
+        # === Step 4. Nodewise Feed-Forward ===
+        x = self.ffn(x)
+
+        # === Step 4.5 Residual connection ===
+        x = x + x_res
         return x
 
     def serialize(self) -> dict[str, Any]:
@@ -1513,7 +1533,7 @@ class SeZMInteractionBlock(nn.Module):
 
         obj.norm = SeparableRMSNorm.deserialize(data["norm"])
         obj.gating = GatedActivation.deserialize(data["gating"])
-        obj.per_l_linear = PerDegreeLinearV2.deserialize(data["per_l_linear"])
+        obj.per_l_linear = SO3LinearV2.deserialize(data["per_l_linear"])
         obj.conv = SO2Convolution.deserialize(data["conv"])
         obj.ffn = EquivariantFFN.deserialize(data["ffn"])
         return obj

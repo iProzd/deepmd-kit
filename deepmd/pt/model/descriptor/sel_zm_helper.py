@@ -82,7 +82,7 @@ class WignerDCalcBase(nn.Module, ABC):
         Floating-point dtype for output matrices.
     """
 
-    def __init__(self, lmax: int, *, eps: float = 1e-10, dtype: torch.dtype) -> None:
+    def __init__(self, lmax: int, *, eps: float = 1e-7, dtype: torch.dtype) -> None:
         super().__init__()
         self.lmax = int(lmax)
         if self.lmax < 0:
@@ -148,7 +148,7 @@ class WignerDCalcBase(nn.Module, ABC):
         Therefore, the Euler angles are extracted as::
 
             alpha = atan2(R[1, 2], R[0, 2])
-            beta = acos(R[2, 2])
+            beta = atan2(sin(beta), R[2, 2])
             gamma = atan2(R[2, 1], -R[2, 0])
 
         Singular cases (beta -> 0 or pi) are handled by setting ``gamma = 0``
@@ -168,17 +168,27 @@ class WignerDCalcBase(nn.Module, ABC):
         gamma : torch.Tensor
             Second z-rotation angle with shape (...,).
         """
-        # === Step 1. Compute beta from R[2,2] ===
-        # Clamp avoids acos domain errors from tiny numerical drift.
+        # === Step 1. Compute beta with stable atan2(sin(beta), cos(beta)) ===
+        # Using acos(cos_beta) creates Inf/NaN gradients near |cos_beta| = 1.
+        # Gimbal lock occur when edge directions can align with the global z-axis.
+        #
+        # For ZYZ convention:
+        #   cos(beta) = R[2, 2]
+        #   sin(beta) = sqrt(R[0, 2]^2 + R[1, 2]^2)
+        #
+        # We apply an epsilon floor to sin(beta) to keep beta differentiable
+        # at the singular manifolds (beta = 0 or pi).
         cos_beta = rot_mat[..., 2, 2].clamp(-1.0, 1.0)
-        beta = torch.acos(cos_beta)
+        r02 = rot_mat[..., 0, 2]
+        r12 = rot_mat[..., 1, 2]
+        sin_beta_sq = r02 * r02 + r12 * r12
+        sin_beta_raw = torch.sqrt(sin_beta_sq.clamp(min=0.0))
+        sin_beta_safe = torch.sqrt(sin_beta_sq.clamp(min=self.eps))
+        beta = torch.atan2(sin_beta_safe, cos_beta)
 
         # === Step 2. Detect singular cases via sin(beta) ===
-        # sin(beta) = sqrt(1 - cos(beta)^2) is stable after clamping.
-        sin_beta = torch.sqrt((1.0 - cos_beta * cos_beta).clamp(min=0.0))
-
         threshold = math.sqrt(self.eps)
-        not_singular = sin_beta > threshold
+        not_singular = sin_beta_raw > threshold
 
         # === Step 3. Non-singular extraction (sin(beta) > 0) ===
         # torch.atan2(y, x) has undefined gradient at (y, x) = (0, 0).
@@ -471,7 +481,7 @@ class WignerDCalc(WignerDCalcBase):
                 "Jt", J.transpose(-1, -2).contiguous(), persistent=True
             )
 
-    def __init__(self, lmax: int, *, eps: float = 1e-10, dtype: torch.dtype) -> None:
+    def __init__(self, lmax: int, *, eps: float = 1e-7, dtype: torch.dtype) -> None:
         super().__init__(lmax, eps=eps, dtype=dtype)
 
         # Precompute J_l = D^{(l)}(Rx(pi/2)) on CPU, then move to target device
@@ -658,7 +668,7 @@ class WignerDCalcParallel(WignerDCalcBase):
         Floating-point dtype for output matrices.
     """
 
-    def __init__(self, lmax: int, *, eps: float = 0.0, dtype: torch.dtype) -> None:
+    def __init__(self, lmax: int, *, eps: float = 1e-7, dtype: torch.dtype) -> None:
         super().__init__(lmax, eps=eps, dtype=dtype)
 
         # === Step 1. Compute block dimension ===
