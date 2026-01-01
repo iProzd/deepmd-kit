@@ -4,36 +4,37 @@
     "descriptor": {
       "type": "se_zm_net",
       "sel": 120,
-      "rcut_smth": 5.3,
       "rcut": 6.0,
-      "l_schedule": [2, 2],
+      "l_schedule": [3, 3, 2],
       "mmax": 2,
       "channels": 64,
       "n_radial": 10,
-      "radial_mlp": [64, 64],
-      "so2_layers": 2,
-      "ffn_neuron": [128],
+      "radial_mlp": [64],
+      "so2_layers": 3,
+      "ffn_neurons": 128,
+      "n_atten_head": 1,
       "use_parallel": true,
       "activation_function": "silu",
       "precision": "float32",
+      "use_amp": true,
       "seed": 7,
-      "_comment": " that's all"
+      "_comment": "that's all"
     },
     "fitting_net": {
       "neuron": [256, 256, 256],
+      "activation_function": "silu",
       "resnet_dt": true,
       "precision": "float32",
-      "activation_function": "silu",
       "seed": 7,
-      "_comment": " that's all"
+      "_comment": "that's all"
     },
-    "_comment": " that's all"
+    "_comment": "that's all"
   },
   "learning_rate": {
     "type": "exp",
     "decay_steps": 5000,
-    "start_lr": 5e-4,
-    "stop_lr": 5e-7,
+    "start_lr": 1e-3,
+    "stop_lr": 1e-6,
     "_comment": "that's all"
   },
   "loss": {
@@ -41,7 +42,7 @@
     "start_pref_e": 0.2,
     "limit_pref_e": 20,
     "start_pref_f": 500,
-    "limit_pref_f": 60,
+    "limit_pref_f": 100,
     "start_pref_v": 0,
     "limit_pref_v": 0,
     "_comment": "that's all"
@@ -56,12 +57,12 @@
     "validation_data": {
       "systems": ["../data/data_3"],
       "batch_size": 1,
-      "numb_btch": 3,
+      "numb_btch": 1,
       "_comment": "that's all"
     },
     "numb_steps": 1000000,
     "warmup_steps": 1000,
-    "gradient_max_norm": 10.0,
+    "gradient_max_norm": 5.0,
     "save_freq": 100,
     "max_ckpt_keep": 3,
     "disp_file": "lcurve.out",
@@ -75,8 +76,11 @@
     "tensorboard_log_dir": "tb_log",
     "profiling": false,
     "profiling_file": "timeline.json",
-    "opt_type": "Adam",
+    "opt_type": "Muon",
+    "weight_decay": 0.001,
+    "lr_adjust": 0,
     "seed": 7,
     "_comment": "that's all"
-  }
+  },
+  "_comment": "that's all"
 }

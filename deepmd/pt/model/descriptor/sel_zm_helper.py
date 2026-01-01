@@ -20,6 +20,7 @@ from typing import (
     NamedTuple,
 )
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -40,32 +41,619 @@ class EdgeFeatureCache(NamedTuple):
         Source node indices with shape (E,).
     dst
         Destination node indices with shape (E,).
-    node_type_feat
-        Per-node type embeddings with shape (N, C).
+    edge_type_feat
+        Per-edge type embeddings with shape (E, C), computed as src+dst.
     edge_vec
         Edge vectors with shape (E, 3) in Å.
     edge_rbf
         Radial basis with shape (E, n_radial).
         The C^2 cutoff envelope is already baked in.
-    edge_sw
-        DeePMD smooth weights with shape (E, 1).
+    edge_env
+        C^2 cutoff envelope weights with shape (E, 1).
     D_list
         Wigner-D blocks per degree. `D_list[l]` has shape (E, 2l+1, 2l+1).
     Dt_list
         Transposed blocks per degree. `Dt_list[l]` has shape (E, 2l+1, 2l+1).
     inv_sqrt_deg
         Destination degree normalization with shape (N, 1, 1).
+    D_full
+        Block-diagonal Wigner-D matrix with shape (E, D, D) where D=(lmax+1)^2.
+        Used for efficient batched rotation. None if not available.
+    Dt_full
+        Transpose of D_full with shape (E, D, D). None if not available.
+    D_to_m_cache
+        Lazy cache for projected D matrices keyed by (lmax, mmax) in parallel mode.
+    Dt_from_m_cache
+        Lazy cache for projected Dt matrices keyed by (lmax, mmax) in parallel mode.
     """
 
     src: torch.Tensor
     dst: torch.Tensor
-    node_type_feat: torch.Tensor
+    edge_type_feat: torch.Tensor
     edge_vec: torch.Tensor
     edge_rbf: torch.Tensor
-    edge_sw: torch.Tensor
+    edge_env: torch.Tensor
     D_list: list[torch.Tensor]
     Dt_list: list[torch.Tensor]
     inv_sqrt_deg: torch.Tensor
+    D_full: torch.Tensor | None = None
+    Dt_full: torch.Tensor | None = None
+    D_to_m_cache: dict[str, torch.Tensor] | None = None
+    Dt_from_m_cache: dict[str, torch.Tensor] | None = None
+
+    def get_D_to_m(
+        self,
+        *,
+        ebed_dim_full: int,
+        coeff_index_m: torch.Tensor,
+        key_lmax: int,
+        key_mmax: int,
+    ) -> torch.Tensor:
+        """
+        Fetch (or build once) the row-projected Wigner-D blocks for m-major layout.
+
+        This is only used in parallel mode where ``D_full`` is present. It selects
+        the subset of rows needed for the m-major truncated layout, caches the
+        result keyed by (lmax, mmax), and reuses it across blocks.
+
+        Parameters
+        ----------
+        ebed_dim_full
+            Full SO(3) dimension D=(lmax+1)^2 used to slice the block-diagonal
+            Wigner matrix.
+        coeff_index_m
+            Indices for the m-major reduced layout with shape (D_m_trunc,).
+        key_lmax
+            lmax used to build ``coeff_index_m`` (cache key).
+        key_mmax
+            mmax used to build ``coeff_index_m`` (cache key).
+
+        Returns
+        -------
+        torch.Tensor
+            Projected rotation matrix with shape (E, D_m_trunc, D_full).
+        """
+        cache_key = f"{int(key_lmax)}:{int(key_mmax)}"
+        cache_dict = self.D_to_m_cache
+        if cache_dict is None:
+            raise ValueError("EdgeFeatureCache.D_to_m_cache is None")
+        cached = cache_dict.get(cache_key)
+        if cached is not None:
+            return cached
+
+        D_full = self.D_full
+        if D_full is None:
+            raise ValueError("EdgeFeatureCache.D_full is None")
+        D_block = D_full[:, :ebed_dim_full, :ebed_dim_full]
+        D_to_m = D_block.index_select(1, coeff_index_m)
+        cache_dict[cache_key] = D_to_m
+        return D_to_m
+
+    def get_Dt_from_m(
+        self,
+        *,
+        ebed_dim_full: int,
+        coeff_index_m: torch.Tensor,
+        key_lmax: int,
+        key_mmax: int,
+    ) -> torch.Tensor:
+        """
+        Fetch (or build once) the column-projected Wigner-D^T blocks for inverse rotation.
+
+        This is only used in parallel mode where ``Dt_full`` is present. It selects
+        the subset of columns needed for the m-major truncated layout, caches the
+        result keyed by (lmax, mmax), and reuses it across blocks.
+
+        Parameters
+        ----------
+        ebed_dim_full
+            Full SO(3) dimension D=(lmax+1)^2 used to slice the block-diagonal
+            Wigner matrix.
+        coeff_index_m
+            Indices for the m-major reduced layout with shape (D_m_trunc,).
+        key_lmax
+            lmax used to build ``coeff_index_m`` (cache key).
+        key_mmax
+            mmax used to build ``coeff_index_m`` (cache key).
+
+        Returns
+        -------
+        torch.Tensor
+            Projected inverse rotation matrix with shape (E, D_full, D_m_trunc).
+        """
+        cache_key = (int(key_lmax), int(key_mmax))
+        cache_dict = self.Dt_from_m_cache
+        if cache_dict is None:
+            raise ValueError("EdgeFeatureCache.Dt_from_m_cache is None")
+        cached = cache_dict.get(cache_key)
+        if cached is not None:
+            return cached
+
+        Dt_full = self.Dt_full
+        if Dt_full is None:
+            raise ValueError("EdgeFeatureCache.Dt_full is None")
+        Dt_block = Dt_full[:, :ebed_dim_full, :ebed_dim_full]
+        Dt_from_m = Dt_block.index_select(2, coeff_index_m)
+        cache_dict[cache_key] = Dt_from_m
+        return Dt_from_m
+
+
+def edge_cache_to_dtype(
+    cache: EdgeFeatureCache, dtype: torch.dtype
+) -> EdgeFeatureCache:
+    """
+    Convert all floating-point tensors in EdgeFeatureCache to the specified dtype.
+
+    Integer tensors (src, dst) are unchanged. This is a standalone function
+    (not a method) to ensure TorchScript compatibility.
+
+    Parameters
+    ----------
+    cache
+        The edge feature cache to convert.
+    dtype
+        Target dtype for floating-point tensors.
+
+    Returns
+    -------
+    EdgeFeatureCache
+        New cache with converted tensors.
+    """
+    # Handle Optional tensors in a TorchScript-compatible way.
+    # Use local variables with explicit None check and assignment.
+    _D_full = cache.D_full
+    _Dt_full = cache.Dt_full
+    D_full: torch.Tensor | None = None
+    Dt_full: torch.Tensor | None = None
+    if _D_full is not None:
+        D_full = _D_full.to(dtype=dtype)
+    if _Dt_full is not None:
+        Dt_full = _Dt_full.to(dtype=dtype)
+
+    return EdgeFeatureCache(
+        src=cache.src,
+        dst=cache.dst,
+        edge_type_feat=cache.edge_type_feat.to(dtype=dtype),
+        edge_vec=cache.edge_vec.to(dtype=dtype),
+        edge_rbf=cache.edge_rbf.to(dtype=dtype),
+        edge_env=cache.edge_env.to(dtype=dtype),
+        D_list=[d.to(dtype=dtype) for d in cache.D_list],
+        Dt_list=[d.to(dtype=dtype) for d in cache.Dt_list],
+        inv_sqrt_deg=cache.inv_sqrt_deg.to(dtype=dtype),
+        D_full=D_full,
+        Dt_full=Dt_full,
+        D_to_m_cache={} if cache.D_to_m_cache is None else cache.D_to_m_cache,
+        Dt_from_m_cache=(
+            {} if cache.Dt_from_m_cache is None else cache.Dt_from_m_cache
+        ),
+    )
+
+
+def safe_norm(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
+    """
+    Compute vector norm with an epsilon lower bound.
+
+    Uses float32 for computation when input is fp16/bf16.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor with shape (N, 3), where N is the number of vectors.
+    eps : float
+        Lower bound for the norm.
+
+    Returns
+    -------
+    torch.Tensor
+        Norm with shape (N, 1), clamped to be >= eps.
+    """
+    in_dtype = x.dtype
+    if in_dtype in (torch.float16, torch.bfloat16):
+        x = x.float()
+    norm = torch.sqrt(torch.sum(x * x, dim=-1, keepdim=True).clamp(min=eps**2))
+    return norm.to(dtype=in_dtype)
+
+
+def safe_numpy_to_tensor(
+    data: Any, *, device: torch.device, dtype: torch.dtype
+) -> torch.Tensor:
+    if isinstance(data, torch.Tensor):
+        return data.to(device=device, dtype=dtype)
+    if isinstance(data, np.ndarray):
+        # Handle bfloat16: numpy uses ml_dtypes.bfloat16, which torch.as_tensor
+        # cannot convert. Convert to float32 first, then cast to target dtype.
+        if hasattr(data.dtype, "name") and "bfloat16" in data.dtype.name:
+            data = data.astype(np.float32)
+        return torch.as_tensor(data, device=device).to(dtype)
+    return torch.as_tensor(data, device=device, dtype=dtype)
+
+
+def get_promoted_dtype(dtype: torch.dtype) -> torch.dtype:
+    """
+    Get promoted dtype for numerical stability.
+
+    For bf16/fp16, use float32 to ensure numerical stability
+    in computation and storage compatibility.
+    """
+    if dtype in (torch.float16, torch.bfloat16):
+        return torch.float32
+    return dtype
+
+
+def np_safe(
+    tensor: torch.Tensor | None,
+) -> np.ndarray | None:
+    """
+    Convert tensor to numpy array, promoting low-precision types to fp32.
+
+    For bf16/fp16, converts to fp32 first since NumPy/HDF5 do not natively
+    support these formats. fp32/fp64 are kept unchanged.
+
+    Parameters
+    ----------
+    tensor
+        PyTorch tensor to convert. Can be None.
+
+    Returns
+    -------
+    np.ndarray or None
+        numpy array with at least fp32 precision.
+    """
+    if tensor is None:
+        return None
+    if tensor.dtype in (torch.float16, torch.bfloat16):
+        tensor = tensor.float()
+    return tensor.detach().cpu().numpy()
+
+
+def get_so3_dim_of_lmax(lmax: int) -> int:
+    """
+    Return SO(3) representation dimension for given lmax.
+
+    The dimension equals::
+
+        sum_{l<=lmax} (2l+1) = (lmax+1)^2
+
+    which is the number of spherical harmonics basis functions.
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+
+    Returns
+    -------
+    int
+        The SO(3) dimension D = (lmax+1)^2.
+    """
+    return int((int(lmax) + 1) ** 2)
+
+
+def map_degree_idx(lmax: int, *, device: torch.device) -> torch.Tensor:
+    """
+    Build degree (l) index for each position in the packed (l, m) layout.
+
+    For each spherical harmonic coefficient position in the packed tensor,
+    returns the corresponding angular momentum quantum number l.
+
+    Examples
+    --------
+    For lmax=2, the packed layout has D=9 positions:
+    - Position 0: l=0, m=0
+    - Positions 1-3: l=1, m=-1,0,+1
+    - Positions 4-8: l=2, m=-2,-1,0,+1,+2
+
+    Returns: [0, 1,1,1, 2,2,2,2,2]
+
+    Parameters
+    ----------
+    lmax
+        Maximum angular momentum degree.
+    device
+        Device for the returned tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Integer tensor with shape (D,), where D=(lmax+1)^2.
+        Each element is the l value for that position.
+    """
+    lmax = int(lmax)
+    counts = torch.tensor(
+        [2 * l + 1 for l in range(lmax + 1)], device=device, dtype=torch.long
+    )
+    return torch.repeat_interleave(
+        torch.arange(lmax + 1, device=device, dtype=torch.long), counts
+    )
+
+
+def project_D_to_m(
+    D_full: torch.Tensor,
+    coeff_index_m: torch.Tensor,
+    ebed_dim_full: int,
+    cache: dict[str, torch.Tensor] | None,
+    key_lmax: int,
+    key_mmax: int,
+) -> torch.Tensor:
+    """
+    Row-project block-diagonal Wigner-D to the m-major truncated layout.
+
+    Parameters
+    ----------
+    D_full
+        Block-diagonal Wigner-D with shape (E, D_full, D_full).
+    coeff_index_m
+        Indices for m-major reduced layout with shape (D_m_trunc,).
+    ebed_dim_full
+        Full SO(3) dimension D_full = (lmax+1)^2 to slice the block.
+    cache
+        Optional cache mapping (lmax, mmax) -> projected matrix.
+    key_lmax
+        lmax used to build coeff_index_m (cache key).
+    key_mmax
+        mmax used to build coeff_index_m (cache key).
+
+    Returns
+    -------
+    torch.Tensor
+        Projected rotation matrix with shape (E, D_m_trunc, D_full).
+
+    Examples
+    --------
+    For lmax=2, mmax=1 (D_full=9, D_m_trunc=7), coeff_index_m selects
+    [0,2,6,1,5,3,7] in packed (l,m) order. The returned tensor keeps only those
+    rows of ``D_full`` while retaining all columns, so that rotating and truncating
+    is done in a single bmm: ``x_local = D_to_m @ x_global``.
+    """
+    cache_key = f"{int(key_lmax)}:{int(key_mmax)}"
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    D_block = D_full[:, :ebed_dim_full, :ebed_dim_full]
+    proj = D_block.index_select(1, coeff_index_m)
+    if cache is not None:
+        cache[cache_key] = proj
+    return proj
+
+
+def project_Dt_from_m(
+    Dt_full: torch.Tensor,
+    coeff_index_m: torch.Tensor,
+    ebed_dim_full: int,
+    cache: dict[str, torch.Tensor] | None,
+    key_lmax: int,
+    key_mmax: int,
+) -> torch.Tensor:
+    """
+    Column-project block-diagonal Wigner-D^T for inverse rotation.
+
+    Parameters
+    ----------
+    Dt_full
+        Block-diagonal Wigner-D^T with shape (E, D_full, D_full).
+    coeff_index_m
+        Indices for m-major reduced layout with shape (D_m_trunc,).
+    ebed_dim_full
+        Full SO(3) dimension D_full = (lmax+1)^2 to slice the block.
+    cache
+        Optional cache mapping (lmax, mmax) -> projected matrix.
+    key_lmax
+        lmax used to build coeff_index_m (cache key).
+    key_mmax
+        mmax used to build coeff_index_m (cache key).
+
+    Returns
+    -------
+    torch.Tensor
+        Projected inverse rotation matrix with shape (E, D_full, D_m_trunc).
+
+    Examples
+    --------
+    Continuing lmax=2, mmax=1, the projection selects the same column subset
+    [0,2,6,1,5,3,7] from ``Dt_full``. This enables inverse rotation with missing
+    coefficients implicitly zeroed: ``x_global = Dt_from_m @ x_local``.
+    """
+    cache_key = f"{int(key_lmax)}:{int(key_mmax)}"
+    if cache is not None:
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+    Dt_block = Dt_full[:, :ebed_dim_full, :ebed_dim_full]
+    proj = Dt_block.index_select(2, coeff_index_m)
+    if cache is not None:
+        cache[cache_key] = proj
+    return proj
+
+
+def so3_packed_index(l: int, m: int) -> int:
+    """
+    Compute packed (l, m) index for real spherical harmonics layout.
+
+    The packed layout is l-primary with m ordered as ``-l..+l`` inside each l-block.
+    The index formula is::
+
+        idx(l, m) = l^2 + l + m
+
+    Parameters
+    ----------
+    l
+        Degree l.
+    m
+        Order m, must satisfy ``-l <= m <= l``.
+
+    Returns
+    -------
+    int
+        Packed index.
+    """
+    l = int(l)
+    m = int(m)
+    return l * l + l + m
+
+
+def build_l_major_index(lmax: int, mmax: int, *, device: torch.device) -> torch.Tensor:
+    """
+    Build coefficient indices for l-major layout truncated by mmax.
+
+    The returned indices select coefficients with ``|m| <= min(mmax, l)`` in the
+    standard packed (l, m) layout. The order is l-major:
+
+    - l = 0..lmax
+    - within each l, m = -min(mmax, l) .. +min(mmax, l)
+
+    Parameters
+    ----------
+    lmax
+        Maximum degree.
+    mmax
+        Maximum order (|m|). Must satisfy ``0 <= mmax <= lmax``.
+    device
+        Device for the returned tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Long tensor of indices with shape (D_m_trunc,), selecting coefficients
+        from the full packed layout with D_full=(lmax+1)^2, where D_m_trunc is
+        the number of coefficients kept under ``|m| <= min(mmax, l)``.
+
+    Examples
+    --------
+    For lmax=2, mmax=1:
+    - Full packed layout: l=0(0), l=1(1-3), l=2(4-8)
+    - Truncated by mmax=1: skip (l=2, m=±2) at indices 4,8
+    - Returns: [0, 1, 2, 3, 5, 6, 7]
+    """
+    lmax_i = int(lmax)
+    mmax_i = int(mmax)
+    if lmax_i < 0:
+        raise ValueError("`lmax` must be non-negative")
+    if mmax_i < 0:
+        raise ValueError("`mmax` must be non-negative")
+    if mmax_i > lmax_i:
+        raise ValueError("`mmax` must be <= `lmax`")
+
+    indices: list[int] = []
+    for l in range(lmax_i + 1):
+        m_keep = min(mmax_i, l)
+        for m in range(-m_keep, m_keep + 1):
+            indices.append(so3_packed_index(l, m))
+    return torch.tensor(indices, device=device, dtype=torch.long)
+
+
+def build_m_major_index(lmax: int, mmax: int, *, device: torch.device) -> torch.Tensor:
+    """
+    Build coefficient indices for m-major layout truncated by mmax.
+
+    This layout minimizes rotation cost and avoids gather-heavy indexing:
+
+    - m = 0: l = 0..lmax (single coefficient per l)
+    - for each m = 1..mmax:
+        - negative part: l = m..lmax, coefficient (l, -m)
+        - positive part: l = m..lmax, coefficient (l, +m)
+
+    Parameters
+    ----------
+    lmax
+        Maximum degree.
+    mmax
+        Maximum order (|m|). Must satisfy ``0 <= mmax <= lmax``.
+    device
+        Device for the returned tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Long tensor of indices with shape (D_m_trunc,), selecting coefficients
+        from the full packed layout with D_full=(lmax+1)^2, where D_m_trunc is
+        the number of coefficients kept under ``|m| <= min(mmax, l)``.
+
+    Examples
+    --------
+    For lmax=2, mmax=1:
+    - m=0 group: (l=0,m=0)→0, (l=1,m=0)→2, (l=2,m=0)→6
+    - m=1 neg group: (l=1,m=-1)→1, (l=2,m=-1)→5
+    - m=1 pos group: (l=1,m=+1)→3, (l=2,m=+1)→7
+    - Returns: [0, 2, 6, 1, 5, 3, 7]
+    """
+    lmax_i = int(lmax)
+    mmax_i = int(mmax)
+    if lmax_i < 0:
+        raise ValueError("`lmax` must be non-negative")
+    if mmax_i < 0:
+        raise ValueError("`mmax` must be non-negative")
+    if mmax_i > lmax_i:
+        raise ValueError("`mmax` must be <= `lmax`")
+
+    indices: list[int] = []
+    # === Step 1. m = 0 group (l = 0..lmax) ===
+    for l in range(lmax_i + 1):
+        indices.append(so3_packed_index(l, 0))
+
+    # === Step 2. m > 0 groups (neg then pos) ===
+    for m in range(1, mmax_i + 1):
+        for l in range(m, lmax_i + 1):
+            indices.append(so3_packed_index(l, -m))
+        for l in range(m, lmax_i + 1):
+            indices.append(so3_packed_index(l, m))
+
+    return torch.tensor(indices, device=device, dtype=torch.long)
+
+
+def build_m_major_l_index(
+    lmax: int, mmax: int, *, device: torch.device
+) -> torch.Tensor:
+    """
+    Build degree (l) index aligned with `build_m_major_index`.
+
+    Parameters
+    ----------
+    lmax
+        Maximum degree.
+    mmax
+        Maximum order (|m|). Must satisfy ``0 <= mmax <= lmax``.
+    device
+        Device for the returned tensor.
+
+    Returns
+    -------
+    torch.Tensor
+        Long tensor of degrees with shape (D_m_trunc,). Entry i is the degree
+        l for the i-th coefficient in the m-major layout.
+
+    Examples
+    --------
+    For lmax=2, mmax=1:
+    - m=0 group: l=0,1,2
+    - m=1 neg group: l=1,2
+    - m=1 pos group: l=1,2
+    - Returns: [0, 1, 2, 1, 2, 1, 2]
+    """
+    lmax_i = int(lmax)
+    mmax_i = int(mmax)
+    if lmax_i < 0:
+        raise ValueError("`lmax` must be non-negative")
+    if mmax_i < 0:
+        raise ValueError("`mmax` must be non-negative")
+    if mmax_i > lmax_i:
+        raise ValueError("`mmax` must be <= `lmax`")
+
+    degrees: list[int] = []
+    # === Step 1. m = 0 group ===
+    for l in range(lmax_i + 1):
+        degrees.append(l)
+
+    # === Step 2. m > 0 groups (neg then pos) ===
+    for m in range(1, mmax_i + 1):
+        for l in range(m, lmax_i + 1):
+            degrees.append(l)
+        for l in range(m, lmax_i + 1):
+            degrees.append(l)
+
+    return torch.tensor(degrees, device=device, dtype=torch.long)
 
 
 class WignerDCalcBase(nn.Module, ABC):
@@ -94,7 +682,12 @@ class WignerDCalcBase(nn.Module, ABC):
     @abstractmethod
     def forward(
         self, rot_mat: torch.Tensor
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """
         Compute Wigner-D blocks for a batch of rotation matrices.
 
@@ -109,6 +702,11 @@ class WignerDCalcBase(nn.Module, ABC):
             List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         Dt_list : list[torch.Tensor]
             Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
+        D_full : torch.Tensor | None
+            Block-diagonal matrix with shape (n_edges, D, D) where D=(lmax+1)^2.
+            None if not computed (e.g., for per-l loop implementation).
+        Dt_full : torch.Tensor | None
+            Transpose of D_full. None if not computed.
         """
         raise NotImplementedError
 
@@ -254,7 +852,7 @@ class WignerDCalcBase(nn.Module, ABC):
         Returns
         -------
         torch.Tensor
-            J_l with shape (2l+1, 2l+1) in self.dtype on CPU.
+            J_l with shape (2l+1, 2l+1) in float64 on CPU.
         """
         dim = 2 * l + 1
 
@@ -304,7 +902,7 @@ class WignerDCalcBase(nn.Module, ABC):
         C_inv = C.conj().transpose(-1, -2)
         D_real = (C @ D_complex @ C_inv).real
 
-        return D_real.to(dtype=self.dtype)
+        return D_real
 
     def _wigner_d_y_element(self, l: int, m1: int, m2: int, beta: float) -> float:
         """
@@ -488,12 +1086,17 @@ class WignerDCalc(WignerDCalcBase):
         # Also cache J_l^T (the transpose in real basis equals the inverse)
         self.j_mats: nn.ModuleList = nn.ModuleList()
         for l in range(self.lmax + 1):
-            J = self._compute_j_matrix(l).to(device=self.device)
+            J = self._compute_j_matrix(l).to(device=self.device, dtype=self.dtype)
             self.j_mats.append(self._JMatrixPair(J))
 
     def forward(
         self, rot_mat: torch.Tensor
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """
         Compute Wigner-D blocks for a batch of rotation matrices.
 
@@ -508,7 +1111,13 @@ class WignerDCalc(WignerDCalcBase):
             List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         Dt_list : list[torch.Tensor]
             Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
+        D_full : None
+            Not computed in per-l implementation.
+        Dt_full : None
+            Not computed in per-l implementation.
         """
+        rot_mat = rot_mat.to(dtype=self.dtype)
+
         # === Step 1. Extract ZYZ Euler angles ===
         # Convention: rot_mat = Rz(alpha) @ Ry(beta) @ Rz(gamma)
         alpha, beta, gamma = self._extract_zyz_euler(rot_mat)
@@ -534,7 +1143,7 @@ class WignerDCalc(WignerDCalcBase):
             D_list.append(D.contiguous())
             Dt_list.append(D.transpose(-1, -2).contiguous())
 
-        return D_list, Dt_list
+        return D_list, Dt_list, None, None
 
     def serialize(self) -> dict[str, Any]:
         """Serialize WignerDCalc (lmax and dtype are stored by parent)."""
@@ -679,10 +1288,13 @@ class WignerDCalcParallel(WignerDCalcBase):
         # === Step 2. Build J_full as block-diagonal matrix ===
         # J_full contains J_l = D^{(l)}(Rx(pi/2)) on diagonal blocks
         J_full = torch.zeros(
-            self.dim_full, self.dim_full, dtype=self.dtype, device=self.device
+            self.dim_full,
+            self.dim_full,
+            dtype=self.dtype,
+            device=self.device,
         )
         for l in range(self.lmax + 1):
-            J_l = self._compute_j_matrix(l).to(device=self.device)
+            J_l = self._compute_j_matrix(l).to(device=self.device, dtype=self.dtype)
             start, end = l * l, (l + 1) * (l + 1)
             J_full[start:end, start:end] = J_l
 
@@ -694,7 +1306,12 @@ class WignerDCalcParallel(WignerDCalcBase):
 
     def forward(
         self, rot_mat: torch.Tensor
-    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    ) -> tuple[
+        list[torch.Tensor],
+        list[torch.Tensor],
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """
         Compute Wigner-D blocks for a batch of rotation matrices.
 
@@ -709,7 +1326,13 @@ class WignerDCalcParallel(WignerDCalcBase):
             List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         Dt_list : list[torch.Tensor]
             Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
+        D_full : torch.Tensor
+            Block-diagonal matrix with shape (n_edges, D, D) where D=(lmax+1)^2.
+        Dt_full : torch.Tensor
+            Transpose of D_full.
         """
+        rot_mat = rot_mat.to(dtype=self.dtype)
+
         # === Step 1. Extract ZYZ Euler angles ===
         # Convention: rot_mat = Rz(alpha) @ Ry(beta) @ Rz(gamma)
         alpha, beta, gamma = self._extract_zyz_euler(rot_mat)
@@ -725,19 +1348,10 @@ class WignerDCalcParallel(WignerDCalcBase):
         J_full: torch.Tensor = self.J_full
         Jt_full: torch.Tensor = self.Jt_full
         D_full = Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full
+        Dt_full = D_full.transpose(-1, -2).contiguous()
 
-        # === Step 4. Slice D_full into per-l blocks ===
-        # Block l occupies indices [l^2, (l+1)^2) in the full matrix.
-        D_list: list[torch.Tensor] = []
-        Dt_list: list[torch.Tensor] = []
-        for l in range(self.lmax + 1):
-            start = l * l
-            end = (l + 1) * (l + 1)
-            D_l = D_full[:, start:end, start:end].contiguous()
-            D_list.append(D_l)
-            Dt_list.append(D_l.transpose(-1, -2).contiguous())
-
-        return D_list, Dt_list
+        # D_list and Dt_list are empty in parallel mode.
+        return [], [], D_full, Dt_full
 
     def serialize(self) -> dict[str, Any]:
         """Serialize WignerDCalcParallel (lmax and dtype are stored by parent)."""
@@ -841,7 +1455,7 @@ class WignerDCalcParallel(WignerDCalcBase):
         """
         # === Step 1. Indices for m=0 diagonal elements ===
         m0_indices = torch.tensor(
-            [l * l + l for l in range(self.lmax + 1)],
+            [so3_packed_index(l, 0) for l in range(self.lmax + 1)],
             dtype=torch.long,
             device=self.device,
         )

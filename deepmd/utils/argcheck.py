@@ -53,9 +53,7 @@ doc_se_atten = "Used by the smooth edition of Deep Potential. The full relative 
 doc_se_atten_v2 = "Used by the smooth edition of Deep Potential. The full relative coordinates are used to construct the descriptor. Attention mechanism with new modifications will be used by this descriptor."
 doc_se_a_mask = "Used by the smooth edition of Deep Potential. It can accept a variable number of atoms in a frame (Non-PBC system). *aparam* are required as an indicator matrix for the real/virtual sign of input atoms."
 doc_hybrid = "Concatenate of a list of descriptors as a new descriptor."
-doc_se_zm_net = (
-    "SeZM-Net: Smooth equivariant ZBL Message-passing Network (PyTorch backend)."
-)
+doc_se_zm_net = "SeZM-Net: Smooth equivariant ZBL Message-passing Network."
 # fitting
 doc_ener = "Fit an energy model (potential energy surface)."
 doc_dos = "Fit a density of states model. The total density of states / site-projected density of states labels should be provided by `dos.npy` or `atom_dos.npy` in each data system. The file has a number of frames (rows) and a number of energy-grid columns (multiplied by the number of atoms in `atom_dos.npy`). See `loss` parameter."
@@ -352,25 +350,39 @@ def descrpt_se_zm_net_args() -> list[Argument]:
     - `list[int]`: sel[i] specifies the maximum number of type-i neighbors within `rcut`\n\n\
     - `str`: Can be "auto:factor" or "auto". "factor" is a float number larger than 1. This option will automatically determine the `sel`. In detail it counts the maximal number of neighbors with in the cutoff radius for each type of neighbor, then multiply the maximum by the "factor". Finally the number is wrapped up to 4 divisible. The option "auto" is equivalent to "auto:1.1".'
     doc_rcut = "The cut-off radius."
-    doc_rcut_smth = "Where to start smoothing. For example the 1/r term is smoothed from `rcut` to `rcut_smth`"
-    doc_lmax = "Maximum order, only used when `l_schedule` is None."
-    doc_l_schedule = "Pyramid schedule of lmax per block. Must be non-increasing."
+    doc_lmax = "Maximum degree, only used when `l_schedule` is None."
+    doc_n_blocks = "Number of blocks (only used when `l_schedule` is None)."
+    doc_l_schedule = (
+        "Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. "
+        "If set, lmax and n_blocks will be ignored."
+    )
     doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
     doc_m_schedule = (
-        "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`."
+        "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. "
+        "If set, `mmax` will be ignored."
     )
-    doc_channels = "Channels per (l,m) coefficient."
+    doc_channels = "Channels per (l,m) coefficient, i.e. feature dimension per degree."
     doc_n_radial = "Number of radial basis functions."
-    doc_radial_mlp = "Hidden sizes for radial networks."
-    doc_n_blocks = "Number of interaction blocks (only used when `l_schedule` is None)."
+    doc_radial_mlp = (
+        "Hidden layer sizes for radial networks. An output layer of size "
+        "(l_schedule[0]+1)*channels will be automatically appended."
+    )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
-    doc_ffn_neuron = (
-        "Hidden sizes for equivariant FFN (first element used as hidden_channels)."
+    doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block."
+    doc_n_atten_head = (
+        "Number of gated attention heads when aggregating messages in SO(2) "
+        "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
+        "channels must be divisible by `n_atten_head` and head-wise gating "
+        "(2*sigmoid on edges, sigmoid on post head gate, no softmax) is applied."
     )
     doc_use_parallel = (
         "If True, use parallel Wigner-D implementation (higher memory usage)."
     )
-    doc_set_davg_zero = "Set the normalization average to zero."
+    doc_use_amp = (
+        "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "
+        "This does not provide accelerations under fp32 precision but will decrease "
+        "the memory usage, while preserving model accuracy."
+    )
     doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
     doc_trainable = "If the parameters in the descriptor are trainable."
@@ -383,8 +395,8 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             "sel", [int, list[int], str], optional=True, default="auto", doc=doc_sel
         ),
         Argument("rcut", float, optional=True, default=6.0, doc=doc_rcut),
-        Argument("rcut_smth", float, optional=True, default=0.5, doc=doc_rcut_smth),
         Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
+        Argument("n_blocks", int, optional=True, default=2, doc=doc_n_blocks),
         Argument(
             "l_schedule", list[int], optional=True, default=None, doc=doc_l_schedule
         ),
@@ -398,25 +410,20 @@ def descrpt_se_zm_net_args() -> list[Argument]:
         Argument(
             "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
         ),
-        Argument("channels", int, optional=True, default=96, doc=doc_channels),
-        Argument("n_radial", int, optional=True, default=8, doc=doc_n_radial),
+        Argument("channels", int, optional=True, default=64, doc=doc_channels),
+        Argument("n_radial", int, optional=True, default=10, doc=doc_n_radial),
         Argument(
             "radial_mlp",
             list[int],
             optional=True,
-            default=[64, 64],
+            default=[64],
             doc=doc_radial_mlp,
         ),
-        Argument("n_blocks", int, optional=True, default=4, doc=doc_n_blocks),
         Argument("so2_layers", int, optional=True, default=2, doc=doc_so2_layers),
-        Argument(
-            "ffn_neuron", list[int], optional=True, default=[128], doc=doc_ffn_neuron
-        ),
+        Argument("ffn_neurons", int, optional=True, default=128, doc=doc_ffn_neurons),
+        Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
         Argument(
             "use_parallel", bool, optional=True, default=False, doc=doc_use_parallel
-        ),
-        Argument(
-            "set_davg_zero", bool, optional=True, default=False, doc=doc_set_davg_zero
         ),
         Argument(
             "activation_function",
@@ -426,6 +433,7 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             doc=doc_activation_function,
         ),
         Argument("precision", str, optional=True, default="float32", doc=doc_precision),
+        Argument("use_amp", bool, optional=True, default=False, doc=doc_use_amp),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
         Argument("seed", [int, None], optional=True, doc=doc_seed),
         Argument(
