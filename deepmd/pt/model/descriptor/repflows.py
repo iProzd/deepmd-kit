@@ -223,6 +223,8 @@ class DescrptBlockRepflows(DescriptorBlock):
         update_use_layernorm: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        use_node_self: bool = True,
+        use_node_sym: bool = True,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
         trainable: bool = True,
@@ -284,6 +286,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.act = ActivationFn(activation_function)
         self.prec = PRECISION_DICT[precision]
 
+        self.use_node_self = use_node_self
+        self.use_node_sym = use_node_sym
+
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
         self.env_protection = env_protection
@@ -341,6 +346,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                     update_use_layernorm=self.update_use_layernorm,
                     use_gated_mlp=self.use_gated_mlp,
                     gated_mlp_norm=self.gated_mlp_norm,
+                    use_node_self=self.use_node_self,
+                    use_node_sym=self.use_node_sym,
                     seed=child_seed(child_seed(seed, 1), ii),
                     trainable=trainable,
                 )

@@ -1692,6 +1692,18 @@ def dpa3_repflow_args() -> list[Argument]:
             optional=True,
             default="none",
         ),
+        Argument(
+            "use_node_self",
+            bool,
+            optional=True,
+            default=True,
+        ),
+        Argument(
+            "use_node_sym",
+            bool,
+            optional=True,
+            default=True,
+        ),
     ]
 
 

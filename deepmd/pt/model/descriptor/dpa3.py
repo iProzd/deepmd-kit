@@ -172,6 +172,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             update_use_layernorm=self.repflow_args.update_use_layernorm,
             use_gated_mlp=self.repflow_args.use_gated_mlp,
             gated_mlp_norm=self.repflow_args.gated_mlp_norm,
+            use_node_self=self.repflow_args.use_node_self,
+            use_node_sym=self.repflow_args.use_node_sym,
             exclude_types=exclude_types,
             env_protection=env_protection,
             precision=precision,

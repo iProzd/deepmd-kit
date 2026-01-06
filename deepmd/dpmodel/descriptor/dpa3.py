@@ -183,6 +183,8 @@ class RepFlowArgs:
         update_use_layernorm: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        use_node_self: bool = True,
+        use_node_sym: bool = True,
     ) -> None:
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -216,6 +218,8 @@ class RepFlowArgs:
         self.update_use_layernorm = update_use_layernorm
         self.use_gated_mlp = use_gated_mlp
         self.gated_mlp_norm = gated_mlp_norm
+        self.use_node_self = use_node_self
+        self.use_node_sym = use_node_sym
 
     def __getitem__(self, key: str) -> Any:
         if hasattr(self, key):

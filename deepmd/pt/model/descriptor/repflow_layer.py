@@ -62,6 +62,8 @@ class RepFlowLayer(torch.nn.Module):
         update_use_layernorm: bool = False,
         use_gated_mlp: bool = False,
         gated_mlp_norm: str = "none",
+        use_node_self: bool = True,
+        use_node_sym: bool = True,
         activation_function: str = "silu",
         update_style: str = "res_residual",
         update_residual: float = 0.1,
@@ -118,6 +120,9 @@ class RepFlowLayer(torch.nn.Module):
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
 
+        self.use_node_self = use_node_self
+        self.use_node_sym = use_node_sym
+
         assert update_residual_init in [
             "norm",
             "const",
@@ -138,7 +143,7 @@ class RepFlowLayer(torch.nn.Module):
             seed=child_seed(seed, 0),
             trainable=trainable,
         )
-        if self.update_style == "res_residual":
+        if self.use_node_self and self.update_style == "res_residual":
             self.n_residual.append(
                 get_residual(
                     n_dim,
@@ -159,7 +164,7 @@ class RepFlowLayer(torch.nn.Module):
             seed=child_seed(seed, 2),
             trainable=trainable,
         )
-        if self.update_style == "res_residual":
+        if self.use_node_sym and self.update_style == "res_residual":
             self.n_residual.append(
                 get_residual(
                     n_dim,
@@ -832,55 +837,60 @@ class RepFlowLayer(torch.nn.Module):
         a_update_list: list[torch.Tensor] = [angle_ebd]
 
         # node self mlp
-        node_self_mlp = self.act(self.node_self_mlp(node_ebd))
-        n_update_list.append(node_self_mlp)
+        if self.use_node_self:
+            node_self_mlp = self.act(self.node_self_mlp(node_ebd))
+            n_update_list.append(node_self_mlp)
 
         # node sym (grrg + drrd)
-        node_sym_list: list[torch.Tensor] = []
-        node_sym_list.append(
-            self.symmetrization_op(
-                edge_ebd,
-                h2,
-                nlist_mask,
-                sw,
-                self.axis_neuron,
+        if self.use_node_sym:
+            node_sym_list: list[torch.Tensor] = []
+            node_sym_list.append(
+                self.symmetrization_op(
+                    edge_ebd,
+                    h2,
+                    nlist_mask,
+                    sw,
+                    self.axis_neuron,
+                )
+                if not self.use_dynamic_sel
+                else self.symmetrization_op_dynamic(
+                    edge_ebd,
+                    h2,
+                    sw,
+                    owner=n2e_index,
+                    num_owner=nb * nloc,
+                    nb=nb,
+                    nloc=nloc,
+                    scale_factor=self.dynamic_e_sel ** (-0.5),
+                    axis_neuron=self.axis_neuron,
+                )
             )
-            if not self.use_dynamic_sel
-            else self.symmetrization_op_dynamic(
-                edge_ebd,
-                h2,
-                sw,
-                owner=n2e_index,
-                num_owner=nb * nloc,
-                nb=nb,
-                nloc=nloc,
-                scale_factor=self.dynamic_e_sel ** (-0.5),
-                axis_neuron=self.axis_neuron,
+            node_sym_list.append(
+                self.symmetrization_op(
+                    nei_node_ebd,
+                    h2,
+                    nlist_mask,
+                    sw,
+                    self.axis_neuron,
+                )
+                if not self.use_dynamic_sel
+                else self.symmetrization_op_dynamic(
+                    nei_node_ebd,
+                    h2,
+                    sw,
+                    owner=n2e_index,
+                    num_owner=nb * nloc,
+                    nb=nb,
+                    nloc=nloc,
+                    scale_factor=self.dynamic_e_sel ** (-0.5),
+                    axis_neuron=self.axis_neuron,
+                )
             )
-        )
-        node_sym_list.append(
-            self.symmetrization_op(
-                nei_node_ebd,
-                h2,
-                nlist_mask,
-                sw,
-                self.axis_neuron,
-            )
-            if not self.use_dynamic_sel
-            else self.symmetrization_op_dynamic(
-                nei_node_ebd,
-                h2,
-                sw,
-                owner=n2e_index,
-                num_owner=nb * nloc,
-                nb=nb,
-                nloc=nloc,
-                scale_factor=self.dynamic_e_sel ** (-0.5),
-                axis_neuron=self.axis_neuron,
-            )
-        )
-        node_sym = self.act(self.node_sym_linear(torch.cat(node_sym_list, dim=-1)))
-        n_update_list.append(node_sym)
+            node_sym = self.act(self.node_sym_linear(torch.cat(node_sym_list, dim=-1)))
+            n_update_list.append(node_sym)
+
+        # from IPython import embed
+        # embed()
 
         if not self.optim_update:
             if not self.use_dynamic_sel:
