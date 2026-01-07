@@ -63,7 +63,7 @@ from .se_zm_block import (
     SeZMInteractionBlock,
     SO3LinearV2,
 )
-from .sel_zm_helper import (
+from .se_zm_helper import (
     EdgeFeatureCache,
     WignerDCalc,
     WignerDCalcBase,
@@ -759,6 +759,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     radial_mlp
         Hidden layer sizes for radial networks. An output layer of size
         (l_schedule[0]+1)*channels will be automatically appended.
+    so2_norm
+        If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
+        When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers per block.
     ffn_neurons
@@ -815,6 +818,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         channels: int = 64,
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
+        so2_norm: bool = False,
         so2_layers: int = 2,
         ffn_neurons: int = 128,
         n_atten_head: int = 0,
@@ -847,6 +851,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         if radial_mlp is None:
             radial_mlp = [64]
         self.radial_mlp = list(radial_mlp)
+        self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
         self.ffn_neurons = int(ffn_neurons)
         self.n_atten_head = int(n_atten_head)
@@ -945,6 +950,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     lmax=l_b,
                     mmax=m_b,
                     channels=self.channels,
+                    so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
                     ffn_neurons=self.ffn_neurons,
                     n_atten_head=self.n_atten_head,
@@ -1599,6 +1605,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "channels": self.channels,
             "n_radial": self.n_radial,
             "radial_mlp": self.radial_mlp,
+            "so2_norm": self.so2_norm,
             "so2_layers": self.so2_layers,
             "ffn_neurons": self.ffn_neurons,
             "n_atten_head": self.n_atten_head,

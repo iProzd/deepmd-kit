@@ -136,6 +136,13 @@ This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5` and `2*sigmoi
 - Unbiased feature scaling: the model learns which features to suppress/amplify from the loss signal
 - Near-identity initialization for `2*sigmoid` gates preserves initial magnitude
 
+### 8. Stability defaults
+
+- Residual branches start near-identity: the output projections of both SO(2) convolution and Equivariant FFN are zero-initialized (weights + bias).
+- Attention aggregation runs in promoted dtype (fp32) and clamps logits to `[-6, 6]` before `sigmoid`.
+- Message feedback into edge gates is bounded: `edge_logits = dst + radial + λ * msg` with `λ ∈ (0, λ_max)` and `λ_max = 0.2`.
+- Multi-layer SO(2) stacks optionally insert a reduced-layout separable RMSNorm between layers (except the last) when `so2_norm=True`. This keeps truncated m-major activations balanced but is disabled by default.
+
 ---
 
 ## Tensor Layouts and Invariants
@@ -221,10 +228,11 @@ For each edge `(src -> dst)`:
    - Apply `SO2Linear` (group by `|m|`):
      - `m=0`: standard linear with additive bias (modulated by radial weights and cutoff to preserve strict smoothness on first layer); bias uses in-place add on preallocated output
      - `|m|>0`: 2x2 complex mixing on `(-m, +m)` pairs treated as `(Re, Im)`
+   - If `so2_norm=True`, apply `ReducedSeparableRMSNorm` (m-major truncated layout) between layers (not after the last)
    - Apply `GatedActivation(mmax=...)` between layers (not after the last):
      - l=0: SiLU activation
      - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
-5. **Final SO(3) channel mixing**: apply `SO3LinearV2` to mix channels across all degrees
+5. **Final SO(3) channel mixing**: apply `SO3LinearV2` to mix channels across all degrees (zero-initialized for residual stability)
 6. **Rotate back (reduced)**:
    - `use_parallel=True`: reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
    - `use_parallel=False`: permute back to l-major-reduced, then apply per-l `Dt_list[l]`
@@ -232,12 +240,12 @@ For each edge `(src -> dst)`:
 7. **Aggregate with optional head gates**:
    - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
    - `n_atten_head > 0`:
-     - **Edge gate**: `g = 2 * sigmoid(proj_b(x_l0)[dst] + proj_s(radial_l0))` (no normalization on inputs)
-     - Weight: `w = edge_env * g`
+     - **Edge gate**: `g = 2 * sigmoid(clamp(dst + radial + λ * msg, [-6, 6]))` where `λ = λ_max * sigmoid(lambda_raw)` with `λ_max = 0.2`.
+     - Weight: `w = edge_env * g` (all gate math and scatter aggregation in promoted dtype, fp32)
      - Split value into `H = n_atten_head` heads, scale by `w`, `index_add` by `dst`
      - Apply `inv_sqrt_deg`
-     - **Head gate**: `alpha = 2 * sigmoid(proj_head(RMSNorm(x_l0)))` with per-head scale `gamma_head` (learnable, init ones)
-     - Both gates use `2*sigmoid` for initial ≈ 1 behavior (no softmax)
+     - **Head gate**: `alpha = 2 * sigmoid(clamp(proj_head(RMSNorm(x_l0)), [-6, 6]))` with bounded per-head scale `gamma_head = 2 * sigmoid(gamma_head_raw)` (init ones, bounded in (0,2))
+     - Both gates use `2*sigmoid` (no softmax) and clamp logits before activation
 
 ### Full Equivariant FFN
 
@@ -265,6 +273,7 @@ Key properties:
 - Each `l` has an independent gate, expanded to all `m` within that `l`
 - `expand_index` maps per-l gates to all `2l+1` m-components
 - Residual connection: `x = x + ffn(x)`
+- Output projection is zero-initialized so the residual path starts near-identity
 
 ---
 
@@ -356,6 +365,7 @@ Key arguments:
 - `channels: int` — Channels per (l,m) coefficient, i.e. feature dimension per degree (default: 64)
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
+- `so2_norm: bool` — If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. When False (default), no normalization is applied between layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
 - `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, channels must be divisible by `n_atten_head`. Edge gate uses `2 * sigmoid(proj_b(x_l0)[dst] + proj_s(radial_l0))` without normalization; head gate uses `2 * sigmoid(proj_head(RMSNorm(x_l0)))` with per-head scale `gamma_head` (no softmax).

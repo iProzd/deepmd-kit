@@ -16,16 +16,16 @@ from deepmd.pt.model.descriptor.se_zm_block import (
     SO2Convolution,
     SO2Linear,
 )
-from deepmd.pt.model.descriptor.se_zm_net import (
-    DescrptSeZMNet,
-    init_edge_rot_mat_frisvad,
-)
-from deepmd.pt.model.descriptor.sel_zm_helper import (
+from deepmd.pt.model.descriptor.se_zm_helper import (
     EdgeFeatureCache,
     WignerDCalc,
     WignerDCalcParallel,
     build_m_major_index,
     edge_cache_to_dtype,
+)
+from deepmd.pt.model.descriptor.se_zm_net import (
+    DescrptSeZMNet,
+    init_edge_rot_mat_frisvad,
 )
 from deepmd.pt.utils import (
     env,
@@ -384,15 +384,23 @@ class TestDescrptSeZMNet(unittest.TestCase):
         assert conv.proj_dst is not None
         assert conv.proj_rad is not None
         assert conv.proj_head is not None
+        assert conv.proj_msg is not None
+        assert conv.norm_dst_for_gate is not None
+        assert conv.norm_msg_for_gate is not None
         conv.proj_dst.matrix.data.fill_(1.0)
         conv.proj_rad.matrix.data.fill_(1.0)
         conv.proj_head.matrix.data.fill_(1.0)
+        conv.proj_msg.matrix.data.fill_(1.0)
         if conv.proj_dst.bias is not None:
             conv.proj_dst.bias.data.zero_()
         if conv.proj_rad.bias is not None:
             conv.proj_rad.bias.data.zero_()
         if conv.proj_head.bias is not None:
             conv.proj_head.bias.data.zero_()
+        if conv.proj_msg.bias is not None:
+            conv.proj_msg.bias.data.zero_()
+        if conv.msg_gate_scale_raw is not None:
+            conv.msg_gate_scale_raw.data.fill_(0.0)
 
         x = torch.tensor(
             [[[1.0, 2.0, 3.0, 4.0]], [[5.0, 6.0, 7.0, 8.0]]],
@@ -425,10 +433,16 @@ class TestDescrptSeZMNet(unittest.TestCase):
         x_global = x[src]
         x_l0 = x[:, 0, :].contiguous()  # (N, C) in self.dtype
         radial_l0 = radial_feat[:, 0, :].contiguous()  # (E, C) in self.dtype
-        # Edge gate: dst normalized, radial unchanged
-        b = conv.proj_dst(conv.norm_dst_for_b(x_l0))
+        msg_l0 = x_global[:, 0, :].contiguous()
+        # Edge gate: dst normalized, radial unchanged, msg normalized with bounded feedback
+        b = conv.proj_dst(conv.norm_dst_for_gate(x_l0))
         s = conv.proj_rad(radial_l0)
-        g = 2.0 * torch.sigmoid((b.index_select(0, dst) + s).to(torch.float32)).to(
+        m = conv.proj_msg(conv.norm_msg_for_gate(msg_l0))
+        msg_gate_scale = conv.msg_gate_scale_max * torch.sigmoid(
+            conv.msg_gate_scale_raw
+        )
+        edge_logits = b.index_select(0, dst) + s + msg_gate_scale.to(dtype) * m
+        g = 2.0 * torch.sigmoid(edge_logits.to(torch.float32).clamp(-6.0, 6.0)).to(
             dtype
         )
         w = edge_env.view(-1, 1) * g
@@ -438,16 +452,18 @@ class TestDescrptSeZMNet(unittest.TestCase):
             -1, 1, conv.n_atten_head, 1
         )
         expected = torch.zeros(
-            2, 1, conv.n_atten_head, head_dim, device=self.device, dtype=dtype
+            2, 1, conv.n_atten_head, head_dim, device=self.device, dtype=torch.float32
         )
-        expected.index_add_(0, dst, msg)
-        # Head gate: 2 * sigmoid with normalization, fp32 sigmoid
+        expected.index_add_(0, dst, msg.to(torch.float32))
+        # Head gate: 2 * sigmoid with normalization, fp32 sigmoid + clamp
         head_logits = conv.proj_head(conv.norm_dst_for_head(x_l0))
-        alpha = 2.0 * torch.sigmoid(head_logits.to(torch.float32)).to(dtype)
-        alpha = alpha * conv.gamma_head.view(1, -1)
+        alpha = 2.0 * torch.sigmoid(head_logits.to(torch.float32).clamp(-6.0, 6.0))
+        gamma_eff = 2.0 * torch.sigmoid(conv.gamma_head_raw)
+        alpha = alpha * gamma_eff.view(1, -1)
         expected = expected * alpha.view(-1, 1, conv.n_atten_head, 1)
         # Apply degree normalization (consistent with baseline path)
-        expected = expected.view(2, 1, conv.channels) * inv_sqrt_deg
+        expected = expected.view(2, 1, conv.channels) * inv_sqrt_deg.to(torch.float32)
+        expected = expected.to(dtype)
 
         torch.testing.assert_close(out, expected)
 

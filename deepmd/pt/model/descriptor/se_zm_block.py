@@ -43,7 +43,7 @@ from deepmd.pt.utils.utils import (
     get_generator,
 )
 
-from .sel_zm_helper import (
+from .se_zm_helper import (
     EdgeFeatureCache,
     build_l_major_index,
     build_m_major_index,
@@ -141,7 +141,7 @@ class GatedActivation(nn.Module):
             )
 
             # === Optimized Init: Gate output ~0 => Sigmoid => 0.5 ===
-            # Ensures maximum gradient flow (sigmoid'(0.5) = 0.25, max) and unbiased
+            # Ensures maximum gradient flow (sigmoid'(0) = 0.25 is maximal, sigmoid(0) = 0.5) and unbiased
             # feature scaling at initialization. All high-order features start with
             # equal gating weight (0.5), allowing the model to learn which to suppress
             # or amplify based on the loss signal.
@@ -462,6 +462,196 @@ class SeparableRMSNorm(nn.Module):
             )
         if obj.bias is not None and bias_data is not None:
             obj.bias.data.copy_(
+                safe_numpy_to_tensor(bias_data, device=obj.device, dtype=obj.dtype)
+            )
+        return obj
+
+
+class ReducedSeparableRMSNorm(nn.Module):
+    """
+    Separable RMSNorm for m-major truncated SO(2) layout.
+
+    Parameters
+    ----------
+    lmax
+        Maximum spherical harmonic degree.
+    mmax
+        Maximum order kept in the truncated layout.
+    channels
+        Number of channels per coefficient.
+    degree_index_m
+        Degree index per coefficient in m-major truncated layout, with shape (D_m_trunc,).
+    affine
+        Whether to apply per-l learnable scale.
+    centering
+        Whether to mean-center scalar (l=0) features.
+    eps
+        Epsilon for numerical stability.
+    dtype
+        Parameter dtype.
+    trainable
+        Whether parameters are trainable.
+    """
+
+    def __init__(
+        self,
+        *,
+        lmax: int,
+        mmax: int,
+        channels: int,
+        degree_index_m: torch.Tensor,
+        affine: bool = True,
+        centering: bool = True,
+        eps: float = 1e-7,
+        dtype: torch.dtype,
+        trainable: bool,
+    ) -> None:
+        super().__init__()
+        self.lmax = int(lmax)
+        self.mmax = int(mmax)
+        self.channels = int(channels)
+        self.affine = bool(affine)
+        self.centering = bool(centering)
+        self.eps = float(eps)
+        self.dtype = dtype
+        self.device = env.DEVICE
+        self.compute_dtype = get_promoted_dtype(self.dtype)
+
+        if degree_index_m.dtype != torch.long:
+            degree_index_m = degree_index_m.to(dtype=torch.long)
+        self.register_buffer("degree_index_m", degree_index_m, persistent=True)
+
+        deg_ns = degree_index_m[1:]
+        weights = torch.zeros(
+            deg_ns.numel(), dtype=self.compute_dtype, device=self.device
+        )
+        scale = 1.0 / (max(1, self.lmax) * max(1, self.channels))
+        for l in range(1, self.lmax + 1):
+            n_coeff_l = 2 * min(l, self.mmax) + 1
+            w_l = scale / float(n_coeff_l)
+            weights[deg_ns == l] = w_l
+        if torch.any(weights == 0):
+            raise ValueError(
+                "ReducedSeparableRMSNorm: balance_weight has zeros; degree_index_m may be invalid."
+            )
+        self.register_buffer("balance_weight", weights, persistent=True)
+
+        if self.affine:
+            self.weight = nn.Parameter(
+                torch.ones(
+                    self.lmax + 1, self.channels, dtype=self.dtype, device=self.device
+                )
+            )
+            self.bias0 = (
+                nn.Parameter(
+                    torch.zeros(self.channels, dtype=self.dtype, device=self.device)
+                )
+                if self.centering
+                else None
+            )
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias0", None)
+
+        for p in self.parameters():
+            p.requires_grad = trainable
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x
+            Input tensor with shape (E, D_m_trunc, C).
+
+        Returns
+        -------
+        torch.Tensor
+            Normalized tensor with shape (E, D_m_trunc, C).
+
+        Raises
+        ------
+        ValueError
+            If the coefficient dimension mismatches degree_index_m.
+        """
+        if x.shape[1] != self.degree_index_m.numel():
+            raise ValueError(
+                "Coefficient dimension mismatch for ReducedSeparableRMSNorm."
+            )
+
+        in_dtype = x.dtype
+        x0 = x[:, :1, :].to(dtype=self.compute_dtype)
+        xt = x[:, 1:, :].to(dtype=self.compute_dtype)
+
+        if self.centering:
+            x0 = x0 - x0.mean(dim=-1, keepdim=True)
+        rms0 = torch.sqrt(x0.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        x0n = (x0 / rms0).to(dtype=in_dtype)
+
+        if xt.numel() == 0:
+            out = x.new_empty(x.shape)
+            out[:, :1, :] = x0n
+            return out
+
+        mean_var = torch.einsum("edc,d->e", xt * xt, self.balance_weight)
+        rmst = torch.sqrt(mean_var + self.eps).view(-1, 1, 1)
+        xtn = (xt / rmst).to(dtype=in_dtype)
+
+        out = x.new_empty(x.shape)
+        out[:, :1, :] = x0n
+        out[:, 1:, :] = xtn
+
+        if self.affine and self.weight is not None:
+            w = torch.index_select(self.weight, dim=0, index=self.degree_index_m)
+            out = out * w.unsqueeze(0)
+            if self.centering and self.bias0 is not None:
+                out[:, 0, :] = out[:, 0, :] + self.bias0
+        return out
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "@class": "ReducedSeparableRMSNorm",
+            "@version": 1,
+            "lmax": self.lmax,
+            "mmax": self.mmax,
+            "channels": self.channels,
+            "affine": self.affine,
+            "centering": self.centering,
+            "eps": self.eps,
+            "precision": RESERVED_PRECISION_DICT[self.dtype],
+            "degree_index_m": np_safe(self.degree_index_m),
+            "weight": np_safe(self.weight) if self.weight is not None else None,
+            "bias0": np_safe(self.bias0) if self.bias0 is not None else None,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> ReducedSeparableRMSNorm:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "ReducedSeparableRMSNorm":
+            raise ValueError(f"Invalid class for ReducedSeparableRMSNorm: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported ReducedSeparableRMSNorm version: {version}")
+
+        degree_index_m_data = data.pop("degree_index_m")
+        weight_data = data.pop("weight")
+        bias_data = data.pop("bias0")
+        precision = data.pop("precision")
+        data["dtype"] = PRECISION_DICT[precision]
+        data["trainable"] = True
+        degree_index_m = safe_numpy_to_tensor(
+            degree_index_m_data, device=env.DEVICE, dtype=torch.long
+        )
+        data["degree_index_m"] = degree_index_m
+
+        obj = cls(**data)
+
+        if obj.weight is not None and weight_data is not None:
+            obj.weight.data.copy_(
+                safe_numpy_to_tensor(weight_data, device=obj.device, dtype=obj.dtype)
+            )
+        if obj.bias0 is not None and bias_data is not None:
+            obj.bias0.data.copy_(
                 safe_numpy_to_tensor(bias_data, device=obj.device, dtype=obj.dtype)
             )
         return obj
@@ -1125,6 +1315,9 @@ class SO2Convolution(nn.Module):
         Maximum SO(2) order (|m|). If None, defaults to lmax.
     channels
         Number of channels per (l, m) coefficient.
+    so2_norm
+        If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
+        When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO2Linear layers per convolution (default: 2).
     n_atten_head
@@ -1148,6 +1341,7 @@ class SO2Convolution(nn.Module):
         lmax: int,
         mmax: int | None = None,
         channels: int,
+        so2_norm: bool = False,
         so2_layers: int = 1,
         n_atten_head: int = 0,
         use_parallel: bool = True,
@@ -1164,6 +1358,7 @@ class SO2Convolution(nn.Module):
         if self.mmax > self.lmax:
             raise ValueError("`mmax` must be <= `lmax`")
         self.channels = int(channels)
+        self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
         if self.so2_layers < 1:
             raise ValueError("`so2_layers` must be >= 1")
@@ -1237,7 +1432,28 @@ class SO2Convolution(nn.Module):
             ]
         )
 
-        # === Step 4. Non-linearity Operators (for layers 2+) ===
+        # === Step 4. Intermediate norms (Optional) ===
+        inter_norms: list[nn.Module] = []
+        if self.so2_norm:
+            for _ in range(max(0, self.so2_layers - 1)):
+                inter_norms.append(
+                    ReducedSeparableRMSNorm(
+                        lmax=self.lmax,
+                        mmax=self.mmax,
+                        channels=self.channels,
+                        degree_index_m=self.degree_index_m,
+                        eps=self.eps,
+                        dtype=self.dtype,
+                        trainable=trainable,
+                    )
+                )
+        else:
+            for _ in range(max(0, self.so2_layers - 1)):
+                inter_norms.append(nn.Identity())
+        inter_norms.append(nn.Identity())
+        self.so2_inter_norms = nn.ModuleList(inter_norms)
+
+        # === Step 5. Intermediate non-linearity ===
         non_linearities: list[nn.Module] = []
         for i in range(max(0, self.so2_layers - 1)):
             non_linearities.append(
@@ -1253,16 +1469,18 @@ class SO2Convolution(nn.Module):
         non_linearities.append(nn.Identity())
         self.non_linearities = nn.ModuleList(non_linearities)
 
-        # === Step 5. Optional head-wise gating components ===
-        # Edge gate: dst_logits + radial_logits (no normalization)
-        # Head gate: post-aggregate per-head scaling with normalization
-        self.norm_dst_for_b: ScalarRMSNorm | None = None
+        # === Step 6. Optional head-wise gating components ===
+        # Edge gate: dst (normalized) + radial (raw) + message scalar (normalized)
+        # Head gate: post-aggregate per-head scaling with normalization + bounded gamma
+        self.norm_dst_for_gate: ScalarRMSNorm | None = None
+        self.norm_msg_for_gate: ScalarRMSNorm | None = None
         self.norm_dst_for_head: ScalarRMSNorm | None = None
         self.proj_dst: MLPLayer | None = None
         self.proj_rad: MLPLayer | None = None
+        self.proj_msg: MLPLayer | None = None
         self.proj_head: MLPLayer | None = None
         if self.n_atten_head > 0:
-            self.norm_dst_for_b = ScalarRMSNorm(
+            self.norm_dst_for_gate = ScalarRMSNorm(
                 channels=self.channels,
                 eps=self.eps,
                 dtype=self.dtype,
@@ -1274,7 +1492,13 @@ class SO2Convolution(nn.Module):
                 dtype=self.dtype,
                 trainable=trainable,
             )
-            # Edge gate projections: dst baseline + radial discriminator
+            self.norm_msg_for_gate = ScalarRMSNorm(
+                channels=self.channels,
+                eps=self.eps,
+                dtype=self.dtype,
+                trainable=trainable,
+            )
+            # Edge gate projections: dst baseline (normalized), radial discriminator (raw), message scalar (normalized)
             self.proj_dst = MLPLayer(
                 self.channels,
                 self.n_atten_head,
@@ -1293,6 +1517,15 @@ class SO2Convolution(nn.Module):
                 seed=child_seed(seed_gate, 1),
                 trainable=trainable,
             )
+            self.proj_msg = MLPLayer(
+                self.channels,
+                self.n_atten_head,
+                activation_function=None,
+                bias=True,
+                precision=self.precision,
+                seed=child_seed(seed_gate, 4),
+                trainable=trainable,
+            )
             # Post-aggregate head gate projection
             self.proj_head = MLPLayer(
                 self.channels,
@@ -1303,11 +1536,11 @@ class SO2Convolution(nn.Module):
                 seed=child_seed(seed_gate, 2),
                 trainable=trainable,
             )
-            # Initialization: Normal(0, 0.01) for matrix, zeros for bias
-            # This ensures logits ≈ 0, so 2*sigmoid ≈ 1 at initialization
+            # Initialization: Normal(0, 0.01) for weights, zeros for bias (logits≈0)
             gen_proj_dst = get_generator(child_seed(seed_gate, 10))
             gen_proj_rad = get_generator(child_seed(seed_gate, 11))
-            gen_proj_head = get_generator(child_seed(seed_gate, 12))
+            gen_proj_msg = get_generator(child_seed(seed_gate, 12))
+            gen_proj_head = get_generator(child_seed(seed_gate, 13))
             nn.init.normal_(
                 self.proj_dst.matrix, mean=0.0, std=0.01, generator=gen_proj_dst
             )
@@ -1319,16 +1552,37 @@ class SO2Convolution(nn.Module):
             if self.proj_rad.bias is not None:
                 nn.init.zeros_(self.proj_rad.bias)
             nn.init.normal_(
+                self.proj_msg.matrix, mean=0.0, std=0.01, generator=gen_proj_msg
+            )
+            if self.proj_msg.bias is not None:
+                nn.init.zeros_(self.proj_msg.bias)
+            nn.init.normal_(
                 self.proj_head.matrix, mean=0.0, std=0.01, generator=gen_proj_head
             )
             if self.proj_head.bias is not None:
                 nn.init.zeros_(self.proj_head.bias)
-            # gamma_head initialized to 1 to preserve initial magnitude
-            self.gamma_head = nn.Parameter(
-                torch.ones(self.n_atten_head, dtype=self.dtype, device=self.device)
+            # gamma_head_raw parameterized to keep gamma_eff in (0, 2)
+            self.gamma_head_raw = nn.Parameter(
+                torch.zeros(
+                    self.n_atten_head,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                )
             )
+            self.msg_gate_scale_max = 0.2
+            self.msg_gate_scale_raw = nn.Parameter(
+                torch.full(
+                    (self.n_atten_head,),
+                    -2.0,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                )
+            )
+        else:
+            self.msg_gate_scale_max = 0.2
+            self.register_parameter("msg_gate_scale_raw", None)
 
-        # === Step 6. Final SO3Linear to mix channels ===
+        # === Step 7. Final SO3Linear to mix channels ===
         self.so3_linear = SO3LinearV2(
             lmax=self.lmax,
             in_channels=self.channels,
@@ -1337,6 +1591,8 @@ class SO2Convolution(nn.Module):
             trainable=trainable,
             seed=seed_so3,
         )
+        nn.init.zeros_(self.so3_linear.weight)
+        nn.init.zeros_(self.so3_linear.bias)
 
     def forward(
         self,
@@ -1372,7 +1628,7 @@ class SO2Convolution(nn.Module):
             # Block-diagonal bmm with reduced rows (parallel mode).
             D_full = edge_cache.D_full
             assert D_full is not None
-            D_to_m = project_D_to_m(
+            D_m_prime = project_D_to_m(
                 D_full=D_full,
                 coeff_index_m=self.coeff_index_m,
                 ebed_dim_full=self.ebed_dim_full,
@@ -1380,7 +1636,7 @@ class SO2Convolution(nn.Module):
                 key_lmax=self.lmax,
                 key_mmax=self.mmax,
             )
-            x_local = torch.bmm(D_to_m, x_src)  # (E, D_m_trunc, C)
+            x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m_trunc, C)
         else:
             # Per-l reduced rotation.
             x_local_l = x_src.new_empty(
@@ -1404,8 +1660,8 @@ class SO2Convolution(nn.Module):
         x_local = x_local * rad_feat  # (E, D_m_trunc, C)
 
         # === Step 3. Multi-layer SO(2) mixing ===
-        for layer_idx, (so2_linear, non_linear) in enumerate(
-            zip(self.so2_linears, self.non_linearities)
+        for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
+            zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
         ):
             x_local = so2_linear(x_local)
 
@@ -1416,8 +1672,8 @@ class SO2Convolution(nn.Module):
                 )
                 x_local[:, 0, :].add_(bias_correction)
 
-            # Apply non-linearity between SO2 layers
-            # The last non-linearity is Identity by construction.
+            # Apply non-linearity between SO2 layers (intermediate norms include Identity for last layer)
+            x_local = inter_norm(x_local)
             x_local = non_linear(x_local)
 
         # === Step 4. Rotate back to global frame ===
@@ -1433,11 +1689,11 @@ class SO2Convolution(nn.Module):
                 key_lmax=self.lmax,
                 key_mmax=self.mmax,
             )
-            x_global = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
+            x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
         else:
             # Per-l einsum loop.
             x_local_l = x_local.index_select(1, self.perm_m_to_l)
-            x_global = x_src.new_zeros(
+            x_message = x_src.new_zeros(
                 x_src.shape[0], self.ebed_dim_full, x_src.shape[2]
             )
             for l in range(self.lmax + 1):
@@ -1448,69 +1704,87 @@ class SO2Convolution(nn.Module):
                 seg_start = self._l_offsets[l]
                 seg_end = self._l_offsets[l + 1]
                 Dt_cols = edge_cache.Dt_list[l][:, :, col_start:col_end]
-                x_global[:, start:end, :] = torch.bmm(
+                x_message[:, start:end, :] = torch.bmm(
                     Dt_cols, x_local_l[:, seg_start:seg_end, :]
                 )
 
         # === Step 5. Aggregate with optional head-wise gating ===
         if self.n_atten_head == 0:
             # Baseline path: envelope -> scatter add -> degree norm
-            x_global = x_global * edge_cache.edge_env.view(-1, 1, 1)  # (E, D, C)
+            x_message = x_message * edge_cache.edge_env.view(-1, 1, 1)  # (E, D, C)
             out = x.new_zeros(x.shape)
-            out.index_add_(0, dst, x_global)
+            out.index_add_(0, dst, x_message)
             out = out * edge_cache.inv_sqrt_deg
         else:
             assert self.head_dim is not None
             assert self.proj_dst is not None
             assert self.proj_rad is not None
             assert self.proj_head is not None
-            assert self.norm_dst_for_b is not None
+            assert self.norm_dst_for_gate is not None
+            assert self.norm_msg_for_gate is not None
             assert self.norm_dst_for_head is not None
 
             # === Step 5.1. Extract scalar features for gating ===
-            # Get scalar features for gating (keep self.dtype for proj_* compatibility)
             x_l0 = x[:, 0, :]  # (N, C) in self.dtype
             radial_l0 = radial_feat[:, 0, :]  # (E, C) in self.dtype
+            msg_l0 = x_message[:, 0, :]  # (E, C) message scalar
 
-            # === Step 5.2. Compute edge gate ===
-            # Edge gate logits: dst branch normalized, radial branch unchanged
-            dst_logits = self.proj_dst(self.norm_dst_for_b(x_l0))  # (N, H)
-            radial_logits = self.proj_rad(radial_l0)  # (E, H)
-            edge_logits = dst_logits.index_select(0, dst) + radial_logits  # (E, H)
-
-            # Edge gate: 2 * sigmoid with fp32 precision for numerical stability
+            # === Step 5.2. Compute edge gate (fp32+ logits path) ===
+            # Edge gate logits: dst scalar normalized, radial unchanged, msg scalar normalized with bounded feedback
             compute_dtype = self.compute_dtype
-            edge_gate = 2.0 * torch.sigmoid(edge_logits.to(dtype=compute_dtype)).to(
-                dtype=self.dtype
+            dst_logits = self.proj_dst(self.norm_dst_for_gate(x_l0)).to(
+                dtype=compute_dtype
+            )  # (N, H) fp32
+            radial_logits = self.proj_rad(radial_l0).to(dtype=compute_dtype)  # (E, H)
+            msg_logits = self.proj_msg(self.norm_msg_for_gate(msg_l0)).to(
+                dtype=compute_dtype
             )  # (E, H)
-            edge_weight = edge_cache.edge_env.view(-1, 1) * edge_gate  # (E, H)
+            assert self.msg_gate_scale_raw is not None
+            msg_gate_scale = (
+                self.msg_gate_scale_max * torch.sigmoid(self.msg_gate_scale_raw)
+            ).view(1, -1)  # (1, H) fp32+
+            edge_logits = (
+                dst_logits.index_select(0, dst)
+                + radial_logits
+                + msg_gate_scale * msg_logits
+            )  # (E, H) fp32+
+            edge_gate = 2.0 * torch.sigmoid(edge_logits.clamp(-6.0, 6.0))
+            edge_weight = (
+                edge_cache.edge_env.view(-1, 1).to(dtype=compute_dtype) * edge_gate
+            )  # (E, H) in compute_dtype
 
-            # === Step 5.3. Head-wise scatter aggregation ===
-            # Head-wise scatter aggregation with envelope
-            V = x_global.reshape(
-                x_global.shape[0], self.ebed_dim_full, self.n_atten_head, self.head_dim
+            # === Step 5.3. Head-wise scatter aggregation (fp32+ accumulation) ===
+            V = x_message.reshape(
+                x_message.shape[0], self.ebed_dim_full, self.n_atten_head, self.head_dim
             )
-            msg = V * edge_weight.view(-1, 1, self.n_atten_head, 1)
-            out_heads = x.new_zeros(
-                x.shape[0], self.ebed_dim_full, self.n_atten_head, self.head_dim
+            msg = V.to(dtype=compute_dtype) * edge_weight.view(
+                -1, 1, self.n_atten_head, 1
+            )
+            out_heads = torch.zeros(
+                x.shape[0],
+                self.ebed_dim_full,
+                self.n_atten_head,
+                self.head_dim,
+                device=x.device,
+                dtype=compute_dtype,
             )
             out_heads.index_add_(0, dst, msg)
 
-            # === Step 5.4. Compute post-aggregate head gate ===
-            # Post-aggregate head gate (with normalization)
-            head_logits = self.proj_head(self.norm_dst_for_head(x_l0))  # (N, H)
-            head_gate = 2.0 * torch.sigmoid(head_logits.to(dtype=compute_dtype)).to(
-                dtype=self.dtype
+            # === Step 5.4. Compute post-aggregate head gate (fp32+ logits path) ===
+            head_logits = self.proj_head(self.norm_dst_for_head(x_l0)).to(
+                dtype=compute_dtype
             )  # (N, H)
-            scale = head_gate * self.gamma_head.view(1, -1)  # (N, H)
+            head_gate = 2.0 * torch.sigmoid(head_logits.clamp(-6.0, 6.0))  # (N, H)
+            gamma_eff = 2.0 * torch.sigmoid(self.gamma_head_raw)  # (H,) compute_dtype
+            scale = head_gate * gamma_eff.view(1, -1)  # (N, H) compute_dtype
 
             # === Step 5.5. Apply head-wise scaling ===
-            # Apply head-wise scaling
             out_heads = out_heads * scale.view(-1, 1, self.n_atten_head, 1)
 
             # === Step 5.6. Apply degree normalization ===
             out = out_heads.view(x.shape[0], self.ebed_dim_full, self.channels)
-            out = out * edge_cache.inv_sqrt_deg
+            out = out * edge_cache.inv_sqrt_deg.to(dtype=compute_dtype)
+            out = out.to(dtype=self.dtype)
 
         # === Step 6. Final channel mixing ===
         out = self.so3_linear(out)  # (N, D, C)
@@ -1523,6 +1797,7 @@ class SO2Convolution(nn.Module):
             "lmax": self.lmax,
             "mmax": self.mmax,
             "channels": self.channels,
+            "so2_norm": self.so2_norm,
             "so2_layers": self.so2_layers,
             "n_atten_head": self.n_atten_head,
             "use_parallel": self.use_parallel,
@@ -1533,17 +1808,25 @@ class SO2Convolution(nn.Module):
                 if self.so2_layers > 1
                 else None
             ),
+            "so2_inter_norms": [
+                norm.serialize() if isinstance(norm, ReducedSeparableRMSNorm) else None
+                for norm in self.so2_inter_norms
+            ],
             "so3_linear": self.so3_linear.serialize(),
             "gate_state": (
                 None
                 if self.n_atten_head == 0
                 else {
-                    "norm_dst_for_b": self.norm_dst_for_b.serialize(),  # type: ignore[union-attr]
-                    "norm_dst_for_head": self.norm_dst_for_head.serialize(),  # type: ignore[union-attr]
+                    "norm_dst_for_gate": self.norm_dst_for_gate.serialize(),
+                    "norm_msg_for_gate": self.norm_msg_for_gate.serialize(),
+                    "norm_dst_for_head": self.norm_dst_for_head.serialize(),
                     "proj_dst": cast("MLPLayer", self.proj_dst).serialize(),
                     "proj_rad": cast("MLPLayer", self.proj_rad).serialize(),
+                    "proj_msg": cast("MLPLayer", self.proj_msg).serialize(),
                     "proj_head": cast("MLPLayer", self.proj_head).serialize(),
-                    "gamma_head": np_safe(self.gamma_head),
+                    "gamma_head_raw": np_safe(self.gamma_head_raw),
+                    "msg_gate_scale_max": self.msg_gate_scale_max,
+                    "msg_gate_scale_raw": np_safe(self.msg_gate_scale_raw),
                 }
             ),
             "precision": RESERVED_PRECISION_DICT[self.dtype],
@@ -1561,6 +1844,7 @@ class SO2Convolution(nn.Module):
 
         so2_linears_data = data.pop("so2_linears")
         non_linearities_data = data.pop("non_linearities")
+        so2_inter_norms_data = data.pop("so2_inter_norms", None)
         so3_linear_data = data.pop("so3_linear")
         gate_state = data.pop("gate_state", None)
 
@@ -1582,20 +1866,45 @@ class SO2Convolution(nn.Module):
             ]
             non_linearities.append(nn.Identity())
             obj.non_linearities = nn.ModuleList(non_linearities)
+        if so2_inter_norms_data is not None:
+            inter_norms: list[nn.Module] = []
+            for state in so2_inter_norms_data:
+                if state is None:
+                    inter_norms.append(nn.Identity())
+                else:
+                    inter_norms.append(ReducedSeparableRMSNorm.deserialize(state))
+            obj.so2_inter_norms = nn.ModuleList(inter_norms)
         obj.so3_linear = SO3LinearV2.deserialize(so3_linear_data)
         if gate_state is not None and obj.n_atten_head > 0:
-            obj.norm_dst_for_b = ScalarRMSNorm.deserialize(gate_state["norm_dst_for_b"])
+            obj.norm_dst_for_gate = ScalarRMSNorm.deserialize(
+                gate_state["norm_dst_for_gate"]
+            )
+            obj.norm_msg_for_gate = ScalarRMSNorm.deserialize(
+                gate_state["norm_msg_for_gate"]
+            )
             obj.norm_dst_for_head = ScalarRMSNorm.deserialize(
                 gate_state["norm_dst_for_head"]
             )
             obj.proj_dst = MLPLayer.deserialize(gate_state["proj_dst"])
             obj.proj_rad = MLPLayer.deserialize(gate_state["proj_rad"])
+            obj.proj_msg = MLPLayer.deserialize(gate_state["proj_msg"])
             obj.proj_head = MLPLayer.deserialize(gate_state["proj_head"])
-            gamma_head = gate_state.get("gamma_head")
-            if gamma_head is not None:
-                obj.gamma_head = nn.Parameter(
+            gamma_head_raw = gate_state.get("gamma_head_raw")
+            if gamma_head_raw is not None:
+                obj.gamma_head_raw = nn.Parameter(
                     safe_numpy_to_tensor(
-                        gamma_head, device=obj.device, dtype=obj.dtype
+                        gamma_head_raw, device=obj.device, dtype=obj.compute_dtype
+                    ).view(obj.n_atten_head)
+                )
+            msg_gate_scale_raw = gate_state.get("msg_gate_scale_raw")
+            msg_gate_scale_max = gate_state.get(
+                "msg_gate_scale_max", obj.msg_gate_scale_max
+            )
+            obj.msg_gate_scale_max = float(msg_gate_scale_max)
+            if msg_gate_scale_raw is not None:
+                obj.msg_gate_scale_raw = nn.Parameter(
+                    safe_numpy_to_tensor(
+                        msg_gate_scale_raw, device=obj.device, dtype=obj.compute_dtype
                     ).view(obj.n_atten_head)
                 )
         return obj
@@ -1684,6 +1993,8 @@ class EquivariantFFN(nn.Module):
             trainable=trainable,
             seed=seed_so3_out,
         )
+        nn.init.zeros_(self.so3_linear_2.weight)
+        nn.init.zeros_(self.so3_linear_2.bias)
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -1776,6 +2087,9 @@ class SeZMInteractionBlock(nn.Module):
         Maximum SO(2) order (|m|) mixed inside SO(2) convolution.
     channels
         Number of channels per (l, m) coefficient.
+    so2_norm
+        If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
+        When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers.
     n_atten_head
@@ -1801,6 +2115,7 @@ class SeZMInteractionBlock(nn.Module):
         lmax: int,
         mmax: int | None = None,
         channels: int,
+        so2_norm: bool = False,
         so2_layers: int = 2,
         n_atten_head: int = 0,
         ffn_neurons: int = 128,
@@ -1819,6 +2134,7 @@ class SeZMInteractionBlock(nn.Module):
         if self.mmax > self.lmax:
             raise ValueError("`mmax` must be <= `lmax`")
         self.channels = int(channels)
+        self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
         self.n_atten_head = int(n_atten_head)
         self.ffn_neurons = int(ffn_neurons)
@@ -1852,6 +2168,7 @@ class SeZMInteractionBlock(nn.Module):
             lmax=self.lmax,
             mmax=self.mmax,
             channels=self.channels,
+            so2_norm=self.so2_norm,
             so2_layers=self.so2_layers,
             n_atten_head=n_atten_head,
             use_parallel=self.use_parallel,
@@ -1922,6 +2239,7 @@ class SeZMInteractionBlock(nn.Module):
             "lmax": self.lmax,
             "mmax": self.mmax,
             "channels": self.channels,
+            "so2_norm": self.so2_norm,
             "so2_layers": self.so2_layers,
             "n_atten_head": self.n_atten_head,
             "ffn_neurons": self.ffn_neurons,

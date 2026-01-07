@@ -10,6 +10,7 @@
       "channels": 64,
       "n_radial": 10,
       "radial_mlp": [64],
+      "so2_norm": false,
       "so2_layers": 3,
       "ffn_neurons": 128,
       "n_atten_head": 1,

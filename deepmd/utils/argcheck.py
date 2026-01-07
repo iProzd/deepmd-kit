@@ -367,6 +367,10 @@ def descrpt_se_zm_net_args() -> list[Argument]:
         "Hidden layer sizes for radial networks. An output layer of size "
         "(l_schedule[0]+1)*channels will be automatically appended."
     )
+    doc_so2_norm = (
+        "If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. "
+        "When False (default), no normalization is applied between layers."
+    )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
     doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block."
     doc_n_atten_head = (
@@ -419,6 +423,7 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             default=[64],
             doc=doc_radial_mlp,
         ),
+        Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
         Argument("so2_layers", int, optional=True, default=2, doc=doc_so2_layers),
         Argument("ffn_neurons", int, optional=True, default=128, doc=doc_ffn_neurons),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
