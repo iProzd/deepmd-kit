@@ -271,15 +271,29 @@ class DPAtomicModel(BaseAtomicModel):
         if self.enable_eval_descriptor_hook:
             self.eval_descriptor_list.append(descriptor.detach())
         # energy, force
-        fit_ret = self.fitting_net(
-            descriptor,
-            atype,
-            gr=rot_mat,
-            g2=g2,
-            h2=h2,
-            fparam=fparam,
-            aparam=aparam,
-        )
+        if not self.fitting_net.need_additional_input():
+            fit_ret = self.fitting_net(
+                descriptor,
+                atype,
+                gr=rot_mat,
+                g2=g2,
+                h2=h2,
+                fparam=fparam,
+                aparam=aparam,
+            )
+        else:
+            add_input = self.descriptor.get_additional_output_for_fitting()
+            fit_ret = self.fitting_net(
+                descriptor,
+                atype,
+                gr=rot_mat,
+                g2=g2,
+                h2=h2,
+                fparam=fparam,
+                aparam=aparam,
+                sw=sw,
+                edge_index=add_input.get("edge_index", None),
+            )
         if self.enable_eval_fitting_last_layer_hook:
             assert "middle_output" in fit_ret, (
                 "eval_fitting_last_layer not supported for this fitting net!"

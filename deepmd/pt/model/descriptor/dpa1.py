@@ -359,6 +359,13 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
     def get_dim_emb(self) -> int:
         return self.se_atten.dim_emb
 
+    def get_norm_fact(self) -> list[float]:
+        """Returns the norm factor."""
+        return [float(self.get_nnei())]
+
+    def get_additional_output_for_fitting(self) -> dict[str, torch.Tensor | None]:
+        return {}
+
     def mixed_types(self) -> bool:
         """If true, the descriptor
         1. assumes total number of atoms aligned across frames;
