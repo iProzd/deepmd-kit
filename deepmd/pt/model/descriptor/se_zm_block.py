@@ -45,7 +45,6 @@ from deepmd.pt.utils.utils import (
 
 from .se_zm_helper import (
     EdgeFeatureCache,
-    build_l_major_index,
     build_m_major_index,
     build_m_major_l_index,
     get_promoted_dtype,
@@ -753,138 +752,11 @@ class ScalarRMSNorm(nn.Module):
 
 class SO3Linear(nn.Module):
     """
-    Degree-wise linear self-interaction shared across m within each l-block.
-
-    NOTE
-    ----
-    - Each degree l has an independent C_out x C_in linear transformation.
-    - Within each l-block, the same linear transformation is shared across all 2l+1 m components.
-    - Bias is only applied to l=0 (scalar) components to preserve equivariance.
-    - Uses Python loop over l, less efficient than SO3LinearV2 but memory friendly.
-
-    Parameters
-    ----------
-    lmax
-        Maximum spherical harmonic degree.
-    in_channels
-        Number of input channels per (l, m) coefficient.
-    out_channels
-        Number of output channels per (l, m) coefficient.
-    dtype
-        Parameter dtype.
-    trainable
-        Whether parameters are trainable.
-    seed
-        Random seed for weight initialization.
-    """
-
-    def __init__(
-        self,
-        *,
-        lmax: int,
-        in_channels: int,
-        out_channels: int,
-        dtype: torch.dtype,
-        trainable: bool,
-        seed: int | list[int] | None = None,
-    ) -> None:
-        super().__init__()
-        self.lmax = int(lmax)
-        self.in_channels = int(in_channels)
-        self.out_channels = int(out_channels)
-        self.dtype = dtype
-        self.device = env.DEVICE
-        self.precision = RESERVED_PRECISION_DICT[dtype]
-
-        linears: list[MLPLayer] = []
-        for l in range(self.lmax + 1):
-            bias = l == 0
-            # MLPLayer stores (num_in, num_out), F.linear uses transpose
-            # So MLPLayer(out, in) gives computation: x @ (out, in).T = x @ (in, out)
-            linears.append(
-                MLPLayer(
-                    self.out_channels,
-                    self.in_channels,
-                    bias=bias,
-                    activation_function=None,
-                    precision=self.precision,
-                    seed=child_seed(seed, l),
-                    trainable=trainable,
-                )
-            )
-        self.linears = nn.ModuleList(linears)
-
-        for p in self.parameters():
-            p.requires_grad = trainable
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Parameters
-        ----------
-        x
-            Input features with shape (N, D, C) where D=(lmax+1)^2.
-
-        Returns
-        -------
-        torch.Tensor
-            Order-wise mixed features with shape (N, D, C).
-        """
-        out = x.new_empty(x.shape)
-        offset = 0
-        for l, linear in enumerate(self.linears):
-            dim = 2 * l + 1
-            seg = x[:, offset : offset + dim, :]
-            out[:, offset : offset + dim, :] = linear(seg)
-            offset += dim
-        return out
-
-    def serialize(self) -> dict[str, Any]:
-        return {
-            "@class": "SO3Linear",
-            "@version": 1,
-            "lmax": self.lmax,
-            "in_channels": self.in_channels,
-            "out_channels": self.out_channels,
-            "precision": RESERVED_PRECISION_DICT[self.dtype],
-            "weights": [layer.serialize() for layer in self.linears],
-        }
-
-    @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> SO3Linear:
-        data = data.copy()
-        data_cls = data.pop("@class")
-        if data_cls != "SO3Linear":
-            raise ValueError(f"Invalid class for SO3Linear: {data_cls}")
-        version = int(data.pop("@version"))
-        if version != 1:
-            raise ValueError(f"Unsupported SO3Linear version: {version}")
-
-        # === Extract weights before creating instance ===
-        weights_data = data.pop("weights")
-
-        # === Convert precision to dtype ===
-        precision = data.pop("precision")
-        data["dtype"] = PRECISION_DICT[precision]
-
-        # === Create instance with remaining args ===
-        data["trainable"] = True
-        data["seed"] = None
-        obj = cls(**data)
-
-        # === Restore MLPLayers ===
-        obj.linears = nn.ModuleList(
-            [MLPLayer.deserialize(state) for state in weights_data]
-        )
-        return obj
-
-
-class SO3LinearV2(nn.Module):
-    """
     Degree-wise linear self-interaction using einsum for efficiency.
 
-    This is a vectorized version of SO3Linear that avoids Python loops
-    by using torch.einsum and index_select. The key insight is that weights
-    are shared across all m components within each l-block.
+    This vectorized implementation avoids Python loops by using torch.einsum
+    and index_select. The key insight is that weights are shared across all
+    m components within each l-block.
 
     NOTE
     ----
@@ -997,7 +869,7 @@ class SO3LinearV2(nn.Module):
 
     def serialize(self) -> dict[str, Any]:
         return {
-            "@class": "SO3LinearV2",
+            "@class": "SO3Linear",
             "@version": 1,
             "lmax": self.lmax,
             "in_channels": self.in_channels,
@@ -1008,14 +880,14 @@ class SO3LinearV2(nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> SO3LinearV2:
+    def deserialize(cls, data: dict[str, Any]) -> SO3Linear:
         data = data.copy()
         data_cls = data.pop("@class")
-        if data_cls != "SO3LinearV2":
-            raise ValueError(f"Invalid class for SO3LinearV2: {data_cls}")
+        if data_cls != "SO3Linear":
+            raise ValueError(f"Invalid class for SO3Linear: {data_cls}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported SO3LinearV2 version: {version}")
+            raise ValueError(f"Unsupported SO3Linear version: {version}")
 
         # === Extract weight/bias before creating instance ===
         weight_data = data.pop("weight")
@@ -1323,8 +1195,6 @@ class SO2Convolution(nn.Module):
     n_atten_head
         Number of gated attention heads when aggregating messages in SO(2) convolution.
         0 means a plain envelope-weighted scatter-sum is applied.
-    use_parallel
-        If True, use block-diagonal parallel Wigner-D for faster computation.
     eps
         Small epsilon for gate-side RMSNorm.
     dtype
@@ -1344,7 +1214,6 @@ class SO2Convolution(nn.Module):
         so2_norm: bool = False,
         so2_layers: int = 1,
         n_atten_head: int = 0,
-        use_parallel: bool = True,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -1373,7 +1242,6 @@ class SO2Convolution(nn.Module):
             None if self.n_atten_head == 0 else int(self.channels // self.n_atten_head)
         )
         self.eps = float(eps)
-        self.use_parallel = bool(use_parallel)
         self.ebed_dim_full = get_so3_dim_of_lmax(self.lmax)
         self.dtype = dtype
         self.device = env.DEVICE
@@ -1386,29 +1254,6 @@ class SO2Convolution(nn.Module):
         self.register_buffer("coeff_index_m", coeff_index_m, persistent=True)
         self.register_buffer("degree_index_m", degree_index_m, persistent=True)
         self.reduced_dim = int(coeff_index_m.numel())
-
-        # For per-l Wigner mode, rotate blocks are per-degree; build a permutation from
-        # l-major reduced -> m-major reduced to avoid full D rotations.
-        coeff_index_l = build_l_major_index(self.lmax, self.mmax, device=self.device)
-        l_list = [int(x) for x in coeff_index_l.tolist()]
-        pos_in_l = {idx: i for i, idx in enumerate(l_list)}
-        perm_l_to_m = torch.tensor(
-            [pos_in_l[int(idx)] for idx in coeff_index_m.tolist()],
-            device=self.device,
-            dtype=torch.long,
-        )
-        inv = [0] * int(perm_l_to_m.numel())
-        for m_pos, l_pos in enumerate(perm_l_to_m.tolist()):
-            inv[int(l_pos)] = int(m_pos)
-        perm_m_to_l = torch.tensor(inv, device=self.device, dtype=torch.long)
-        self.register_buffer("perm_l_to_m", perm_l_to_m, persistent=True)
-        self.register_buffer("perm_m_to_l", perm_m_to_l, persistent=True)
-
-        l_offsets: list[int] = [0]
-        for l in range(self.lmax + 1):
-            m_keep = min(self.mmax, l)
-            l_offsets.append(l_offsets[-1] + (2 * m_keep + 1))
-        self._l_offsets = l_offsets
 
         # === Step 2. Split deterministic seeds at the module top-level ===
         seed_so2_stack = child_seed(seed, 0)
@@ -1583,7 +1428,7 @@ class SO2Convolution(nn.Module):
             self.register_parameter("msg_gate_scale_raw", None)
 
         # === Step 7. Final SO3Linear to mix channels ===
-        self.so3_linear = SO3LinearV2(
+        self.so3_linear = SO3Linear(
             lmax=self.lmax,
             in_channels=self.channels,
             out_channels=self.channels,
@@ -1624,36 +1469,17 @@ class SO2Convolution(nn.Module):
         x_src = x[src]  # (E, D, C)
 
         # === Step 1. Rotate to edge-aligned local frame ===
-        if self.use_parallel:
-            # Block-diagonal bmm with reduced rows (parallel mode).
-            D_full = edge_cache.D_full
-            assert D_full is not None
-            D_m_prime = project_D_to_m(
-                D_full=D_full,
-                coeff_index_m=self.coeff_index_m,
-                ebed_dim_full=self.ebed_dim_full,
-                cache=edge_cache.D_to_m_cache,
-                key_lmax=self.lmax,
-                key_mmax=self.mmax,
-            )
-            x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m_trunc, C)
-        else:
-            # Per-l reduced rotation.
-            x_local_l = x_src.new_empty(
-                x_src.shape[0], self.reduced_dim, x_src.shape[2]
-            )
-            for l in range(self.lmax + 1):
-                start, end = l * l, (l + 1) * (l + 1)
-                m_keep = min(self.mmax, l)
-                row_start = l - m_keep
-                row_end = l + m_keep + 1
-                D_rows = edge_cache.D_list[l][:, row_start:row_end, :]
-                seg_start = self._l_offsets[l]
-                seg_end = self._l_offsets[l + 1]
-                x_local_l[:, seg_start:seg_end, :] = torch.bmm(
-                    D_rows, x_src[:, start:end, :]
-                )
-            x_local: torch.Tensor = x_local_l.index_select(1, self.perm_l_to_m)
+        D_full = edge_cache.D_full
+        assert D_full is not None
+        D_m_prime = project_D_to_m(
+            D_full=D_full,
+            coeff_index_m=self.coeff_index_m,
+            ebed_dim_full=self.ebed_dim_full,
+            cache=edge_cache.D_to_m_cache,
+            key_lmax=self.lmax,
+            key_mmax=self.mmax,
+        )
+        x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m_trunc, C)
 
         # === Step 2. Select radial/type features for reduced layout ===
         rad_feat = radial_feat[:, self.degree_index_m, :]  # (E, D_m_trunc, C)
@@ -1677,36 +1503,17 @@ class SO2Convolution(nn.Module):
             x_local = non_linear(x_local)
 
         # === Step 4. Rotate back to global frame ===
-        if self.use_parallel:
-            # Block-diagonal bmm with reduced columns (parallel mode).
-            Dt_full = edge_cache.Dt_full
-            assert Dt_full is not None
-            Dt_from_m = project_Dt_from_m(
-                Dt_full=Dt_full,
-                coeff_index_m=self.coeff_index_m,
-                ebed_dim_full=self.ebed_dim_full,
-                cache=edge_cache.Dt_from_m_cache,
-                key_lmax=self.lmax,
-                key_mmax=self.mmax,
-            )
-            x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
-        else:
-            # Per-l einsum loop.
-            x_local_l = x_local.index_select(1, self.perm_m_to_l)
-            x_message = x_src.new_zeros(
-                x_src.shape[0], self.ebed_dim_full, x_src.shape[2]
-            )
-            for l in range(self.lmax + 1):
-                start, end = l * l, (l + 1) * (l + 1)
-                m_keep = min(self.mmax, l)
-                col_start = l - m_keep
-                col_end = l + m_keep + 1
-                seg_start = self._l_offsets[l]
-                seg_end = self._l_offsets[l + 1]
-                Dt_cols = edge_cache.Dt_list[l][:, :, col_start:col_end]
-                x_message[:, start:end, :] = torch.bmm(
-                    Dt_cols, x_local_l[:, seg_start:seg_end, :]
-                )
+        Dt_full = edge_cache.Dt_full
+        assert Dt_full is not None
+        Dt_from_m = project_Dt_from_m(
+            Dt_full=Dt_full,
+            coeff_index_m=self.coeff_index_m,
+            ebed_dim_full=self.ebed_dim_full,
+            cache=edge_cache.Dt_from_m_cache,
+            key_lmax=self.lmax,
+            key_mmax=self.mmax,
+        )
+        x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
 
         # === Step 5. Aggregate with optional head-wise gating ===
         if self.n_atten_head == 0:
@@ -1800,7 +1607,6 @@ class SO2Convolution(nn.Module):
             "so2_norm": self.so2_norm,
             "so2_layers": self.so2_layers,
             "n_atten_head": self.n_atten_head,
-            "use_parallel": self.use_parallel,
             "eps": self.eps,
             "so2_linears": [net.serialize() for net in self.so2_linears],
             "non_linearities": (
@@ -1874,7 +1680,7 @@ class SO2Convolution(nn.Module):
                 else:
                     inter_norms.append(ReducedSeparableRMSNorm.deserialize(state))
             obj.so2_inter_norms = nn.ModuleList(inter_norms)
-        obj.so3_linear = SO3LinearV2.deserialize(so3_linear_data)
+        obj.so3_linear = SO3Linear.deserialize(so3_linear_data)
         if gate_state is not None and obj.n_atten_head > 0:
             obj.norm_dst_for_gate = ScalarRMSNorm.deserialize(
                 gate_state["norm_dst_for_gate"]
@@ -1965,7 +1771,7 @@ class EquivariantFFN(nn.Module):
         seed_so3_out = child_seed(seed, 2)
 
         # === First SO3Linear for channel mixing ===
-        self.so3_linear_1 = SO3LinearV2(
+        self.so3_linear_1 = SO3Linear(
             lmax=self.lmax,
             in_channels=self.channels,
             out_channels=self.hidden_channels,
@@ -1985,7 +1791,7 @@ class EquivariantFFN(nn.Module):
         )
 
         # === Second SO3Linear for channel mixing ===
-        self.so3_linear_2 = SO3LinearV2(
+        self.so3_linear_2 = SO3Linear(
             lmax=self.lmax,
             in_channels=self.hidden_channels,
             out_channels=self.channels,
@@ -2066,8 +1872,8 @@ class EquivariantFFN(nn.Module):
         obj = cls(**data)
 
         # === Restore sub-modules ===
-        obj.so3_linear_1 = SO3LinearV2.deserialize(so3_linear_1_data)
-        obj.so3_linear_2 = SO3LinearV2.deserialize(so3_linear_2_data)
+        obj.so3_linear_1 = SO3Linear.deserialize(so3_linear_1_data)
+        obj.so3_linear_2 = SO3Linear.deserialize(so3_linear_2_data)
         obj.act = GatedActivation.deserialize(act_data)
         return obj
 
@@ -2120,7 +1926,6 @@ class SeZMInteractionBlock(nn.Module):
         n_atten_head: int = 0,
         ffn_neurons: int = 128,
         activation_function: str,
-        use_parallel: bool = True,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -2139,7 +1944,6 @@ class SeZMInteractionBlock(nn.Module):
         self.n_atten_head = int(n_atten_head)
         self.ffn_neurons = int(ffn_neurons)
         self.activation_function = activation_function
-        self.use_parallel = bool(use_parallel)
         self.eps = float(eps)
         self.dtype = dtype
         self.precision = RESERVED_PRECISION_DICT[dtype]
@@ -2171,7 +1975,6 @@ class SeZMInteractionBlock(nn.Module):
             so2_norm=self.so2_norm,
             so2_layers=self.so2_layers,
             n_atten_head=n_atten_head,
-            use_parallel=self.use_parallel,
             eps=self.eps,
             dtype=dtype,
             seed=seed_so2_conv,
@@ -2244,7 +2047,6 @@ class SeZMInteractionBlock(nn.Module):
             "n_atten_head": self.n_atten_head,
             "ffn_neurons": self.ffn_neurons,
             "activation_function": self.activation_function,
-            "use_parallel": self.use_parallel,
             "eps": self.eps,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "pre_so2_norm": self.pre_so2_norm.serialize(),

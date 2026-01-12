@@ -5,9 +5,7 @@ Helper utilities for SeZM-Net PyTorch descriptor.
 This module contains:
 - ``EdgeFeatureCache``: Shared data structure for edge features
 - ``WignerDCalcBase``: Abstract base class for Wigner-D calculators
-- ``WignerDCalc``: Per-l loop implementation, memory efficient for large n_edges
-- ``WignerDCalcParallel``: Block-diagonal parallel implementation, faster for small n_edges
-  but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2
+- ``WignerDCalculator``: Block-diagonal parallel implementation
 """
 
 import math
@@ -50,10 +48,6 @@ class EdgeFeatureCache(NamedTuple):
         The C^2 cutoff envelope is already baked in.
     edge_env
         C^2 cutoff envelope weights with shape (E, 1).
-    D_list
-        Wigner-D blocks per degree. `D_list[l]` has shape (E, 2l+1, 2l+1).
-    Dt_list
-        Transposed blocks per degree. `Dt_list[l]` has shape (E, 2l+1, 2l+1).
     inv_sqrt_deg
         Destination degree normalization with shape (N, 1, 1).
     D_full
@@ -62,9 +56,9 @@ class EdgeFeatureCache(NamedTuple):
     Dt_full
         Transpose of D_full with shape (E, D, D). None if not available.
     D_to_m_cache
-        Lazy cache for projected D matrices keyed by (lmax, mmax) in parallel mode.
+        Lazy cache for projected D matrices keyed by (lmax, mmax).
     Dt_from_m_cache
-        Lazy cache for projected Dt matrices keyed by (lmax, mmax) in parallel mode.
+        Lazy cache for projected Dt matrices keyed by (lmax, mmax).
     """
 
     src: torch.Tensor
@@ -73,8 +67,6 @@ class EdgeFeatureCache(NamedTuple):
     edge_vec: torch.Tensor
     edge_rbf: torch.Tensor
     edge_env: torch.Tensor
-    D_list: list[torch.Tensor]
-    Dt_list: list[torch.Tensor]
     inv_sqrt_deg: torch.Tensor
     D_full: torch.Tensor | None = None
     Dt_full: torch.Tensor | None = None
@@ -92,9 +84,8 @@ class EdgeFeatureCache(NamedTuple):
         """
         Fetch (or build once) the row-projected Wigner-D blocks for m-major layout.
 
-        This is only used in parallel mode where ``D_full`` is present. It selects
-        the subset of rows needed for the m-major truncated layout, caches the
-        result keyed by (lmax, mmax), and reuses it across blocks.
+        This selects the subset of rows needed for the m-major truncated layout,
+        caches the result keyed by (lmax, mmax), and reuses it across blocks.
 
         Parameters
         ----------
@@ -140,9 +131,8 @@ class EdgeFeatureCache(NamedTuple):
         """
         Fetch (or build once) the column-projected Wigner-D^T blocks for inverse rotation.
 
-        This is only used in parallel mode where ``Dt_full`` is present. It selects
-        the subset of columns needed for the m-major truncated layout, caches the
-        result keyed by (lmax, mmax), and reuses it across blocks.
+        This selects the subset of columns needed for the m-major truncated layout,
+        caches the result keyed by (lmax, mmax), and reuses it across blocks.
 
         Parameters
         ----------
@@ -217,8 +207,6 @@ def edge_cache_to_dtype(
         edge_vec=cache.edge_vec.to(dtype=dtype),
         edge_rbf=cache.edge_rbf.to(dtype=dtype),
         edge_env=cache.edge_env.to(dtype=dtype),
-        D_list=[d.to(dtype=dtype) for d in cache.D_list],
-        Dt_list=[d.to(dtype=dtype) for d in cache.Dt_list],
         inv_sqrt_deg=cache.inv_sqrt_deg.to(dtype=dtype),
         D_full=D_full,
         Dt_full=Dt_full,
@@ -680,14 +668,7 @@ class WignerDCalcBase(nn.Module, ABC):
         self.eps = float(eps)
 
     @abstractmethod
-    def forward(
-        self, rot_mat: torch.Tensor
-    ) -> tuple[
-        list[torch.Tensor],
-        list[torch.Tensor],
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+    def forward(self, rot_mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Wigner-D blocks for a batch of rotation matrices.
 
@@ -698,15 +679,10 @@ class WignerDCalcBase(nn.Module, ABC):
 
         Returns
         -------
-        D_list : list[torch.Tensor]
-            List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
-        Dt_list : list[torch.Tensor]
-            Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
-        D_full : torch.Tensor | None
+        D_full : torch.Tensor
             Block-diagonal matrix with shape (n_edges, D, D) where D=(lmax+1)^2.
-            None if not computed (e.g., for per-l loop implementation).
-        Dt_full : torch.Tensor | None
-            Transpose of D_full. None if not computed.
+        Dt_full : torch.Tensor
+            Transpose of D_full.
         """
         raise NotImplementedError
 
@@ -986,12 +962,13 @@ class WignerDCalcBase(nn.Module, ABC):
         return out
 
 
-class WignerDCalc(WignerDCalcBase):
+class WignerDCalculator(WignerDCalcBase):
     """
     Fast Wigner-D blocks in the real spherical harmonics (tesseral) basis.
 
-    This module precomputes constant J matrices as buffers and constructs
-    per-edge D^l blocks from Euler angles using only batched matmuls.
+    This module assembles all D^l blocks into a single block-diagonal matrix
+    and computes them in one batched matmul chain. This reduces Python dispatch
+    overhead but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2.
 
     Notes
     -----
@@ -1049,200 +1026,6 @@ class WignerDCalc(WignerDCalcBase):
 
         D^{(l)}(rot_mat) = Z^{(l)}(alpha) @ J_l^T @ Z^{(l)}(beta) @ J_l @ Z^{(l)}(gamma)
 
-    **Outputs and Usage**
-
-    - ``D_list[l]`` has shape ``(n_edges, 2l+1, 2l+1)`` and is orthogonal. It
-      represents the same global->local rotation as ``rot_mat``.
-    - ``Dt_list[l] = D_list[l].transpose(-1, -2)`` is its inverse.
-    - Apply blocks to per-degree features as::
-
-        x_local^{(l)}  = D_list[l]  @ x_global^{(l)}
-        x_global^{(l)} = Dt_list[l] @ x_local^{(l)}
-
-    Parameters
-    ----------
-    lmax : int
-        Maximum angular momentum degree.
-    eps : float
-        Small epsilon for numerical stability.
-    dtype : torch.dtype
-        Floating-point dtype for output matrices.
-    """
-
-    class _JMatrixPair(nn.Module):
-        """Store per-degree constant J and J^T as buffers."""
-
-        def __init__(self, J: torch.Tensor) -> None:
-            super().__init__()
-            self.register_buffer("J", J.contiguous(), persistent=True)
-            self.register_buffer(
-                "Jt", J.transpose(-1, -2).contiguous(), persistent=True
-            )
-
-    def __init__(self, lmax: int, *, eps: float = 1e-7, dtype: torch.dtype) -> None:
-        super().__init__(lmax, eps=eps, dtype=dtype)
-
-        # Precompute J_l = D^{(l)}(Rx(pi/2)) on CPU, then move to target device
-        # Also cache J_l^T (the transpose in real basis equals the inverse)
-        self.j_mats: nn.ModuleList = nn.ModuleList()
-        for l in range(self.lmax + 1):
-            J = self._compute_j_matrix(l).to(device=self.device, dtype=self.dtype)
-            self.j_mats.append(self._JMatrixPair(J))
-
-    def forward(
-        self, rot_mat: torch.Tensor
-    ) -> tuple[
-        list[torch.Tensor],
-        list[torch.Tensor],
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
-        """
-        Compute Wigner-D blocks for a batch of rotation matrices.
-
-        Parameters
-        ----------
-        rot_mat : torch.Tensor
-            Rotation matrices with shape (n_edges, 3, 3), global->local.
-
-        Returns
-        -------
-        D_list : list[torch.Tensor]
-            List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
-        Dt_list : list[torch.Tensor]
-            Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
-        D_full : None
-            Not computed in per-l implementation.
-        Dt_full : None
-            Not computed in per-l implementation.
-        """
-        rot_mat = rot_mat.to(dtype=self.dtype)
-
-        # === Step 1. Extract ZYZ Euler angles ===
-        # Convention: rot_mat = Rz(alpha) @ Ry(beta) @ Rz(gamma)
-        alpha, beta, gamma = self._extract_zyz_euler(rot_mat)
-
-        # === Step 2. Build real-basis Wigner-D blocks for each l ===
-        # D^{(l)}(R) = Z(alpha) @ J^T @ Z(beta) @ J @ Z(gamma)
-        D_list: list[torch.Tensor] = []
-        Dt_list: list[torch.Tensor] = []
-
-        for l, pair in enumerate(self.j_mats):
-            J: torch.Tensor = pair.J
-            Jt: torch.Tensor = pair.Jt
-
-            Za = self._build_z_rotation(alpha, l)
-            Zb = self._build_z_rotation(beta, l)
-            Zc = self._build_z_rotation(gamma, l)
-
-            # J_l = D_x^{(l)}(pi/2) in the real basis, hence:
-            #   D_x^{(l)}(-pi/2) = J_l^{-1} = J_l^T
-            # and the conjugation identity becomes:
-            #   D_y^{(l)}(beta) = J_l^T @ Z^{(l)}(beta) @ J_l
-            D = Za @ Jt @ Zb @ J @ Zc
-            D_list.append(D.contiguous())
-            Dt_list.append(D.transpose(-1, -2).contiguous())
-
-        return D_list, Dt_list, None, None
-
-    def serialize(self) -> dict[str, Any]:
-        """Serialize WignerDCalc (lmax and dtype are stored by parent)."""
-        return {
-            "@class": "WignerDCalc",
-            "@version": 1,
-        }
-
-    @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> WignerDCalcBase:
-        """Deserialize WignerDCalc - parent handles lmax/dtype reconstruction."""
-        data = data.copy()
-        data_cls = data.pop("@class")
-        if data_cls not in ("WignerDCalc", "WignerDCalcParallel"):
-            raise ValueError(f"Invalid class for WignerDCalc: {data_cls}")
-        version = int(data.pop("@version"))
-        if version != 1:
-            raise ValueError(f"Unsupported WignerDCalc version: {version}")
-        # Parent must reconstruct with actual lmax and dtype
-        raise NotImplementedError(
-            "WignerDCalc.deserialize should be called by parent with lmax/dtype"
-        )
-
-    def _build_z_rotation(self, angle: torch.Tensor, l: int) -> torch.Tensor:
-        """
-        Build z-rotation matrix in the real spherical harmonics basis.
-
-        In the complex spherical harmonics basis, a z-axis rotation is diagonal:
-
-            D_z^{(l)}(theta)_{m1,m2} = delta_{m1,m2} * exp(-i * m1 * theta)
-
-        In the real (tesseral) basis used here, each pair (m, -m) for m > 0
-        spans a 2D subspace that rotates by angle m*theta.
-
-        For each |m| > 0, there's a 2x2 rotation block; for m = 0, the element is 1.
-
-        In real SH basis with ordering m = -l, ..., 0, ..., l::
-
-            Z[l + m, l + m] = cos(m * θ)
-            Z[l + m, l - m] = sin(m * θ)
-            Z[l - m, l + m] = -sin(m * θ)
-            Z[l - m, l - m] = cos(m * θ)
-
-        Parameters
-        ----------
-        angle : torch.Tensor
-            Rotation angles with shape (n_edges,).
-        l : int
-            Angular momentum order.
-
-        Returns
-        -------
-        torch.Tensor
-            Rotation matrices with shape (n_edges, 2l+1, 2l+1).
-        """
-        n_edges = angle.shape[0]
-        # === Step 1. Handle l=0 Special Case ===
-        if l == 0:
-            return torch.ones(n_edges, 1, 1, dtype=angle.dtype, device=angle.device)
-        dim = 2 * l + 1
-        Z = torch.zeros(n_edges, dim, dim, dtype=angle.dtype, device=angle.device)
-
-        # === Step 2. Fill m=0 element ===
-        Z[:, l, l] = 1.0
-
-        # === Step 3. Fill 2x2 blocks for |m|>0 (vectorized over m) ===
-        m_idx = torch.arange(1, l + 1, device=angle.device, dtype=torch.long)
-        m_float = m_idx.to(dtype=angle.dtype)
-
-        angles_m = angle.unsqueeze(-1) * m_float  # (n_edges, l)
-        c = torch.cos(angles_m)
-        s = torch.sin(angles_m)
-
-        idx_pos = l + m_idx  # (l,)
-        idx_neg = l - m_idx  # (l,)
-
-        # 2x2 blocks in ordered subspace [m=-m, m=+m]:
-        #   [[ cos(mθ), -sin(mθ)],
-        #    [ sin(mθ),  cos(mθ)]]
-        Z[:, idx_pos, idx_pos] = c
-        Z[:, idx_neg, idx_neg] = c
-        Z[:, idx_pos, idx_neg] = s
-        Z[:, idx_neg, idx_pos] = -s
-
-        return Z
-
-
-class WignerDCalcParallel(WignerDCalcBase):
-    """
-    Fast Wigner-D blocks using block-diagonal parallel computation.
-
-    This implementation assembles all D^l blocks into a single block-diagonal matrix
-    and computes them in one batched matmul chain. This reduces Python dispatch overhead
-    but requires O(n_edges * dim_full^2) memory where dim_full = (lmax+1)^2.
-
-    For large n_edges, use ``WignerDCalc`` instead which processes each l separately.
-
-    Notes
-    -----
     **Block-Diagonal Parallel Computation**
 
     Instead of computing each l separately, we assemble all blocks into a single
@@ -1265,7 +1048,17 @@ class WignerDCalcParallel(WignerDCalcBase):
       - pos = l^2 + (l + m) for +m
       - neg = l^2 + (l - m) for -m
 
-    See ``WignerDCalc`` docstring for conventions and mathematical details.
+    **Outputs and Usage**
+
+    - ``D_full`` has shape ``(n_edges, D, D)`` and is orthogonal. It represents the
+      same global->local rotation as ``rot_mat``.
+    - ``Dt_full = D_full.transpose(-1, -2)`` is the inverse (local->global).
+    - Apply to packed features as::
+
+        x_local = D_full @ x_global
+        x_global = Dt_full @ x_local
+
+    - For degree ``l``, the block is sliced by ``[l^2 : (l+1)^2]`` along both axes.
 
     Parameters
     ----------
@@ -1304,14 +1097,7 @@ class WignerDCalcParallel(WignerDCalcBase):
         # === Step 3. Precompute indices for Z_full construction ===
         self._precompute_z_indices()
 
-    def forward(
-        self, rot_mat: torch.Tensor
-    ) -> tuple[
-        list[torch.Tensor],
-        list[torch.Tensor],
-        torch.Tensor | None,
-        torch.Tensor | None,
-    ]:
+    def forward(self, rot_mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Wigner-D blocks for a batch of rotation matrices.
 
@@ -1322,10 +1108,6 @@ class WignerDCalcParallel(WignerDCalcBase):
 
         Returns
         -------
-        D_list : list[torch.Tensor]
-            List of D^l blocks, ``D_list[l]`` has shape (n_edges, 2l+1, 2l+1).
-        Dt_list : list[torch.Tensor]
-            Transpose blocks, ``Dt_list[l]`` has shape (n_edges, 2l+1, 2l+1).
         D_full : torch.Tensor
             Block-diagonal matrix with shape (n_edges, D, D) where D=(lmax+1)^2.
         Dt_full : torch.Tensor
@@ -1350,28 +1132,27 @@ class WignerDCalcParallel(WignerDCalcBase):
         D_full = Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full
         Dt_full = D_full.transpose(-1, -2).contiguous()
 
-        # D_list and Dt_list are empty in parallel mode.
-        return [], [], D_full, Dt_full
+        return D_full, Dt_full
 
     def serialize(self) -> dict[str, Any]:
-        """Serialize WignerDCalcParallel (lmax and dtype are stored by parent)."""
+        """Serialize WignerDCalculator (lmax and dtype are stored by parent)."""
         return {
-            "@class": "WignerDCalcParallel",
+            "@class": "WignerDCalculator",
             "@version": 1,
         }
 
     @classmethod
     def deserialize(cls, data: dict[str, Any]) -> WignerDCalcBase:
-        """Deserialize WignerDCalcParallel - parent handles lmax/dtype reconstruction."""
+        """Deserialize WignerDCalculator - parent handles lmax/dtype reconstruction."""
         data = data.copy()
         data_cls = data.pop("@class")
-        if data_cls not in ("WignerDCalc", "WignerDCalcParallel"):
-            raise ValueError(f"Invalid class for WignerDCalcParallel: {data_cls}")
+        if data_cls != "WignerDCalculator":
+            raise ValueError(f"Invalid class for WignerDCalculator: {data_cls}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported WignerDCalcParallel version: {version}")
+            raise ValueError(f"Unsupported WignerDCalculator version: {version}")
         raise NotImplementedError(
-            "WignerDCalcParallel.deserialize should be called by parent with lmax/dtype"
+            "WignerDCalculator.deserialize should be called by parent with lmax/dtype"
         )
 
     def _build_z_rotation(self, angle: torch.Tensor) -> torch.Tensor:

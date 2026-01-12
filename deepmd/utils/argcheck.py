@@ -379,9 +379,6 @@ def descrpt_se_zm_net_args() -> list[Argument]:
         "channels must be divisible by `n_atten_head` and head-wise gating "
         "(2*sigmoid on edges, sigmoid on post head gate, no softmax) is applied."
     )
-    doc_use_parallel = (
-        "If True, use parallel Wigner-D implementation (higher memory usage)."
-    )
     doc_use_amp = (
         "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "
         "This does not provide accelerations under fp32 precision but will decrease "
@@ -423,13 +420,45 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             default=[64],
             doc=doc_radial_mlp,
         ),
+        Argument(
+            "use_env_seed",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported
+            + "If True, add environment matrix initial embedding to l=0 features using 4D [s, s*r_hat] representation.",
+        ),
+        Argument(
+            "env_seed_max",
+            float,
+            optional=True,
+            default=1.0,
+            doc=doc_only_pt_supported
+            + "Maximum scale magnitude for env_seed injection. The scale is bounded in "
+            + "[-env_seed_max, env_seed_max] via sigmoid parameterization.",
+        ),
+        Argument(
+            "env_seed_embed_dim",
+            int,
+            optional=True,
+            default=64,
+            doc=doc_only_pt_supported
+            + "Output dimension of the G network in environment initial embedding. "
+            + "Other dimensions are derived: axis_dim=min(8, max(4, env_seed_embed_dim//2)), "
+            + "type_dim=min(16, max(8, env_seed_embed_dim//2)), hidden_dim=min(64, max(32, 2*env_seed_embed_dim)).",
+        ),
+        Argument(
+            "env_seed_norm",
+            str,
+            optional=True,
+            default="sqrt_deg",
+            doc=doc_only_pt_supported
+            + "Normalization mode for env_agg aggregation: 'deg' (1/degree) or 'sqrt_deg' (1/sqrt(degree)).",
+        ),
         Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
         Argument("so2_layers", int, optional=True, default=2, doc=doc_so2_layers),
         Argument("ffn_neurons", int, optional=True, default=128, doc=doc_ffn_neurons),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
-        Argument(
-            "use_parallel", bool, optional=True, default=False, doc=doc_use_parallel
-        ),
         Argument(
             "activation_function",
             str,

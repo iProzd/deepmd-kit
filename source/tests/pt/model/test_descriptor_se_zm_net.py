@@ -18,10 +18,10 @@ from deepmd.pt.model.descriptor.se_zm_block import (
 )
 from deepmd.pt.model.descriptor.se_zm_helper import (
     EdgeFeatureCache,
-    WignerDCalc,
-    WignerDCalcParallel,
+    WignerDCalculator,
     build_m_major_index,
     edge_cache_to_dtype,
+    so3_packed_index,
 )
 from deepmd.pt.model.descriptor.se_zm_net import (
     DescrptSeZMNet,
@@ -83,9 +83,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
 
     def test_forward_shape_and_dtype(self) -> None:
         """Test that forward produces correct shape and dtype."""
-        for prec, use_parallel in itertools.product(
-            ["float64", "float32", "bfloat16"], [False, True]
-        ):
+        for prec in ["float64", "float32", "bfloat16"]:
             dtype = PRECISION_DICT[prec]
             coord, atype, nlist = self._tiny_system(dtype=dtype)
             extended_coord = coord.reshape(1, -1)
@@ -99,15 +97,11 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 ffn_neurons=16,
-                use_parallel=use_parallel,
                 precision=prec,
                 trainable=True,
             )
             self.assertEqual(model.dtype, dtype)
-            if use_parallel:
-                self.assertIsInstance(model.wigner_calc, WignerDCalcParallel)
-            else:
-                self.assertIsInstance(model.wigner_calc, WignerDCalc)
+            self.assertIsInstance(model.wigner_calc, WignerDCalculator)
 
             desc, _, _, _, sw = model(
                 extended_coord, atype, nlist, mapping=None, comm_dict=None
@@ -119,9 +113,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
 
     def test_backward_gradient(self) -> None:
         """Test backward gradient through coordinates."""
-        for prec, use_parallel in itertools.product(
-            ["float64", "float32", "bfloat16"], [False, True]
-        ):
+        for prec in ["float64", "float32", "bfloat16"]:
             dtype = PRECISION_DICT[prec]
             coord, atype, nlist = self._tiny_system(dtype=dtype)
             extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
@@ -134,7 +126,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 n_radial=3,
                 radial_mlp=[6],
                 ffn_neurons=8,
-                use_parallel=use_parallel,
                 precision=prec,
                 trainable=True,
             )
@@ -146,9 +137,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
 
     def test_serialization_deserialization(self) -> None:
         """Test serialization and deserialization preserves model state."""
-        for prec, use_parallel in itertools.product(
-            ["float64", "float32", "bfloat16"], [False, True]
-        ):
+        for prec in ["float64", "float32", "bfloat16"]:
             dtype = PRECISION_DICT[prec]
             coord, atype, nlist = self._tiny_system(dtype=dtype)
             extended_coord = coord.reshape(1, -1)
@@ -164,7 +153,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 radial_mlp=[8],
                 so2_layers=2,
                 ffn_neurons=16,
-                use_parallel=use_parallel,
                 precision=prec,
                 trainable=True,
             )
@@ -209,9 +197,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
 
     def test_seed_reproducibility(self) -> None:
         """Test that fixed seed produces identical model initialization."""
-        for prec, use_parallel in itertools.product(
-            ["float64", "float32", "bfloat16"], [False, True]
-        ):
+        for prec in ["float64", "float32", "bfloat16"]:
             dtype = PRECISION_DICT[prec]
             seed = 12345
 
@@ -226,7 +212,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 radial_mlp=[8],
                 so2_layers=2,
                 ffn_neurons=16,
-                use_parallel=use_parallel,
                 precision=prec,
                 trainable=True,
                 seed=seed,
@@ -242,7 +227,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 radial_mlp=[8],
                 so2_layers=2,
                 ffn_neurons=16,
-                use_parallel=use_parallel,
                 precision=prec,
                 trainable=True,
                 seed=seed,
@@ -324,7 +308,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
             channels=4,
             so2_layers=1,
             n_atten_head=0,
-            use_parallel=False,
             dtype=dtype,
             seed=None,
             trainable=True,
@@ -341,8 +324,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
         dst = torch.tensor([1, 0], device=self.device, dtype=torch.long)
         edge_env = torch.tensor([[0.5], [0.25]], device=self.device, dtype=dtype)
         inv_sqrt_deg = torch.tensor([[[1.0]], [[0.5]]], device=self.device, dtype=dtype)
-        D_list = [torch.ones(2, 1, 1, device=self.device, dtype=dtype)]
-        Dt_list = [torch.ones(2, 1, 1, device=self.device, dtype=dtype)]
+        D_full = torch.ones(2, 1, 1, device=self.device, dtype=dtype)
         edge_cache = EdgeFeatureCache(
             src=src,
             dst=dst,
@@ -350,11 +332,9 @@ class TestDescrptSeZMNet(unittest.TestCase):
             edge_vec=torch.zeros(2, 3, device=self.device, dtype=dtype),
             edge_rbf=torch.zeros(2, 1, device=self.device, dtype=dtype),
             edge_env=edge_env,
-            D_list=D_list,
-            Dt_list=Dt_list,
             inv_sqrt_deg=inv_sqrt_deg,
-            D_full=None,
-            Dt_full=None,
+            D_full=D_full,
+            Dt_full=D_full,
             D_to_m_cache={},
             Dt_from_m_cache={},
         )
@@ -375,7 +355,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
             channels=4,
             so2_layers=1,
             n_atten_head=2,
-            use_parallel=False,
             dtype=dtype,
             seed=None,
             trainable=True,
@@ -412,8 +391,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
         dst = torch.tensor([1, 0], device=self.device, dtype=torch.long)
         edge_env = torch.tensor([[0.5], [0.25]], device=self.device, dtype=dtype)
         inv_sqrt_deg = torch.tensor([[[1.0]], [[0.5]]], device=self.device, dtype=dtype)
-        D_list = [torch.ones(2, 1, 1, device=self.device, dtype=dtype)]
-        Dt_list = [torch.ones(2, 1, 1, device=self.device, dtype=dtype)]
+        D_full = torch.ones(2, 1, 1, device=self.device, dtype=dtype)
         edge_cache = EdgeFeatureCache(
             src=src,
             dst=dst,
@@ -421,11 +399,11 @@ class TestDescrptSeZMNet(unittest.TestCase):
             edge_vec=torch.zeros(2, 3, device=self.device, dtype=dtype),
             edge_rbf=torch.zeros(2, 1, device=self.device, dtype=dtype),
             edge_env=edge_env,
-            D_list=D_list,
-            Dt_list=Dt_list,
             inv_sqrt_deg=inv_sqrt_deg,
-            D_full=None,
-            Dt_full=None,
+            D_full=D_full,
+            Dt_full=D_full,
+            D_to_m_cache={},
+            Dt_from_m_cache={},
         )
 
         out = conv(x, edge_cache, radial_feat)
@@ -475,7 +453,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 channels=3,
                 so2_layers=1,
                 n_atten_head=2,
-                use_parallel=False,
                 dtype=torch.float32,
                 seed=None,
                 trainable=True,
@@ -554,7 +531,7 @@ class TestInitEdgeRotMatFrisvad(unittest.TestCase):
             self._assert_rotation_invariants(rot_mat, edge_vec)
 
 
-class TestWignerDCalc(unittest.TestCase):
+class TestWignerDCalculator(unittest.TestCase):
     """Test the Wigner-D matrix calculator."""
 
     def setUp(self) -> None:
@@ -571,25 +548,18 @@ class TestWignerDCalc(unittest.TestCase):
 
     def _extract_l_block(
         self,
-        D_list: list[torch.Tensor],
-        D_full: torch.Tensor | None,
+        D_full: torch.Tensor,
         l: int,
     ) -> torch.Tensor:
-        """Extract the l-block from either D_list or D_full."""
-        if D_list:
-            return D_list[l]
+        """Extract the l-block from D_full."""
         s, e = l * l, (l + 1) * (l + 1)
         return D_full[:, s:e, s:e]
 
     def test_orthogonality(self) -> None:
         """Test D @ D^T = I for random rotations."""
-        for dtype, wigner_cls, lmax in itertools.product(
-            [torch.float64, torch.float32],
-            [WignerDCalc, WignerDCalcParallel],
-            [1, 2, 3],
-        ):
+        for dtype, lmax in itertools.product([torch.float64, torch.float32], [1, 2, 3]):
             atol, rtol = self._get_tols(dtype)
-            wigner = wigner_cls(lmax=lmax, dtype=dtype)
+            wigner = WignerDCalculator(lmax=lmax, dtype=dtype)
             alpha = (
                 torch.rand(self.batch, device=self.device, dtype=dtype) * 2 * 3.14159
             )
@@ -598,15 +568,15 @@ class TestWignerDCalc(unittest.TestCase):
                 torch.rand(self.batch, device=self.device, dtype=dtype) * 2 * 3.14159
             )
             rot = _zyz_euler_to_matrix(alpha, beta, gamma)
-            D_list, Dt_list, D_full, Dt_full = wigner(rot)
+            D_full, Dt_full = wigner(rot)
 
             for l in range(lmax + 1):
                 dim = 2 * l + 1
                 eye = torch.eye(dim, device=self.device, dtype=dtype).expand(
                     self.batch, dim, dim
                 )
-                D_l = self._extract_l_block(D_list, D_full, l)
-                Dt_l = self._extract_l_block(Dt_list, Dt_full, l)
+                D_l = self._extract_l_block(D_full, l)
+                Dt_l = self._extract_l_block(Dt_full, l)
                 prod = D_l @ Dt_l
                 torch.testing.assert_close(
                     prod,
@@ -614,17 +584,13 @@ class TestWignerDCalc(unittest.TestCase):
                     atol=atol,
                     rtol=rtol,
                     msg=(
-                        f"Orthogonality failed for {wigner_cls.__name__}, dtype={dtype}, lmax={lmax}, l={l}"
+                        f"Orthogonality failed for WignerDCalculator, dtype={dtype}, lmax={lmax}, l={l}"
                     ),
                 )
 
     def test_group_property(self) -> None:
         """Test group property: D(R1 @ R2) ~= D(R1) @ D(R2)."""
-        for dtype, wigner_cls, lmax in itertools.product(
-            [torch.float64, torch.float32],
-            [WignerDCalc, WignerDCalcParallel],
-            [1, 2, 3],
-        ):
+        for dtype, lmax in itertools.product([torch.float64, torch.float32], [1, 2, 3]):
             if dtype == torch.float64:
                 atol = 1e-10
                 rtol = 1e-10
@@ -632,7 +598,7 @@ class TestWignerDCalc(unittest.TestCase):
                 atol = 5e-4
                 rtol = 5e-4
 
-            wigner = wigner_cls(lmax=lmax, dtype=dtype)
+            wigner = WignerDCalculator(lmax=lmax, dtype=dtype)
 
             # Avoid gimbal lock by keeping beta away from 0 and pi.
             alpha1 = (
@@ -659,71 +625,28 @@ class TestWignerDCalc(unittest.TestCase):
             rot2 = _zyz_euler_to_matrix(alpha2, beta2, gamma2)
             rot12 = rot1 @ rot2
 
-            D1, _, D1_full, _ = wigner(rot1)
-            D2, _, D2_full, _ = wigner(rot2)
-            D12, _, D12_full, _ = wigner(rot12)
+            D1_full, _ = wigner(rot1)
+            D2_full, _ = wigner(rot2)
+            D12_full, _ = wigner(rot12)
 
             for l in range(lmax + 1):
-                D1_l = self._extract_l_block(D1, D1_full, l)
-                D2_l = self._extract_l_block(D2, D2_full, l)
-                D12_l = self._extract_l_block(D12, D12_full, l)
+                D1_l = self._extract_l_block(D1_full, l)
+                D2_l = self._extract_l_block(D2_full, l)
+                D12_l = self._extract_l_block(D12_full, l)
                 torch.testing.assert_close(
                     D12_l,
                     D1_l @ D2_l,
                     atol=atol,
                     rtol=rtol,
                     msg=(
-                        f"Group property failed for {wigner_cls.__name__}, dtype={dtype}, lmax={lmax}, l={l}"
+                        f"Group property failed for WignerDCalculator, dtype={dtype}, lmax={lmax}, l={l}"
                     ),
-                )
-
-    def test_parallel_matches_per_l(self) -> None:
-        """Test that the parallel implementation matches the per-l implementation."""
-        for dtype, lmax in itertools.product([torch.float64, torch.float32], [1, 2, 3]):
-            atol, rtol = self._get_tols(dtype)
-            wigner_ref = WignerDCalc(lmax=lmax, dtype=dtype)
-            wigner_par = WignerDCalcParallel(lmax=lmax, dtype=dtype)
-
-            alpha = (
-                torch.rand(self.batch, device=self.device, dtype=dtype) * 2 * 3.14159
-            )
-            beta = 0.1 + torch.rand(self.batch, device=self.device, dtype=dtype) * (
-                3.14159 - 0.2
-            )
-            gamma = (
-                torch.rand(self.batch, device=self.device, dtype=dtype) * 2 * 3.14159
-            )
-            rot = _zyz_euler_to_matrix(alpha, beta, gamma)
-
-            D_ref, Dt_ref, _, _ = wigner_ref(rot)
-            _, _, D_full_par, Dt_full_par = wigner_par(rot)
-
-            for l in range(lmax + 1):
-                D_par_l = self._extract_l_block([], D_full_par, l)
-                Dt_par_l = self._extract_l_block([], Dt_full_par, l)
-                torch.testing.assert_close(
-                    D_par_l,
-                    D_ref[l],
-                    atol=atol,
-                    rtol=rtol,
-                    msg=f"D mismatch for dtype={dtype}, lmax={lmax}, l={l}",
-                )
-                torch.testing.assert_close(
-                    Dt_par_l,
-                    Dt_ref[l],
-                    atol=atol,
-                    rtol=rtol,
-                    msg=f"Dt mismatch for dtype={dtype}, lmax={lmax}, l={l}",
                 )
 
     def test_backward_no_nan_at_gimbal_lock(self) -> None:
         """Test backward stability for rotations with beta=0 or pi."""
-        for dtype, wigner_cls, lmax in itertools.product(
-            [torch.float64, torch.float32],
-            [WignerDCalc, WignerDCalcParallel],
-            [1, 2, 3],
-        ):
-            wigner = wigner_cls(lmax=lmax, dtype=dtype)
+        for dtype, lmax in itertools.product([torch.float64, torch.float32], [1, 2, 3]):
+            wigner = WignerDCalculator(lmax=lmax, dtype=dtype)
             edge_vec = torch.tensor(
                 [[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]],
                 device=self.device,
@@ -731,19 +654,15 @@ class TestWignerDCalc(unittest.TestCase):
                 requires_grad=True,
             )
             rot_mat = init_edge_rot_mat_frisvad(edge_vec)
-            D_list, _, D_full, _ = wigner(rot_mat)
-            # Use D_full for parallel mode, D_list for per-l mode.
-            if D_list:
-                loss = sum((D**2).sum() for D in D_list)
-            else:
-                loss = (D_full**2).sum()
+            D_full, _ = wigner(rot_mat)
+            loss = (D_full**2).sum()
             loss.backward()
 
             self.assertIsNotNone(edge_vec.grad)
             self.assertTrue(
                 torch.isfinite(edge_vec.grad).all().item(),
                 msg=(
-                    f"Non-finite gradients at gimbal lock for {wigner_cls.__name__}, dtype={dtype}, lmax={lmax}"
+                    f"Non-finite gradients at gimbal lock for WignerDCalculator, dtype={dtype}, lmax={lmax}"
                 ),
             )
 
@@ -756,14 +675,11 @@ class TestWignerDCalc(unittest.TestCase):
         ordering (m=-1,0,+1) with the implementation's phase conventions.
         """
         # === Step 1. Define the fixed Cartesian <-> real-SH basis map (l=1) ===
-        # With the real SH conventions used in WignerDCalc, the mapping is a signed
+        # With the real SH conventions used in WignerDCalculator, the mapping is a signed
         # permutation:
         #   x_sh = S @ v_cart
         #   v_cart = S^T @ x_sh
-        for dtype, wigner_cls in itertools.product(
-            [torch.float64, torch.float32],
-            [WignerDCalc, WignerDCalcParallel],
-        ):
+        for dtype in [torch.float64, torch.float32]:
             atol, rtol = self._get_tols(dtype)
             S = torch.tensor(
                 [[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]],
@@ -772,7 +688,7 @@ class TestWignerDCalc(unittest.TestCase):
             )
             S_batch = S.unsqueeze(0).expand(self.batch, 3, 3)
 
-            wigner = wigner_cls(lmax=1, dtype=dtype)
+            wigner = WignerDCalculator(lmax=1, dtype=dtype)
 
             alpha = (
                 torch.rand(self.batch, device=self.device, dtype=dtype) * 2 * 3.14159
@@ -785,9 +701,9 @@ class TestWignerDCalc(unittest.TestCase):
             )
             rot = _zyz_euler_to_matrix(alpha, beta, gamma)
 
-            D_list, Dt_list, D_full, Dt_full = wigner(rot)
-            D1 = self._extract_l_block(D_list, D_full, 1)
-            Dt1 = self._extract_l_block(Dt_list, Dt_full, 1)
+            D_full, Dt_full = wigner(rot)
+            D1 = self._extract_l_block(D_full, 1)
+            Dt1 = self._extract_l_block(Dt_full, 1)
 
             # === Step 2. Compare against the vector representation ===
             expected = S_batch @ rot @ S_batch.transpose(-1, -2)
@@ -796,14 +712,14 @@ class TestWignerDCalc(unittest.TestCase):
                 expected,
                 atol=atol,
                 rtol=rtol,
-                msg=f"l=1 block mismatch for {wigner_cls.__name__}, dtype={dtype}",
+                msg=f"l=1 block mismatch for WignerDCalculator, dtype={dtype}",
             )
             torch.testing.assert_close(
                 Dt1,
                 expected.transpose(-1, -2),
                 atol=atol,
                 rtol=rtol,
-                msg=f"l=1 transpose block mismatch for {wigner_cls.__name__}, dtype={dtype}",
+                msg=f"l=1 transpose block mismatch for WignerDCalculator, dtype={dtype}",
             )
 
     def test_edge_frame_m0_column_matches_edge_direction(self) -> None:
@@ -835,21 +751,23 @@ class TestWignerDCalc(unittest.TestCase):
             edge_unit = edge_vec / edge_norm
             rot_mat = init_edge_rot_mat_frisvad(edge_vec)
 
-            wigner = WignerDCalc(lmax=1, dtype=dtype)
-            _, Dt_list, _, _ = wigner(rot_mat)
+            wigner = WignerDCalculator(lmax=1, dtype=dtype)
+            _, Dt_full = wigner(rot_mat)
 
             # === Step 3. Column m=0 of Dt^{(1)} equals the rotated local m=0 axis ===
             # In the implementation's real-SH convention, the Cartesian axis corresponding to
             # (l=1, m=0) is -z. Therefore the rotated vector is -edge_unit.
             m0 = 1
-            col = Dt_list[1][:, :, m0]  # (E, 3) in real-SH basis
+            start, end = 1, 4
+            m0_index = so3_packed_index(1, 0)
+            col = Dt_full[:, start:end, m0_index]  # (E, 3) in real-SH basis
             vec_cart = torch.einsum("ij,ej->ei", St, col)
             torch.testing.assert_close(
                 vec_cart,
                 -edge_unit,
                 atol=atol,
                 rtol=rtol,
-                msg=f"Dt_list[1][:,:,m0] does not match -edge_unit in Cartesian space (dtype={dtype})",
+                msg=f"Dt_full column does not match -edge_unit in Cartesian space (dtype={dtype})",
             )
 
 
@@ -880,18 +798,6 @@ class TestEdgeFeatureCacheProjection(unittest.TestCase):
             edge_vec=torch.zeros(n_edges, 3, device=self.device, dtype=dtype),
             edge_rbf=torch.zeros(n_edges, 1, device=self.device, dtype=dtype),
             edge_env=torch.ones(n_edges, 1, device=self.device, dtype=dtype),
-            D_list=[
-                torch.zeros(
-                    n_edges, 2 * l + 1, 2 * l + 1, device=self.device, dtype=dtype
-                )
-                for l in range(lmax + 1)
-            ],
-            Dt_list=[
-                torch.zeros(
-                    n_edges, 2 * l + 1, 2 * l + 1, device=self.device, dtype=dtype
-                )
-                for l in range(lmax + 1)
-            ],
             inv_sqrt_deg=torch.ones(1, 1, 1, device=self.device, dtype=dtype),
             D_full=D_full,
             Dt_full=Dt_full,
@@ -1084,10 +990,7 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
         n_nodes = 12
         n_edges = 32
 
-        for dtype, use_parallel in itertools.product(
-            [torch.float64, torch.float32, torch.bfloat16],
-            [False, True],
-        ):
+        for dtype in [torch.float64, torch.float32, torch.bfloat16]:
             atol, rtol = self._get_tols(dtype)
             D_full = (lmax + 1) ** 2
 
@@ -1099,16 +1002,8 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             gamma = torch.rand(n_edges, device=self.device, dtype=dtype) * 2 * 3.14159
             rot = _zyz_euler_to_matrix(alpha, beta, gamma)
 
-            if use_parallel:
-                wigner = WignerDCalcParallel(lmax=lmax, dtype=dtype)
-                D_list, Dt_list, D_full_mat, Dt_full_mat = wigner(rot)
-                assert D_full_mat is not None
-                assert Dt_full_mat is not None
-            else:
-                wigner = WignerDCalc(lmax=lmax, dtype=dtype)
-                D_list, Dt_list, D_full_mat, Dt_full_mat = wigner(rot)
-                self.assertIsNone(D_full_mat)
-                self.assertIsNone(Dt_full_mat)
+            wigner = WignerDCalculator(lmax=lmax, dtype=dtype)
+            D_full_mat, Dt_full_mat = wigner(rot)
 
             # === Step 2. Synthetic graph and cached invariants ===
             src = torch.randint(0, n_nodes, (n_edges,), device=self.device)
@@ -1129,19 +1024,15 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
                 edge_vec=torch.zeros(n_edges, 3, device=self.device, dtype=dtype),
                 edge_rbf=torch.zeros(n_edges, 1, device=self.device, dtype=dtype),
                 edge_env=edge_env,
-                D_list=D_list,
-                Dt_list=Dt_list,
                 inv_sqrt_deg=inv_sqrt_deg,
                 D_full=D_full_mat,
                 Dt_full=Dt_full_mat,
                 D_to_m_cache={},
                 Dt_from_m_cache={},
             )
-            # WignerDCalc forces fp32+, convert cache to target dtype
+            # WignerDCalculator forces fp32+, convert cache to target dtype
             edge_cache = edge_cache_to_dtype(edge_cache, dtype)
             # Update references from converted cache for Step 4
-            D_list = edge_cache.D_list
-            Dt_list = edge_cache.Dt_list
             D_full_mat = edge_cache.D_full
             Dt_full_mat = edge_cache.Dt_full
 
@@ -1158,7 +1049,6 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
                 mmax=mmax,
                 channels=channels,
                 so2_layers=so2_layers,
-                use_parallel=use_parallel,
                 dtype=dtype,
                 seed=123,
                 trainable=True,
@@ -1170,19 +1060,11 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             # === Step 4. Reference path: full rotate/back + zero-fill truncation ===
             x_src = x.index_select(0, src)
 
-            if use_parallel:
-                assert D_full_mat is not None
-                assert Dt_full_mat is not None
-                D_block = D_full_mat[:, :D_full, :D_full]
-                Dt_block = Dt_full_mat[:, :D_full, :D_full]
-                x_local_full = torch.bmm(D_block, x_src)
-            else:
-                x_local_full = x_src.new_empty(x_src.shape)
-                for l in range(lmax + 1):
-                    start, end = l * l, (l + 1) * (l + 1)
-                    x_local_full[:, start:end, :] = torch.einsum(
-                        "eij,ejc->eic", D_list[l], x_src[:, start:end, :]
-                    )
+            assert D_full_mat is not None
+            assert Dt_full_mat is not None
+            D_block = D_full_mat[:, :D_full, :D_full]
+            Dt_block = Dt_full_mat[:, :D_full, :D_full]
+            x_local_full = torch.bmm(D_block, x_src)
 
             m_idx = build_m_major_index(lmax, mmax, device=self.device)
             x_local_red = x_local_full.index_select(1, m_idx)
@@ -1204,15 +1086,7 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             x_local_full_zero = x_local_full.new_zeros(x_local_full.shape)
             x_local_full_zero.index_copy_(1, m_idx, x_local_red)
 
-            if use_parallel:
-                x_global_ref = torch.bmm(Dt_block, x_local_full_zero)
-            else:
-                x_global_ref = x_local_full_zero.new_empty(x_local_full_zero.shape)
-                for l in range(lmax + 1):
-                    start, end = l * l, (l + 1) * (l + 1)
-                    x_global_ref[:, start:end, :] = torch.einsum(
-                        "eij,ejc->eic", Dt_list[l], x_local_full_zero[:, start:end, :]
-                    )
+            x_global_ref = torch.bmm(Dt_block, x_local_full_zero)
 
             x_global_ref = x_global_ref * edge_env.view(-1, 1, 1)
             out_ref = x.new_zeros(x.shape)
@@ -1253,9 +1127,7 @@ class TestJITScript(unittest.TestCase):
 
     def test_jit_script_basic(self) -> None:
         """Test that DescrptSeZMNet can be scripted with torch.jit.script."""
-        for prec, use_parallel in itertools.product(
-            ["float64", "float32", "bfloat16"], [False, True]
-        ):
+        for prec in ["float64", "float32", "bfloat16"]:
             dtype = PRECISION_DICT[prec]
             atol, rtol = self._get_tols(dtype)
             coord, atype, nlist = self._tiny_system(dtype=dtype)
@@ -1271,7 +1143,6 @@ class TestJITScript(unittest.TestCase):
                 n_radial=3,
                 radial_mlp=[6],
                 ffn_neurons=8,
-                use_parallel=use_parallel,
                 precision=prec,
                 trainable=True,
             )
@@ -1287,9 +1158,7 @@ class TestJITScript(unittest.TestCase):
             try:
                 scripted_model = torch.jit.script(model)
             except Exception as e:
-                self.fail(
-                    f"torch.jit.script failed for {prec}, use_parallel={use_parallel}: {e}"
-                )
+                self.fail(f"torch.jit.script failed for {prec}: {e}")
 
             # Get output from scripted model
             with torch.no_grad():
@@ -1303,14 +1172,14 @@ class TestJITScript(unittest.TestCase):
                 desc_ref,
                 atol=atol,
                 rtol=rtol,
-                msg=f"Descriptor output mismatch after scripting (prec={prec}, parallel={use_parallel})",
+                msg=f"Descriptor output mismatch after scripting (prec={prec})",
             )
             torch.testing.assert_close(
                 sw_script,
                 sw_ref,
                 atol=atol,
                 rtol=rtol,
-                msg=f"Smooth weight mismatch after scripting (prec={prec}, parallel={use_parallel})",
+                msg=f"Smooth weight mismatch after scripting (prec={prec})",
             )
 
     def test_jit_script_forward_backward(self) -> None:
@@ -1329,7 +1198,6 @@ class TestJITScript(unittest.TestCase):
             radial_mlp=[8],
             so2_layers=2,
             ffn_neurons=16,
-            use_parallel=False,
             precision="float64",
             trainable=True,
         )
@@ -1356,6 +1224,159 @@ class TestJITScript(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(extended_coord.grad)
         self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
+
+
+class TestEnvironmentInitialEmbedding(unittest.TestCase):
+    """Test the EnvironmentInitialEmbedding module."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+    def _tiny_system(
+        self, *, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Create a minimal two-atom system for testing."""
+        coord = torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=self.device,
+        ).view(1, -1, 3)
+        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
+        nlist = torch.tensor(
+            [[[1, -1], [0, -1]]], dtype=torch.int64, device=self.device
+        )
+        return coord, atype, nlist
+
+    def _get_tols(self, dtype: torch.dtype) -> tuple[float, float]:
+        if dtype == torch.float64:
+            return 1e-10, 1e-10
+        if dtype == torch.float32:
+            return 5e-5, 5e-5
+        return 5e-3, 5e-3
+
+    def test_env_seed_forward_shape(self) -> None:
+        """Test that env_seed enabled model produces correct shape."""
+        for prec in ["float64", "float32"]:
+            dtype = PRECISION_DICT[prec]
+            coord, atype, nlist = self._tiny_system(dtype=dtype)
+            extended_coord = coord.reshape(1, -1)
+
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=8,
+                n_radial=4,
+                radial_mlp=[8],
+                ffn_neurons=16,
+                precision=prec,
+                use_env_seed=True,
+                env_seed_embed_dim=16,
+                env_seed_axis_dim=4,
+                trainable=True,
+            )
+            self.assertTrue(model.use_env_seed)
+            self.assertIsNotNone(model.env_seed_embedding)
+
+            desc, _, _, _, sw = model(
+                extended_coord, atype, nlist, mapping=None, comm_dict=None
+            )
+            self.assertEqual(desc.shape, (1, 2, 8))
+            self.assertEqual(sw.shape, (1, 2, 2, 1))
+
+    def test_env_seed_backward_gradient(self) -> None:
+        """Test backward gradient through env seed."""
+        for prec in ["float64", "float32"]:
+            dtype = PRECISION_DICT[prec]
+            coord, atype, nlist = self._tiny_system(dtype=dtype)
+            extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
+
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=4,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neurons=8,
+                precision=prec,
+                use_env_seed=True,
+                env_seed_embed_dim=8,
+                env_seed_axis_dim=2,
+                trainable=True,
+            )
+            desc, *_ = model(extended_coord, atype, nlist, mapping=None, comm_dict=None)
+            loss = desc.sum()
+            loss.backward()
+            self.assertIsNotNone(extended_coord.grad)
+            self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
+
+    def test_env_seed_serialization(self) -> None:
+        """Test serialization/deserialization with env_seed enabled."""
+        for prec in ["float64", "float32"]:
+            dtype = PRECISION_DICT[prec]
+            coord, atype, nlist = self._tiny_system(dtype=dtype)
+            extended_coord = coord.reshape(1, -1)
+
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=8,
+                n_radial=4,
+                radial_mlp=[8],
+                ffn_neurons=16,
+                precision=prec,
+                use_env_seed=True,
+                env_seed_embed_dim=16,
+                env_seed_axis_dim=4,
+                trainable=True,
+            )
+
+            # Forward before serialization
+            desc1, _, _, _, sw1 = model(extended_coord, atype, nlist)
+
+            # Serialize
+            data = model.serialize()
+
+            # Deserialize
+            model_restored = DescrptSeZMNet.deserialize(data)
+            self.assertTrue(model_restored.use_env_seed)
+            self.assertIsNotNone(model_restored.env_seed_embedding)
+
+            # Forward after deserialization
+            desc2, _, _, _, sw2 = model_restored(extended_coord, atype, nlist)
+
+            atol, rtol = self._get_tols(dtype)
+            torch.testing.assert_close(
+                desc1,
+                desc2,
+                atol=atol,
+                rtol=rtol,
+                msg="Descriptor mismatch after deserialization with env_seed",
+            )
+
+    def test_env_seed_off_identical(self) -> None:
+        """Test that use_env_seed=False doesn't create the module."""
+        for prec in ["float64", "float32"]:
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=8,
+                n_radial=4,
+                radial_mlp=[8],
+                ffn_neurons=16,
+                precision=prec,
+                use_env_seed=False,
+                trainable=True,
+            )
+            self.assertFalse(model.use_env_seed)
+            self.assertIsNone(model.env_seed_embedding)
 
 
 if __name__ == "__main__":

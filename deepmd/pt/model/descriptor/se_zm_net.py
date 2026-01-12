@@ -61,13 +61,11 @@ from .base_descriptor import (
 )
 from .se_zm_block import (
     SeZMInteractionBlock,
-    SO3LinearV2,
+    SO3Linear,
 )
 from .se_zm_helper import (
     EdgeFeatureCache,
-    WignerDCalc,
-    WignerDCalcBase,
-    WignerDCalcParallel,
+    WignerDCalculator,
     edge_cache_to_dtype,
     get_promoted_dtype,
     get_so3_dim_of_lmax,
@@ -613,8 +611,6 @@ class GeometricInitialEmbedding(nn.Module):
         Maximum degree.
     channels
         Number of channels per (l, m) coefficient.
-    use_parallel
-        If True, use Dt_full for rotation; otherwise use Dt_list.
     dtype
         Parameter dtype.
     """
@@ -624,13 +620,11 @@ class GeometricInitialEmbedding(nn.Module):
         *,
         lmax: int,
         channels: int,
-        use_parallel: bool = True,
         dtype: torch.dtype,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
         self.channels = int(channels)
-        self.use_parallel = bool(use_parallel)
         self.ebed_dim = get_so3_dim_of_lmax(self.lmax)
         self.dtype = dtype
         self.device = env.DEVICE
@@ -679,12 +673,9 @@ class GeometricInitialEmbedding(nn.Module):
             start, end = l * l, (l + 1) * (l + 1)
             # Extract m=0 column from Wigner-D transpose (local->global rotation).
             # Global column index for m=0 in l-block: l^2 + l.
-            if self.use_parallel:
-                Dt_full = edge_cache.Dt_full
-                assert Dt_full is not None
-                d_col = Dt_full[:, start:end, so3_packed_index(l, 0)]  # (E, 2l+1)
-            else:
-                d_col = edge_cache.Dt_list[l][:, :, l]  # (E, 2l+1)
+            Dt_full = edge_cache.Dt_full
+            assert Dt_full is not None
+            d_col = Dt_full[:, start:end, so3_packed_index(l, 0)]  # (E, 2l+1)
             msg_global = d_col.unsqueeze(-1) * radial_feat[:, l - 1, :].unsqueeze(
                 1
             )  # (E, 2l+1, C)
@@ -702,7 +693,6 @@ class GeometricInitialEmbedding(nn.Module):
             "@version": 1,
             "lmax": self.lmax,
             "channels": self.channels,
-            "use_parallel": self.use_parallel,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
         }
 
@@ -720,6 +710,335 @@ class GeometricInitialEmbedding(nn.Module):
         precision = data.pop("precision")
         data["dtype"] = PRECISION_DICT[precision]
         return cls(**data)
+
+
+class EnvironmentInitialEmbedding(nn.Module):
+    """
+    Environment matrix initial embedding for l=0 features.
+
+    Computes an initial embedding based on the 4D environment matrix::
+
+        [s, s * rx, s * ry, s * rz]
+
+    Combined with independent type embeddings (individual type embedding),
+    providing physical inductive bias for l=0 features.
+
+    The computation follows the environment matrix approach where::
+
+        1. Build `r_tilde = [s, s*r_hat]` where `s = edge_env / r` and `r_hat = edge_vec / r`
+        2. G network: `g = G(rbf_proj(edge_rbf), type_src, type_dst)` produces per-edge features
+           - Uses independent `env_type_embed` instead of projecting from main type embedding
+           - Uses `rbf_proj` to project edge_rbf to `rbf_out_dim`
+        3. env_agg: aggregate outer product `r_tilde ⊗ g` by destination node
+        4. D matrix: `D = env_agg^T @ env_agg[:, :, :axis_dim]`
+        5. Output: residual-scaled projection of flattened D matrix
+
+    Parameters
+    ----------
+    ntypes : int
+        Number of atom types.
+    n_radial : int
+        Number of radial basis functions.
+    channels : int
+        Output channel dimension (same as type embedding channels).
+    embed_dim : int
+        G network output dimension (filter width).
+    axis_dim : int
+        D matrix axis dimension (must be < embed_dim).
+    type_dim : int
+        Dimension for independent type embeddings in env_seed.
+    hidden_dim : int
+        Hidden layer size for G network.
+    norm : str
+        Normalization mode: "deg" (divide by degree) or "sqrt_deg" (multiply by 1/sqrt(deg)).
+    activation_function : str
+        Activation function for G network hidden layer.
+    eps : float
+        Small epsilon for numerical stability.
+    dtype : torch.dtype
+        Parameter dtype.
+    trainable : bool
+        Whether parameters are trainable.
+    seed : int | list[int] | None
+        Random seed for reproducibility.
+    """
+
+    def __init__(
+        self,
+        *,
+        ntypes: int,
+        n_radial: int,
+        channels: int,
+        embed_dim: int = 64,
+        axis_dim: int = 8,
+        type_dim: int = 16,
+        hidden_dim: int = 64,
+        env_seed_max: float = 1.0,
+        norm: str = "sqrt_deg",
+        activation_function: str = "silu",
+        eps: float = 1e-7,
+        dtype: torch.dtype,
+        trainable: bool,
+        seed: int | list[int] | None = None,
+    ) -> None:
+        super().__init__()
+
+        # === Validate parameters ===
+        if axis_dim >= embed_dim:
+            raise ValueError(
+                f"`axis_dim` ({axis_dim}) must be < `embed_dim` ({embed_dim})"
+            )
+        if norm not in ("deg", "sqrt_deg"):
+            raise ValueError(f"`norm` must be 'deg' or 'sqrt_deg', got '{norm}'")
+
+        self.ntypes = int(ntypes)
+        self.n_radial = int(n_radial)
+        self.channels = int(channels)
+        self.embed_dim = int(embed_dim)
+        self.axis_dim = int(axis_dim)
+        self.type_dim = int(type_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.env_seed_max = float(env_seed_max)
+        self.norm = str(norm)
+        self.activation_function = str(activation_function)
+        self.eps = float(eps)
+        self.dtype = dtype
+        self.device = env.DEVICE
+        self.precision = RESERVED_PRECISION_DICT[dtype]
+
+        # === RBF projection: n_radial -> rbf_out_dim (two-layer MLP) ===
+        # rbf_out_dim = max(32, channels - 2*type_dim) to align G-network input ~ channels
+        # First layer: n_radial -> rbf_out_dim with activation
+        # Second layer: rbf_out_dim -> rbf_out_dim linear
+        self.rbf_out_dim = max(32, self.channels - 2 * self.type_dim)
+        seed_rbf_proj = child_seed(seed, 0)
+        self.rbf_proj_layer1 = MLPLayer(
+            self.n_radial,
+            self.rbf_out_dim,
+            bias=True,
+            activation_function=self.activation_function,
+            precision=self.precision,
+            seed=child_seed(seed_rbf_proj, 0),
+        )
+        self.rbf_proj_layer2 = MLPLayer(
+            self.rbf_out_dim,
+            self.rbf_out_dim,
+            bias=True,
+            activation_function=None,
+            precision=self.precision,
+            seed=child_seed(seed_rbf_proj, 1),
+        )
+
+        # === Independent type embedding: ntypes -> type_dim ===
+        # Individual type embedding
+        seed_type_embed = child_seed(seed, 1)
+        self.env_type_embed = TypeEmbedNet(
+            type_nums=self.ntypes,
+            embed_dim=self.type_dim,
+            precision=self.precision,
+            seed=seed_type_embed,
+            trainable=trainable,
+        )
+
+        # === G network: (rbf_out_dim + 2*type_dim) -> hidden_dim -> embed_dim ===
+        seed_g_net = child_seed(seed, 2)
+        g_in_dim = self.rbf_out_dim + 2 * self.type_dim
+        self.g_layer1 = MLPLayer(
+            g_in_dim,
+            self.hidden_dim,
+            bias=True,
+            activation_function=self.activation_function,
+            precision=self.precision,
+            seed=child_seed(seed_g_net, 0),
+        )
+        self.g_layer2 = MLPLayer(
+            self.hidden_dim,
+            self.embed_dim,
+            bias=True,
+            activation_function=None,
+            precision=self.precision,
+            seed=child_seed(seed_g_net, 1),
+        )
+
+        # === Output projection: embed_dim * axis_dim -> channels ===
+        seed_out = child_seed(seed, 3)
+        self.output_proj = MLPLayer(
+            self.embed_dim * self.axis_dim,
+            self.channels,
+            bias=True,
+            activation_function=None,
+            precision=self.precision,
+            seed=seed_out,
+        )
+
+        # === Learnable gamma for bounded sigmoid scale ===
+        # scale = env_seed_max * (2*sigmoid(gamma) - 1) in [-env_seed_max, env_seed_max]
+        # Initialized to 0.0 so sigmoid(0) = 0.5 → scale = 0 (safe residual start)
+        self.gamma = nn.Parameter(
+            torch.tensor(0.0, dtype=self.dtype, device=self.device)
+        )
+
+        for p in self.parameters():
+            p.requires_grad = trainable
+
+    def forward(
+        self,
+        *,
+        edge_cache: EdgeFeatureCache,
+        atype_flat: torch.Tensor,
+        n_nodes: int,
+    ) -> torch.Tensor:
+        """
+        Compute environment scalar env_seed embedding.
+
+        Parameters
+        ----------
+        edge_cache : EdgeFeatureCache
+            Edge cache containing src, dst, edge_vec, edge_rbf, edge_env.
+        atype_flat : torch.Tensor
+            Flattened atom types with shape (N,), where N = nf * nloc.
+        n_nodes : int
+            Number of nodes (N = nf * nloc).
+
+        Returns
+        -------
+        torch.Tensor
+            Scalar env_seed with shape (N, channels).
+        """
+        num_edges = edge_cache.src.numel()
+        if num_edges == 0:
+            return torch.zeros(
+                n_nodes, self.channels, dtype=self.dtype, device=self.device
+            )
+
+        src, dst = edge_cache.src, edge_cache.dst
+        edge_vec = edge_cache.edge_vec  # (E, 3)
+        edge_rbf = edge_cache.edge_rbf  # (E, n_radial)
+        edge_env = edge_cache.edge_env  # (E, 1)
+
+        # === Step 1. Construct r_tilde = [s, s*r_hat] ===
+        # s = edge_env * (1/r), r_hat = edge_vec / r
+        r_sq = (edge_vec * edge_vec).sum(dim=-1, keepdim=True)  # (E, 1)
+        r = torch.sqrt(r_sq.clamp(min=self.eps * self.eps))  # (E, 1)
+        inv_r = 1.0 / r  # (E, 1)
+        s = edge_env * inv_r  # (E, 1)
+        r_hat = edge_vec * inv_r  # (E, 3)
+        r_tilde = torch.cat([s, s * r_hat], dim=-1)  # (E, 4)
+
+        # === Step 2. Compute G network input and output ===
+        # Use independent type embeddings (decoupled from main type embedding)
+        atype_src = atype_flat.index_select(0, src)  # (E,)
+        atype_dst = atype_flat.index_select(0, dst)  # (E,)
+        type_src = self.env_type_embed(atype_src)  # (E, type_dim)
+        type_dst = self.env_type_embed(atype_dst)  # (E, type_dim)
+
+        # Project edge_rbf to rbf_out_dim (two-layer MLP)
+        rbf_proj: torch.Tensor = self.rbf_proj_layer2(
+            self.rbf_proj_layer1(edge_rbf)
+        )  # (E, rbf_out_dim)
+
+        # G network input: concat projected RBF and type embeddings
+        g_input = torch.cat([rbf_proj, type_src, type_dst], dim=-1)  # (E, g_in_dim)
+        g = self.g_layer2(self.g_layer1(g_input))  # (E, embed_dim)
+
+        # === Step 3. Aggregate outer product by destination node ===
+        # outer = r_tilde[:, :, None] * g[:, None, :]  # (E, 4, embed_dim)
+        outer: torch.Tensor = r_tilde.unsqueeze(-1) * g.unsqueeze(
+            1
+        )  # (E, 4, embed_dim)
+        outer_flat = outer.reshape(num_edges, 4 * self.embed_dim)  # (E, 4*embed_dim)
+
+        env_agg = outer_flat.new_zeros(n_nodes, 4 * self.embed_dim)
+        env_agg.index_add_(0, dst, outer_flat)  # (N, 4*embed_dim)
+        env_agg = env_agg.view(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)
+
+        # === Step 4. Normalization by actual neighbor count ===
+        node_edges = edge_vec.new_zeros(n_nodes)
+        node_edges.index_add_(0, dst, node_edges.new_ones(num_edges))
+        node_edges_clamped = node_edges.clamp(min=1.0)
+
+        if self.norm == "deg":
+            env_agg = env_agg / node_edges_clamped.view(-1, 1, 1)
+        else:  # sqrt_deg
+            env_agg = env_agg * torch.rsqrt(node_edges_clamped).view(-1, 1, 1)
+
+        # === Step 5. D matrix construction: D = env_agg^T @ env_agg[:,:,:axis_dim] ===
+        env_agg_t = env_agg.permute(0, 2, 1)  # (N, embed_dim, 4)
+        env_agg_axis = env_agg[:, :, : self.axis_dim]  # (N, 4, axis_dim)
+        D = torch.bmm(env_agg_t, env_agg_axis)  # (N, embed_dim, axis_dim)
+
+        # === Step 6. Output projection with bounded sigmoid scale ===
+        D_flat = D.reshape(n_nodes, self.embed_dim * self.axis_dim)  # (N, embed*axis)
+        env_seed = self.output_proj(D_flat)  # (N, channels)
+        # scale = env_seed_max * (2*sigmoid(gamma) - 1) in [-env_seed_max, env_seed_max]
+        scale = self.env_seed_max * (2.0 * torch.sigmoid(self.gamma) - 1.0)
+        env_seed = scale * env_seed
+
+        return env_seed
+
+    def serialize(self) -> dict[str, Any]:
+        """Serialize to dictionary."""
+        return {
+            "@class": "EnvironmentInitialEmbedding",
+            "@version": 1,
+            "ntypes": self.ntypes,
+            "n_radial": self.n_radial,
+            "channels": self.channels,
+            "embed_dim": self.embed_dim,
+            "axis_dim": self.axis_dim,
+            "type_dim": self.type_dim,
+            "hidden_dim": self.hidden_dim,
+            "env_seed_max": self.env_seed_max,
+            "norm": self.norm,
+            "activation_function": self.activation_function,
+            "eps": self.eps,
+            "precision": self.precision,
+            "rbf_proj_layer1": self.rbf_proj_layer1.serialize(),
+            "rbf_proj_layer2": self.rbf_proj_layer2.serialize(),
+            "env_type_embed": self.env_type_embed.embedding.serialize(),
+            "g_layer1": self.g_layer1.serialize(),
+            "g_layer2": self.g_layer2.serialize(),
+            "output_proj": self.output_proj.serialize(),
+            "gamma": np_safe(self.gamma),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> EnvironmentInitialEmbedding:
+        """Deserialize from dictionary."""
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "EnvironmentInitialEmbedding":
+            raise ValueError(f"Invalid class: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported version: {version}")
+
+        rbf_proj_layer1_data = data.pop("rbf_proj_layer1")
+        rbf_proj_layer2_data = data.pop("rbf_proj_layer2")
+        env_type_embed_data = data.pop("env_type_embed")
+        g_layer1_data = data.pop("g_layer1")
+        g_layer2_data = data.pop("g_layer2")
+        output_proj_data = data.pop("output_proj")
+        gamma_data = data.pop("gamma")
+
+        precision = data.pop("precision")
+        data["dtype"] = PRECISION_DICT[precision]
+        data["trainable"] = True
+        data["seed"] = None
+
+        obj = cls(**data)
+        obj.rbf_proj_layer1 = MLPLayer.deserialize(rbf_proj_layer1_data)
+        obj.rbf_proj_layer2 = MLPLayer.deserialize(rbf_proj_layer2_data)
+        obj.env_type_embed.embedding = TypeEmbedNetConsistent.deserialize(
+            env_type_embed_data
+        )
+        obj.g_layer1 = MLPLayer.deserialize(g_layer1_data)
+        obj.g_layer2 = MLPLayer.deserialize(g_layer2_data)
+        obj.output_proj = MLPLayer.deserialize(output_proj_data)
+        obj.gamma.data.copy_(
+            safe_numpy_to_tensor(gamma_data, device=obj.device, dtype=obj.dtype)
+        )
+        return obj
 
 
 @BaseDescriptor.register("se_zm_net")
@@ -758,7 +1077,23 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Number of radial basis functions.
     radial_mlp
         Hidden layer sizes for radial networks. An output layer of size
-        (l_schedule[0]+1)*channels will be automatically appended.
+        `(l_schedule[0]+1)*channels` will be automatically appended.
+    use_env_seed
+        If True, add environment matrix initial embedding to l=0 features using
+        4D `[s, s*r_hat]` representation. Provides physical inductive bias from
+        local atomic environments.
+    env_seed_embed_dim
+        Output dimension of the G network in environment initial embedding.
+        Other dimensions are derived from this value:
+        `axis_dim=min(8, max(4, embed_dim//2))`,
+        `type_dim=min(16, max(8, embed_dim//2))`,
+        `hidden_dim=min(64, max(32, 2*embed_dim))`.
+    env_seed_norm
+        Normalization mode for env_agg aggregation: `"deg"` (1/degree) or
+        `"sqrt_deg"` (1/sqrt(degree)).
+    env_seed_max
+        Maximum scale magnitude for env_seed injection. The scale is bounded in
+        `[-env_seed_max, env_seed_max]` via sigmoid parameterization.
     so2_norm
         If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
@@ -776,8 +1111,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         (edge distances, Wigner-D matrices, rotations, GIE) always run in fp32+ to
         provide accurate geometric information for better convergence. Only the
         interaction blocks use this precision.
-    use_parallel
-        If True, use the parallel operations, which requires more memory. For example, use block-diagonal parallel Wigner-D (`O(E * D^2)` memory, faster for small `E`).
     use_amp
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
@@ -818,13 +1151,16 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         channels: int = 64,
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
+        use_env_seed: bool = False,
+        env_seed_max: float = 1.0,
+        env_seed_embed_dim: int = 64,
+        env_seed_norm: str = "sqrt_deg",
         so2_norm: bool = False,
         so2_layers: int = 2,
         ffn_neurons: int = 128,
         n_atten_head: int = 0,
         activation_function: str = "silu",
         precision: str = "float32",
-        use_parallel: bool = False,
         use_amp: bool = False,
         exclude_types: list[tuple[int, int]] | None = None,
         env_protection: float = 1e-7,
@@ -861,16 +1197,27 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.device = env.DEVICE
         self.compute_dtype = get_promoted_dtype(self.dtype)
         self.eps = float(env_protection)
-        self.use_parallel = bool(use_parallel)
         self.use_amp = bool(use_amp)
         self.trainable = bool(trainable)
         self.seed = seed
+
+        # === Env seed parameters ===
+        self.use_env_seed = bool(use_env_seed)
+        self.env_seed_embed_dim = int(env_seed_embed_dim)
+        # Derived: axis_dim in [4, 8], scales with embed_dim // 2
+        self.env_seed_axis_dim = min(8, max(4, self.env_seed_embed_dim // 2))
+        # Derived: type_dim in [8, 16], larger for complex type systems
+        self.env_seed_type_dim = min(16, max(8, self.env_seed_embed_dim // 2))
+        self.env_seed_hidden_dim = min(64, max(32, 2 * self.env_seed_embed_dim))
+        self.env_seed_max = float(env_seed_max)
+        self.env_seed_norm = str(env_seed_norm)
 
         # === Step 0. Split deterministic seeds at the descriptor top-level ===
         seed_type_embedding = child_seed(self.seed, 0)
         seed_blocks = child_seed(self.seed, 1)
         seed_out = child_seed(self.seed, 2)
         seed_radial_embedding = child_seed(self.seed, 3)
+        seed_env_seed = child_seed(self.seed, 4)
 
         # === Step 1. L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
@@ -888,15 +1235,39 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # === Step 3. Excluded type pairs ===
         self.reinit_exclude(exclude_types)
 
-        # === Step 4. Core modules ===
+        # === Step 4. Type embedding ===
+        type_embedding_precision = RESERVED_PRECISION_DICT[self.compute_dtype]
         self.type_embedding = TypeEmbedNet(
             type_nums=self.ntypes,
             embed_dim=self.channels,
-            precision=self.precision,
+            precision=type_embedding_precision,  # force fp32+
             seed=seed_type_embedding,
             type_map=type_map,
             trainable=self.trainable,
         )
+
+        # === Step 5. Env scalar seed embedding (optional) ===
+        if self.use_env_seed:
+            self.env_seed_embedding: EnvironmentInitialEmbedding | None = (
+                EnvironmentInitialEmbedding(
+                    ntypes=self.ntypes,
+                    n_radial=self.n_radial,
+                    channels=self.channels,
+                    embed_dim=self.env_seed_embed_dim,
+                    axis_dim=self.env_seed_axis_dim,
+                    type_dim=self.env_seed_type_dim,
+                    hidden_dim=self.env_seed_hidden_dim,
+                    env_seed_max=self.env_seed_max,
+                    norm=self.env_seed_norm,
+                    activation_function=self.activation_function,
+                    eps=self.eps,
+                    dtype=self.compute_dtype,  # force fp32+
+                    trainable=self.trainable,
+                    seed=seed_env_seed,
+                )
+            )
+        else:
+            self.env_seed_embedding = None
 
         self.radial_basis = RadialBasis(
             self.rcut,
@@ -924,20 +1295,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         wigner_lmax = self.l_schedule[0]
         # force fp32+
-        if self.use_parallel:
-            self.wigner_calc: WignerDCalcBase = WignerDCalcParallel(
-                lmax=wigner_lmax, eps=self.eps, dtype=self.compute_dtype
-            )
-        else:
-            self.wigner_calc = WignerDCalc(
-                lmax=wigner_lmax, eps=self.eps, dtype=self.compute_dtype
-            )
+        self.wigner_calc = WignerDCalculator(
+            lmax=wigner_lmax, eps=self.eps, dtype=self.compute_dtype
+        )
 
         if self.l_schedule[0] > 0:
             self.gie = GeometricInitialEmbedding(
                 lmax=self.l_schedule[0],
                 channels=self.channels,
-                use_parallel=self.use_parallel,
                 dtype=self.compute_dtype,  # force fp32+
             )
         else:
@@ -955,7 +1320,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     ffn_neurons=self.ffn_neurons,
                     n_atten_head=self.n_atten_head,
                     activation_function=self.activation_function,
-                    use_parallel=self.use_parallel,
                     eps=self.eps,
                     dtype=self.dtype,
                     seed=child_seed(seed_blocks, block_idx),
@@ -967,7 +1331,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # === Final SO3Linear for l=0 output mixing ===
         # This mixes channels in the final scalar (l=0) descriptor output.
         # Uses promoted dtype (float32+) for better performance.
-        self.so3_linear_output = SO3LinearV2(
+        self.so3_linear_output = SO3Linear(
             lmax=0,
             in_channels=self.channels,
             out_channels=self.channels,
@@ -1064,7 +1428,17 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         else:
             radial_feat = None
 
-        # === Step 7. Geometric Initial Embedding (fp32+) ===
+        # === Step 7. Env scalar env_seed embedding (optional, fp32+) ===
+        if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
+            atype_flat = atype_loc.reshape(-1)  # (N,)
+            env_seed = self.env_seed_embedding(
+                edge_cache=edge_cache,
+                atype_flat=atype_flat,
+                n_nodes=n_nodes,
+            )
+            x[:, 0, :] = x[:, 0, :] + env_seed
+
+        # === Step 8. Geometric Initial Embedding (fp32+) ===
         if self.gie is not None and radial_feat is not None:
             # GIE only needs l>=1, slice radial_feat[:, 1:, :]
             x = x + self.gie(
@@ -1073,7 +1447,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 radial_feat=radial_feat[:, 1:, :],
             )
 
-        # === Step 8. Fuse edge type features into radial features (fp32+) ===
+        # === Step 9. Fuse edge type features into radial features (fp32+) ===
         if radial_feat is not None:
             radial_feat = radial_feat + edge_cache.edge_type_feat.unsqueeze(1)
             radial_feat = radial_feat.to(dtype=self.dtype)
@@ -1083,7 +1457,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         else:
             rad_feat_per_block = None
 
-        # === Step 9. Convert to self.dtype for NN blocks ===
+        # === Step 10. Convert to self.dtype and run blocks ===
         x = x.to(dtype=self.dtype)
         edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
         if torch.jit.is_scripting():
@@ -1132,7 +1506,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         torch.Tensor
             Output features with shape (N, D, C).
         """
-        # === Step 10. Blocks with pyramid l-schedule slicing ===
+        # Blocks with pyramid l-schedule slicing
         for i, block in enumerate(self.blocks):
             x = x[:, : self.ebed_dims[i], :]
             blk_radial = (
@@ -1264,7 +1638,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         - per-edge geometry: ``edge_vec``
         - per-edge smooth weights: C^2 cutoff envelope ``edge_env``
         - per-edge radial basis: ``edge_rbf`` (envelope already baked in)
-        - per-edge rotation blocks: real-basis Wigner-D matrices ``D_list`` and ``Dt_list``
+        - per-edge rotation blocks: block-diagonal Wigner-D matrices ``D_full`` and ``Dt_full``
         - destination-node normalization: ``inv_sqrt_deg`` for neighbor norm
 
         Notes
@@ -1368,8 +1742,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 edge_vec=empty_vec,
                 edge_rbf=empty_rbf,
                 edge_env=torch.empty(0, 1, dtype=dtype, device=device),
-                D_list=[torch.empty(0, 1, 1, dtype=dtype, device=device)],
-                Dt_list=[torch.empty(0, 1, 1, dtype=dtype, device=device)],
                 inv_sqrt_deg=inv_sqrt_deg,
                 D_full=None,
                 Dt_full=None,
@@ -1389,16 +1761,18 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         valid_f_idx = edge_idx_flat // (nloc * nnei)
         rem = edge_idx_flat % (nloc * nnei)
         valid_loc_idx = rem // nnei
+        # neighbor indices from the extended axis (0..nall-1) for valid edges.
         valid_neighbor = nlist_flat[edge_idx_flat]
         if mapping is None:
-            # Neighbor indices are already local indices.
+            # Neighbor indices are already local indices in [0, nloc).
             src_local = valid_neighbor
         else:
             # Map extended index -> local index for each frame.
+            # mapping_flat packs (nf, nall) so frame k uses offset k * nall.
             mapping_flat = mapping.reshape(-1)
             src_local = mapping_flat[valid_f_idx * nall + valid_neighbor]
 
-        # dst is the center atom (per-frame local index -> global node index)
+        # dst is the center atom: per-frame local index -> global node index.
         dst = valid_f_idx * nloc + valid_loc_idx
         src_ok = (src_local >= 0) & (src_local < nloc)
         if not bool(src_ok.all()):
@@ -1426,7 +1800,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 7. Wigner-D blocks ===
         rot_mat = init_edge_rot_mat_frisvad(edge_vec, edge_len=edge_len, eps=self.eps)
-        D_list, Dt_list, D_full, Dt_full = self.wigner_calc(rot_mat)
+        D_full, Dt_full = self.wigner_calc(rot_mat)
 
         # === Step 8. Neighbor normalization (destination degree) ===
         # Compute inverse sqrt degree for graph-style message normalization.
@@ -1442,11 +1816,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             edge_vec=edge_vec,  # (E, 3)
             edge_rbf=edge_rbf,  # (E, n_radial)
             edge_env=edge_env,  # (E, 1)
-            D_list=D_list,  # [(E, 2l+1, 2l+1) for l in 0..lmax]
-            Dt_list=Dt_list,  # [(E, 2l+1, 2l+1) for l in 0..lmax]
             inv_sqrt_deg=inv_sqrt_deg,  # (N, 1, 1)
-            D_full=D_full,  # (E, D, D) or None
-            Dt_full=Dt_full,  # (E, D, D) or None
+            D_full=D_full,  # (E, D, D)
+            Dt_full=Dt_full,  # (E, D, D)
             D_to_m_cache={},
             Dt_from_m_cache={},
         )
@@ -1609,15 +1981,23 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "so2_layers": self.so2_layers,
             "ffn_neurons": self.ffn_neurons,
             "n_atten_head": self.n_atten_head,
-            "use_parallel": self.use_parallel,
             "activation_function": self.activation_function,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "use_amp": self.use_amp,
             "exclude_types": self.exclude_types,
             "env_protection": self.eps,
+            "use_env_seed": self.use_env_seed,
+            "env_seed_embed_dim": self.env_seed_embed_dim,
+            "env_seed_norm": self.env_seed_norm,
+            "env_seed_max": self.env_seed_max,
             "trainable": self.trainable,
             "seed": self.seed,
             "type_embedding": self.type_embedding.embedding.serialize(),
+            "env_seed_embedding": (
+                self.env_seed_embedding.serialize()
+                if self.env_seed_embedding is not None
+                else None
+            ),
             "radial_basis": self.radial_basis.serialize(),
             "radial_embedding": self.radial_embedding.serialize(),
             "gie": self.gie.serialize() if self.gie is not None else None,
@@ -1646,6 +2026,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         stats = data.pop("@variables")
         data.pop("env_mat")
         type_embedding = data.pop("type_embedding")
+        env_seed_embedding_data = data.pop("env_seed_embedding", None)
         radial_basis_data = data.pop("radial_basis")
         radial_embedding_data = data.pop("radial_embedding")
         gie_data = data.pop("gie", None)
@@ -1656,6 +2037,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         obj.type_embedding.embedding = TypeEmbedNetConsistent.deserialize(
             type_embedding
         )
+        if env_seed_embedding_data is not None:
+            obj.env_seed_embedding = EnvironmentInitialEmbedding.deserialize(
+                env_seed_embedding_data
+            )
         obj.radial_basis = RadialBasis.deserialize(radial_basis_data)
         obj.radial_embedding = RadialMLP.deserialize(radial_embedding_data)
 
@@ -1665,7 +2050,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         obj.blocks = nn.ModuleList(
             [SeZMInteractionBlock.deserialize(blk_data) for blk_data in blocks_data]
         )
-        obj.so3_linear_output = SO3LinearV2.deserialize(so3_linear_output_data)
+        obj.so3_linear_output = SO3Linear.deserialize(so3_linear_output_data)
 
         obj.mean = safe_numpy_to_tensor(
             stats["davg"], device=obj.device, dtype=obj.mean.dtype

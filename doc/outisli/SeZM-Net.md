@@ -49,7 +49,7 @@ Inputs (extended_coord, extended_atype, nlist, mapping)
        ├─ edge_type_feat: per-edge type embedding (src+dst)
        ├─ edge_rbf: Bessel radial basis via sinc × C² envelope (trainable frequencies)
        ├─ edge_sw: C² cutoff envelope weights in flattened edge layout
-       ├─ D_list[l], Dt_list[l]: Wigner-D blocks per l
+       ├─ D_full, Dt_full: block-diagonal Wigner-D matrices
        └─ inv_sqrt_deg: inverse sqrt degree for normalization
 
 Radial embedding (computed once):
@@ -57,7 +57,7 @@ Radial embedding (computed once):
      └─ fused once with edge_type_feat after GIE
 
 Node init:
-  ├─ l=0: Type embedding
+  ├─ l=0: Type embedding + (optional) EnvironmentInitialEmbedding
   └─ l>0: Zonal (m=0) initial embedding via cached Wigner-D + radial_feat[:, 1:, :]
 
 Interaction blocks (pyramid schedule):
@@ -143,6 +143,53 @@ This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5` and `2*sigmoi
 - Message feedback into edge gates is bounded: `edge_logits = dst + radial + λ * msg` with `λ ∈ (0, λ_max)` and `λ_max = 0.2`.
 - Multi-layer SO(2) stacks optionally insert a reduced-layout separable RMSNorm between layers (except the last) when `so2_norm=True`. This keeps truncated m-major activations balanced but is disabled by default.
 
+### 9. Optional environment matrix initial embedding (EnvironmentInitialEmbedding)
+
+An optional module that provides physical inductive bias for l=0 features using a 4D environment matrix approach. When `use_env_seed=True`:
+
+**Key design: Type embedding decoupling**
+
+- Uses an **independent** `env_type_embed` (TypeEmbedNet) instead of projecting from the main type embedding
+- This allows `env_seed` to learn type representations independent from the main descriptor backbone
+- RBF projection (`rbf_proj`) aligns G-network input dimension to approximately `channels`
+
+**Computation pipeline**:
+
+1. **r_tilde construction**: For each edge, build a 4D vector `[s, s*rx, s*ry, s*rz]` where:
+   - `s = edge_env / r` (smooth weight divided by distance)
+   - `r_hat = edge_vec / r` (unit direction vector)
+   - `r_tilde = [s, s * r_hat]` encodes both radial decay and angular information
+
+2. **G network**: Computes per-edge filter features:
+   - RBF projection: Two-layer MLP `rbf_proj_layer1 → rbf_proj_layer2` with dimension `rbf_out_dim = max(32, channels - 2*type_dim)`
+     - First layer: `n_radial → rbf_out_dim` with activation (SiLU)
+     - Second layer: `rbf_out_dim → rbf_out_dim` linear
+   - Type embeddings: `type_src, type_dst = env_type_embed(atype[src]), env_type_embed(atype[dst])`
+   - Input: `concat([rbf_proj, type_src, type_dst])` with dimension `(E, rbf_out_dim + 2*type_dim) ≈ channels`
+   - Two-layer MLP: `hidden_dim` → `embed_dim` with SiLU activation
+
+3. **env_agg (environment aggregation)**: Vectorized outer product and scatter:
+   - `outer = r_tilde[:, :, None] * g[:, None, :]` produces `(E, 4, embed_dim)`
+   - Scatter-sum by destination node: `env_agg.index_add_(0, dst, outer_flat)`
+   - Normalize by neighbor count (degree normalization)
+
+4. **D matrix construction**: Captures local geometry via matrix product:
+   - `D = env_agg^T @ env_agg[:, :, :axis_dim]` with shape `(N, embed_dim, axis_dim)`
+
+5. **Output projection with bounded sigmoid scale**: Project and scale:
+   - Flatten D to `(N, embed_dim * axis_dim)` and project to `(N, channels)`
+   - Apply bounded sigmoid scale: `scale = env_seed_max * (2*sigmoid(gamma) - 1)`
+   - `gamma` is initialized to 0.0 → `scale = 0` (safe residual start)
+   - `scale` is bounded in `[-env_seed_max, env_seed_max]` (default: `[-1.0, 1.0]`)
+
+**Key properties**:
+
+- Uses **global frame** direction (not edge-aligned local frame) to preserve angular information
+- Neighbor count normalization uses actual degree, not `inv_sqrt_deg` from edge cache
+- `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
+- **Bounded scale** prevents env_seed from destabilizing early training
+- **Sigmoid parameterization** ensures good gradient flow at `gamma=0` (`sigmoid'(0) = 0.25`)
+
 ---
 
 ## Tensor Layouts and Invariants
@@ -182,10 +229,8 @@ Let `E` be the number of valid edges:
 - `edge_vec`: `(E, 3)` in Å
 - `edge_rbf`: `(E, n_radial)` Bessel radial basis via sinc × C² envelope (trainable frequencies)
 - `edge_sw`: `(E, 1)` C² cutoff envelope weights flattened to valid edges
-- `D_list[l]`: `(E, 2l+1, 2l+1)` real-basis Wigner-D block (empty when `use_parallel=True`)
-- `Dt_list[l]`: transpose of `D_list[l]` (empty when `use_parallel=True`)
-- `D_full`: `(E, D, D)` block-diagonal Wigner-D matrix (only when `use_parallel=True`)
-- `Dt_full`: transpose of `D_full` (only when `use_parallel=True`)
+- `D_full`: `(E, D, D)` block-diagonal Wigner-D matrix
+- `Dt_full`: transpose of `D_full`
 - `inv_sqrt_deg`: `(N, 1, 1)` inverse sqrt degree for graph-style normalization
 
 ---
@@ -204,8 +249,7 @@ Definition:
 
 Implementation detail:
 
-- When `use_parallel=True`: extract m=0 column from `Dt_full[:, s:e, l*(l+1)]`
-- When `use_parallel=False`: extract from `Dt_list[l][:, :, l]`
+- Extract the m=0 column from `Dt_full[:, s:e, l*(l+1)]`
 
 The global index for m=0 in l-block is `l^2 + l = l*(l+1)`.
 
@@ -215,10 +259,8 @@ For each edge `(src -> dst)`:
 
 1. **Rotate to local frame (reduced)**: The edge-local path uses the **m-major reduced layout**
    controlled by `mmax`. Rotation computes only the required coefficients:
-   - `use_parallel=True`: project once per `(lmax, mmax)` via cached
-     `project_D_to_m(D_full, coeff_index_m)` (shared by all blocks; TorchScript-friendly)
-   - `use_parallel=False`: per-l reduced rotation using only the kept rows, then permute
-     from l-major-reduced to m-major
+   - project once per `(lmax, mmax)` via cached `project_D_to_m(D_full, coeff_index_m)`
+     (shared by all blocks; TorchScript-friendly)
 2. **Type feature fusion (once, outside blocks)**:
    - `edge_type_feat = type_ebed[src] + type_ebed[dst]` with shape `(E, C)`
    - `radial_feat = radial_feat + edge_type_feat.unsqueeze(1)` with shape `(E, lmax+1, C)`
@@ -234,9 +276,7 @@ For each edge `(src -> dst)`:
      - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
 5. **Final SO(3) channel mixing**: apply `SO3LinearV2` to mix channels across all degrees (zero-initialized for residual stability)
 6. **Rotate back (reduced)**:
-   - `use_parallel=True`: reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
-   - `use_parallel=False`: permute back to l-major-reduced, then apply per-l `Dt_list[l]`
-     with only the kept columns (omitted coefficients are treated as zero)
+   - reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
 7. **Aggregate with optional head gates**:
    - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
    - `n_atten_head > 0`:
@@ -369,10 +409,12 @@ Key arguments:
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
 - `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, channels must be divisible by `n_atten_head`. Edge gate uses `2 * sigmoid(proj_b(x_l0)[dst] + proj_s(radial_l0))` without normalization; head gate uses `2 * sigmoid(proj_head(RMSNorm(x_l0)))` with per-head scale `gamma_head` (no softmax).
-- `use_parallel: bool` — If True, use the parallel operations, which requires more memory. For example, use block-diagonal parallel Wigner-D (`O(E * D^2)` memory, faster for small `E`)
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
+- `use_env_seed: bool` — If True, add environment matrix initial embedding to l=0 features using 4D `[s, s*r_hat]` representation (default: False)
+- `env_seed_embed_dim: int` — Output dimension of the G network in environment initial embedding. Other dimensions are derived: `axis_dim = min(8, max(4, env_seed_embed_dim//2))`, `type_dim = min(16, max(8, env_seed_embed_dim//2))`, `hidden_dim = min(64, max(32, 2*env_seed_embed_dim))` (default: 64)
+- `env_seed_norm: str` — Normalization mode for env_agg aggregation: "deg" (1/degree) or "sqrt_deg" (1/sqrt(degree)) (default: "sqrt_deg")
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 
@@ -393,8 +435,9 @@ Output:
 
 `serialize()` captures:
 
-- hyperparameters including `l_schedule`, `m_schedule`, and `compute_mode`
+- hyperparameters including `l_schedule`, `m_schedule`, `use_env_seed`, and `compute_mode`
 - type embedding parameters
+- **env_seed_embedding** (if `use_env_seed=True`): independent type embedding (`env_type_embed`), two-layer RBF projection (`rbf_proj_layer1`, `rbf_proj_layer2`), G network layers, output projection, bounded scale parameter (`gamma`) and `env_seed_max`
 - **radial basis with trainable frequencies**
 - **radial embedding** (RadialMLP: edge_rbf -> (lmax+1)\*C, architecture: Linear → LayerNorm → Activation, first layer bias zero-initialized)
 - geometric initial embedding (GIE, if lmax > 0)
@@ -444,24 +487,8 @@ This double-guarantee ensures:
 ### Wigner-D blocks (real SH basis)
 
 SeZM-Net uses real-basis Wigner-D blocks to rotate per-degree features between the global frame
-and the edge-aligned local frame.
-
-#### Two implementations
-
-Two implementations are provided in `deepmd/pt/model/descriptor/sel_zm_helper.py`:
-
-| Class                 | Description               | Memory                  | Speed                    |
-| --------------------- | ------------------------- | ----------------------- | ------------------------ |
-| `WignerDCalc`         | Per-l loop implementation | O(n_edges × max(2l+1)²) | Moderate                 |
-| `WignerDCalcParallel` | Block-diagonal parallel   | O(n_edges × dim_full²)  | Faster for small n_edges |
-
-where `dim_full = (lmax+1)² = ebed_dim`.
-
-**Recommendation**:
-
-- Use `WignerDCalc` (default) for large `n_edges` to avoid memory issues.
-- Use `WignerDCalcParallel` (`use_parallel=True`) for small `n_edges` where dispatch overhead dominates.
-  - This also enables block-diagonal rotation in SO2Convolution, reducing kernel launches from `2*(lmax+1)` to 2 per block.
+and the edge-aligned local frame. The block-diagonal matrices are computed by
+`WignerDCalculator` in `deepmd/pt/model/descriptor/se_zm_helper.py`.
 
 #### Conventions
 
@@ -469,37 +496,14 @@ where `dim_full = (lmax+1)² = ebed_dim`.
   - `v_local = rot_mat @ v_global`
   - It is built by either `init_edge_rot_mat(edge_vec)` (Gram-Schmidt with a reference-axis switch) or `init_edge_rot_mat_frisvad(edge_vec)` (Frisvad ONB with a strict cross-product fallback near `-Z`) so that `rot_mat @ (edge_vec / ||edge_vec||) = (0, 0, 1)`.
 - For each degree `l`, real SH channels are ordered by `m=-l..+l` (index `i = m + l`).
-- `D_list[l]` / `Dt_list[l]` are real-basis Wigner-D blocks:
-  - `D_list[l]`: `(E, 2l+1, 2l+1)` and represents the same global->local rotation as `rot_mat`.
-  - `Dt_list[l] = D_list[l]^T`: inverse blocks (local->global).
-
-#### Implementation notes
-
-- Real-basis Wigner-D blocks are orthogonal, so `Dt = D^T` (local->global).
-- Parallel mode builds a block-diagonal `D_full` to reduce kernel launches; it trades memory for speed.
+- `D_full` is block-diagonal with block `l` occupying indices `[l^2 : (l+1)^2)`.
+- `Dt_full = D_full^T` is the inverse rotation (local->global).
 
 #### Usage in message passing
 
-SeZM modules store `use_parallel` as an instance attribute set during `__init__`. This determines whether to use
-block-diagonal parallel rotation (`D_full`/`Dt_full`) or per-l loop rotation (`D_list`/`Dt_list`):
-
-- `DescrptSeZMNet(use_parallel=...)` passes the setting to `GeometricInitialEmbedding` and `SeZMInteractionBlock`.
-- `SeZMInteractionBlock` passes it further to `SO2Convolution`.
-
-When `use_parallel=False` (per-l loop):
-
-- rotate to local (reduced): keep only rows `m in [-min(mmax,l), +min(mmax,l)]`
-  - `x_local_keep^{(l)} = D_list[l][:, rows, :] @ x_global^{(l)}`
-- rotate back (reduced): treat omitted coefficients as zero by using only kept columns
-  - `x_global^{(l)} = Dt_list[l][:, :, cols] @ x_local_keep^{(l)}`
-
-When `use_parallel=True` (block-diagonal):
-
-- rotate to local (reduced): `x_local = bmm(D_full[:, coeff_index_m, :], x_global)`
-- rotate back (reduced): `x_global = bmm(Dt_full[:, :, coeff_index_m], x_local)`
-
-The block-diagonal approach reduces `lmax+1` einsum/bmm calls per rotation direction to a **single bmm call**,
-significantly reducing CUDA kernel launch overhead for small-to-medium `lmax`.
+- Rotate to local (reduced): `x_local = bmm(D_full[:, coeff_index_m, :], x_global)`
+- Rotate back (reduced): `x_global = bmm(Dt_full[:, :, coeff_index_m], x_local)`
+- `project_D_to_m` / `project_Dt_from_m` cache the projected blocks keyed by `(lmax, mmax)`.
 
 ### Padded neighbor safety
 
