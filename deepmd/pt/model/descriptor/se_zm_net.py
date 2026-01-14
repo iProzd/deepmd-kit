@@ -74,6 +74,10 @@ from .se_zm_helper import (
     safe_numpy_to_tensor,
     so3_packed_index,
 )
+from .se_zm_triton import (
+    is_triton_available,
+    outer_scatter_sum,
+)
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -731,7 +735,7 @@ class EnvironmentInitialEmbedding(nn.Module):
            - Uses `rbf_proj` to project edge_rbf to `rbf_out_dim`
         3. env_agg: aggregate outer product `r_tilde ⊗ g` by destination node
         4. D matrix: `D = env_agg^T @ env_agg[:, :, :axis_dim]`
-        5. Output: residual-scaled projection of flattened D matrix
+        5. Output: projection of flattened D matrix into FiLM deltas
 
     Parameters
     ----------
@@ -740,7 +744,7 @@ class EnvironmentInitialEmbedding(nn.Module):
     n_radial : int
         Number of radial basis functions.
     channels : int
-        Output channel dimension (same as type embedding channels).
+        Output channel dimension per FiLM branch (final output is 2*channels).
     embed_dim : int
         G network output dimension (filter width).
     axis_dim : int
@@ -759,6 +763,9 @@ class EnvironmentInitialEmbedding(nn.Module):
         Parameter dtype.
     trainable : bool
         Whether parameters are trainable.
+    use_triton : bool
+        If True and Triton is available, use fused Triton kernels for performance-
+        critical operations. Only effective on CUDA devices.
     seed : int | list[int] | None
         Random seed for reproducibility.
     """
@@ -773,12 +780,12 @@ class EnvironmentInitialEmbedding(nn.Module):
         axis_dim: int = 8,
         type_dim: int = 16,
         hidden_dim: int = 64,
-        env_seed_max: float = 1.0,
         norm: str = "sqrt_deg",
         activation_function: str = "silu",
         eps: float = 1e-7,
         dtype: torch.dtype,
         trainable: bool,
+        use_triton: bool = False,
         seed: int | list[int] | None = None,
     ) -> None:
         super().__init__()
@@ -798,13 +805,13 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.axis_dim = int(axis_dim)
         self.type_dim = int(type_dim)
         self.hidden_dim = int(hidden_dim)
-        self.env_seed_max = float(env_seed_max)
         self.norm = str(norm)
         self.activation_function = str(activation_function)
         self.eps = float(eps)
         self.dtype = dtype
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
+        self.use_triton = bool(use_triton)
 
         # === RBF projection: n_radial -> rbf_out_dim (two-layer MLP) ===
         # rbf_out_dim = max(32, channels - 2*type_dim) to align G-network input ~ channels
@@ -860,23 +867,22 @@ class EnvironmentInitialEmbedding(nn.Module):
             seed=child_seed(seed_g_net, 1),
         )
 
-        # === Output projection: embed_dim * axis_dim -> channels ===
+        # === Output projection: embed_dim * axis_dim -> 2*channels ===
         seed_out = child_seed(seed, 3)
         self.output_proj = MLPLayer(
             self.embed_dim * self.axis_dim,
-            self.channels,
+            2 * self.channels,
             bias=True,
             activation_function=None,
             precision=self.precision,
             seed=seed_out,
         )
 
-        # === Learnable gamma for bounded sigmoid scale ===
-        # scale = env_seed_max * (2*sigmoid(gamma) - 1) in [-env_seed_max, env_seed_max]
-        # Initialized to 0.0 so sigmoid(0) = 0.5 → scale = 0 (safe residual start)
-        self.gamma = nn.Parameter(
-            torch.tensor(0.0, dtype=self.dtype, device=self.device)
-        )
+        # Zero init so FiLM starts as identity: scale_delta=0, shift=0.
+        with torch.no_grad():
+            self.output_proj.matrix.zero_()
+            if self.output_proj.bias is not None:
+                self.output_proj.bias.zero_()
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -889,7 +895,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         n_nodes: int,
     ) -> torch.Tensor:
         """
-        Compute environment scalar env_seed embedding.
+        Compute environment FiLM deltas for l=0 conditioning.
 
         Parameters
         ----------
@@ -903,12 +909,12 @@ class EnvironmentInitialEmbedding(nn.Module):
         Returns
         -------
         torch.Tensor
-            Scalar env_seed with shape (N, channels).
+            FiLM deltas with shape (N, 2*channels).
         """
         num_edges = edge_cache.src.numel()
         if num_edges == 0:
             return torch.zeros(
-                n_nodes, self.channels, dtype=self.dtype, device=self.device
+                n_nodes, 2 * self.channels, dtype=self.dtype, device=self.device
             )
 
         src, dst = edge_cache.src, edge_cache.dst
@@ -942,39 +948,39 @@ class EnvironmentInitialEmbedding(nn.Module):
         g = self.g_layer2(self.g_layer1(g_input))  # (E, embed_dim)
 
         # === Step 3. Aggregate outer product by destination node ===
-        # outer = r_tilde[:, :, None] * g[:, None, :]  # (E, 4, embed_dim)
-        outer: torch.Tensor = r_tilde.unsqueeze(-1) * g.unsqueeze(
-            1
-        )  # (E, 4, embed_dim)
-        outer_flat = outer.reshape(num_edges, 4 * self.embed_dim)  # (E, 4*embed_dim)
-
-        env_agg = outer_flat.new_zeros(n_nodes, 4 * self.embed_dim)
-        env_agg.index_add_(0, dst, outer_flat)  # (N, 4*embed_dim)
-        env_agg = env_agg.view(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)
+        # Triton fuses outer-product + scatter-sum and provides custom backward/gradgrad.
+        if self.use_triton and r_tilde.is_cuda:
+            env_agg = outer_scatter_sum(r_tilde, g, dst, n_nodes)  # (N, 4, embed_dim)
+        else:
+            # PyTorch fallback path
+            # outer = r_tilde[:, :, None] * g[:, None, :]  # (E, 4, embed_dim)
+            outer: torch.Tensor = r_tilde.unsqueeze(-1) * g.unsqueeze(
+                1
+            )  # (E, 4, embed_dim)
+            outer_flat = outer.reshape(
+                num_edges, 4 * self.embed_dim
+            )  # (E, 4*embed_dim)
+            env_agg = outer_flat.new_zeros(n_nodes, 4 * self.embed_dim)
+            env_agg.index_add_(0, dst, outer_flat)  # (N, 4*embed_dim)
+            env_agg = env_agg.view(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)
 
         # === Step 4. Normalization by actual neighbor count ===
-        node_edges = edge_vec.new_zeros(n_nodes)
-        node_edges.index_add_(0, dst, node_edges.new_ones(num_edges))
-        node_edges_clamped = node_edges.clamp(min=1.0)
+        # Use cached deg from edge_cache (already computed in build_edge_cache)
+        deg_clamped = edge_cache.deg.clamp(min=1.0)
 
         if self.norm == "deg":
-            env_agg = env_agg / node_edges_clamped.view(-1, 1, 1)
+            env_agg = env_agg / deg_clamped.view(-1, 1, 1)
         else:  # sqrt_deg
-            env_agg = env_agg * torch.rsqrt(node_edges_clamped).view(-1, 1, 1)
+            env_agg = env_agg * torch.rsqrt(deg_clamped).view(-1, 1, 1)
 
         # === Step 5. D matrix construction: D = env_agg^T @ env_agg[:,:,:axis_dim] ===
         env_agg_t = env_agg.permute(0, 2, 1)  # (N, embed_dim, 4)
         env_agg_axis = env_agg[:, :, : self.axis_dim]  # (N, 4, axis_dim)
         D = torch.bmm(env_agg_t, env_agg_axis)  # (N, embed_dim, axis_dim)
 
-        # === Step 6. Output projection with bounded sigmoid scale ===
+        # === Step 6. Output projection for FiLM deltas ===
         D_flat = D.reshape(n_nodes, self.embed_dim * self.axis_dim)  # (N, embed*axis)
-        env_seed = self.output_proj(D_flat)  # (N, channels)
-        # scale = env_seed_max * (2*sigmoid(gamma) - 1) in [-env_seed_max, env_seed_max]
-        scale = self.env_seed_max * (2.0 * torch.sigmoid(self.gamma) - 1.0)
-        env_seed = scale * env_seed
-
-        return env_seed
+        return self.output_proj(D_flat)  # (N, 2*channels)
 
     def serialize(self) -> dict[str, Any]:
         """Serialize to dictionary."""
@@ -988,18 +994,17 @@ class EnvironmentInitialEmbedding(nn.Module):
             "axis_dim": self.axis_dim,
             "type_dim": self.type_dim,
             "hidden_dim": self.hidden_dim,
-            "env_seed_max": self.env_seed_max,
             "norm": self.norm,
             "activation_function": self.activation_function,
             "eps": self.eps,
             "precision": self.precision,
+            "use_triton": self.use_triton,
             "rbf_proj_layer1": self.rbf_proj_layer1.serialize(),
             "rbf_proj_layer2": self.rbf_proj_layer2.serialize(),
             "env_type_embed": self.env_type_embed.embedding.serialize(),
             "g_layer1": self.g_layer1.serialize(),
             "g_layer2": self.g_layer2.serialize(),
             "output_proj": self.output_proj.serialize(),
-            "gamma": np_safe(self.gamma),
         }
 
     @classmethod
@@ -1019,7 +1024,6 @@ class EnvironmentInitialEmbedding(nn.Module):
         g_layer1_data = data.pop("g_layer1")
         g_layer2_data = data.pop("g_layer2")
         output_proj_data = data.pop("output_proj")
-        gamma_data = data.pop("gamma")
 
         precision = data.pop("precision")
         data["dtype"] = PRECISION_DICT[precision]
@@ -1035,9 +1039,6 @@ class EnvironmentInitialEmbedding(nn.Module):
         obj.g_layer1 = MLPLayer.deserialize(g_layer1_data)
         obj.g_layer2 = MLPLayer.deserialize(g_layer2_data)
         obj.output_proj = MLPLayer.deserialize(output_proj_data)
-        obj.gamma.data.copy_(
-            safe_numpy_to_tensor(gamma_data, device=obj.device, dtype=obj.dtype)
-        )
         return obj
 
 
@@ -1079,9 +1080,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Hidden layer sizes for radial networks. An output layer of size
         `(l_schedule[0]+1)*channels` will be automatically appended.
     use_env_seed
-        If True, add environment matrix initial embedding to l=0 features using
-        4D `[s, s*r_hat]` representation. Provides physical inductive bias from
-        local atomic environments.
+        If True, apply environment matrix initial embedding as FiLM conditioning
+        on l=0 features using 4D `[s, s*r_hat]` representation. FiLM deltas are
+        zero-initialized to start as identity.
     env_seed_embed_dim
         Output dimension of the G network in environment initial embedding.
         Other dimensions are derived from this value:
@@ -1091,9 +1092,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     env_seed_norm
         Normalization mode for env_agg aggregation: `"deg"` (1/degree) or
         `"sqrt_deg"` (1/sqrt(degree)).
-    env_seed_max
-        Maximum scale magnitude for env_seed injection. The scale is bounded in
-        `[-env_seed_max, env_seed_max]` via sigmoid parameterization.
+    env_film_scale_delta
+        Symmetric FiLM scale delta around 1. The scale is computed as
+        `1 + env_film_scale_delta * (2 * sigmoid(scale_logits) - 1)`, yielding
+        `(1 - env_film_scale_delta, 1 + env_film_scale_delta)`. With zero-initialized
+        logits, the initial scale is 1.0.
     so2_norm
         If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
@@ -1115,6 +1118,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
         the memory usage, while persevering model accuracy.
+    use_triton
+        If True and Triton is available, use fused Triton kernels for performance-
+        critical operations. Only effective on CUDA devices.
+        Falls back to PyTorch if Triton is unavailable.
     exclude_types
         List of excluded type pairs.
     env_protection
@@ -1152,9 +1159,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
         use_env_seed: bool = False,
-        env_seed_max: float = 1.0,
         env_seed_embed_dim: int = 64,
         env_seed_norm: str = "sqrt_deg",
+        env_film_scale_delta: float = 0.5,
         so2_norm: bool = False,
         so2_layers: int = 2,
         ffn_neurons: int = 128,
@@ -1162,6 +1169,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         activation_function: str = "silu",
         precision: str = "float32",
         use_amp: bool = False,
+        use_triton: bool = False,
         exclude_types: list[tuple[int, int]] | None = None,
         env_protection: float = 1e-7,
         trainable: bool = True,
@@ -1201,6 +1209,18 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.trainable = bool(trainable)
         self.seed = seed
 
+        # === Triton acceleration ===
+        if use_triton and not is_triton_available():
+            import warnings
+
+            warnings.warn(
+                "use_triton=True but Triton is not available. "
+                "Falling back to PyTorch implementation.",
+                stacklevel=2,
+            )
+            use_triton = False
+        self.use_triton = bool(use_triton)
+
         # === Env seed parameters ===
         self.use_env_seed = bool(use_env_seed)
         self.env_seed_embed_dim = int(env_seed_embed_dim)
@@ -1209,8 +1229,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # Derived: type_dim in [8, 16], larger for complex type systems
         self.env_seed_type_dim = min(16, max(8, self.env_seed_embed_dim // 2))
         self.env_seed_hidden_dim = min(64, max(32, 2 * self.env_seed_embed_dim))
-        self.env_seed_max = float(env_seed_max)
         self.env_seed_norm = str(env_seed_norm)
+        self.env_film_scale_delta = float(env_film_scale_delta)
+        if self.env_film_scale_delta < 0.0:
+            raise ValueError("env_film_scale_delta must be non-negative")
 
         # === Step 0. Split deterministic seeds at the descriptor top-level ===
         seed_type_embedding = child_seed(self.seed, 0)
@@ -1246,7 +1268,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             trainable=self.trainable,
         )
 
-        # === Step 5. Env scalar seed embedding (optional) ===
+        # === Step 5. Env FiLM embedding (optional) ===
         if self.use_env_seed:
             self.env_seed_embedding: EnvironmentInitialEmbedding | None = (
                 EnvironmentInitialEmbedding(
@@ -1257,12 +1279,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     axis_dim=self.env_seed_axis_dim,
                     type_dim=self.env_seed_type_dim,
                     hidden_dim=self.env_seed_hidden_dim,
-                    env_seed_max=self.env_seed_max,
                     norm=self.env_seed_norm,
                     activation_function=self.activation_function,
                     eps=self.eps,
                     dtype=self.compute_dtype,  # force fp32+
                     trainable=self.trainable,
+                    use_triton=self.use_triton,
                     seed=seed_env_seed,
                 )
             )
@@ -1296,7 +1318,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         wigner_lmax = self.l_schedule[0]
         # force fp32+
         self.wigner_calc = WignerDCalculator(
-            lmax=wigner_lmax, eps=self.eps, dtype=self.compute_dtype
+            lmax=wigner_lmax,
+            eps=self.eps,
+            dtype=self.compute_dtype,
+            use_triton=self.use_triton,
         )
 
         if self.l_schedule[0] > 0:
@@ -1320,6 +1345,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     ffn_neurons=self.ffn_neurons,
                     n_atten_head=self.n_atten_head,
                     activation_function=self.activation_function,
+                    use_triton=self.use_triton,
                     eps=self.eps,
                     dtype=self.dtype,
                     seed=child_seed(seed_blocks, block_idx),
@@ -1428,15 +1454,20 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         else:
             radial_feat = None
 
-        # === Step 7. Env scalar env_seed embedding (optional, fp32+) ===
+        # === Step 7. Env FiLM conditioning (optional, fp32+) ===
         if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
             atype_flat = atype_loc.reshape(-1)  # (N,)
-            env_seed = self.env_seed_embedding(
+            film = self.env_seed_embedding(
                 edge_cache=edge_cache,
                 atype_flat=atype_flat,
                 n_nodes=n_nodes,
             )
-            x[:, 0, :] = x[:, 0, :] + env_seed
+            scale_logits, shift = film.chunk(2, dim=-1)
+            scale = 1.0 + self.env_film_scale_delta * (
+                2.0 * torch.sigmoid(scale_logits) - 1.0
+            )
+            x0 = x[:, 0, :].clone()
+            x[:, 0, :] = x0 * scale + shift
 
         # === Step 8. Geometric Initial Embedding (fp32+) ===
         if self.gie is not None and radial_feat is not None:
@@ -1734,6 +1765,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             empty_type_feat = torch.empty(
                 0, type_ebed.shape[1], dtype=dtype, device=device
             )
+            deg = torch.zeros(n_nodes, dtype=dtype, device=device)
             inv_sqrt_deg = torch.ones(n_nodes, 1, 1, dtype=dtype, device=device)
             cache = EdgeFeatureCache(
                 src=empty_long,
@@ -1742,6 +1774,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 edge_vec=empty_vec,
                 edge_rbf=empty_rbf,
                 edge_env=torch.empty(0, 1, dtype=dtype, device=device),
+                deg=deg,
                 inv_sqrt_deg=inv_sqrt_deg,
                 D_full=None,
                 Dt_full=None,
@@ -1816,6 +1849,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             edge_vec=edge_vec,  # (E, 3)
             edge_rbf=edge_rbf,  # (E, n_radial)
             edge_env=edge_env,  # (E, 1)
+            deg=deg,  # (N,)
             inv_sqrt_deg=inv_sqrt_deg,  # (N, 1, 1)
             D_full=D_full,  # (E, D, D)
             Dt_full=Dt_full,  # (E, D, D)
@@ -1984,12 +2018,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "activation_function": self.activation_function,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "use_amp": self.use_amp,
+            "use_triton": self.use_triton,
             "exclude_types": self.exclude_types,
             "env_protection": self.eps,
             "use_env_seed": self.use_env_seed,
             "env_seed_embed_dim": self.env_seed_embed_dim,
             "env_seed_norm": self.env_seed_norm,
-            "env_seed_max": self.env_seed_max,
+            "env_film_scale_delta": self.env_film_scale_delta,
             "trainable": self.trainable,
             "seed": self.seed,
             "type_embedding": self.type_embedding.embedding.serialize(),
@@ -2058,6 +2093,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         obj.stddev = safe_numpy_to_tensor(
             stats["dstd"], device=obj.device, dtype=obj.stddev.dtype
         )
+        for p in obj.parameters():
+            p.requires_grad = obj.trainable
         return obj
 
     @classmethod

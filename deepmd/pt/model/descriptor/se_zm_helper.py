@@ -26,6 +26,10 @@ from deepmd.pt.utils import (
     env,
 )
 
+from .se_zm_triton import (
+    build_z_rotation_triton,
+)
+
 
 class EdgeFeatureCache(NamedTuple):
     """
@@ -48,6 +52,9 @@ class EdgeFeatureCache(NamedTuple):
         The C^2 cutoff envelope is already baked in.
     edge_env
         C^2 cutoff envelope weights with shape (E, 1).
+    deg
+        Destination node degree (number of incoming edges) with shape (N,).
+        Used for neighbor normalization in EnvironmentInitialEmbedding.
     inv_sqrt_deg
         Destination degree normalization with shape (N, 1, 1).
     D_full
@@ -67,6 +74,7 @@ class EdgeFeatureCache(NamedTuple):
     edge_vec: torch.Tensor
     edge_rbf: torch.Tensor
     edge_env: torch.Tensor
+    deg: torch.Tensor
     inv_sqrt_deg: torch.Tensor
     D_full: torch.Tensor | None = None
     Dt_full: torch.Tensor | None = None
@@ -207,6 +215,7 @@ def edge_cache_to_dtype(
         edge_vec=cache.edge_vec.to(dtype=dtype),
         edge_rbf=cache.edge_rbf.to(dtype=dtype),
         edge_env=cache.edge_env.to(dtype=dtype),
+        deg=cache.deg.to(dtype=dtype),
         inv_sqrt_deg=cache.inv_sqrt_deg.to(dtype=dtype),
         D_full=D_full,
         Dt_full=Dt_full,
@@ -1068,10 +1077,22 @@ class WignerDCalculator(WignerDCalcBase):
         Small epsilon for numerical stability.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
+    use_triton : bool
+        If True and Triton is available, use fused Triton kernel for Z-rotation
+        matrix construction. Only effective on CUDA devices. Backward uses
+        PyTorch trig inside the custom autograd wrapper.
     """
 
-    def __init__(self, lmax: int, *, eps: float = 1e-7, dtype: torch.dtype) -> None:
+    def __init__(
+        self,
+        lmax: int,
+        *,
+        eps: float = 1e-7,
+        dtype: torch.dtype,
+        use_triton: bool = False,
+    ) -> None:
         super().__init__(lmax, eps=eps, dtype=dtype)
+        self.use_triton = use_triton
 
         # === Step 1. Compute block dimension ===
         # dim_full = sum_{l=0..lmax}(2l+1) = (lmax+1)^2
@@ -1179,6 +1200,23 @@ class WignerDCalculator(WignerDCalcBase):
         torch.Tensor
             Block-diagonal rotation matrices with shape (n_edges, dim_full, dim_full).
         """
+        m0_indices: torch.Tensor = self.m0_indices
+        m_values: torch.Tensor = self.m_values
+        pos_indices: torch.Tensor = self.pos_indices
+        neg_indices: torch.Tensor = self.neg_indices
+
+        # === Step 1. Triton path (CUDA only, skip during JIT scripting) ===
+        if not torch.jit.is_scripting() and self.use_triton and angle.is_cuda:
+            return build_z_rotation_triton(
+                angle,
+                dim_full=self.dim_full,
+                m0_indices=m0_indices,
+                pos_indices=pos_indices,
+                neg_indices=neg_indices,
+                m_values=m_values,
+            )
+
+        # === Step 2. PyTorch fallback: allocate Z matrix ===
         n_edges = angle.shape[0]
         Z = torch.zeros(
             n_edges,
@@ -1188,17 +1226,12 @@ class WignerDCalculator(WignerDCalcBase):
             device=angle.device,
         )
 
-        # === Step 1. Set m=0 diagonal elements to 1 ===
+        # === Step 3. Set m=0 diagonal elements to 1 ===
         # Z[:, m0_idx, m0_idx] = 1 for each l's center element
-        m0_indices: torch.Tensor = self.m0_indices
         Z[:, m0_indices, m0_indices] = 1.0
 
-        # === Step 2. Fill m>0 rotation blocks ===
-        m_values: torch.Tensor = self.m_values
+        # === Step 4. Fill m>0 rotation blocks ===
         if m_values.numel() > 0:
-            pos_indices: torch.Tensor = self.pos_indices
-            neg_indices: torch.Tensor = self.neg_indices
-
             # Compute cos(m*angle) and sin(m*angle) for all (l,m) pairs
             # angles_m: (n_edges, n_blocks) where n_blocks = total (l,m) pairs with m>0
             angles_m = angle[:, None] * m_values[None, :]  # (n_edges, n_blocks)

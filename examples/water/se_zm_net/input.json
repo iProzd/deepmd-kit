@@ -12,6 +12,7 @@
       "radial_mlp": [64],
       "use_env_seed": false,
       "env_seed_embed_dim": 64,
+      "env_film_scale_delta": 0.5,
       "env_seed_norm": "sqrt_deg",
       "so2_norm": false,
       "so2_layers": 3,
@@ -20,6 +21,7 @@
       "activation_function": "silu",
       "precision": "float32",
       "use_amp": true,
+      "use_triton": false,
       "seed": 7,
       "_comment": "that's all"
     },

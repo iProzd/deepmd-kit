@@ -173,22 +173,24 @@ An optional module that provides physical inductive bias for l=0 features using 
    - Scatter-sum by destination node: `env_agg.index_add_(0, dst, outer_flat)`
    - Normalize by neighbor count (degree normalization)
 
+- **Triton optimization**: When `use_triton=True` and Triton is available on CUDA, a fused kernel computes the outer-product and scatter-sum in one pass, avoiding the `(E, 4, embed_dim)` intermediate tensor. Backward and double-backward are implemented as custom Triton kernels to keep force training on the Triton path.
+
 4. **D matrix construction**: Captures local geometry via matrix product:
    - `D = env_agg^T @ env_agg[:, :, :axis_dim]` with shape `(N, embed_dim, axis_dim)`
 
-5. **Output projection with bounded sigmoid scale**: Project and scale:
-   - Flatten D to `(N, embed_dim * axis_dim)` and project to `(N, channels)`
-   - Apply bounded sigmoid scale: `scale = env_seed_max * (2*sigmoid(gamma) - 1)`
-   - `gamma` is initialized to 0.0 → `scale = 0` (safe residual start)
-   - `scale` is bounded in `[-env_seed_max, env_seed_max]` (default: `[-1.0, 1.0]`)
+5. **Output projection to FiLM deltas**:
+   - Flatten D to `(N, embed_dim * axis_dim)` and project to `(N, 2*channels)`
+   - Split to `(scale_logits, shift)` and apply FiLM on `l=0`:
+     `scale = 1 + env_film_scale_delta * (2 * sigmoid(scale_logits) - 1)`
+     `x0 = x0 * scale + shift`
+   - Output projection is zero-initialized → `scale_logits=0`, `shift=0` at init
 
 **Key properties**:
 
 - Uses **global frame** direction (not edge-aligned local frame) to preserve angular information
 - Neighbor count normalization uses actual degree, not `inv_sqrt_deg` from edge cache
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
-- **Bounded scale** prevents env_seed from destabilizing early training
-- **Sigmoid parameterization** ensures good gradient flow at `gamma=0` (`sigmoid'(0) = 0.25`)
+- **Identity start** is guaranteed for any `env_film_scale_delta` with zero-initialized logits
 
 ---
 
@@ -412,9 +414,11 @@ Key arguments:
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
-- `use_env_seed: bool` — If True, add environment matrix initial embedding to l=0 features using 4D `[s, s*r_hat]` representation (default: False)
+- `use_triton: bool` — If True and Triton is available, use fused Triton kernels for outer-product scatter-sum in EnvironmentInitialEmbedding, including custom backward/double-backward. This reduces memory usage by avoiding large intermediate tensors. Only effective on CUDA devices. Falls back to PyTorch if Triton is unavailable (default: False)
+- `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation (default: False)
 - `env_seed_embed_dim: int` — Output dimension of the G network in environment initial embedding. Other dimensions are derived: `axis_dim = min(8, max(4, env_seed_embed_dim//2))`, `type_dim = min(16, max(8, env_seed_embed_dim//2))`, `hidden_dim = min(64, max(32, 2*env_seed_embed_dim))` (default: 64)
 - `env_seed_norm: str` — Normalization mode for env_agg aggregation: "deg" (1/degree) or "sqrt_deg" (1/sqrt(degree)) (default: "sqrt_deg")
+- `env_film_scale_delta: float` — Symmetric FiLM scale delta around 1 for env_seed. The scale is `1 + env_film_scale_delta * (2*sigmoid(scale_logits) - 1)` (default: 0.5)
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 
@@ -437,7 +441,7 @@ Output:
 
 - hyperparameters including `l_schedule`, `m_schedule`, `use_env_seed`, and `compute_mode`
 - type embedding parameters
-- **env_seed_embedding** (if `use_env_seed=True`): independent type embedding (`env_type_embed`), two-layer RBF projection (`rbf_proj_layer1`, `rbf_proj_layer2`), G network layers, output projection, bounded scale parameter (`gamma`) and `env_seed_max`
+- **env_seed_embedding** (if `use_env_seed=True`): independent type embedding (`env_type_embed`), two-layer RBF projection (`rbf_proj_layer1`, `rbf_proj_layer2`), G network layers, output projection (2\*C), zero-init for FiLM deltas
 - **radial basis with trainable frequencies**
 - **radial embedding** (RadialMLP: edge_rbf -> (lmax+1)\*C, architecture: Linear → LayerNorm → Activation, first layer bias zero-initialized)
 - geometric initial embedding (GIE, if lmax > 0)
@@ -498,6 +502,16 @@ and the edge-aligned local frame. The block-diagonal matrices are computed by
 - For each degree `l`, real SH channels are ordered by `m=-l..+l` (index `i = m + l`).
 - `D_full` is block-diagonal with block `l` occupying indices `[l^2 : (l+1)^2)`.
 - `Dt_full = D_full^T` is the inverse rotation (local->global).
+
+#### Z-rotation Triton optimization
+
+When `use_triton=True` and Triton is available on CUDA, `WignerDCalculator._build_z_rotation()` uses a fused Triton kernel to construct the block-diagonal Z rotation matrices. This replaces the slow Python/advanced-indexing filling (`Z[:, idx, idx] = ...`) with a single kernel launch that writes all sparse entries in one pass.
+
+- **Forward**: Triton kernel stores `K = n_m0 + 4*n_blk` entries per edge (m=0 diagonals + 2x2 rotation blocks for m>0) into the flattened `Z_flat` tensor, then reshapes to `(E, D, D)`.
+- **Backward**: Uses pure PyTorch operations (gather + analytical gradients) to preserve double-backward correctness for force training.
+- **JIT compatibility**: The Triton path is skipped during `torch.jit.script()` via `torch.jit.is_scripting()` check.
+
+The matmul chain `D_full = Za @ Jt @ Zb @ J @ Zc` remains unchanged; only the Z matrix construction is accelerated.
 
 #### Usage in message passing
 

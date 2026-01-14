@@ -426,16 +426,7 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             optional=True,
             default=False,
             doc=doc_only_pt_supported
-            + "If True, add environment matrix initial embedding to l=0 features using 4D [s, s*r_hat] representation.",
-        ),
-        Argument(
-            "env_seed_max",
-            float,
-            optional=True,
-            default=1.0,
-            doc=doc_only_pt_supported
-            + "Maximum scale magnitude for env_seed injection. The scale is bounded in "
-            + "[-env_seed_max, env_seed_max] via sigmoid parameterization.",
+            + "If True, apply environment matrix initial embedding as FiLM conditioning on l=0 features using 4D [s, s*r_hat] representation.",
         ),
         Argument(
             "env_seed_embed_dim",
@@ -446,6 +437,16 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             + "Output dimension of the G network in environment initial embedding. "
             + "Other dimensions are derived: axis_dim=min(8, max(4, env_seed_embed_dim//2)), "
             + "type_dim=min(16, max(8, env_seed_embed_dim//2)), hidden_dim=min(64, max(32, 2*env_seed_embed_dim)).",
+        ),
+        Argument(
+            "env_film_scale_delta",
+            float,
+            optional=True,
+            default=0.5,
+            doc=doc_only_pt_supported
+            + "Symmetric FiLM scale delta around 1 for env_seed. The scale is "
+            + "`1 + env_film_scale_delta * (2*sigmoid(scale_logits) - 1)` with "
+            + "logits zero-initialized (identity at init).",
         ),
         Argument(
             "env_seed_norm",
@@ -468,6 +469,16 @@ def descrpt_se_zm_net_args() -> list[Argument]:
         ),
         Argument("precision", str, optional=True, default="float32", doc=doc_precision),
         Argument("use_amp", bool, optional=True, default=False, doc=doc_use_amp),
+        Argument(
+            "use_triton",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported
+            + "If True and Triton is available, use fused Triton kernels for performance-"
+            + "critical operations. Only effective on "
+            + "CUDA devices. Falls back to PyTorch if Triton is unavailable.",
+        ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
         Argument("seed", [int, None], optional=True, doc=doc_seed),
         Argument(

@@ -195,6 +195,30 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 msg="Smooth weight mismatch after deserialization",
             )
 
+    def test_deserialize_respects_trainable(self) -> None:
+        """Test that trainable flag is preserved after deserialization."""
+        for prec in ["float64", "float32"]:
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=4,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neurons=8,
+                precision=prec,
+                use_env_seed=True,
+                env_seed_embed_dim=8,
+                trainable=False,
+            )
+            data = model.serialize()
+            model_restored = DescrptSeZMNet.deserialize(data)
+            self.assertFalse(model_restored.trainable)
+            self.assertTrue(
+                all(not p.requires_grad for p in model_restored.parameters())
+            )
+
     def test_seed_reproducibility(self) -> None:
         """Test that fixed seed produces identical model initialization."""
         for prec in ["float64", "float32", "bfloat16"]:
@@ -332,6 +356,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             edge_vec=torch.zeros(2, 3, device=self.device, dtype=dtype),
             edge_rbf=torch.zeros(2, 1, device=self.device, dtype=dtype),
             edge_env=edge_env,
+            deg=torch.tensor([1.0, 1.0], device=self.device, dtype=dtype),
             inv_sqrt_deg=inv_sqrt_deg,
             D_full=D_full,
             Dt_full=D_full,
@@ -399,6 +424,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             edge_vec=torch.zeros(2, 3, device=self.device, dtype=dtype),
             edge_rbf=torch.zeros(2, 1, device=self.device, dtype=dtype),
             edge_env=edge_env,
+            deg=torch.tensor([1.0, 1.0], device=self.device, dtype=dtype),
             inv_sqrt_deg=inv_sqrt_deg,
             D_full=D_full,
             Dt_full=D_full,
@@ -798,6 +824,7 @@ class TestEdgeFeatureCacheProjection(unittest.TestCase):
             edge_vec=torch.zeros(n_edges, 3, device=self.device, dtype=dtype),
             edge_rbf=torch.zeros(n_edges, 1, device=self.device, dtype=dtype),
             edge_env=torch.ones(n_edges, 1, device=self.device, dtype=dtype),
+            deg=torch.tensor([float(n_edges)], device=self.device, dtype=dtype),
             inv_sqrt_deg=torch.ones(1, 1, 1, device=self.device, dtype=dtype),
             D_full=D_full,
             Dt_full=Dt_full,
@@ -1016,6 +1043,7 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
                 0, src
             ) + node_type_feat.index_select(0, dst)
             edge_env = torch.rand(n_edges, 1, device=self.device, dtype=dtype)
+            deg = torch.bincount(dst, minlength=n_nodes).to(dtype=dtype)
             inv_sqrt_deg = torch.ones(n_nodes, 1, 1, device=self.device, dtype=dtype)
             edge_cache = EdgeFeatureCache(
                 src=src,
@@ -1024,6 +1052,7 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
                 edge_vec=torch.zeros(n_edges, 3, device=self.device, dtype=dtype),
                 edge_rbf=torch.zeros(n_edges, 1, device=self.device, dtype=dtype),
                 edge_env=edge_env,
+                deg=deg,
                 inv_sqrt_deg=inv_sqrt_deg,
                 D_full=D_full_mat,
                 Dt_full=Dt_full_mat,
@@ -1273,7 +1302,7 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 precision=prec,
                 use_env_seed=True,
                 env_seed_embed_dim=16,
-                env_seed_axis_dim=4,
+                env_film_scale_delta=0.3,
                 trainable=True,
             )
             self.assertTrue(model.use_env_seed)
@@ -1304,7 +1333,6 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 precision=prec,
                 use_env_seed=True,
                 env_seed_embed_dim=8,
-                env_seed_axis_dim=2,
                 trainable=True,
             )
             desc, *_ = model(extended_coord, atype, nlist, mapping=None, comm_dict=None)
@@ -1332,7 +1360,6 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 precision=prec,
                 use_env_seed=True,
                 env_seed_embed_dim=16,
-                env_seed_axis_dim=4,
                 trainable=True,
             )
 
@@ -1359,24 +1386,447 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 msg="Descriptor mismatch after deserialization with env_seed",
             )
 
-    def test_env_seed_off_identical(self) -> None:
-        """Test that use_env_seed=False doesn't create the module."""
+    def test_env_seed_identity_at_init(self) -> None:
+        """Test that FiLM starts as identity at initialization."""
         for prec in ["float64", "float32"]:
-            model = DescrptSeZMNet(
-                rcut=3.0,
-                sel=[1, 1],
-                ntypes=2,
-                l_schedule=[1, 0],
-                channels=8,
-                n_radial=4,
-                radial_mlp=[8],
-                ffn_neurons=16,
-                precision=prec,
-                use_env_seed=False,
-                trainable=True,
+            dtype = PRECISION_DICT[prec]
+            coord, atype, nlist = self._tiny_system(dtype=dtype)
+            extended_coord = coord.reshape(1, -1)
+            seed = 2023
+            base_kwargs = {
+                "rcut": 3.0,
+                "sel": [1, 1],
+                "ntypes": 2,
+                "l_schedule": [1, 0],
+                "channels": 8,
+                "n_radial": 4,
+                "radial_mlp": [8],
+                "ffn_neurons": 16,
+                "precision": prec,
+                "trainable": True,
+                "seed": seed,
+            }
+
+            model_no_env = DescrptSeZMNet(use_env_seed=False, **base_kwargs)
+            model_env = DescrptSeZMNet(
+                use_env_seed=True,
+                env_seed_embed_dim=16,
+                **base_kwargs,
             )
-            self.assertFalse(model.use_env_seed)
-            self.assertIsNone(model.env_seed_embedding)
+
+            desc_no, *_ = model_no_env(
+                extended_coord, atype, nlist, mapping=None, comm_dict=None
+            )
+            desc_env, *_ = model_env(
+                extended_coord, atype, nlist, mapping=None, comm_dict=None
+            )
+
+            atol, rtol = self._get_tols(dtype)
+            torch.testing.assert_close(
+                desc_no,
+                desc_env,
+                atol=atol,
+                rtol=rtol,
+                msg="FiLM should start as identity",
+            )
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")
+class TestTritonConsistency(unittest.TestCase):
+    """Test Triton implementations match PyTorch reference."""
+
+    def setUp(self) -> None:
+        torch.manual_seed(42)
+        self.device = torch.device("cuda")
+
+    def test_outer_scatter_sum_consistency(self) -> None:
+        """Test outer_scatter_sum Triton matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            outer_scatter_sum,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, N, C = 100, 20, 64
+        r_tilde = torch.randn(E, 4, device=self.device, dtype=torch.float32)
+        g = torch.randn(E, C, device=self.device, dtype=torch.float32)
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        # Triton
+        out_triton = outer_scatter_sum(r_tilde, g, dst, N)
+
+        # PyTorch reference
+        outer = r_tilde.unsqueeze(-1) * g.unsqueeze(1)  # (E, 4, C)
+        out_ref = torch.zeros(N, 4, C, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, outer)
+
+        torch.testing.assert_close(out_triton, out_ref, atol=1e-5, rtol=1e-5)
+
+    def test_outer_scatter_sum_backward_consistency(self) -> None:
+        """Test outer_scatter_sum backward matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            outer_scatter_sum,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, N, C = 32, 12, 24
+        r_tilde = torch.randn(
+            E, 4, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        g = torch.randn(
+            E, C, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+        grad_out = torch.randn(N, 4, C, device=self.device, dtype=torch.float32)
+
+        r_ref = r_tilde.detach().clone().requires_grad_(True)
+        g_ref = g.detach().clone().requires_grad_(True)
+
+        out_triton = outer_scatter_sum(r_tilde, g, dst, N)
+        out_ref = torch.zeros(N, 4, C, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, r_ref.unsqueeze(-1) * g_ref.unsqueeze(1))
+
+        grads_triton = torch.autograd.grad(out_triton, [r_tilde, g], grad_out)
+        grads_ref = torch.autograd.grad(out_ref, [r_ref, g_ref], grad_out)
+
+        torch.testing.assert_close(grads_triton[0], grads_ref[0], atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(grads_triton[1], grads_ref[1], atol=1e-5, rtol=1e-5)
+
+    def test_outer_scatter_sum_double_backward_consistency(self) -> None:
+        """Test outer_scatter_sum double backward matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            outer_scatter_sum,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, N, C = 16, 8, 12
+        r_tilde = torch.randn(
+            E, 4, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        g = torch.randn(
+            E, C, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        r_ref = r_tilde.detach().clone().requires_grad_(True)
+        g_ref = g.detach().clone().requires_grad_(True)
+
+        out_triton = outer_scatter_sum(r_tilde, g, dst, N)
+        out_ref = torch.zeros(N, 4, C, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, r_ref.unsqueeze(-1) * g_ref.unsqueeze(1))
+
+        grad_out_triton = torch.randn_like(out_triton, requires_grad=True)
+        grad_out_ref = grad_out_triton.detach().clone().requires_grad_(True)
+
+        grads_triton = torch.autograd.grad(
+            out_triton, [r_tilde, g], grad_out_triton, create_graph=True
+        )
+        grads_ref = torch.autograd.grad(
+            out_ref, [r_ref, g_ref], grad_out_ref, create_graph=True
+        )
+
+        loss_triton = grads_triton[0].sum() + grads_triton[1].sum()
+        loss_ref = grads_ref[0].sum() + grads_ref[1].sum()
+
+        grad2_triton = torch.autograd.grad(loss_triton, [r_tilde, g, grad_out_triton])
+        grad2_ref = torch.autograd.grad(loss_ref, [r_ref, g_ref, grad_out_ref])
+
+        torch.testing.assert_close(grad2_triton[0], grad2_ref[0], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad2_triton[1], grad2_ref[1], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad2_triton[2], grad2_ref[2], atol=1e-4, rtol=1e-4)
+
+    def test_z_rotation_consistency(self) -> None:
+        """Test build_z_rotation Triton matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_helper import (
+            WignerDCalculator,
+        )
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        lmax = 3
+        E = 50
+        angle = torch.randn(E, device=self.device, dtype=torch.float64)
+
+        # Create calculator with Triton enabled
+        calc_triton = WignerDCalculator(lmax=lmax, use_triton=True, dtype=torch.float64)
+        calc_triton = calc_triton.to(self.device)
+
+        # Create calculator with Triton disabled
+        calc_pytorch = WignerDCalculator(
+            lmax=lmax, use_triton=False, dtype=torch.float64
+        )
+        calc_pytorch = calc_pytorch.to(self.device)
+
+        Z_triton = calc_triton._build_z_rotation(angle)
+        Z_pytorch = calc_pytorch._build_z_rotation(angle)
+
+        torch.testing.assert_close(Z_triton, Z_pytorch, atol=1e-10, rtol=1e-10)
+
+    def test_separable_rmsnorm_consistency(self) -> None:
+        """Test SeparableRMSNorm Triton matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_block import (
+            SeparableRMSNorm,
+        )
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        N, lmax, C = 32, 3, 64
+        D = (lmax + 1) ** 2
+        x = torch.randn(N, D, C, device=self.device, dtype=torch.float32)
+
+        # Triton version
+        norm_triton = SeparableRMSNorm(
+            lmax=lmax, channels=C, dtype=torch.float32, use_triton=True, trainable=True
+        ).to(self.device)
+
+        # PyTorch version (same weights)
+        norm_pytorch = SeparableRMSNorm(
+            lmax=lmax, channels=C, dtype=torch.float32, use_triton=False, trainable=True
+        ).to(self.device)
+        norm_pytorch.load_state_dict(norm_triton.state_dict())
+
+        out_triton = norm_triton(x)
+        out_pytorch = norm_pytorch(x)
+
+        torch.testing.assert_close(out_triton, out_pytorch, atol=1e-5, rtol=1e-5)
+
+    def test_so2_baseline_scatter_consistency(self) -> None:
+        """Test SO2 baseline scatter Triton matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            so2_baseline_scatter_triton,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, D, C, N = 100, 16, 64, 20
+        x_message = torch.randn(E, D, C, device=self.device, dtype=torch.float32)
+        edge_env = torch.rand(E, 1, device=self.device, dtype=torch.float32)
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        # Triton
+        out_triton = so2_baseline_scatter_triton(x_message, edge_env, dst, N)
+
+        # PyTorch reference
+        weighted = x_message * edge_env.view(-1, 1, 1)
+        out_ref = torch.zeros(N, D, C, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, weighted)
+
+        torch.testing.assert_close(out_triton, out_ref, atol=1e-5, rtol=1e-5)
+
+    def test_so2_head_scatter_consistency(self) -> None:
+        """Test SO2 head scatter Triton matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            so2_head_scatter_triton,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, D, H, Hd, N = 100, 16, 4, 16, 20
+        V = torch.randn(E, D, H, Hd, device=self.device, dtype=torch.float32)
+        edge_weight = torch.rand(E, H, device=self.device, dtype=torch.float32)
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        # Triton
+        out_triton = so2_head_scatter_triton(V, edge_weight, dst, N)
+
+        # PyTorch reference
+        msg = V * edge_weight.view(-1, 1, H, 1)
+        out_ref = torch.zeros(N, D, H, Hd, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, msg)
+
+        torch.testing.assert_close(out_triton, out_ref, atol=1e-5, rtol=1e-5)
+
+    def test_so2_baseline_scatter_backward_consistency(self) -> None:
+        """Test SO2 baseline scatter backward matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            so2_baseline_scatter_triton,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, D, C, N = 50, 8, 32, 10
+        x_msg = torch.randn(
+            E, D, C, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        edge_env = torch.rand(
+            E, 1, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        # Clone for PyTorch reference
+        x_msg_ref = x_msg.detach().clone().requires_grad_(True)
+        edge_env_ref = edge_env.detach().clone().requires_grad_(True)
+
+        # Triton forward + backward
+        out_triton = so2_baseline_scatter_triton(x_msg, edge_env, dst, N)
+        grad_out = torch.randn_like(out_triton)
+        out_triton.backward(grad_out)
+
+        # PyTorch reference forward + backward
+        weighted = x_msg_ref * edge_env_ref.view(-1, 1, 1)
+        out_ref = torch.zeros(N, D, C, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, weighted)
+        out_ref.backward(grad_out)
+
+        torch.testing.assert_close(x_msg.grad, x_msg_ref.grad, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(
+            edge_env.grad, edge_env_ref.grad, atol=1e-5, rtol=1e-5
+        )
+
+    def test_so2_head_scatter_backward_consistency(self) -> None:
+        """Test SO2 head scatter backward matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            so2_head_scatter_triton,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, D, H, Hd, N = 50, 8, 4, 8, 10
+        V = torch.randn(
+            E, D, H, Hd, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        edge_weight = torch.rand(
+            E, H, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        # Clone for PyTorch reference
+        V_ref = V.detach().clone().requires_grad_(True)
+        ew_ref = edge_weight.detach().clone().requires_grad_(True)
+
+        # Triton forward + backward
+        out_triton = so2_head_scatter_triton(V, edge_weight, dst, N)
+        grad_out = torch.randn_like(out_triton)
+        out_triton.backward(grad_out)
+
+        # PyTorch reference forward + backward
+        msg = V_ref * ew_ref.view(-1, 1, H, 1)
+        out_ref = torch.zeros(N, D, H, Hd, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, msg)
+        out_ref.backward(grad_out)
+
+        torch.testing.assert_close(V.grad, V_ref.grad, atol=1e-5, rtol=1e-5)
+        torch.testing.assert_close(edge_weight.grad, ew_ref.grad, atol=1e-5, rtol=1e-5)
+
+    def test_so2_baseline_scatter_double_backward_consistency(self) -> None:
+        """Test SO2 baseline scatter double backward matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            so2_baseline_scatter_triton,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, D, C, N = 12, 4, 8, 6
+        x_msg = torch.randn(
+            E, D, C, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        edge_env = torch.rand(
+            E, 1, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        x_ref = x_msg.detach().clone().requires_grad_(True)
+        env_ref = edge_env.detach().clone().requires_grad_(True)
+
+        out_triton = so2_baseline_scatter_triton(x_msg, edge_env, dst, N)
+        out_ref = torch.zeros(N, D, C, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, x_ref * env_ref.view(-1, 1, 1))
+
+        grad_out_triton = torch.randn_like(out_triton, requires_grad=True)
+        grad_out_ref = grad_out_triton.detach().clone().requires_grad_(True)
+
+        grads_triton = torch.autograd.grad(
+            out_triton, [x_msg, edge_env], grad_out_triton, create_graph=True
+        )
+        grads_ref = torch.autograd.grad(
+            out_ref, [x_ref, env_ref], grad_out_ref, create_graph=True
+        )
+
+        loss_triton = grads_triton[0].sum() + grads_triton[1].sum()
+        loss_ref = grads_ref[0].sum() + grads_ref[1].sum()
+
+        grad2_triton = torch.autograd.grad(
+            loss_triton, [x_msg, edge_env, grad_out_triton]
+        )
+        grad2_ref = torch.autograd.grad(loss_ref, [x_ref, env_ref, grad_out_ref])
+
+        torch.testing.assert_close(grad2_triton[0], grad2_ref[0], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad2_triton[1], grad2_ref[1], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad2_triton[2], grad2_ref[2], atol=1e-4, rtol=1e-4)
+
+    def test_so2_head_scatter_double_backward_consistency(self) -> None:
+        """Test SO2 head scatter double backward matches PyTorch."""
+        from deepmd.pt.model.descriptor.se_zm_triton import (
+            is_triton_available,
+            so2_head_scatter_triton,
+        )
+
+        if not is_triton_available():
+            self.skipTest("Triton not available")
+
+        E, D, H, Hd, N = 10, 4, 2, 6, 5
+        V = torch.randn(
+            E, D, H, Hd, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        edge_weight = torch.rand(
+            E, H, device=self.device, dtype=torch.float32, requires_grad=True
+        )
+        dst = torch.randint(0, N, (E,), device=self.device, dtype=torch.int64)
+
+        V_ref = V.detach().clone().requires_grad_(True)
+        ew_ref = edge_weight.detach().clone().requires_grad_(True)
+
+        out_triton = so2_head_scatter_triton(V, edge_weight, dst, N)
+        out_ref = torch.zeros(N, D, H, Hd, device=self.device, dtype=torch.float32)
+        out_ref.index_add_(0, dst, V_ref * ew_ref.view(-1, 1, H, 1))
+
+        grad_out_triton = torch.randn_like(out_triton, requires_grad=True)
+        grad_out_ref = grad_out_triton.detach().clone().requires_grad_(True)
+
+        grads_triton = torch.autograd.grad(
+            out_triton, [V, edge_weight], grad_out_triton, create_graph=True
+        )
+        grads_ref = torch.autograd.grad(
+            out_ref, [V_ref, ew_ref], grad_out_ref, create_graph=True
+        )
+
+        loss_triton = grads_triton[0].sum() + grads_triton[1].sum()
+        loss_ref = grads_ref[0].sum() + grads_ref[1].sum()
+
+        grad2_triton = torch.autograd.grad(
+            loss_triton, [V, edge_weight, grad_out_triton]
+        )
+        grad2_ref = torch.autograd.grad(loss_ref, [V_ref, ew_ref, grad_out_ref])
+
+        torch.testing.assert_close(grad2_triton[0], grad2_ref[0], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad2_triton[1], grad2_ref[1], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(grad2_triton[2], grad2_ref[2], atol=1e-4, rtol=1e-4)
 
 
 if __name__ == "__main__":

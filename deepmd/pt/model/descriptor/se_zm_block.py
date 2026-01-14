@@ -55,6 +55,11 @@ from .se_zm_helper import (
     project_Dt_from_m,
     safe_numpy_to_tensor,
 )
+from .se_zm_triton import (
+    separable_rmsnorm_triton,
+    so2_baseline_scatter_triton,
+    so2_head_scatter_triton,
+)
 
 
 class GatedActivation(nn.Module):
@@ -284,6 +289,7 @@ class SeparableRMSNorm(nn.Module):
         eps: float = 1e-7,
         dtype: torch.dtype,
         trainable: bool,
+        use_triton: bool = False,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -294,6 +300,7 @@ class SeparableRMSNorm(nn.Module):
         self.device = env.DEVICE
         self.eps = float(eps)
         self.compute_dtype = get_promoted_dtype(self.dtype)
+        self.use_triton = use_triton
 
         # === Step 1. Learnable Parameters ===
         if self.affine:
@@ -375,6 +382,19 @@ class SeparableRMSNorm(nn.Module):
         torch.Tensor
             Normalized features with shape (N, D, C).
         """
+        # === Triton path (CUDA only, skip during JIT scripting) ===
+        if not torch.jit.is_scripting() and self.use_triton and x.is_cuda:
+            return separable_rmsnorm_triton(
+                x,
+                self.balance_weight,
+                self.weight,
+                self.bias,
+                self.expand_index,
+                self.eps,
+                self.centering,
+            )
+
+        # === PyTorch fallback ===
         in_dtype = x.dtype
         x0 = x[:, :1, :]
         xt = x[:, 1:, :]
@@ -1195,6 +1215,8 @@ class SO2Convolution(nn.Module):
     n_atten_head
         Number of gated attention heads when aggregating messages in SO(2) convolution.
         0 means a plain envelope-weighted scatter-sum is applied.
+    use_triton
+        Whether to use Triton kernels for scatter operations.
     eps
         Small epsilon for gate-side RMSNorm.
     dtype
@@ -1214,6 +1236,7 @@ class SO2Convolution(nn.Module):
         so2_norm: bool = False,
         so2_layers: int = 1,
         n_atten_head: int = 0,
+        use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -1241,6 +1264,7 @@ class SO2Convolution(nn.Module):
         self.head_dim = (
             None if self.n_atten_head == 0 else int(self.channels // self.n_atten_head)
         )
+        self.use_triton = bool(use_triton)
         self.eps = float(eps)
         self.ebed_dim_full = get_so3_dim_of_lmax(self.lmax)
         self.dtype = dtype
@@ -1517,11 +1541,19 @@ class SO2Convolution(nn.Module):
 
         # === Step 5. Aggregate with optional head-wise gating ===
         if self.n_atten_head == 0:
-            # Baseline path: envelope -> scatter add -> degree norm
-            x_message = x_message * edge_cache.edge_env.view(-1, 1, 1)  # (E, D, C)
-            out = x.new_zeros(x.shape)
-            out.index_add_(0, dst, x_message)
-            out = out * edge_cache.inv_sqrt_deg
+            # Baseline path: fused envelope-weighted scatter add -> degree norm
+            # === Triton path (CUDA only, skip during JIT scripting) ===
+            # Custom backward/gradgrad keeps force training in Triton.
+            if not torch.jit.is_scripting() and self.use_triton and x_message.is_cuda:
+                out = so2_baseline_scatter_triton(
+                    x_message, edge_cache.edge_env, dst, x.shape[0]
+                )
+                out = out.to(dtype=self.dtype) * edge_cache.inv_sqrt_deg
+            else:
+                x_message = x_message * edge_cache.edge_env.view(-1, 1, 1)
+                out = x.new_zeros(x.shape)
+                out.index_add_(0, dst, x_message)
+                out = out * edge_cache.inv_sqrt_deg
         else:
             assert self.head_dim is not None
             assert self.proj_dst is not None
@@ -1564,18 +1596,25 @@ class SO2Convolution(nn.Module):
             V = x_message.reshape(
                 x_message.shape[0], self.ebed_dim_full, self.n_atten_head, self.head_dim
             )
-            msg = V.to(dtype=compute_dtype) * edge_weight.view(
-                -1, 1, self.n_atten_head, 1
-            )
-            out_heads = torch.zeros(
-                x.shape[0],
-                self.ebed_dim_full,
-                self.n_atten_head,
-                self.head_dim,
-                device=x.device,
-                dtype=compute_dtype,
-            )
-            out_heads.index_add_(0, dst, msg)
+            # === Triton path (CUDA only, skip during JIT scripting) ===
+            # Custom backward/gradgrad keeps force training in Triton.
+            if not torch.jit.is_scripting() and self.use_triton and V.is_cuda:
+                out_heads = so2_head_scatter_triton(
+                    V.to(dtype=compute_dtype), edge_weight, dst, x.shape[0]
+                )
+            else:
+                msg = V.to(dtype=compute_dtype) * edge_weight.view(
+                    -1, 1, self.n_atten_head, 1
+                )
+                out_heads = torch.zeros(
+                    x.shape[0],
+                    self.ebed_dim_full,
+                    self.n_atten_head,
+                    self.head_dim,
+                    device=x.device,
+                    dtype=compute_dtype,
+                )
+                out_heads.index_add_(0, dst, msg)
 
             # === Step 5.4. Compute post-aggregate head gate (fp32+ logits path) ===
             head_logits = self.proj_head(self.norm_dst_for_head(x_l0)).to(
@@ -1905,6 +1944,8 @@ class SeZMInteractionBlock(nn.Module):
         Hidden layer sizes for FFN.
     activation_function
         Activation function for l=0 components.
+    use_triton
+        Whether to use Triton kernels for scatter operations.
     eps
         Small epsilon for numerical stability.
     dtype
@@ -1926,6 +1967,7 @@ class SeZMInteractionBlock(nn.Module):
         n_atten_head: int = 0,
         ffn_neurons: int = 128,
         activation_function: str,
+        use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -1944,6 +1986,7 @@ class SeZMInteractionBlock(nn.Module):
         self.n_atten_head = int(n_atten_head)
         self.ffn_neurons = int(ffn_neurons)
         self.activation_function = activation_function
+        self.use_triton = bool(use_triton)
         self.eps = float(eps)
         self.dtype = dtype
         self.precision = RESERVED_PRECISION_DICT[dtype]
@@ -1975,6 +2018,7 @@ class SeZMInteractionBlock(nn.Module):
             so2_norm=self.so2_norm,
             so2_layers=self.so2_layers,
             n_atten_head=n_atten_head,
+            use_triton=self.use_triton,
             eps=self.eps,
             dtype=dtype,
             seed=seed_so2_conv,
