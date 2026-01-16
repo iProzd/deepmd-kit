@@ -13,6 +13,12 @@ from abc import (
     ABC,
     abstractmethod,
 )
+from collections.abc import (
+    Generator,
+)
+from contextlib import (
+    contextmanager,
+)
 from typing import (
     Any,
     NamedTuple,
@@ -24,10 +30,6 @@ import torch.nn as nn
 
 from deepmd.pt.utils import (
     env,
-)
-
-from .se_zm_triton import (
-    build_z_rotation_triton,
 )
 
 
@@ -176,6 +178,25 @@ class EdgeFeatureCache(NamedTuple):
         return Dt_from_m
 
 
+@contextmanager
+def nvtx_range(name: str) -> Generator[None, None, None]:
+    """
+    Create an NVTX range when CUDA is available; otherwise, no-op.
+
+    Parameters
+    ----------
+    name
+        Range name shown in Nsight Systems/Compute.
+    """
+    if torch.cuda.is_available():
+        nvtx = torch.cuda.nvtx
+        if hasattr(nvtx, "range"):
+            with nvtx.range(name):
+                yield
+            return
+    yield
+
+
 def edge_cache_to_dtype(
     cache: EdgeFeatureCache, dtype: torch.dtype
 ) -> EdgeFeatureCache:
@@ -183,7 +204,7 @@ def edge_cache_to_dtype(
     Convert all floating-point tensors in EdgeFeatureCache to the specified dtype.
 
     Integer tensors (src, dst) are unchanged. This is a standalone function
-    (not a method) to ensure TorchScript compatibility.
+    (not a method) to keep it side-effect free.
 
     Parameters
     ----------
@@ -197,7 +218,7 @@ def edge_cache_to_dtype(
     EdgeFeatureCache
         New cache with converted tensors.
     """
-    # Handle Optional tensors in a TorchScript-compatible way.
+    # Handle Optional tensors explicitly.
     # Use local variables with explicit None check and assignment.
     _D_full = cache.D_full
     _Dt_full = cache.Dt_full
@@ -1089,10 +1110,8 @@ class WignerDCalculator(WignerDCalcBase):
         *,
         eps: float = 1e-7,
         dtype: torch.dtype,
-        use_triton: bool = False,
     ) -> None:
         super().__init__(lmax, eps=eps, dtype=dtype)
-        self.use_triton = use_triton
 
         # === Step 1. Compute block dimension ===
         # dim_full = sum_{l=0..lmax}(2l+1) = (lmax+1)^2
@@ -1138,20 +1157,23 @@ class WignerDCalculator(WignerDCalcBase):
 
         # === Step 1. Extract ZYZ Euler angles ===
         # Convention: rot_mat = Rz(alpha) @ Ry(beta) @ Rz(gamma)
-        alpha, beta, gamma = self._extract_zyz_euler(rot_mat)
+        with nvtx_range("WignerD/euler"):
+            alpha, beta, gamma = self._extract_zyz_euler(rot_mat)
 
         # === Step 2. Build block-diagonal Z matrices ===
         # Each Z_full has shape (n_edges, dim_full, dim_full)
-        Za_full = self._build_z_rotation(alpha)
-        Zb_full = self._build_z_rotation(beta)
-        Zc_full = self._build_z_rotation(gamma)
+        with nvtx_range("WignerD/z_rotation"):
+            Za_full = self._build_z_rotation(alpha)
+            Zb_full = self._build_z_rotation(beta)
+            Zc_full = self._build_z_rotation(gamma)
 
         # === Step 3. Compute D_full via single matmul chain ===
         # D^{(l)}(R) = Z(alpha) @ J^T @ Z(beta) @ J @ Z(gamma)
-        J_full: torch.Tensor = self.J_full
-        Jt_full: torch.Tensor = self.Jt_full
-        D_full = Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full
-        Dt_full = D_full.transpose(-1, -2).contiguous()
+        with nvtx_range("WignerD/matmul"):
+            J_full: torch.Tensor = self.J_full
+            Jt_full: torch.Tensor = self.Jt_full
+            D_full = Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full
+            Dt_full = D_full.transpose(-1, -2).contiguous()
 
         return D_full, Dt_full
 
@@ -1205,18 +1227,7 @@ class WignerDCalculator(WignerDCalcBase):
         pos_indices: torch.Tensor = self.pos_indices
         neg_indices: torch.Tensor = self.neg_indices
 
-        # === Step 1. Triton path (CUDA only, skip during JIT scripting) ===
-        if not torch.jit.is_scripting() and self.use_triton and angle.is_cuda:
-            return build_z_rotation_triton(
-                angle,
-                dim_full=self.dim_full,
-                m0_indices=m0_indices,
-                pos_indices=pos_indices,
-                neg_indices=neg_indices,
-                m_values=m_values,
-            )
-
-        # === Step 2. PyTorch fallback: allocate Z matrix ===
+        # === Step 1. Allocate Z matrix ===
         n_edges = angle.shape[0]
         Z = torch.zeros(
             n_edges,
@@ -1226,11 +1237,11 @@ class WignerDCalculator(WignerDCalcBase):
             device=angle.device,
         )
 
-        # === Step 3. Set m=0 diagonal elements to 1 ===
+        # === Step 2. Set m=0 diagonal elements to 1 ===
         # Z[:, m0_idx, m0_idx] = 1 for each l's center element
         Z[:, m0_indices, m0_indices] = 1.0
 
-        # === Step 4. Fill m>0 rotation blocks ===
+        # === Step 3. Fill m>0 rotation blocks ===
         if m_values.numel() > 0:
             # Compute cos(m*angle) and sin(m*angle) for all (l,m) pairs
             # angles_m: (n_edges, n_blocks) where n_blocks = total (l,m) pairs with m>0

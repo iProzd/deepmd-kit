@@ -192,6 +192,11 @@ An optional module that provides physical inductive bias for l=0 features using 
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
 - **Identity start** is guaranteed for any `env_film_scale_delta` with zero-initialized logits
 
+### 10. Runtime acceleration flags and serialization
+
+- `use_triton` is serialized for the descriptor and its internal modules that have Triton paths.
+- Inference uses the saved flag and automatically falls back to PyTorch when Triton is unavailable or CUDA is not present.
+
 ---
 
 ## Tensor Layouts and Invariants
@@ -218,11 +223,13 @@ Packing convention:
 
 ### Edge cache tensors
 
-Edge cache holds **only valid edges**:
+Edge cache holds **valid edges** (non-padding, non-excluded):
 
 - padding (`nlist == -1`) is removed
 - excluded type pairs are removed
-- edges with `r >= rcut` are removed
+- edges with `r >= rcut` are **NOT** removed; their `edge_env=0` (from C² envelope) naturally zeros their messages
+
+This design avoids the dynamic-output-size `nonzero` kernel for distance filtering and enables smoother degree/normalization (no discontinuous edge count jumps at rcut boundary).
 
 Let `E` be the number of valid edges:
 
@@ -521,7 +528,8 @@ The matmul chain `D_full = Za @ Jt @ Zb @ J @ Zc` remains unchanged; only the Z 
 
 ### Padded neighbor safety
 
-- Padding edges are removed before any normalization or angle computation.
+- Padding edges (`nlist == -1`) are removed before any normalization or angle computation.
+- Padding indices are replaced with 0 (any valid index) during gather; their values are masked out by `keep = valid_nlist & pair_keep_mask`, avoiding the extra `cat` operation for sentinel coordinates.
 - `PairExcludeMask` returns a **keep mask** (1=keep, 0=excluded). It does not remove padding by itself, so always combine it with `nlist >= 0`.
 - No zero-length vector is normalized for padding edges.
 

@@ -51,12 +51,12 @@ from .se_zm_helper import (
     get_so3_dim_of_lmax,
     map_degree_idx,
     np_safe,
+    nvtx_range,
     project_D_to_m,
     project_Dt_from_m,
     safe_numpy_to_tensor,
 )
 from .se_zm_triton import (
-    separable_rmsnorm_triton,
     so2_baseline_scatter_triton,
     so2_head_scatter_triton,
 )
@@ -289,7 +289,6 @@ class SeparableRMSNorm(nn.Module):
         eps: float = 1e-7,
         dtype: torch.dtype,
         trainable: bool,
-        use_triton: bool = False,
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -300,7 +299,6 @@ class SeparableRMSNorm(nn.Module):
         self.device = env.DEVICE
         self.eps = float(eps)
         self.compute_dtype = get_promoted_dtype(self.dtype)
-        self.use_triton = use_triton
 
         # === Step 1. Learnable Parameters ===
         if self.affine:
@@ -321,7 +319,7 @@ class SeparableRMSNorm(nn.Module):
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)
 
-        # === Step 2. Index and Weight Buffers (always registered for JIT) ===
+        # === Step 2. Index and Weight Buffers ===
         if self.lmax > 0:
             # Expand index for weight application
             expand_index = map_degree_idx(self.lmax, device=self.device)[1:]
@@ -350,7 +348,6 @@ class SeparableRMSNorm(nn.Module):
             )
             self.register_buffer("balance_weight_c", balance_weight_c, persistent=True)
         else:
-            # Empty buffers for JIT compatibility
             self.register_buffer(
                 "expand_index",
                 torch.zeros(0, dtype=torch.long, device=self.device),
@@ -382,19 +379,6 @@ class SeparableRMSNorm(nn.Module):
         torch.Tensor
             Normalized features with shape (N, D, C).
         """
-        # === Triton path (CUDA only, skip during JIT scripting) ===
-        if not torch.jit.is_scripting() and self.use_triton and x.is_cuda:
-            return separable_rmsnorm_triton(
-                x,
-                self.balance_weight,
-                self.weight,
-                self.bias,
-                self.expand_index,
-                self.eps,
-                self.centering,
-            )
-
-        # === PyTorch fallback ===
         in_dtype = x.dtype
         x0 = x[:, :1, :]
         xt = x[:, 1:, :]
@@ -1493,147 +1477,154 @@ class SO2Convolution(nn.Module):
         x_src = x[src]  # (E, D, C)
 
         # === Step 1. Rotate to edge-aligned local frame ===
-        D_full = edge_cache.D_full
-        assert D_full is not None
-        D_m_prime = project_D_to_m(
-            D_full=D_full,
-            coeff_index_m=self.coeff_index_m,
-            ebed_dim_full=self.ebed_dim_full,
-            cache=edge_cache.D_to_m_cache,
-            key_lmax=self.lmax,
-            key_mmax=self.mmax,
-        )
-        x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m_trunc, C)
+        with nvtx_range("SO2Conv/rotate_to_local"):
+            D_full = edge_cache.D_full
+            assert D_full is not None
+            D_m_prime = project_D_to_m(
+                D_full=D_full,
+                coeff_index_m=self.coeff_index_m,
+                ebed_dim_full=self.ebed_dim_full,
+                cache=edge_cache.D_to_m_cache,
+                key_lmax=self.lmax,
+                key_mmax=self.mmax,
+            )
+            x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m_trunc, C)
 
         # === Step 2. Select radial/type features for reduced layout ===
-        rad_feat = radial_feat[:, self.degree_index_m, :]  # (E, D_m_trunc, C)
-        x_local = x_local * rad_feat  # (E, D_m_trunc, C)
+        with nvtx_range("SO2Conv/radial_fuse"):
+            rad_feat = radial_feat[:, self.degree_index_m, :]  # (E, D_m_trunc, C)
+            x_local = x_local * rad_feat  # (E, D_m_trunc, C)
 
         # === Step 3. Multi-layer SO(2) mixing ===
-        for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
-            zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
-        ):
-            x_local = so2_linear(x_local)
+        with nvtx_range("SO2Conv/so2_layers"):
+            for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
+                zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
+            ):
+                x_local = so2_linear(x_local)
 
-            # Bias correction for first layer to preserve strict smoothness at rcut.
-            if layer_idx == 0:
-                bias_correction = so2_linear.bias0 * (
-                    rad_feat[:, 0, :] * edge_cache.edge_env - 1.0
-                )
-                x_local[:, 0, :].add_(bias_correction)
+                if layer_idx == 0:
+                    bias_correction = so2_linear.bias0 * (
+                        rad_feat[:, 0, :] * edge_cache.edge_env - 1.0
+                    )
+                    x_local[:, 0, :].add_(bias_correction)
 
-            # Apply non-linearity between SO2 layers (intermediate norms include Identity for last layer)
-            x_local = inter_norm(x_local)
-            x_local = non_linear(x_local)
+                x_local = inter_norm(x_local)
+                x_local = non_linear(x_local)
 
         # === Step 4. Rotate back to global frame ===
-        Dt_full = edge_cache.Dt_full
-        assert Dt_full is not None
-        Dt_from_m = project_Dt_from_m(
-            Dt_full=Dt_full,
-            coeff_index_m=self.coeff_index_m,
-            ebed_dim_full=self.ebed_dim_full,
-            cache=edge_cache.Dt_from_m_cache,
-            key_lmax=self.lmax,
-            key_mmax=self.mmax,
-        )
-        x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
+        with nvtx_range("SO2Conv/rotate_back"):
+            Dt_full = edge_cache.Dt_full
+            assert Dt_full is not None
+            Dt_from_m = project_Dt_from_m(
+                Dt_full=Dt_full,
+                coeff_index_m=self.coeff_index_m,
+                ebed_dim_full=self.ebed_dim_full,
+                cache=edge_cache.Dt_from_m_cache,
+                key_lmax=self.lmax,
+                key_mmax=self.mmax,
+            )
+            x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
 
         # === Step 5. Aggregate with optional head-wise gating ===
-        if self.n_atten_head == 0:
-            # Baseline path: fused envelope-weighted scatter add -> degree norm
-            # === Triton path (CUDA only, skip during JIT scripting) ===
-            # Custom backward/gradgrad keeps force training in Triton.
-            if not torch.jit.is_scripting() and self.use_triton and x_message.is_cuda:
-                out = so2_baseline_scatter_triton(
-                    x_message, edge_cache.edge_env, dst, x.shape[0]
-                )
-                out = out.to(dtype=self.dtype) * edge_cache.inv_sqrt_deg
+        with nvtx_range("SO2Conv/aggregate"):
+            if self.n_atten_head == 0:
+                # Baseline path: fused envelope-weighted scatter add -> degree norm
+                # Custom backward/gradgrad keeps force training in Triton.
+                if self.use_triton and x_message.is_cuda:
+                    out = so2_baseline_scatter_triton(
+                        x_message, edge_cache.edge_env, dst, x.shape[0]
+                    )
+                    out = out.to(dtype=self.dtype) * edge_cache.inv_sqrt_deg
+                else:
+                    x_message = x_message * edge_cache.edge_env.view(-1, 1, 1)
+                    out = x.new_zeros(x.shape)
+                    out.index_add_(0, dst, x_message)
+                    out = out * edge_cache.inv_sqrt_deg
             else:
-                x_message = x_message * edge_cache.edge_env.view(-1, 1, 1)
-                out = x.new_zeros(x.shape)
-                out.index_add_(0, dst, x_message)
-                out = out * edge_cache.inv_sqrt_deg
-        else:
-            assert self.head_dim is not None
-            assert self.proj_dst is not None
-            assert self.proj_rad is not None
-            assert self.proj_head is not None
-            assert self.norm_dst_for_gate is not None
-            assert self.norm_msg_for_gate is not None
-            assert self.norm_dst_for_head is not None
+                assert self.head_dim is not None
+                assert self.proj_dst is not None
+                assert self.proj_rad is not None
+                assert self.proj_head is not None
+                assert self.norm_dst_for_gate is not None
+                assert self.norm_msg_for_gate is not None
+                assert self.norm_dst_for_head is not None
 
-            # === Step 5.1. Extract scalar features for gating ===
-            x_l0 = x[:, 0, :]  # (N, C) in self.dtype
-            radial_l0 = radial_feat[:, 0, :]  # (E, C) in self.dtype
-            msg_l0 = x_message[:, 0, :]  # (E, C) message scalar
+                # === Step 5.1. Extract scalar features for gating ===
+                x_l0 = x[:, 0, :]  # (N, C) in self.dtype
+                radial_l0 = radial_feat[:, 0, :]  # (E, C) in self.dtype
+                msg_l0 = x_message[:, 0, :]  # (E, C) message scalar
 
-            # === Step 5.2. Compute edge gate (fp32+ logits path) ===
-            # Edge gate logits: dst scalar normalized, radial unchanged, msg scalar normalized with bounded feedback
-            compute_dtype = self.compute_dtype
-            dst_logits = self.proj_dst(self.norm_dst_for_gate(x_l0)).to(
-                dtype=compute_dtype
-            )  # (N, H) fp32
-            radial_logits = self.proj_rad(radial_l0).to(dtype=compute_dtype)  # (E, H)
-            msg_logits = self.proj_msg(self.norm_msg_for_gate(msg_l0)).to(
-                dtype=compute_dtype
-            )  # (E, H)
-            assert self.msg_gate_scale_raw is not None
-            msg_gate_scale = (
-                self.msg_gate_scale_max * torch.sigmoid(self.msg_gate_scale_raw)
-            ).view(1, -1)  # (1, H) fp32+
-            edge_logits = (
-                dst_logits.index_select(0, dst)
-                + radial_logits
-                + msg_gate_scale * msg_logits
-            )  # (E, H) fp32+
-            edge_gate = 2.0 * torch.sigmoid(edge_logits.clamp(-6.0, 6.0))
-            edge_weight = (
-                edge_cache.edge_env.view(-1, 1).to(dtype=compute_dtype) * edge_gate
-            )  # (E, H) in compute_dtype
+                # === Step 5.2. Compute edge gate (fp32+ logits path) ===
+                # Edge gate logits: dst scalar normalized, radial unchanged, msg scalar normalized with bounded feedback
+                compute_dtype = self.compute_dtype
+                dst_logits = self.proj_dst(self.norm_dst_for_gate(x_l0)).to(
+                    dtype=compute_dtype
+                )  # (N, H) fp32
+                radial_logits = self.proj_rad(radial_l0).to(
+                    dtype=compute_dtype
+                )  # (E, H)
+                msg_logits = self.proj_msg(self.norm_msg_for_gate(msg_l0)).to(
+                    dtype=compute_dtype
+                )  # (E, H)
+                assert self.msg_gate_scale_raw is not None
+                msg_gate_scale = (
+                    self.msg_gate_scale_max * torch.sigmoid(self.msg_gate_scale_raw)
+                ).view(1, -1)  # (1, H) fp32+
+                edge_logits = (
+                    dst_logits.index_select(0, dst)
+                    + radial_logits
+                    + msg_gate_scale * msg_logits
+                )  # (E, H) fp32+
+                edge_gate = 2.0 * torch.sigmoid(edge_logits.clamp(-6.0, 6.0))
+                edge_weight = (
+                    edge_cache.edge_env.view(-1, 1).to(dtype=compute_dtype) * edge_gate
+                )  # (E, H) in compute_dtype
 
-            # === Step 5.3. Head-wise scatter aggregation (fp32+ accumulation) ===
-            V = x_message.reshape(
-                x_message.shape[0], self.ebed_dim_full, self.n_atten_head, self.head_dim
-            )
-            # === Triton path (CUDA only, skip during JIT scripting) ===
-            # Custom backward/gradgrad keeps force training in Triton.
-            if not torch.jit.is_scripting() and self.use_triton and V.is_cuda:
-                out_heads = so2_head_scatter_triton(
-                    V.to(dtype=compute_dtype), edge_weight, dst, x.shape[0]
-                )
-            else:
-                msg = V.to(dtype=compute_dtype) * edge_weight.view(
-                    -1, 1, self.n_atten_head, 1
-                )
-                out_heads = torch.zeros(
-                    x.shape[0],
+                # === Step 5.3. Head-wise scatter aggregation (fp32+ accumulation) ===
+                V = x_message.reshape(
+                    x_message.shape[0],
                     self.ebed_dim_full,
                     self.n_atten_head,
                     self.head_dim,
-                    device=x.device,
-                    dtype=compute_dtype,
                 )
-                out_heads.index_add_(0, dst, msg)
+                # Custom backward/gradgrad keeps force training in Triton.
+                if self.use_triton and V.is_cuda:
+                    out_heads = so2_head_scatter_triton(
+                        V.to(dtype=compute_dtype), edge_weight, dst, x.shape[0]
+                    )
+                else:
+                    msg = V.to(dtype=compute_dtype) * edge_weight.view(
+                        -1, 1, self.n_atten_head, 1
+                    )
+                    out_heads = torch.zeros(
+                        x.shape[0],
+                        self.ebed_dim_full,
+                        self.n_atten_head,
+                        self.head_dim,
+                        device=x.device,
+                        dtype=compute_dtype,
+                    )
+                    out_heads.index_add_(0, dst, msg)
 
-            # === Step 5.4. Compute post-aggregate head gate (fp32+ logits path) ===
-            head_logits = self.proj_head(self.norm_dst_for_head(x_l0)).to(
-                dtype=compute_dtype
-            )  # (N, H)
-            head_gate = 2.0 * torch.sigmoid(head_logits.clamp(-6.0, 6.0))  # (N, H)
-            gamma_eff = 2.0 * torch.sigmoid(self.gamma_head_raw)  # (H,) compute_dtype
-            scale = head_gate * gamma_eff.view(1, -1)  # (N, H) compute_dtype
+                # === Step 5.4. Compute post-aggregate head gate (fp32+ logits path) ===
+                head_logits = self.proj_head(self.norm_dst_for_head(x_l0)).to(
+                    dtype=compute_dtype
+                )  # (N, H)
+                head_gate = 2.0 * torch.sigmoid(head_logits.clamp(-6.0, 6.0))  # (N, H)
+                gamma_eff = 2.0 * torch.sigmoid(self.gamma_head_raw)  # (H,)
+                scale = head_gate * gamma_eff.view(1, -1)  # (N, H) compute_dtype
 
-            # === Step 5.5. Apply head-wise scaling ===
-            out_heads = out_heads * scale.view(-1, 1, self.n_atten_head, 1)
+                # === Step 5.5. Apply head-wise scaling ===
+                out_heads = out_heads * scale.view(-1, 1, self.n_atten_head, 1)
 
-            # === Step 5.6. Apply degree normalization ===
-            out = out_heads.view(x.shape[0], self.ebed_dim_full, self.channels)
-            out = out * edge_cache.inv_sqrt_deg.to(dtype=compute_dtype)
-            out = out.to(dtype=self.dtype)
+                # === Step 5.6. Apply degree normalization ===
+                out = out_heads.view(x.shape[0], self.ebed_dim_full, self.channels)
+                out = out * edge_cache.inv_sqrt_deg.to(dtype=compute_dtype)
+                out = out.to(dtype=self.dtype)
 
         # === Step 6. Final channel mixing ===
-        out = self.so3_linear(out)  # (N, D, C)
+        with nvtx_range("SO2Conv/so3_linear"):
+            out = self.so3_linear(out)  # (N, D, C)
         return out
 
     def serialize(self) -> dict[str, Any]:
@@ -1646,6 +1637,7 @@ class SO2Convolution(nn.Module):
             "so2_norm": self.so2_norm,
             "so2_layers": self.so2_layers,
             "n_atten_head": self.n_atten_head,
+            "use_triton": self.use_triton,
             "eps": self.eps,
             "so2_linears": [net.serialize() for net in self.so2_linears],
             "non_linearities": (
@@ -2059,21 +2051,25 @@ class SeZMInteractionBlock(nn.Module):
         x_res = x
 
         # === Step 1. Pre-Norm ===
-        x = self.pre_so2_norm(x)
+        with nvtx_range("SeZMBlock/pre_norm"):
+            x = self.pre_so2_norm(x)
 
         # === Step 2. SO(2) convolution ===
-        if edge_cache.src.numel() > 0 and radial_feat is not None:
-            x = self.so2_conv(x, edge_cache, radial_feat)
+        with nvtx_range("SeZMBlock/so2_conv"):
+            if edge_cache.src.numel() > 0 and radial_feat is not None:
+                x = self.so2_conv(x, edge_cache, radial_feat)
 
         # === Step 2.5 Residual connection ===
         x = x + x_res
         x_res = x
 
         # === Step 3. Pre-Norm ===
-        x = self.pre_ffn_norm(x)
+        with nvtx_range("SeZMBlock/pre_ffn_norm"):
+            x = self.pre_ffn_norm(x)
 
         # === Step 4. Nodewise Feed-Forward ===
-        x = self.ffn(x)
+        with nvtx_range("SeZMBlock/ffn"):
+            x = self.ffn(x)
 
         # === Step 4.5 Residual connection ===
         x = x + x_res
@@ -2091,6 +2087,7 @@ class SeZMInteractionBlock(nn.Module):
             "n_atten_head": self.n_atten_head,
             "ffn_neurons": self.ffn_neurons,
             "activation_function": self.activation_function,
+            "use_triton": self.use_triton,
             "eps": self.eps,
             "precision": RESERVED_PRECISION_DICT[self.dtype],
             "pre_so2_norm": self.pre_so2_norm.serialize(),
