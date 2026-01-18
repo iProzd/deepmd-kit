@@ -69,6 +69,9 @@ from .polar_model import (
 from .property_model import (
     PropertyModel,
 )
+from .sezm_net_model import (
+    SeZMNetModel,
+)
 from .spin_model import (
     SpinEnergyModel,
     SpinModel,
@@ -288,6 +291,35 @@ def get_standard_model(model_params: dict) -> BaseModel:
     return model
 
 
+def get_sezm_net_model(model_params: dict) -> BaseModel:
+    model_params_old = model_params
+    model_params = copy.deepcopy(model_params)
+    model_params.setdefault("descriptor", {})
+    model_params.setdefault("fitting_net", {})
+    model_params["fitting_net"]["type"] = "ener"
+    ntypes = len(model_params["type_map"])
+    descriptor, fitting, _ = _get_standard_model_components(model_params, ntypes)
+    atom_exclude_types = model_params.get("atom_exclude_types", [])
+    pair_exclude_types = model_params.get("pair_exclude_types", [])
+    preset_out_bias = model_params.get("preset_out_bias")
+    preset_out_bias = _convert_preset_out_bias_to_array(
+        preset_out_bias, model_params["type_map"]
+    )
+    data_stat_protect = model_params.get("data_stat_protect", 1e-2)
+
+    model = SeZMNetModel(
+        descriptor=descriptor,
+        fitting=fitting,
+        type_map=model_params["type_map"],
+        atom_exclude_types=atom_exclude_types,
+        pair_exclude_types=pair_exclude_types,
+        preset_out_bias=preset_out_bias,
+        data_stat_protect=data_stat_protect,
+    )
+    model.model_def_script = json.dumps(model_params_old)
+    return model
+
+
 def get_model(model_params: dict) -> Any:
     model_type = model_params.get("type", "standard")
     if model_type == "standard":
@@ -299,6 +331,8 @@ def get_model(model_params: dict) -> Any:
             return get_standard_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
+    elif model_type == "SeZM-Net":
+        return get_sezm_net_model(model_params)
     else:
         return BaseModel.get_class_by_type(model_type).get_model(model_params)
 
@@ -313,6 +347,7 @@ __all__ = [
     "FrozenModel",
     "LinearEnergyModel",
     "PolarModel",
+    "SeZMNetModel",
     "SpinEnergyModel",
     "SpinModel",
     "get_model",

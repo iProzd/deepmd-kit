@@ -1,7 +1,7 @@
 # Input for SeZM-Net: Smooth equivariant ZBL Message-passing Network (PyTorch)
 
 This directory stores a minimal configuration for training SeZM-Net
-(`type: se_zm_net`) on the water example dataset.
+(`model.type: SeZM-Net`, `descriptor.type: SeZM`) on the water example dataset.
 
 Run:
 

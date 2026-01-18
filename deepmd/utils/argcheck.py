@@ -53,7 +53,7 @@ doc_se_atten = "Used by the smooth edition of Deep Potential. The full relative 
 doc_se_atten_v2 = "Used by the smooth edition of Deep Potential. The full relative coordinates are used to construct the descriptor. Attention mechanism with new modifications will be used by this descriptor."
 doc_se_a_mask = "Used by the smooth edition of Deep Potential. It can accept a variable number of atoms in a frame (Non-PBC system). *aparam* are required as an indicator matrix for the real/virtual sign of input atoms."
 doc_hybrid = "Concatenate of a list of descriptors as a new descriptor."
-doc_se_zm_net = "SeZM-Net: Smooth equivariant ZBL Message-passing Network."
+doc_se_zm = "SeZM descriptor: Smooth equivariant ZBL Message-passing Network."
 # fitting
 doc_ener = "Fit an energy model (potential energy surface)."
 doc_dos = "Fit a density of states model. The total density of states / site-projected density of states labels should be provided by `dos.npy` or `atom_dos.npy` in each data system. The file has a number of frames (rows) and a number of energy-grid columns (multiplied by the number of atoms in `atom_dos.npy`). See `loss` parameter."
@@ -342,9 +342,11 @@ def descrpt_se_a_args() -> list[Argument]:
 
 
 @descrpt_args_plugin.register(
-    "se_zm_net", alias=["se_zm"], doc=doc_only_pt_supported + doc_se_zm_net
+    "SeZM",
+    alias=["se_zm"],
+    doc=doc_only_pt_supported + doc_se_zm,
 )
-def descrpt_se_zm_net_args() -> list[Argument]:
+def descrpt_se_zm_args() -> list[Argument]:
     doc_sel = 'The maximum number of neighbors. It can be:\n\n\
     - `int`: the total maximum number of neighbors within `rcut` (all types combined)\n\n\
     - `list[int]`: sel[i] specifies the maximum number of type-i neighbors within `rcut`\n\n\
@@ -439,13 +441,13 @@ def descrpt_se_zm_net_args() -> list[Argument]:
             + "type_dim=min(16, max(8, env_seed_embed_dim//2)), hidden_dim=min(64, max(32, 2*env_seed_embed_dim)).",
         ),
         Argument(
-            "env_film_scale_delta",
+            "env_seed_scale_delta",
             float,
             optional=True,
             default=0.5,
             doc=doc_only_pt_supported
             + "Symmetric FiLM scale delta around 1 for env_seed. The scale is "
-            + "`1 + env_film_scale_delta * (2*sigmoid(scale_logits) - 1)` with "
+            + "`1 + env_seed_scale_delta * (2*sigmoid(scale_logits) - 1)` with "
             + "logits zero-initialized (identity at init).",
         ),
         Argument(
@@ -2575,6 +2577,60 @@ def standard_model_args() -> Argument:
             ),
         ],
         doc="Standard model, which contains a descriptor and a fitting.",
+    )
+    return ca
+
+
+@model_args_plugin.register(
+    "SeZM-Net",
+    alias=["se_zm_net", "se_zm-net", "sezm-net"],
+)
+def sezm_net_model_args() -> Argument:
+    doc_descrpt = (
+        "The descriptor of atomic environment. User-provided (SeZM is recommended)."
+    )
+    doc_fitting = "The fitting of physical properties. Forced to ener."
+    doc_model_branch_alias = (
+        "List of aliases for this model branch. "
+        "Multiple aliases can be defined, and any alias can reference this branch throughout the model usage. "
+        "Used only in multitask models."
+    )
+    doc_info = (
+        "Dictionary of metadata for this model branch. "
+        "Store arbitrary key-value pairs with branch-specific information. "
+        "Used only in multitask models."
+    )
+
+    ca = Argument(
+        "SeZM-Net",
+        dict,
+        [
+            Argument(
+                "descriptor", dict, [], [descrpt_variant_type_args()], doc=doc_descrpt
+            ),
+            Argument(
+                "fitting_net",
+                dict,
+                [],
+                [fitting_variant_type_args()],
+                doc=doc_fitting,
+            ),
+            Argument(
+                "model_branch_alias",
+                list[str],
+                optional=True,
+                default=[],
+                doc=doc_only_pt_supported + doc_model_branch_alias,
+            ),
+            Argument(
+                "info",
+                dict,
+                optional=True,
+                default={},
+                doc=doc_only_pt_supported + doc_info,
+            ),
+        ],
+        doc="SeZM-Net model scaffold with fixed descriptor and fitting types.",
     )
     return ca
 

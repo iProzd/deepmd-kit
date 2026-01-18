@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """
-SeZM-Net: Smooth equivariant ZBL Message-passing Network descriptor for DeePMD-kit
+SeZM: Smooth equivariant ZBL Message-passing Network descriptor for DeePMD-kit
 (PyTorch backend).
 
 This implementation is designed around two non-negotiables:
@@ -1032,11 +1032,10 @@ class EnvironmentInitialEmbedding(nn.Module):
         return obj
 
 
-@BaseDescriptor.register("se_zm_net")
-@BaseDescriptor.register("se_zm")
+@BaseDescriptor.register("SeZM")
 class DescrptSeZMNet(BaseDescriptor, nn.Module):
     """
-    SeZM-Net: Smooth equivariant ZBL Message-passing Network descriptor for DeePMD-kit.
+    SeZM: Smooth equivariant ZBL Message-passing Network descriptor for DeePMD-kit.
 
     Parameters
     ----------
@@ -1082,10 +1081,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     env_seed_norm
         Normalization mode for env_agg aggregation: `"deg"` (1/degree) or
         `"sqrt_deg"` (1/sqrt(degree)).
-    env_film_scale_delta
+    env_seed_scale_delta
         Symmetric FiLM scale delta around 1. The scale is computed as
-        `1 + env_film_scale_delta * (2 * sigmoid(scale_logits) - 1)`, yielding
-        `(1 - env_film_scale_delta, 1 + env_film_scale_delta)`. With zero-initialized
+        `1 + env_seed_scale_delta * (2 * sigmoid(scale_logits) - 1)`, yielding
+        `(1 - env_seed_scale_delta, 1 + env_seed_scale_delta)`. With zero-initialized
         logits, the initial scale is 1.0.
     so2_norm
         If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
@@ -1127,7 +1126,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
     Notes
     -----
-    SeZM-Net does not use the traditional environment matrix (r, a_x, a_y, a_z).
+    SeZM does not use the traditional environment matrix (r, a_x, a_y, a_z).
     Instead, it uses radial basis functions and spherical harmonics directly.
     The mean/stddev statistics are kept for interface compatibility but are not
     actively used in the forward pass.
@@ -1151,7 +1150,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         use_env_seed: bool = False,
         env_seed_embed_dim: int = 64,
         env_seed_norm: str = "sqrt_deg",
-        env_film_scale_delta: float = 0.5,
+        env_seed_scale_delta: float = 0.5,
         so2_norm: bool = False,
         so2_layers: int = 2,
         ffn_neurons: int = 128,
@@ -1220,9 +1219,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.env_seed_type_dim = min(16, max(8, self.env_seed_embed_dim // 2))
         self.env_seed_hidden_dim = min(64, max(32, 2 * self.env_seed_embed_dim))
         self.env_seed_norm = str(env_seed_norm)
-        self.env_film_scale_delta = float(env_film_scale_delta)
-        if self.env_film_scale_delta < 0.0:
-            raise ValueError("env_film_scale_delta must be non-negative")
+        self.env_seed_scale_delta = float(env_seed_scale_delta)
+        if self.env_seed_scale_delta < 0.0:
+            raise ValueError("env_seed_scale_delta must be non-negative")
 
         # === Step 0. Split deterministic seeds at the descriptor top-level ===
         seed_type_embedding = child_seed(self.seed, 0)
@@ -1456,7 +1455,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                 )
                 scale_logits, shift = film.chunk(2, dim=-1)
-                scale = 1.0 + self.env_film_scale_delta * (
+                scale = 1.0 + self.env_seed_scale_delta * (
                     2.0 * torch.sigmoid(scale_logits) - 1.0
                 )
                 x0 = x[:, 0, :].clone()
@@ -1904,7 +1903,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         1. assumes total number of atoms of each atom type aligned across frames;
         2. requires a neighbor list that distinguishes different atomic types.
 
-        SeZM-Net uses TypeEmbedNet for type handling, so it does not require
+        SeZM uses TypeEmbedNet for type handling, so it does not require
         a type-distinguished neighbor list.
         """
         return True
@@ -1929,7 +1928,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     def share_params(
         self, base_class: Any, shared_level: int, resume: bool = False
     ) -> None:
-        raise NotImplementedError("share_params is not supported for se_zm_net")
+        raise NotImplementedError("share_params is not supported for SeZM")
 
     def enable_compression(
         self,
@@ -1954,12 +1953,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         check_frequency
             The overflow check frequency
         """
-        raise NotImplementedError("Compression is unsupported for se_zm_net.")
+        raise NotImplementedError("Compression is unsupported for SeZM.")
 
     def change_type_map(
         self, type_map: list[str], model_with_new_type_stat: Any | None = None
     ) -> None:
-        raise NotImplementedError("change_type_map is not supported for se_zm_net")
+        raise NotImplementedError("change_type_map is not supported for SeZM")
 
     def reinit_exclude(
         self, exclude_types: list[tuple[int, int]] | None = None
@@ -1972,7 +1971,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     # =========================================================================
     # Statistics interface (interface compatibility only)
     # -------------------------------------------------------------------------
-    # SeZM-Net uses SeparableRMSNorm inside blocks for feature normalization,
+    # SeZM uses SeparableRMSNorm inside blocks for feature normalization,
     # so mean/stddev are NOT used in forward(). These methods are kept for:
     #   1. Interface compatibility with BaseDescriptor
     #   2. Consistent serialization format (davg/dstd in checkpoint)
@@ -1997,7 +1996,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         """
         Compute statistics (interface compatibility, not used in forward).
 
-        SeZM-Net uses learnable SeparableRMSNorm for normalization, so these
+        SeZM uses learnable SeparableRMSNorm for normalization, so these
         statistics do not affect the forward pass. This is a no-op that keeps
         mean/stddev at their initialized values (zero/one) for interface consistency.
         """
@@ -2008,7 +2007,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     def serialize(self) -> dict[str, Any]:
         return {
             "@class": "Descriptor",
-            "type": "se_zm_net",
+            "type": "SeZM",
             "@version": 1,
             "rcut": self.rcut,
             "sel": self.sel,
@@ -2032,7 +2031,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "use_env_seed": self.use_env_seed,
             "env_seed_embed_dim": self.env_seed_embed_dim,
             "env_seed_norm": self.env_seed_norm,
-            "env_film_scale_delta": self.env_film_scale_delta,
+            "env_seed_scale_delta": self.env_seed_scale_delta,
             "trainable": self.trainable,
             "seed": self.seed,
             "type_embedding": self.type_embedding.embedding.serialize(),
@@ -2060,11 +2059,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         if data_cls != "Descriptor":
             raise ValueError(f"Invalid class for DescrptSeZMNet: {data_cls}")
         type_val = data.pop("type")
-        if type_val != "se_zm_net":
+        if type_val != "SeZM":
             raise ValueError(f"Invalid type for DescrptSeZMNet: {type_val}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported se_zm_net version: {version}")
+            raise ValueError(f"Unsupported SeZM version: {version}")
 
         stats = data.pop("@variables")
         data.pop("env_mat")

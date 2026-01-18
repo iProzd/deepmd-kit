@@ -1,10 +1,11 @@
 # SeZM-Net: Smooth equivariant ZBL Message-passing Network
 
-SeZM-Net is a small-`l` equivariant message passing descriptor designed for molecular dynamics (MD) workloads where **inference speed** and **physical correctness** (conservative forces + smooth PES) dominate.
+SeZM is a small-`l` equivariant message passing descriptor designed for molecular dynamics (MD) workloads where **inference speed** and **physical correctness** (conservative forces + smooth PES) dominate.
+SeZM-Net is the model branch built on top of the SeZM descriptor.
 
-This document is the **final spec** for the `se_zm_net` PyTorch descriptor implemented in:
+This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_zm`) implemented in:
 
-- `deepmd/pt/model/descriptor/se_zm_net.py`
+- `deepmd/pt/model/descriptor/se_zm.py`
 - `deepmd/pt/model/descriptor/se_zm_block.py`
 
 ---
@@ -12,7 +13,7 @@ This document is the **final spec** for the `se_zm_net` PyTorch descriptor imple
 ## Goals (Non-Negotiable)
 
 1. **Conservative forces**
-   - SeZM-Net outputs features meant for an energy model; forces must come from `autograd` of energy w.r.t. coordinates.
+   - SeZM outputs features meant for an energy model; forces must come from `autograd` of energy w.r.t. coordinates.
    - Geometry / rotations are fully differentiable; **no `.detach()`** in edge rotations.
 
 2. **Smooth cutoff**
@@ -35,6 +36,16 @@ This document is the **final spec** for the `se_zm_net` PyTorch descriptor imple
 - ZBL gating / short-range repulsion: only a **clean placeholder hook** is provided.
 - Top-K neighbor selection: **not allowed**. Use `rcut` and masks only.
 - External equivariant libraries (e.g. e3nn): **not allowed**.
+
+---
+
+## Model Integration (PyTorch)
+
+- Set `model.type = "SeZM-Net"` (aliases: `"se_zm_net"`, `"se_zm-net"`, `"sezm-net"`) to select the SeZM-Net model scaffold. Aliases are resolved during configuration validation.
+- `loss.type` still follows the fitting target (e.g., `"ener"`).
+- The current scaffold reuses the standard energy model path and DeePMD-kit neighbor list builder, but isolates the entry point for future replacement.
+- Internally it is built as `make_model(SeZMNetAtomicModel)` and currently mirrors the Energy atomic model behavior.
+- `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is forced to `ener` for this model branch.
 
 ---
 
@@ -181,7 +192,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 5. **Output projection to FiLM deltas**:
    - Flatten D to `(N, embed_dim * axis_dim)` and project to `(N, 2*channels)`
    - Split to `(scale_logits, shift)` and apply FiLM on `l=0`:
-     `scale = 1 + env_film_scale_delta * (2 * sigmoid(scale_logits) - 1)`
+     `scale = 1 + env_seed_scale_delta * (2 * sigmoid(scale_logits) - 1)`
      `x0 = x0 * scale + shift`
    - Output projection is zero-initialized → `scale_logits=0`, `shift=0` at init
 
@@ -190,7 +201,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 - Uses **global frame** direction (not edge-aligned local frame) to preserve angular information
 - Neighbor count normalization uses actual degree, not `inv_sqrt_deg` from edge cache
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
-- **Identity start** is guaranteed for any `env_film_scale_delta` with zero-initialized logits
+- **Identity start** is guaranteed for any `env_seed_scale_delta` with zero-initialized logits
 
 ### 10. Runtime acceleration flags and serialization
 
@@ -360,7 +371,7 @@ Components:
 
 ## Pyramid `l_schedule`
 
-SeZM-Net supports:
+SeZM supports:
 
 1. constant `lmax` (default): `l_schedule = [lmax] * n_blocks`
 2. explicit pyramid: `l_schedule = [2, 2, 1, 0]` (example)
@@ -376,7 +387,7 @@ Rules:
 
 ## Pyramid `m_schedule`
 
-SeZM-Net supports:
+SeZM supports:
 
 1. constant `mmax` (default None): if `mmax is None`, `m_schedule[i] = l_schedule[i]`, otherwise `m_schedule[i] = min(mmax, l_schedule[i])`
 2. explicit pyramid: `m_schedule = [2, 2, 1, 0]` (example)
@@ -425,16 +436,16 @@ Key arguments:
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation (default: False)
 - `env_seed_embed_dim: int` — Output dimension of the G network in environment initial embedding. Other dimensions are derived: `axis_dim = min(8, max(4, env_seed_embed_dim//2))`, `type_dim = min(16, max(8, env_seed_embed_dim//2))`, `hidden_dim = min(64, max(32, 2*env_seed_embed_dim))` (default: 64)
 - `env_seed_norm: str` — Normalization mode for env_agg aggregation: "deg" (1/degree) or "sqrt_deg" (1/sqrt(degree)) (default: "sqrt_deg")
-- `env_film_scale_delta: float` — Symmetric FiLM scale delta around 1 for env_seed. The scale is `1 + env_film_scale_delta * (2*sigmoid(scale_logits) - 1)` (default: 0.5)
+- `env_seed_scale_delta: float` — Symmetric FiLM scale delta around 1 for env_seed. The scale is `1 + env_seed_scale_delta * (2*sigmoid(scale_logits) - 1)` (default: 0.5)
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 
 ### Interface Compatibility Notes
 
-SeZM-Net uses `_ENV_DIM = 1` (se_r style) for `EnvMatStatSe` compatibility. This means:
+SeZM uses `_ENV_DIM = 1` (se_r style) for `EnvMatStatSe` compatibility. This means:
 
 - `ndescrpt = nnei * 1` (only radial statistics are collected)
-- `mean` and `stddev` statistics are maintained but not used in the forward pass (SeZM-Net uses radial basis functions directly instead of traditional env_mat)
+- `mean` and `stddev` statistics are maintained but not used in the forward pass (SeZM uses radial basis functions directly instead of traditional env_mat)
 
 Output:
 
@@ -497,7 +508,7 @@ This double-guarantee ensures:
 
 ### Wigner-D blocks (real SH basis)
 
-SeZM-Net uses real-basis Wigner-D blocks to rotate per-degree features between the global frame
+SeZM uses real-basis Wigner-D blocks to rotate per-degree features between the global frame
 and the edge-aligned local frame. The block-diagonal matrices are computed by
 `WignerDCalculator` in `deepmd/pt/model/descriptor/se_zm_helper.py`.
 
@@ -563,7 +574,7 @@ What is cached / reused:
 
 ## DeePMD Interface Compatibility
 
-SeZM-Net follows the **new-style descriptor interface** (same as `dpa3`), using `extended_coord` / `extended_atype` parameter names (instead of `coord_ext` / `atype_ext` used by older descriptors like `se_a` and `se_r`).
+SeZM follows the **new-style descriptor interface** (same as `dpa3`), using `extended_coord` / `extended_atype` parameter names (instead of `coord_ext` / `atype_ext` used by older descriptors like `se_a` and `se_r`).
 
 - Implements the required `BaseDescriptor` interface (forward, stats accessors, (de)serialization, neighbor info, exclusion updates).
 - `_ENV_DIM = 1` for `EnvMatStatSe` compatibility; statistics are stored but not used in forward.

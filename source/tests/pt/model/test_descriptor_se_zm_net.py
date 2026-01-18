@@ -12,6 +12,10 @@ if torch_set_num_interop_threads is not None:
 if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
+from deepmd.pt.model.descriptor.se_zm import (
+    DescrptSeZMNet,
+    init_edge_rot_mat_frisvad,
+)
 from deepmd.pt.model.descriptor.se_zm_block import (
     SO2Convolution,
     SO2Linear,
@@ -22,10 +26,6 @@ from deepmd.pt.model.descriptor.se_zm_helper import (
     build_m_major_index,
     edge_cache_to_dtype,
     so3_packed_index,
-)
-from deepmd.pt.model.descriptor.se_zm_net import (
-    DescrptSeZMNet,
-    init_edge_rot_mat_frisvad,
 )
 from deepmd.pt.utils import (
     env,
@@ -258,7 +258,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
 
             # Compare parameters
             for (n1, p1), (n2, p2) in zip(
-                model1.named_parameters(), model2.named_parameters()
+                model1.named_parameters(), model2.named_parameters(), strict=False
             ):
                 self.assertEqual(n1, n2, msg="Parameter name mismatch")
                 if dtype == torch.float64:
@@ -1102,7 +1102,7 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             x_local_red = x_local_red * rad_feat_red
 
             for layer_idx, (so2_linear, non_linear) in enumerate(
-                zip(so2_conv.so2_linears, so2_conv.non_linearities)
+                zip(so2_conv.so2_linears, so2_conv.non_linearities, strict=False)
             ):
                 x_local_red = so2_linear(x_local_red)
                 if layer_idx == 0:
@@ -1173,7 +1173,7 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 precision=prec,
                 use_env_seed=True,
                 env_seed_embed_dim=16,
-                env_film_scale_delta=0.3,
+                env_seed_scale_delta=0.3,
                 trainable=True,
             )
             self.assertTrue(model.use_env_seed)
