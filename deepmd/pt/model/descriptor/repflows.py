@@ -283,6 +283,13 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.update_style = update_style
         self.update_residual = update_residual
         self.update_residual_init = update_residual_init
+        if self.update_style.startswith("mHC"):
+            assert self.use_dynamic_sel, "mHC style update must use dynamic selection!"
+            self.use_mhc = True
+            self.n_stream = int(self.update_style.split(":")[-1])
+        else:
+            self.use_mhc = False
+            self.n_stream = 1
         self.act = ActivationFn(activation_function)
         self.prec = PRECISION_DICT[precision]
 
@@ -604,11 +611,33 @@ class DescrptBlockRepflows(DescriptorBlock):
         # nf x nloc x a_nnei x a_nnei x a_dim [OR] n_angle x a_dim
         angle_ebd = self.angle_embd(angle_input)
 
+        if self.use_mhc:
+            node_ebd = (
+                node_ebd.unsqueeze(2)
+                .expand(-1, -1, int(self.n_stream), -1)
+                .contiguous()
+                .view(nframes, nloc, self.n_stream * self.n_dim)
+            )
+            edge_ebd = (
+                edge_ebd.unsqueeze(1)
+                .expand(-1, int(self.n_stream), -1)
+                .contiguous()
+                .view(-1, self.n_stream * self.e_dim)
+            )
+            angle_ebd = (
+                angle_ebd.unsqueeze(1)
+                .expand(-1, int(self.n_stream), -1)
+                .contiguous()
+                .view(-1, self.n_stream * self.a_dim)
+            )
+
         # nb x nall x n_dim
         if not parallel_mode:
             assert mapping is not None
             mapping = (
-                mapping.view(nframes, nall).unsqueeze(-1).expand(-1, -1, self.n_dim)
+                mapping.view(nframes, nall)
+                .unsqueeze(-1)
+                .expand(-1, -1, self.n_stream * self.n_dim)
             )
         for idx, ll in enumerate(self.layers):
             # node_ebd:     nb x nloc x n_dim
@@ -693,6 +722,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                 angle_index=angle_index,
             )
 
+        node_ebd = node_ebd.view(nframes, nloc, self.n_stream, self.n_dim).mean(-2)
+        edge_ebd = edge_ebd.view(-1, self.n_stream, self.e_dim).mean(-2)
         # nb x nloc x 3 x e_dim
         h2g2 = (
             RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)

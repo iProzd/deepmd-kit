@@ -165,8 +165,8 @@ class DeepEval(DeepEvalBackend):
                         ] = state_dict[item].clone()
                 state_dict = state_dict_head
             model = get_model(self.input_param).to(DEVICE)
-            if not self.input_param.get("hessian_mode") and not no_jit:
-                model = torch.jit.script(model)
+            # if not self.input_param.get("hessian_mode") and not no_jit:
+            #     model = torch.jit.script(model)
             self.dp = ModelWrapper(model)
             try:
                 self.dp.load_state_dict(state_dict)

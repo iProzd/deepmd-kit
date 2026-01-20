@@ -16,6 +16,9 @@ from deepmd.pt.model.descriptor.repformer_layer import (
     _make_nei_g1,
     get_residual,
 )
+from deepmd.pt.model.network.mHC import (
+    MHCCoefficients,
+)
 from deepmd.pt.model.network.mlp import (
     GatedMLP,
     MLPLayer,
@@ -122,6 +125,9 @@ class RepFlowLayer(torch.nn.Module):
 
         self.use_node_self = use_node_self
         self.use_node_sym = use_node_sym
+        self.numb_n_res = 0
+        self.numb_e_res = 0
+        self.numb_a_res = 0
 
         assert update_residual_init in [
             "norm",
@@ -143,6 +149,7 @@ class RepFlowLayer(torch.nn.Module):
             seed=child_seed(seed, 0),
             trainable=trainable,
         )
+        self.numb_n_res += 1 if self.use_node_self else 0
         if self.use_node_self and self.update_style == "res_residual":
             self.n_residual.append(
                 get_residual(
@@ -164,6 +171,7 @@ class RepFlowLayer(torch.nn.Module):
             seed=child_seed(seed, 2),
             trainable=trainable,
         )
+        self.numb_n_res += 1 if self.use_node_sym else 0
         if self.use_node_sym and self.update_style == "res_residual":
             self.n_residual.append(
                 get_residual(
@@ -194,6 +202,7 @@ class RepFlowLayer(torch.nn.Module):
                 precision=precision,
                 seed=child_seed(seed, 4),
             )
+        self.numb_n_res += 1 * self.n_multi_edge_message
         if self.update_style == "res_residual":
             for head_index in range(self.n_multi_edge_message):
                 self.n_residual.append(
@@ -215,6 +224,7 @@ class RepFlowLayer(torch.nn.Module):
             seed=child_seed(seed, 6),
             trainable=trainable,
         )
+        self.numb_e_res += 1
         if self.update_style == "res_residual":
             self.e_residual.append(
                 get_residual(
@@ -302,6 +312,7 @@ class RepFlowLayer(torch.nn.Module):
                 seed=child_seed(seed, 11),
                 trainable=trainable,
             )
+            self.numb_e_res += 1
             if self.update_style == "res_residual":
                 self.e_residual.append(
                     get_residual(
@@ -322,6 +333,7 @@ class RepFlowLayer(torch.nn.Module):
                 seed=child_seed(seed, 13),
                 trainable=trainable,
             )
+            self.numb_a_res += 1
             if self.update_style == "res_residual":
                 self.a_residual.append(
                     get_residual(
@@ -340,6 +352,41 @@ class RepFlowLayer(torch.nn.Module):
             self.a_compress_n_linear = None
             self.a_compress_e_linear = None
             self.angle_dim = 0
+
+        if self.update_style.startswith("mHC"):
+            assert self.use_dynamic_sel, "mHC style update must use dynamic selection!"
+            self.use_mhc = True
+            self.n_stream = int(self.update_style.split(":")[-1])
+            self.n_mhc_coeff = MHCCoefficients(
+                self.n_dim,
+                n_streams=self.n_stream,
+                num_res=self.numb_n_res,
+                precision=precision,
+                trainable=trainable,
+                seed=child_seed(seed, 100),
+            )
+            self.e_mhc_coeff = MHCCoefficients(
+                self.e_dim,
+                n_streams=self.n_stream,
+                num_res=self.numb_e_res,
+                precision=precision,
+                trainable=trainable,
+                seed=child_seed(seed, 200),
+            )
+            self.a_mhc_coeff = MHCCoefficients(
+                self.a_dim,
+                n_streams=self.n_stream,
+                num_res=self.numb_a_res,
+                precision=precision,
+                trainable=trainable,
+                seed=child_seed(seed, 300),
+            )
+        else:
+            self.use_mhc = False
+            self.n_stream = 1
+            self.n_mhc_coeff = None
+            self.e_mhc_coeff = None
+            self.a_mhc_coeff = None
 
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
@@ -805,8 +852,6 @@ class RepFlowLayer(torch.nn.Module):
         """
         nb, nloc, nnei = nlist.shape
         nall = node_ebd_ext.shape[1]
-        node_ebd = node_ebd_ext[:, :nloc, :]
-        assert (nb, nloc) == node_ebd.shape[:2]
         if not self.use_dynamic_sel:
             assert (nb, nloc, nnei, 3) == h2.shape
             n_edge = None
@@ -823,6 +868,50 @@ class RepFlowLayer(torch.nn.Module):
             angle_index[2],
         )
 
+        if self.use_mhc:
+            assert self.n_mhc_coeff is not None
+            assert self.e_mhc_coeff is not None
+            assert self.a_mhc_coeff is not None
+            # nb x nall x n_stream, nb x nall x k x n_stream, nb x nall x n_stream x n_stream
+            n_H_pre, n_H_post, n_H_res = self.n_mhc_coeff(node_ebd_ext)
+            # nedge x n_stream, nedge x k x n_stream, nedge x n_stream x n_stream
+            e_H_pre, e_H_post, e_H_res = self.e_mhc_coeff(edge_ebd)
+            # nangle x n_stream, nangle x k x n_stream, nangle x n_stream x n_stream
+            a_H_pre, a_H_post, a_H_res = self.a_mhc_coeff(angle_ebd)
+            node_ebd_ext_reshape = node_ebd_ext.view(
+                nb, nall, self.n_stream, self.n_dim
+            )
+            edge_ebd_reshape = edge_ebd.view(-1, self.n_stream, self.e_dim)
+            angle_ebd_reshape = angle_ebd.view(-1, self.n_stream, self.a_dim)
+            # update list
+            n_update_list: list[torch.Tensor] = [
+                torch.matmul(
+                    n_H_res[:, :nloc, :, :], node_ebd_ext_reshape[:, :nloc, :, :]
+                )
+            ]
+            e_update_list: list[torch.Tensor] = [
+                torch.matmul(e_H_res, edge_ebd_reshape)
+            ]
+            a_update_list: list[torch.Tensor] = [
+                torch.matmul(a_H_res, angle_ebd_reshape)
+            ]
+            node_ebd_ext = (node_ebd_ext_reshape * n_H_pre.unsqueeze(-1)).sum(-2)
+            node_ebd = node_ebd_ext[:, :nloc, :]
+            assert (nb, nloc) == node_ebd.shape[:2]
+            n_H_post = n_H_post[:, :nloc, :, :]
+            edge_ebd = (edge_ebd_reshape * e_H_pre.unsqueeze(-1)).sum(-2)
+            angle_ebd = (angle_ebd_reshape * a_H_pre.unsqueeze(-1)).sum(-2)
+        else:
+            node_ebd = node_ebd_ext[:, :nloc, :]
+            assert (nb, nloc) == node_ebd.shape[:2]
+            # update list
+            n_update_list: list[torch.Tensor] = [node_ebd]
+            e_update_list: list[torch.Tensor] = [edge_ebd]
+            a_update_list: list[torch.Tensor] = [angle_ebd]
+            n_H_post = None
+            e_H_post = None
+            a_H_post = None
+
         # nb x nloc x nnei x n_dim [OR] n_edge x n_dim
         nei_node_ebd = (
             _make_nei_g1(node_ebd_ext, nlist)
@@ -831,10 +920,6 @@ class RepFlowLayer(torch.nn.Module):
                 node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
             )
         )
-
-        n_update_list: list[torch.Tensor] = [node_ebd]
-        e_update_list: list[torch.Tensor] = [edge_ebd]
-        a_update_list: list[torch.Tensor] = [angle_ebd]
 
         # node self mlp
         if self.use_node_self:
@@ -968,7 +1053,7 @@ class RepFlowLayer(torch.nn.Module):
         else:
             n_update_list.append(node_edge_update)
         # update node_ebd
-        n_updated = self.list_update(n_update_list, "node")
+        n_updated = self.list_update(n_update_list, "node", n_H_post)
 
         # edge self message
         if not self.optim_update:
@@ -1150,7 +1235,7 @@ class RepFlowLayer(torch.nn.Module):
                 self.act(self.edge_angle_linear2(padding_edge_angle_update))
             )
             # update edge_ebd
-            e_updated = self.list_update(e_update_list, "edge")
+            e_updated = self.list_update(e_update_list, "edge", e_H_post)
 
             # angle self message
             # nb x nloc x a_nnei x a_nnei x dim_a
@@ -1179,10 +1264,10 @@ class RepFlowLayer(torch.nn.Module):
             a_update_list.append(angle_self_update)
         else:
             # update edge_ebd
-            e_updated = self.list_update(e_update_list, "edge")
+            e_updated = self.list_update(e_update_list, "edge", e_H_post)
 
         # update angle_ebd
-        a_updated = self.list_update(a_update_list, "angle")
+        a_updated = self.list_update(a_update_list, "angle", a_H_post)
         if self.update_use_layernorm:
             assert self.node_layernorm is not None
             n_updated = self.node_layernorm(n_updated)
@@ -1234,13 +1319,38 @@ class RepFlowLayer(torch.nn.Module):
         return uu
 
     @torch.jit.export
+    def list_update_mHc(
+        self,
+        update_list: list[torch.Tensor],
+        post_res_tensor: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        # .. x k x n
+        assert post_res_tensor is not None
+        # .. x n x dim
+        x = update_list[0]
+        nitem = len(update_list)
+        x_shape = x.shape
+        # .. x k x dim
+        all_res = torch.concat(update_list[1:], dim=-1).view(
+            [*x_shape[:-2], nitem - 1, -1]
+        )
+        # .. x n x dim
+        post_res = torch.matmul(post_res_tensor.transpose(-1, -2), all_res)
+        return (x + post_res).view([*x_shape[:-2], -1])
+
+    @torch.jit.export
     def list_update(
-        self, update_list: list[torch.Tensor], update_name: str = "node"
+        self,
+        update_list: list[torch.Tensor],
+        update_name: str = "node",
+        post_res_tensor: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.update_style == "res_avg":
             return self.list_update_res_avg(update_list)
         elif self.update_style == "res_incr":
             return self.list_update_res_incr(update_list)
+        elif self.update_style.startswith("mHC"):
+            return self.list_update_mHc(update_list, post_res_tensor)
         elif self.update_style == "res_residual":
             return self.list_update_res_residual(update_list, update_name=update_name)
         else:
