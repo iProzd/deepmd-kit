@@ -59,6 +59,7 @@ class RepFlowLayer(torch.nn.Module):
         axis_neuron: int = 4,
         update_angle: bool = True,
         optim_update: bool = True,
+        mHC_only_node: bool = False,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
         smooth_edge_update: bool = False,
@@ -123,6 +124,8 @@ class RepFlowLayer(torch.nn.Module):
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel = self.a_sel / self.sel_reduce_factor
 
+        self.mHC_only_node = mHC_only_node
+        self.use_mhc = True if self.update_style.startswith("mHC") else False
         self.use_node_self = use_node_self
         self.use_node_sym = use_node_sym
         self.numb_n_res = 0
@@ -225,7 +228,7 @@ class RepFlowLayer(torch.nn.Module):
             trainable=trainable,
         )
         self.numb_e_res += 1
-        if self.update_style == "res_residual":
+        if self.update_style == "res_residual" or (self.use_mhc and self.mHC_only_node):
             self.e_residual.append(
                 get_residual(
                     e_dim,
@@ -313,7 +316,9 @@ class RepFlowLayer(torch.nn.Module):
                 trainable=trainable,
             )
             self.numb_e_res += 1
-            if self.update_style == "res_residual":
+            if self.update_style == "res_residual" or (
+                self.use_mhc and self.mHC_only_node
+            ):
                 self.e_residual.append(
                     get_residual(
                         self.e_dim,
@@ -334,7 +339,9 @@ class RepFlowLayer(torch.nn.Module):
                 trainable=trainable,
             )
             self.numb_a_res += 1
-            if self.update_style == "res_residual":
+            if self.update_style == "res_residual" or (
+                self.use_mhc and self.mHC_only_node
+            ):
                 self.a_residual.append(
                     get_residual(
                         self.a_dim,
@@ -355,7 +362,6 @@ class RepFlowLayer(torch.nn.Module):
 
         if self.update_style.startswith("mHC"):
             assert self.use_dynamic_sel, "mHC style update must use dynamic selection!"
-            self.use_mhc = True
             self.n_stream = int(self.update_style.split(":")[-1])
             self.n_mhc_coeff = MHCCoefficients(
                 self.n_dim,
@@ -365,24 +371,27 @@ class RepFlowLayer(torch.nn.Module):
                 trainable=trainable,
                 seed=child_seed(seed, 100),
             )
-            self.e_mhc_coeff = MHCCoefficients(
-                self.e_dim,
-                n_streams=self.n_stream,
-                num_res=self.numb_e_res,
-                precision=precision,
-                trainable=trainable,
-                seed=child_seed(seed, 200),
-            )
-            self.a_mhc_coeff = MHCCoefficients(
-                self.a_dim,
-                n_streams=self.n_stream,
-                num_res=self.numb_a_res,
-                precision=precision,
-                trainable=trainable,
-                seed=child_seed(seed, 300),
-            )
+            if not self.mHC_only_node:
+                self.e_mhc_coeff = MHCCoefficients(
+                    self.e_dim,
+                    n_streams=self.n_stream,
+                    num_res=self.numb_e_res,
+                    precision=precision,
+                    trainable=trainable,
+                    seed=child_seed(seed, 200),
+                )
+                self.a_mhc_coeff = MHCCoefficients(
+                    self.a_dim,
+                    n_streams=self.n_stream,
+                    num_res=self.numb_a_res,
+                    precision=precision,
+                    trainable=trainable,
+                    seed=child_seed(seed, 300),
+                )
+            else:
+                self.e_mhc_coeff = None
+                self.a_mhc_coeff = None
         else:
-            self.use_mhc = False
             self.n_stream = 1
             self.n_mhc_coeff = None
             self.e_mhc_coeff = None
@@ -870,37 +879,45 @@ class RepFlowLayer(torch.nn.Module):
 
         if self.use_mhc:
             assert self.n_mhc_coeff is not None
-            assert self.e_mhc_coeff is not None
-            assert self.a_mhc_coeff is not None
             # nb x nall x n_stream, nb x nall x k x n_stream, nb x nall x n_stream x n_stream
             n_H_pre, n_H_post, n_H_res = self.n_mhc_coeff(node_ebd_ext)
-            # nedge x n_stream, nedge x k x n_stream, nedge x n_stream x n_stream
-            e_H_pre, e_H_post, e_H_res = self.e_mhc_coeff(edge_ebd)
-            # nangle x n_stream, nangle x k x n_stream, nangle x n_stream x n_stream
-            a_H_pre, a_H_post, a_H_res = self.a_mhc_coeff(angle_ebd)
             node_ebd_ext_reshape = node_ebd_ext.view(
                 nb, nall, self.n_stream, self.n_dim
             )
-            edge_ebd_reshape = edge_ebd.view(-1, self.n_stream, self.e_dim)
-            angle_ebd_reshape = angle_ebd.view(-1, self.n_stream, self.a_dim)
             # update list
             n_update_list: list[torch.Tensor] = [
                 torch.matmul(
                     n_H_res[:, :nloc, :, :], node_ebd_ext_reshape[:, :nloc, :, :]
                 )
             ]
-            e_update_list: list[torch.Tensor] = [
-                torch.matmul(e_H_res, edge_ebd_reshape)
-            ]
-            a_update_list: list[torch.Tensor] = [
-                torch.matmul(a_H_res, angle_ebd_reshape)
-            ]
             node_ebd_ext = (node_ebd_ext_reshape * n_H_pre.unsqueeze(-1)).sum(-2)
             node_ebd = node_ebd_ext[:, :nloc, :]
             assert (nb, nloc) == node_ebd.shape[:2]
             n_H_post = n_H_post[:, :nloc, :, :]
-            edge_ebd = (edge_ebd_reshape * e_H_pre.unsqueeze(-1)).sum(-2)
-            angle_ebd = (angle_ebd_reshape * a_H_pre.unsqueeze(-1)).sum(-2)
+
+            if not self.mHC_only_node:
+                assert self.e_mhc_coeff is not None
+                assert self.a_mhc_coeff is not None
+                # nedge x n_stream, nedge x k x n_stream, nedge x n_stream x n_stream
+                e_H_pre, e_H_post, e_H_res = self.e_mhc_coeff(edge_ebd)
+                # nangle x n_stream, nangle x k x n_stream, nangle x n_stream x n_stream
+                a_H_pre, a_H_post, a_H_res = self.a_mhc_coeff(angle_ebd)
+                edge_ebd_reshape = edge_ebd.view(-1, self.n_stream, self.e_dim)
+                angle_ebd_reshape = angle_ebd.view(-1, self.n_stream, self.a_dim)
+                # update list
+                e_update_list: list[torch.Tensor] = [
+                    torch.matmul(e_H_res, edge_ebd_reshape)
+                ]
+                a_update_list: list[torch.Tensor] = [
+                    torch.matmul(a_H_res, angle_ebd_reshape)
+                ]
+                edge_ebd = (edge_ebd_reshape * e_H_pre.unsqueeze(-1)).sum(-2)
+                angle_ebd = (angle_ebd_reshape * a_H_pre.unsqueeze(-1)).sum(-2)
+            else:
+                e_update_list: list[torch.Tensor] = [edge_ebd]
+                a_update_list: list[torch.Tensor] = [angle_ebd]
+                e_H_post = None
+                a_H_post = None
         else:
             node_ebd = node_ebd_ext[:, :nloc, :]
             assert (nb, nloc) == node_ebd.shape[:2]
@@ -1349,9 +1366,13 @@ class RepFlowLayer(torch.nn.Module):
             return self.list_update_res_avg(update_list)
         elif self.update_style == "res_incr":
             return self.list_update_res_incr(update_list)
-        elif self.update_style.startswith("mHC"):
+        elif self.update_style.startswith("mHC") and (
+            update_name in ["node"] or not self.mHC_only_node
+        ):
             return self.list_update_mHc(update_list, post_res_tensor)
-        elif self.update_style == "res_residual":
+        elif self.update_style == "res_residual" or (
+            self.update_style.startswith("mHC") and self.mHC_only_node
+        ):
             return self.list_update_res_residual(update_list, update_name=update_name)
         else:
             raise RuntimeError(f"unknown update style {self.update_style}")

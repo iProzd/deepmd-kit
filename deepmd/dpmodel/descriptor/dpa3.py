@@ -174,6 +174,7 @@ class RepFlowArgs:
         update_residual_init: str = "const",
         fix_stat_std: float = 0.3,
         skip_stat: bool = False,
+        mHC_only_node: bool = False,
         optim_update: bool = True,
         smooth_edge_update: bool = False,
         edge_init_use_dist: bool = False,
@@ -209,6 +210,7 @@ class RepFlowArgs:
         self.skip_stat = skip_stat
         self.a_compress_e_rate = a_compress_e_rate
         self.a_compress_use_split = a_compress_use_split
+        self.mHC_only_node = mHC_only_node
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.edge_init_use_dist = edge_init_use_dist

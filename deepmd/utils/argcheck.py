@@ -1631,6 +1631,12 @@ def dpa3_repflow_args() -> list[Argument]:
             doc=doc_update_residual_init,
         ),
         Argument(
+            "mHC_only_node",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "optim_update",
             bool,
             optional=True,

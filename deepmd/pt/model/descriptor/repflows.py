@@ -214,6 +214,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         env_protection: float = 0.0,
         precision: str = "float64",
         fix_stat_std: float = 0.3,
+        mHC_only_node: bool = False,
         smooth_edge_update: bool = False,
         edge_init_use_dist: bool = False,
         use_exp_switch: bool = False,
@@ -257,6 +258,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.set_stddev_constant = fix_stat_std != 0.0
         self.a_compress_use_split = a_compress_use_split
         self.use_loc_mapping = use_loc_mapping
+        self.mHC_only_node = mHC_only_node
         self.optim_update = optim_update
         self.smooth_edge_update = smooth_edge_update
         self.edge_init_use_dist = edge_init_use_dist
@@ -346,6 +348,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     update_residual=self.update_residual,
                     update_residual_init=self.update_residual_init,
                     precision=precision,
+                    mHC_only_node=self.mHC_only_node,
                     optim_update=self.optim_update,
                     use_dynamic_sel=self.use_dynamic_sel,
                     sel_reduce_factor=self.sel_reduce_factor,
@@ -618,18 +621,19 @@ class DescrptBlockRepflows(DescriptorBlock):
                 .contiguous()
                 .view(nframes, nloc, self.n_stream * self.n_dim)
             )
-            edge_ebd = (
-                edge_ebd.unsqueeze(1)
-                .expand(-1, int(self.n_stream), -1)
-                .contiguous()
-                .view(-1, self.n_stream * self.e_dim)
-            )
-            angle_ebd = (
-                angle_ebd.unsqueeze(1)
-                .expand(-1, int(self.n_stream), -1)
-                .contiguous()
-                .view(-1, self.n_stream * self.a_dim)
-            )
+            if not self.mHC_only_node:
+                edge_ebd = (
+                    edge_ebd.unsqueeze(1)
+                    .expand(-1, int(self.n_stream), -1)
+                    .contiguous()
+                    .view(-1, self.n_stream * self.e_dim)
+                )
+                angle_ebd = (
+                    angle_ebd.unsqueeze(1)
+                    .expand(-1, int(self.n_stream), -1)
+                    .contiguous()
+                    .view(-1, self.n_stream * self.a_dim)
+                )
 
         # nb x nall x n_dim
         if not parallel_mode:
@@ -722,8 +726,10 @@ class DescrptBlockRepflows(DescriptorBlock):
                 angle_index=angle_index,
             )
 
-        node_ebd = node_ebd.view(nframes, nloc, self.n_stream, self.n_dim).mean(-2)
-        edge_ebd = edge_ebd.view(-1, self.n_stream, self.e_dim).mean(-2)
+        if self.use_mhc:
+            node_ebd = node_ebd.view(nframes, nloc, self.n_stream, self.n_dim).mean(-2)
+            if not self.mHC_only_node:
+                edge_ebd = edge_ebd.view(-1, self.n_stream, self.e_dim).mean(-2)
         # nb x nloc x 3 x e_dim
         h2g2 = (
             RepFlowLayer._cal_hg(edge_ebd, h2, nlist_mask, sw)
