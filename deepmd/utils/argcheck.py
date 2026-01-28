@@ -1637,6 +1637,12 @@ def dpa3_repflow_args() -> list[Argument]:
             default=False,
         ),
         Argument(
+            "use_diff_input",
+            bool,
+            optional=True,
+            default=False,
+        ),
+        Argument(
             "optim_update",
             bool,
             optional=True,

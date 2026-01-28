@@ -186,6 +186,7 @@ class RepFlowArgs:
         gated_mlp_norm: str = "none",
         use_node_self: bool = True,
         use_node_sym: bool = True,
+        use_diff_input: bool = False,
     ) -> None:
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -222,6 +223,7 @@ class RepFlowArgs:
         self.gated_mlp_norm = gated_mlp_norm
         self.use_node_self = use_node_self
         self.use_node_sym = use_node_sym
+        self.use_diff_input = use_diff_input
 
     def __getitem__(self, key: str) -> Any:
         if hasattr(self, key):

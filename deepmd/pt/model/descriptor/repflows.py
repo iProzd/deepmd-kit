@@ -226,6 +226,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         gated_mlp_norm: str = "none",
         use_node_self: bool = True,
         use_node_sym: bool = True,
+        use_diff_input: bool = False,
         optim_update: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
         trainable: bool = True,
@@ -297,6 +298,7 @@ class DescrptBlockRepflows(DescriptorBlock):
 
         self.use_node_self = use_node_self
         self.use_node_sym = use_node_sym
+        self.use_diff_input = use_diff_input
 
         # order matters, placed after the assignment of self.ntypes
         self.reinit_exclude(exclude_types)
@@ -309,7 +311,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.gated_mlp_norm = gated_mlp_norm
 
         self.edge_embd = MLPLayer(
-            1,
+            1 if not self.use_diff_input else 4,
             self.e_dim,
             precision=precision,
             seed=child_seed(seed, 0),
@@ -554,6 +556,9 @@ class DescrptBlockRepflows(DescriptorBlock):
         if self.edge_init_use_dist:
             # nb x nloc x nnei x 1
             edge_input = torch.linalg.norm(diff, dim=-1, keepdim=True)
+
+        if self.use_diff_input:
+            edge_input = torch.cat([edge_input, diff], dim=-1)
 
         # nf x nloc x a_nnei x 3
         normalized_diff_i = a_diff / (
