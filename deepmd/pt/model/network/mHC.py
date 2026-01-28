@@ -47,6 +47,7 @@ class MHCCoefficients(nn.Module):
         rms_eps: float = 1e-6,
         b_res_offdiag: float = -4.0,  # init H_res close to I
         num_res: int = 1,  # number of residuals, k
+        post_residual: float = 0.1,
         precision: str = DEFAULT_PRECISION,
         trainable: bool = True,
         seed: Optional[Union[int, list[int]]] = None,
@@ -86,6 +87,7 @@ class MHCCoefficients(nn.Module):
         self.alpha_res = nn.Parameter(
             data=torch.tensor(float(alpha_init), dtype=self.prec, device=device)
         )
+        self.post_residual = post_residual
 
         # init H_pre ≈ 1/n, H_post ≈ 1, H_res ≈ I
         if self.n == 1:
@@ -132,9 +134,9 @@ class MHCCoefficients(nn.Module):
 
         # Eq.(8): constraints
         H_pre = torch.sigmoid(Ht_pre).view([*x_shape[:-1], self.n])  # (B,S,n)
-        H_post = (torch.sigmoid(Ht_post) * (2.0 / float(self.k))).view(
-            [*x_shape[:-1], self.k, self.n]
-        )
+        H_post = (
+            torch.sigmoid(Ht_post) * (2.0 / float(self.k)) * self.post_residual
+        ).view([*x_shape[:-1], self.k, self.n])
         H_res = sinkhorn_knopp(Ht_res, n_iters=self.tmax).view(
             [*x_shape[:-1], self.n, self.n]
         )

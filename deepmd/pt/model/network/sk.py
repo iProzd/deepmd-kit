@@ -34,7 +34,7 @@ class SinkhornKnopp:
         # self._D1 = None  # 行缩放系数 r
         # self._D2 = None  # 列缩放系数 c
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def fit(self, x: torch.Tensor) -> [torch.Tensor, torch.Tensor]:
         """
         运行 Sinkhorn 算法.
