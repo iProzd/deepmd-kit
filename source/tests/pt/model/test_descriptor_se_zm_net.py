@@ -1131,6 +1131,135 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             torch.testing.assert_close(out_opt, out_ref, atol=atol, rtol=rtol)
 
 
+class TestJITScript(unittest.TestCase):
+    """Test torch.jit.script compatibility for SeZM-Net descriptor."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+    def _tiny_system(
+        self, *, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Create a minimal two-atom system for testing."""
+        coord = torch.tensor(
+            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=self.device,
+        ).view(1, -1, 3)
+        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
+        nlist = torch.tensor(
+            [[[1, -1], [0, -1]]], dtype=torch.int64, device=self.device
+        )
+        return coord, atype, nlist
+
+    def _get_tols(self, dtype: torch.dtype) -> tuple[float, float]:
+        if dtype == torch.float64:
+            return 1e-10, 1e-10
+        if dtype == torch.float32:
+            return 5e-5, 5e-5
+        return 5e-3, 5e-3
+
+    def test_jit_script_basic(self) -> None:
+        """Test that DescrptSeZMNet can be scripted with torch.jit.script."""
+        for prec in ["float64", "float32", "bfloat16"]:
+            dtype = PRECISION_DICT[prec]
+            atol, rtol = self._get_tols(dtype)
+            coord, atype, nlist = self._tiny_system(dtype=dtype)
+            extended_coord = coord.reshape(1, -1)
+
+            # Create and script the model
+            model = DescrptSeZMNet(
+                rcut=3.0,
+                sel=[1, 1],
+                ntypes=2,
+                l_schedule=[1, 0],
+                channels=4,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neurons=8,
+                precision=prec,
+                trainable=True,
+            )
+
+            # Get reference output before scripting
+            model.eval()
+            with torch.no_grad():
+                desc_ref, _, _, _, sw_ref = model(
+                    extended_coord, atype, nlist, mapping=None, comm_dict=None
+                )
+
+            # Script the model
+            try:
+                scripted_model = torch.jit.script(model)
+            except Exception as e:
+                self.fail(f"torch.jit.script failed for {prec}: {e}")
+
+            # Get output from scripted model
+            with torch.no_grad():
+                desc_script, _, _, _, sw_script = scripted_model(
+                    extended_coord, atype, nlist, mapping=None, comm_dict=None
+                )
+
+            # Verify outputs match
+            torch.testing.assert_close(
+                desc_script,
+                desc_ref,
+                atol=atol,
+                rtol=rtol,
+                msg=f"Descriptor output mismatch after scripting (prec={prec})",
+            )
+            torch.testing.assert_close(
+                sw_script,
+                sw_ref,
+                atol=atol,
+                rtol=rtol,
+                msg=f"Smooth weight mismatch after scripting (prec={prec})",
+            )
+
+    def test_jit_script_forward_backward(self) -> None:
+        """Test that scripted model can execute forward and backward pass correctly."""
+        dtype = torch.float64
+        coord, atype, nlist = self._tiny_system(dtype=dtype)
+        extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
+
+        model = DescrptSeZMNet(
+            rcut=3.0,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 1, 0],
+            channels=8,
+            n_radial=4,
+            radial_mlp=[8],
+            so2_layers=2,
+            ffn_neurons=16,
+            precision="float64",
+            trainable=True,
+        )
+
+        # Script the model
+        scripted_model = torch.jit.script(model)
+
+        # Execute forward pass
+        desc, rot_mat, g2, h2, sw = scripted_model(
+            extended_coord, atype, nlist, mapping=None, comm_dict=None
+        )
+
+        # Verify output shapes and types
+        self.assertEqual(desc.shape, (1, 2, 8))
+        self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
+        self.assertIsNone(rot_mat)
+        self.assertIsNone(g2)
+        self.assertIsNone(h2)
+        self.assertEqual(sw.shape, (1, 2, 2, 1))
+        self.assertEqual(sw.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
+
+        # Verify backward pass
+        loss = desc.sum()
+        loss.backward()
+        self.assertIsNotNone(extended_coord.grad)
+        self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
+
+
 class TestEnvironmentInitialEmbedding(unittest.TestCase):
     """Test the EnvironmentInitialEmbedding module."""
 
