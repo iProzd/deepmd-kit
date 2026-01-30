@@ -113,7 +113,8 @@ class DeepEval(DeepEvalBackend):
         auto_batch_size: bool | int | AutoBatchSize = True,
         neighbor_list: Optional["ase.neighborlist.NewPrimitiveNeighborList"] = None,
         head: str | int | None = None,
-        no_jit: bool = False,
+        # TODO: Temporarily set to True for SeZM-Net development (JIT not yet supported)
+        no_jit: bool = True,
         **kwargs: Any,
     ) -> None:
         self.output_def = output_def
@@ -709,7 +710,10 @@ class DeepEval(DeepEvalBackend):
         """
         out = []
         for mm in self.dp.model["Default"].modules():
-            if mm.original_name == TypeEmbedNetConsistent.__name__:
+            if (
+                getattr(mm, "original_name", type(mm).__name__)
+                == TypeEmbedNetConsistent.__name__
+            ):
                 out.append(mm(DEVICE))
         if not out:
             raise KeyError("The model has no type embedding networks.")
