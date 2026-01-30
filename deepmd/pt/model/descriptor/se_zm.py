@@ -89,15 +89,6 @@ if TYPE_CHECKING:
         Generator,
     )
 
-    from jaxtyping import (
-        Bool,
-        Float,
-        Int,
-    )
-    from torch import (
-        Tensor,
-    )
-
     from deepmd.utils.data_system import (
         DeepmdDataSystem,
     )
@@ -287,7 +278,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.device = env.DEVICE
         self.compute_dtype = get_promoted_dtype(self.dtype)
         self.mlp_bias = bool(mlp_bias)
-        self.use_amp = bool(use_amp)
+        self.use_amp = bool(use_amp)  # and self.training
         self.trainable = bool(trainable)
         self.seed = seed
 
@@ -486,17 +477,17 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
     def forward(
         self,
-        extended_coord: Float[Tensor, "nf 3_nall"] | Float[Tensor, "nf nall 3"],
-        extended_atype: Int[Tensor, "nf nall"],
-        nlist: Int[Tensor, "nf nloc nnei"],
-        mapping: Int[Tensor, "nf nall"] | None = None,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
     ) -> tuple[
-        Float[Tensor, "nf nloc channels"],
+        torch.Tensor,
         None,
         None,
         None,
-        Float[Tensor, "nf nloc nnei 1"],
+        torch.Tensor,
     ]:
         """
         Compute the descriptor.
@@ -552,10 +543,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 3. Type embedding (l=0) ===
         with nvtx_range("SeZMNet/type_embedding"):
-            atype_loc: Int[Tensor, "nf nloc"] = extended_atype[:, :nloc]
-            type_ebed: Float[Tensor, "N C"] = self.type_embedding(atype_loc).reshape(
+            atype_loc = extended_atype[:, :nloc]  # (nf, nloc)
+            type_ebed = self.type_embedding(atype_loc).reshape(
                 n_nodes, self.channels
-            )
+            )  # (N, C)
 
         # === Step 4. Build edge cache once (geometry + RBF + Wigner-D) ===
         with nvtx_range("SeZMNet/build_edge_cache"):
@@ -574,12 +565,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         lmax_0 = self.l_schedule[0]
         ebed_dim_0 = get_so3_dim_of_lmax(lmax_0)  # (lmax+1)^2
-        x0: Float[Tensor, "N C"] = type_ebed
-        x0_out: Float[Tensor, "N C"] = x0
+        x0 = type_ebed  # (N, C)
+        x0_out = x0  # (N, C)
 
         # === Step 6. Compute radial features once (fp32+) ===
         # Shape: (E, (lmax+1)*C) -> (E, lmax+1, C)
-        radial_feat: Float[Tensor, "E lmax_plus_1 C"] | None = None
+        radial_feat = None
         with nvtx_range("SeZMNet/radial_embedding"):
             if edge_cache.src.numel() > 0:
                 radial_feat = rearrange(
@@ -587,32 +578,28 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     "E (L C) -> E L C",
                     L=self.lmax + 1,
                     C=self.channels,
-                )
+                )  # (E, lmax+1, C)
 
         # === Step 7. Env FiLM conditioning (optional, fp32+) ===
         with nvtx_range("SeZMNet/env_film"):
             if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
-                atype_flat: Int[Tensor, " N"] = atype_loc.reshape(-1)
-                film: Float[Tensor, "N 2_C"] = self.env_seed_embedding(
+                atype_flat = atype_loc.reshape(-1)  # (N,)
+                film = self.env_seed_embedding(
                     edge_cache=edge_cache,
                     atype_flat=atype_flat,
                     n_nodes=n_nodes,
-                )
+                )  # (N, 2*C)
                 scale_logits, shift_logits = film.chunk(2, dim=-1)  # (N, C), (N, C)
-                scale_hat: Float[Tensor, "N C"] = self.film_scale_norm(scale_logits)
-                shift_hat: Float[Tensor, "N C"] = self.film_shift_norm(shift_logits)
+                scale_hat = self.film_scale_norm(scale_logits)  # (N, C)
+                shift_hat = self.film_shift_norm(shift_logits)  # (N, C)
                 scale_strength = torch.exp(self.film_scale_strength_log)
                 shift_strength = torch.exp(self.film_shift_strength_log)
-                scale: Float[Tensor, "N C"] = 1.0 + scale_strength * torch.tanh(
-                    scale_hat
-                )
-                shift: Float[Tensor, "N C"] = shift_strength * torch.tanh(shift_hat)
+                scale = 1.0 + scale_strength * torch.tanh(scale_hat)  # (N, C)
+                shift = shift_strength * torch.tanh(shift_hat)  # (N, C)
                 x0_out = x0 * scale + shift
 
         # === Step 8. Build l=0 features ===
-        x: Float[Tensor, "N D C"] = type_ebed.new_zeros(
-            n_nodes, ebed_dim_0, self.channels
-        )
+        x = type_ebed.new_zeros(n_nodes, ebed_dim_0, self.channels)  # (N, D, C)
         x[:, 0, :] = x0_out
 
         # === Step 9. Geometric Initial Embedding (fp32+) ===
@@ -632,15 +619,15 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     edge_cache.edge_type_feat, "E C -> E 1 C"
                 )
                 radial_feat = radial_feat.to(dtype=self.dtype)
-                rad_feat_per_block: list[Float[Tensor, "E lmax_plus_1 C"]] = [
+                rad_feat_per_block = [
                     radial_feat[:, :rad_len, :] for rad_len in self.rad_sizes_per_block
-                ]
+                ]  # list of (E, lmax+1, C)
             else:
                 rad_feat_per_block = None
 
         # === Step 11. Convert to self.dtype and run blocks ===
         with nvtx_range("SeZMNet/blocks"):
-            x: Float[Tensor, "N D C"] = x.to(dtype=self.dtype)
+            x = x.to(dtype=self.dtype)  # (N, D, C)
             if edge_cache.src.numel() > 0 and rad_feat_per_block is not None:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
@@ -650,13 +637,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # Extract l=0 scalar features and apply FFN in promoted dtype.
         # Residual keeps the output close to identity with zero-initialized FFN output.
         with nvtx_range("SeZMNet/output_ffn"):
-            x_scalar: Float[Tensor, "N 1 C"] = x[:, 0:1, :].to(dtype=self.compute_dtype)
+            x_scalar = x[:, 0:1, :].to(dtype=self.compute_dtype)  # (N, 1, C)
             x_scalar = x_scalar + self.output_ffn(x_scalar)
 
         # === Step 13. Reshape to (nf, nloc, channels) and return ===
-        descriptor: Float[Tensor, "nf nloc C"] = rearrange(
+        descriptor = rearrange(
             x_scalar, "(nf nloc) 1 C -> nf nloc C", nf=nf, nloc=nloc
-        )
+        )  # (nf, nloc, C)
         return (
             descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
             None,
@@ -667,10 +654,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
     def _forward_blocks(
         self,
-        x: Float[Tensor, "N D C"],
+        x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
-        radial_feat_per_block: list[Float[Tensor, "E lmax_plus_1 C"]] | None,
-    ) -> Float[Tensor, "N D C"]:
+        radial_feat_per_block: list[torch.Tensor] | None,
+    ) -> torch.Tensor:
         """
         Run the interaction blocks.
 
@@ -686,7 +673,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Output features with shape (N, D, C).
         """
         # Blocks with pyramid l-schedule slicing
@@ -702,13 +689,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     def build_edge_cache(
         self,
         *,
-        type_ebed: Float[Tensor, "N C"],
-        extended_coord: Float[Tensor, "nf nall 3"],
-        extended_atype: Int[Tensor, "nf nall"],
-        nlist: Int[Tensor, "nf nloc nnei"],
-        mapping: Int[Tensor, "nf nall"] | None,
-        pair_keep_mask: Bool[Tensor, "nf nloc nnei"],
-    ) -> tuple[EdgeFeatureCache, Float[Tensor, "nf nloc nnei 1"]]:
+        type_ebed: torch.Tensor,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None,
+        pair_keep_mask: torch.Tensor,
+    ) -> tuple[EdgeFeatureCache, torch.Tensor]:
         """
         Build the global edge cache from DeePMD padded neighbor list.
 
@@ -767,7 +754,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 0. Force fp32+ for geometry ===
         geom_dtype = get_promoted_dtype(extended_coord.dtype)
-        coord: Float[Tensor, "nf nall 3"] = extended_coord.to(dtype=geom_dtype)
+        coord = extended_coord.to(dtype=geom_dtype)  # (nf, nall, 3)
         nall = coord.shape[1]
 
         # === Step 1. Build per-pair geometry with padding-safe gather ===
@@ -775,35 +762,35 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # replace padding indices with 0 (any valid index works since padding positions
         # are masked out by `keep`). This avoids the extra cat operation for sentinel.
         with nvtx_range("SeZMNet/edge_cache/geometry"):
-            valid_nlist: Bool[Tensor, "nf nloc nnei"] = nlist >= 0
-            keep: Bool[Tensor, "nf nloc nnei"] = valid_nlist & pair_keep_mask
+            valid_nlist = nlist >= 0  # (nf, nloc, nnei)
+            keep = valid_nlist & pair_keep_mask  # (nf, nloc, nnei)
 
             # Replace padding (-1) with 0 to avoid gather errors.
             # Padding positions are excluded by `keep` mask, so their values don't matter.
-            gather_index: Int[Tensor, "nf nloc nnei"] = torch.where(
+            gather_index = torch.where(  # (nf, nloc, nnei)
                 valid_nlist, nlist, torch.zeros_like(nlist)
             )
-            index: Int[Tensor, "nf nloc_x_nnei 3"] = rearrange(
+            index = rearrange(  # (nf, nloc*nnei, 3)
                 gather_index, "nf nloc nnei -> nf (nloc nnei) 1"
             ).expand(-1, -1, 3)
-            nei_pos: Float[Tensor, "nf nloc nnei 3"] = rearrange(
+            nei_pos = rearrange(  # (nf, nloc, nnei, 3)
                 torch.gather(coord, 1, index),
                 "nf (nloc nnei) c -> nf nloc nnei c",
                 nloc=nloc,
                 nnei=nnei,
             )
-            atom_pos: Float[Tensor, "nf nloc 1 3"] = rearrange(
+            atom_pos = rearrange(  # (nf, nloc, 1, 3)
                 coord[:, :nloc], "nf nloc c -> nf nloc 1 c"
             )
-            diff: Float[Tensor, "nf nloc nnei 3"] = nei_pos - atom_pos
-            length: Float[Tensor, "nf nloc nnei 1"] = torch.linalg.norm(
+            diff = nei_pos - atom_pos  # (nf, nloc, nnei, 3)
+            length = torch.linalg.norm(  # (nf, nloc, nnei, 1)
                 diff, dim=-1, keepdim=True
             )
 
         # === Step 2. C^2 envelope weight `sw` ===
         # sw is the C^2-continuous cutoff envelope weight in [0, 1], applied per neighbor pair.
         with nvtx_range("SeZMNet/edge_cache/envelope"):
-            sw: Float[Tensor, "nf nloc nnei 1"] = self.c2_envelope(length)
+            sw = self.c2_envelope(length)  # (nf, nloc, nnei, 1)
             sw = sw * rearrange(keep, "nf nloc nnei -> nf nloc nnei 1").to(
                 dtype=sw.dtype
             )
@@ -817,30 +804,30 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # This avoids the dynamic-output-size `nonzero` kernel and enables smoother
         # degree/normalization (no discontinuous edge count jumps at rcut boundary).
         with nvtx_range("SeZMNet/edge_cache/filter"):
-            edge_keep: Bool[Tensor, " nf_x_nloc_x_nnei"] = rearrange(
+            edge_keep = rearrange(  # (nf*nloc*nnei,)
                 keep, "nf nloc nnei -> (nf nloc nnei)"
             )
-            edge_idx: Int[Tensor, " E"] = torch.nonzero(edge_keep).squeeze(-1)
-            edge_env: Float[Tensor, "E 1"] = sw.reshape(-1, 1)[edge_idx]
+            edge_idx = torch.nonzero(edge_keep).squeeze(-1)  # (E,)
+            edge_env = sw.reshape(-1, 1)[edge_idx]  # (E, 1)
 
         if edge_idx.numel() == 0:
             # No edges -> empty cache.
             device = extended_coord.device
             dtype = extended_coord.dtype
-            empty_long: Int[Tensor, " 0"] = torch.empty(
+            empty_long = torch.empty(  # (0,)
                 0, dtype=torch.long, device=device
             )
-            empty_vec: Float[Tensor, "0 3"] = torch.empty(
+            empty_vec = torch.empty(  # (0, 3)
                 0, 3, dtype=dtype, device=device
             )
-            empty_rbf: Float[Tensor, "0 n_radial"] = torch.empty(
+            empty_rbf = torch.empty(  # (0, n_radial)
                 0, self.radial_basis.n_radial, dtype=dtype, device=device
             )
-            empty_type_feat: Float[Tensor, "0 C"] = torch.empty(
+            empty_type_feat = torch.empty(  # (0, C)
                 0, type_ebed.shape[1], dtype=dtype, device=device
             )
-            deg: Float[Tensor, " N"] = torch.zeros(n_nodes, dtype=dtype, device=device)
-            inv_sqrt_deg: Float[Tensor, "N 1 1"] = torch.ones(
+            deg = torch.zeros(n_nodes, dtype=dtype, device=device)  # (N,)
+            inv_sqrt_deg = torch.ones(  # (N, 1, 1)
                 n_nodes, 1, 1, dtype=dtype, device=device
             )
             cache = EdgeFeatureCache(
@@ -866,25 +853,25 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         #   loc_idx in [0, nloc)
         #   neighbor index from nlist (extended axis)
         with nvtx_range("SeZMNet/edge_cache/index"):
-            nlist_flat: Int[Tensor, " nf_x_nloc_x_nnei"] = nlist.reshape(-1)
-            edge_idx_flat: Int[Tensor, " E"] = edge_idx.to(dtype=torch.long)
-            valid_f_idx: Int[Tensor, " E"] = edge_idx_flat // (nloc * nnei)
-            rem: Int[Tensor, " E"] = edge_idx_flat % (nloc * nnei)
-            valid_loc_idx: Int[Tensor, " E"] = rem // nnei
+            nlist_flat = nlist.reshape(-1)  # (nf*nloc*nnei,)
+            edge_idx_flat = edge_idx.to(dtype=torch.long)  # (E,)
+            valid_f_idx = edge_idx_flat // (nloc * nnei)  # (E,)
+            rem = edge_idx_flat % (nloc * nnei)  # (E,)
+            valid_loc_idx = rem // nnei  # (E,)
             # neighbor indices from the extended axis (0..nall-1) for valid edges.
-            valid_neighbor: Int[Tensor, " E"] = nlist_flat[edge_idx_flat]
+            valid_neighbor = nlist_flat[edge_idx_flat]  # (E,)
             if mapping is None:
                 # Neighbor indices are already local indices in [0, nloc).
-                src_local: Int[Tensor, " E"] = valid_neighbor
+                src_local = valid_neighbor  # (E,)
             else:
                 # Map extended index -> local index for each frame.
                 # mapping_flat packs (nf, nall) so frame k uses offset k * nall.
-                mapping_flat: Int[Tensor, " nf_x_nall"] = mapping.reshape(-1)
+                mapping_flat = mapping.reshape(-1)  # (nf*nall,)
                 src_local = mapping_flat[valid_f_idx * nall + valid_neighbor]
 
             # dst is the center atom: per-frame local index -> global node index.
-            dst: Int[Tensor, " E"] = valid_f_idx * nloc + valid_loc_idx
-            src_ok: Bool[Tensor, " E"] = (src_local >= 0) & (src_local < nloc)
+            dst = valid_f_idx * nloc + valid_loc_idx  # (E,)
+            src_ok = (src_local >= 0) & (src_local < nloc)  # (E,)
             if not bool(src_ok.all()):
                 # Drop edges that map outside the local range (e.g. broken mapping or ghost-only neighbor).
                 edge_idx = edge_idx[src_ok]
@@ -895,40 +882,42 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 edge_env = edge_env[src_ok]
 
             # src is the neighbor atom (per-frame local index -> global node index)
-            src: Int[Tensor, " E"] = valid_f_idx * nloc + src_local
+            src = valid_f_idx * nloc + src_local  # (E,)
             num_edges = int(src.numel())
 
         # === Step 5. Gather per-edge geometry ===
         # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
         with nvtx_range("SeZMNet/edge_cache/edge_geom"):
-            diff_flat: Float[Tensor, " nf_x_nloc_x_nnei 3"] = diff.reshape(-1, 3)
-            length_flat: Float[Tensor, " nf_x_nloc_x_nnei 1"] = length.reshape(-1, 1)
-            edge_vec: Float[Tensor, " E 3"] = diff_flat[edge_idx]
-            edge_len: Float[Tensor, " E 1"] = length_flat[edge_idx]
+            diff_flat = diff.reshape(-1, 3)  # (nf*nloc*nnei, 3)
+            length_flat = length.reshape(-1, 1)  # (nf*nloc*nnei, 1)
+            edge_vec = diff_flat[edge_idx]  # (E, 3)
+            edge_len = length_flat[edge_idx]  # (E, 1)
 
         # === Step 6. Radial basis (envelope already baked in) ===
         with nvtx_range("SeZMNet/edge_cache/radial_basis"):
-            edge_rbf: Float[Tensor, " E n_radial"] = self.radial_basis(edge_len)
+            edge_rbf = self.radial_basis(edge_len)  # (E, n_radial)
 
         # === Step 7. Wigner-D blocks ===
         with nvtx_range("SeZMNet/edge_cache/rot_mat"):
-            rot_mat: Float[Tensor, " E 3 3"] = init_edge_rot_mat_frisvad(
+            rot_mat = init_edge_rot_mat_frisvad(  # (E, 3, 3)
                 edge_vec, edge_len=edge_len, eps=self.eps
             )
         with nvtx_range("SeZMNet/edge_cache/wigner_d"):
             D_full, Dt_full = self.wigner_calc(rot_mat)  # (E, D, D), (E, D, D)
 
-        edge_type_feat: Float[Tensor, " E C"] = build_edge_type_feat(
+        edge_type_feat = build_edge_type_feat(  # (E, C)
             type_ebed, src, dst, num_edges=num_edges
         )
 
         # === Step 8. Neighbor normalization (destination degree) ===
         # Compute inverse sqrt degree for graph-style message normalization.
         with nvtx_range("SeZMNet/edge_cache/degree"):
-            deg: Float[Tensor, " N"] = torch.bincount(dst, minlength=n_nodes).to(
-                dtype=edge_vec.dtype, device=edge_vec.device
-            )
-            inv_sqrt_deg: Float[Tensor, " N 1 1"] = rearrange(
+            deg = torch.zeros(
+                n_nodes, dtype=edge_vec.dtype, device=edge_vec.device
+            )  # (N,)
+            ones = torch.ones_like(dst, dtype=edge_vec.dtype)  # (E,)
+            deg.index_add_(0, dst, ones)  # (N,)
+            inv_sqrt_deg = rearrange(  # (N, 1, 1)
                 torch.rsqrt(deg.clamp(min=1)), "N -> N 1 1"
             )
 
@@ -1000,8 +989,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.mmax = int(self.m_schedule[0])
 
     def _apply_zbl_gating_hook(
-        self, type_ebed: Float[Tensor, "N C"], edge_cache: EdgeFeatureCache
-    ) -> Float[Tensor, "N C"]:
+        self, type_ebed: torch.Tensor, edge_cache: EdgeFeatureCache
+    ) -> torch.Tensor:
         """
         Placeholder hook for ZBL gating (not implemented).
 
@@ -1014,7 +1003,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N C"]
+        torch.Tensor
             Updated scalar features with shape (N, C).
         """
         del edge_cache
@@ -1041,7 +1030,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         None
             Runs the wrapped region under the configured AMP setting.
         """
-        if not self.use_amp or device.type != "cuda":
+        if not self.use_amp or device.type != "cuda":  # and self.training
             yield
             return
 

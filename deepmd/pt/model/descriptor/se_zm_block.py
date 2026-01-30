@@ -19,16 +19,11 @@ from __future__ import (
 
 import math
 from typing import (
-    TYPE_CHECKING,
     Any,
 )
 
 import torch
 import torch.nn as nn
-
-if TYPE_CHECKING:
-    from torch import Tensor
-    from jaxtyping import Float
 
 from deepmd.dpmodel.utils.seed import (
     child_seed,
@@ -184,8 +179,8 @@ class GatedActivation(nn.Module):
             p.requires_grad = trainable
 
     def forward(
-        self, x: Float[Tensor, "N D C"], gate: Float[Tensor, "N D C"] | None = None
-    ) -> Float[Tensor, "N D C"]:
+        self, x: torch.Tensor, gate: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -199,19 +194,19 @@ class GatedActivation(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Gated features with shape (N, D, C).
         """
         # === Determine gate source ===
         # GLU mode: use external gate's scalar; Standard mode: use x's scalar
-        gate_scalar_source: Float[Tensor, "N C"] = (
+        gate_scalar_source = (  # (N, C)
             gate[:, 0, :] if gate is not None else x[:, 0, :]
         )
 
         # === Step 1. l=0 activation ===
         if gate is not None:
             # GLU mode: x0 * act(g0) (e.g., SwiGLU, GeGLU)
-            x0: Float[Tensor, "N 1 C"] = x[:, 0:1, :] * self.scalar_act(gate[:, 0:1, :])
+            x0 = x[:, 0:1, :] * self.scalar_act(gate[:, 0:1, :])  # (N, 1, C)
         else:
             # Standard mode: act(x0)
             x0 = self.scalar_act(x[:, 0:1, :])
@@ -222,20 +217,20 @@ class GatedActivation(nn.Module):
         # === Step 2. Generate per-l gates from scalar features ===
         # gate_scalar_source has shape (N, C)
         # gate_linear outputs (N, lmax * C)
-        gating_scalars: Float[Tensor, "N lmax_x_C"] = torch.sigmoid(
+        gating_scalars = torch.sigmoid(  # (N, lmax * C)
             self.gate_linear(gate_scalar_source)
         )
 
         # Reshape to (N, lmax, C) then expand to (N, D-1, C)
-        gating_scalars: Float[Tensor, "N lmax C"] = gating_scalars.reshape(
+        gating_scalars = gating_scalars.reshape(  # (N, lmax, C)
             x.shape[0], self.lmax, self.channels
         )
-        gates: Float[Tensor, "N D_minus_1 C"] = gating_scalars.index_select(
+        gates = gating_scalars.index_select(  # (N, D-1, C)
             dim=1, index=self.expand_index
         )
 
         # === Step 3. Apply gates to l>0 components ===
-        out: Float[Tensor, "N D C"] = x.new_empty(x.shape)
+        out = x.new_empty(x.shape)  # (N, D, C)
         out[:, 0:1, :] = x0
         out[:, 1:, :] = x[:, 1:, :] * gates
         return out
@@ -380,7 +375,7 @@ class SeparableRMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(self, x: Float[Tensor, "N D C"]) -> Float[Tensor, "N D C"]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -389,26 +384,26 @@ class SeparableRMSNorm(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Normalized features with shape (N, D, C), same dtype as input.
         """
         in_dtype = x.dtype
         x = x.to(dtype=self.dtype)
-        x0: Float[Tensor, "N 1 C"] = x[:, :1, :]
-        xt: Float[Tensor, "N D_minus_1 C"] = x[:, 1:, :]
+        x0 = x[:, :1, :]  # (N, 1, C)
+        xt = x[:, 1:, :]  # (N, D-1, C)
 
         # === Step 1. l=0: Standard RMS Norm ===
         if self.centering:
             x0 = x0 - x0.mean(dim=-1, keepdim=True)
-        inv_rms0: Float[Tensor, "N 1 1"] = torch.rsqrt(
+        inv_rms0 = torch.rsqrt(  # (N, 1, 1)
             x0.pow(2).mean(dim=-1, keepdim=True) + self.eps
         )
         x0 = x0 * inv_rms0
 
-        weight0: Float[Tensor, "1 1 C"] = self.weight[0].reshape(1, 1, -1)
+        weight0 = self.weight[0].reshape(1, 1, -1)  # (1, 1, C)
         x0 = x0 * weight0
         if self.bias is not None:
-            bias0: Float[Tensor, "1 1 C"] = self.bias.reshape(1, 1, -1)
+            bias0 = self.bias.reshape(1, 1, -1)  # (1, 1, C)
             x0 = x0 + bias0
 
         if xt.numel() == 0:
@@ -417,15 +412,15 @@ class SeparableRMSNorm(nn.Module):
         # === Step 2. l>0: Degree-Balanced RMS Norm ===
         # Fused weighted sum: einsum avoids allocating intermediate (N, D-1, C) tensor.
         # balance_weight already pre-fused with 1/(lmax * C).
-        mean_variance: Float[Tensor, " N"] = torch.einsum(
+        mean_variance = torch.einsum(  # (N,)
             "ndc,d->n", xt * xt, self.balance_weight
         )
-        inv_rmst: Float[Tensor, "N 1 1"] = torch.rsqrt(
+        inv_rmst = torch.rsqrt(  # (N, 1, 1)
             mean_variance + self.eps
         ).reshape(-1, 1, 1)
         xt = xt * inv_rmst
 
-        wt: Float[Tensor, "D_minus_1 C"] = torch.index_select(
+        wt = torch.index_select(  # (D-1, C)
             self.weight, dim=0, index=self.expand_index
         )
         xt = xt * wt.unsqueeze(0)
@@ -561,9 +556,7 @@ class ReducedSeparableRMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(
-        self, x: Float[Tensor, "E D_m_trunc C"]
-    ) -> Float[Tensor, "E D_m_trunc C"]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -572,7 +565,7 @@ class ReducedSeparableRMSNorm(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "E D_m_trunc C"]
+        torch.Tensor
             Normalized tensor with shape (E, D_m_trunc, C), same dtype as input.
 
         Raises
@@ -587,12 +580,12 @@ class ReducedSeparableRMSNorm(nn.Module):
 
         in_dtype = x.dtype
         x = x.to(dtype=self.dtype)
-        x0: Float[Tensor, "E 1 C"] = x[:, :1, :]
-        xt: Float[Tensor, "E D_m_trunc_minus_1 C"] = x[:, 1:, :]
+        x0 = x[:, :1, :]  # (E, 1, C)
+        xt = x[:, 1:, :]  # (E, D_m_trunc-1, C)
 
         if self.centering:
             x0 = x0 - x0.mean(dim=-1, keepdim=True)
-        inv_rms0: Float[Tensor, "E 1 1"] = torch.rsqrt(
+        inv_rms0 = torch.rsqrt(  # (E, 1, 1)
             x0.pow(2).mean(dim=-1, keepdim=True) + self.eps
         )
         x0 = x0 * inv_rms0
@@ -604,24 +597,24 @@ class ReducedSeparableRMSNorm(nn.Module):
                     x0 += self.bias0.reshape(1, 1, -1)
             return x0.to(dtype=in_dtype)
 
-        mean_var: Float[Tensor, " E"] = torch.einsum(
+        mean_var = torch.einsum(  # (E,)
             "edc,d->e", xt * xt, self.balance_weight
         )
-        inv_rmst: Float[Tensor, "E 1 1"] = torch.rsqrt(mean_var + self.eps).reshape(
+        inv_rmst = torch.rsqrt(mean_var + self.eps).reshape(  # (E, 1, 1)
             -1, 1, 1
         )
         xt = xt * inv_rmst
 
         if self.affine and self.weight is not None:
-            w: Float[Tensor, "D_m_trunc C"] = torch.index_select(
+            w = torch.index_select(  # (D_m_trunc, C)
                 self.weight, dim=0, index=self.degree_index_m
             )
-            w0: Float[Tensor, "1 1 C"] = w[0].reshape(1, 1, -1)
-            wt: Float[Tensor, "1 D_m_trunc_minus_1 C"] = w[1:].unsqueeze(0)
+            w0 = w[0].reshape(1, 1, -1)  # (1, 1, C)
+            wt = w[1:].unsqueeze(0)  # (1, D_m_trunc-1, C)
             x0.mul_(w0)
             xt.mul_(wt)
             if self.centering and self.bias0 is not None:
-                bias0: Float[Tensor, "1 1 C"] = self.bias0.reshape(1, 1, -1)
+                bias0 = self.bias0.reshape(1, 1, -1)  # (1, 1, C)
                 x0 += bias0
 
         return torch.cat([x0, xt], dim=1).to(dtype=in_dtype)
@@ -711,7 +704,7 @@ class ScalarRMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(self, x: Float[Tensor, "... C"]) -> Float[Tensor, "... C"]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -720,7 +713,7 @@ class ScalarRMSNorm(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "... C"]
+        torch.Tensor
             Normalized tensor with the same shape as input, same dtype as input.
         """
         in_dtype = x.dtype
@@ -729,7 +722,7 @@ class ScalarRMSNorm(nn.Module):
         inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x = x * inv_rms
 
-        weight: Float[Tensor, " C"] = self.weight
+        weight = self.weight  # (C,)
         x = x * weight
         return x.to(dtype=in_dtype)
 
@@ -864,7 +857,7 @@ class SO3Linear(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(self, x: Float[Tensor, "N D C_in"]) -> Float[Tensor, "N D C_out"]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -873,7 +866,7 @@ class SO3Linear(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C_out"]
+        torch.Tensor
             Order-wise mixed features with shape (N, D, C_out).
         """
         # === Step 1. Expand weight: (lmax+1, C_out, C_in) -> (D, C_out, C_in) ===
@@ -894,7 +887,7 @@ class SO3Linear(nn.Module):
 
         # === Step 3. Add bias only to l=0 (index 0) ===
         if self.bias is not None:
-            bias0: Float[Tensor, "1 C_out"] = self.bias.reshape(1, -1)
+            bias0 = self.bias.reshape(1, -1)  # (1, C_out)
             out[:, 0, :] = out[:, 0, :] + bias0
 
         return out
@@ -1096,26 +1089,24 @@ class SO2Linear(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(
-        self, x: Float[Tensor, "N D_m_trunc Cin"]
-    ) -> Float[Tensor, "N D_m_trunc Cout"]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
-        x : Float[Tensor, "N D_m_trunc Cin"]
+        x
             Input with shape (N, D_m_trunc, Cin), where D_m_trunc is the
             coefficient dimension of the m-major layout truncated by `mmax`.
 
         Returns
         -------
-        Float[Tensor, "N D_m_trunc Cout"]
+        torch.Tensor
             Output with shape (N, D_m_trunc, Cout), where Cout is output channels.
         """
         # === Step 1. Flatten input in m-major order ===
         # Layout: [m=0 (l=0..lmax), m=1 neg, m=1 pos, m=2 neg, m=2 pos, ...],
         # each coefficient contributes a Cin-sized block in the flattened axis.
         n_atom, D_m_trunc, Cin = x.shape
-        x_flat: Float[Tensor, "N D_m_trunc_x_Cin"] = x.reshape(n_atom, -1)
+        x_flat = x.reshape(n_atom, -1)  # (N, D_m_trunc * Cin)
 
         # === Step 2. Build block-diagonal weight (m=0 + all |m|>0 groups) ===
         # m=0: unconstrained linear over (lmax+1) coefficients.
@@ -1133,8 +1124,8 @@ class SO2Linear(nn.Module):
         weight = torch.block_diag(*weight_blocks)
 
         # === Step 3. Single matmul + reshape ===
-        out_flat: Float[Tensor, "N D_m_trunc_x_Cout"] = torch.matmul(x_flat, weight.t())
-        out: Float[Tensor, "N D_m_trunc Cout"] = out_flat.reshape(
+        out_flat = torch.matmul(x_flat, weight.t())  # (N, D_m_trunc * Cout)
+        out = out_flat.reshape(  # (N, D_m_trunc, Cout)
             n_atom, D_m_trunc, self.out_channels
         )
 
@@ -1463,10 +1454,10 @@ class SO2Convolution(nn.Module):
 
     def forward(
         self,
-        x: Float[Tensor, "N D C"],
+        x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
-        radial_feat: Float[Tensor, "E lmax_plus_1 C"],
-    ) -> Float[Tensor, "N D C"]:
+        radial_feat: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -1480,11 +1471,11 @@ class SO2Convolution(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Message updates with shape (N, D, C).
         """
         src, dst = edge_cache.src, edge_cache.dst
-        x_src: Float[Tensor, "E D C"] = x[src]
+        x_src = x[src]  # (E, D, C)
 
         # === Step 1. Rotate to edge-aligned local frame ===
         with nvtx_range("SO2Conv/rotate_to_local"):
@@ -1497,11 +1488,11 @@ class SO2Convolution(nn.Module):
                 key_lmax=self.lmax,
                 key_mmax=self.mmax,
             )
-            x_local: Float[Tensor, "E D_m_trunc C"] = torch.bmm(D_m_prime, x_src)
+            x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m_trunc, C)
 
         # === Step 2. Select radial/type features for reduced layout ===
         with nvtx_range("SO2Conv/radial_fuse"):
-            rad_feat: Float[Tensor, "E D_m_trunc C"] = radial_feat[
+            rad_feat = radial_feat[  # (E, D_m_trunc, C)
                 :, self.degree_index_m, :
             ]
             x_local.mul_(rad_feat)
@@ -1514,7 +1505,7 @@ class SO2Convolution(nn.Module):
                 x_local = so2_linear(x_local)
 
                 if layer_idx == 0 and so2_linear.bias0 is not None:
-                    bias_correction: Float[Tensor, "E C"] = so2_linear.bias0 * (
+                    bias_correction = so2_linear.bias0 * (  # (E, C)
                         rad_feat[:, 0, :] * edge_cache.edge_env - 1.0
                     )
                     x_local[:, 0, :].add_(bias_correction)
@@ -1533,7 +1524,7 @@ class SO2Convolution(nn.Module):
                 key_lmax=self.lmax,
                 key_mmax=self.mmax,
             )
-            x_message: Float[Tensor, "E D C"] = torch.bmm(Dt_from_m, x_local)
+            x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
 
         # === Step 5. Aggregate with optional head-wise gating ===
         with nvtx_range("SO2Conv/aggregate"):
@@ -1554,40 +1545,40 @@ class SO2Convolution(nn.Module):
                     out.mul_(edge_cache.inv_sqrt_deg)
             else:
                 # === Step 5.1. Extract scalar features for gating ===
-                x_l0: Float[Tensor, "N C"] = x[:, 0, :]
-                radial_l0: Float[Tensor, "E C"] = radial_feat[:, 0, :]
-                msg_l0: Float[Tensor, "E C"] = x_message[:, 0, :]
+                x_l0 = x[:, 0, :]  # (N, C)
+                radial_l0 = radial_feat[:, 0, :]  # (E, C)
+                msg_l0 = x_message[:, 0, :]  # (E, C)
 
                 # === Step 5.2. Compute edge gate (fp32+ logits path) ===
                 # Edge gate logits: dst/msg normalized inputs, radial stays raw
                 compute_dtype = self.compute_dtype
-                dst_logits: Float[Tensor, "N H"] = self.proj_dst(
+                dst_logits = self.proj_dst(  # (N, H)
                     self.norm_dst_for_gate(x_l0)
                 ).to(dtype=compute_dtype)
-                radial_logits: Float[Tensor, "E H"] = self.proj_rad(radial_l0).to(
+                radial_logits = self.proj_rad(radial_l0).to(  # (E, H)
                     dtype=compute_dtype
                 )
-                msg_logits: Float[Tensor, "E H"] = self.proj_msg(
+                msg_logits = self.proj_msg(  # (E, H)
                     self.norm_msg_for_gate(msg_l0)
                 ).to(dtype=compute_dtype)
-                msg_alpha: Float[Tensor, "1 H"] = torch.exp(
+                msg_alpha = torch.exp(  # (1, H)
                     self.msg_gate_alpha_log
                 ).view(1, -1)
-                edge_logits: Float[Tensor, "E H"] = (
+                edge_logits = (  # (E, H)
                     dst_logits.index_select(0, dst)
                     + radial_logits
                     + msg_alpha * msg_logits
                 )
-                tau: Float[Tensor, "1 H"] = torch.exp(self.gate_tau_log).view(1, -1)
-                edge_gate: Float[Tensor, "E H"] = torch.sigmoid(edge_logits / tau)
-                edge_weight: Float[Tensor, "E H"] = (
+                tau = torch.exp(self.gate_tau_log).view(1, -1)  # (1, H)
+                edge_gate = torch.sigmoid(edge_logits / tau)  # (E, H)
+                edge_weight = (  # (E, H)
                     edge_cache.edge_env.to(dtype=compute_dtype) * edge_gate
                 )
 
                 # === Step 5.3. Head-wise scatter aggregation (fp32+ accumulation) ===
                 # Mixed-precision strategy: V stays in its native dtype (bf16/fp32/fp64),
                 E = x_message.shape[0]
-                V: Float[Tensor, "E D H head_dim"] = x_message.reshape(
+                V = x_message.reshape(  # (E, D, H, head_dim)
                     E, self.ebed_dim_full, self.n_atten_head, self.head_dim
                 )
 
@@ -1597,14 +1588,14 @@ class SO2Convolution(nn.Module):
                     out_heads = so2_head_scatter_triton(V, edge_weight, dst, x.shape[0])
                 else:
                     # Multiply in V's dtype (cheap), then cast contribution for stable accumulation
-                    edge_weight_4d: Float[Tensor, "E 1 H 1"] = edge_weight.reshape(
+                    edge_weight_4d = edge_weight.reshape(  # (E, 1, H, 1)
                         E, 1, self.n_atten_head, 1
                     )
-                    msg: Float[Tensor, "E D H head_dim"] = V * edge_weight_4d
-                    msg_acc: Float[Tensor, "E D H head_dim"] = msg.to(
+                    msg = V * edge_weight_4d  # (E, D, H, head_dim)
+                    msg_acc = msg.to(  # (E, D, H, head_dim)
                         dtype=compute_dtype
                     )
-                    out_heads: Float[Tensor, "N D H head_dim"] = torch.zeros(
+                    out_heads = torch.zeros(  # (N, D, H, head_dim)
                         x.shape[0],
                         self.ebed_dim_full,
                         self.n_atten_head,
@@ -1615,7 +1606,7 @@ class SO2Convolution(nn.Module):
                     out_heads.index_add_(0, dst, msg_acc)
 
                 # === Step 5.4. Apply degree normalization ===
-                out: Float[Tensor, "N D C"] = out_heads.reshape(
+                out = out_heads.reshape(  # (N, D, C)
                     x.shape[0], self.ebed_dim_full, self.channels
                 )
                 out.mul_(edge_cache.inv_sqrt_deg.to(dtype=compute_dtype))
@@ -1787,7 +1778,7 @@ class EquivariantFFN(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(self, x: Float[Tensor, "N D C"]) -> Float[Tensor, "N D C"]:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -1796,7 +1787,7 @@ class EquivariantFFN(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Output with shape (N, D, C).
         """
         # === Step 1. Input up projection ===
@@ -2046,10 +2037,10 @@ class SeZMInteractionBlock(nn.Module):
 
     def forward(
         self,
-        x: Float[Tensor, "N D C"],
+        x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
-        radial_feat: Float[Tensor, "E lmax_plus_1 C"] | None,
-    ) -> Float[Tensor, "N D C"]:
+        radial_feat: torch.Tensor | None,
+    ) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -2062,18 +2053,18 @@ class SeZMInteractionBlock(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Updated features with shape (N, D, C).
         """
-        x_res: Float[Tensor, "N D C"] = x
+        x_res = x  # (N, D, C)
 
         # === Step 1. Pre-Norm (SO2) ===
         with nvtx_range("SeZMBlock/pre_norm"):
-            x_pre: Float[Tensor, "N D C"] = self.pre_so2_norm(x)
+            x_pre = self.pre_so2_norm(x)  # (N, D, C)
 
         # === Step 2. SO(2) convolution ===
         with nvtx_range("SeZMBlock/so2_conv"):
-            y: Float[Tensor, "N D C"] = self.so2_conv(x_pre, edge_cache, radial_feat)
+            y = self.so2_conv(x_pre, edge_cache, radial_feat)  # (N, D, C)
 
         # === Step 3. Post-Norm (SO2) ===
         with nvtx_range("SeZMBlock/post_so2_norm"):

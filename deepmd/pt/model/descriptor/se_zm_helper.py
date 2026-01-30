@@ -33,10 +33,6 @@ from einops import (
     rearrange,
 )
 
-if TYPE_CHECKING:
-    from torch import Tensor
-    from jaxtyping import Float, Int
-
 from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
@@ -92,11 +88,11 @@ def init_trunc_normal_fan_in_out(
 
 
 def build_edge_type_feat(
-    type_ebed: Float[Tensor, "N C"],
-    src: Int[Tensor, " E"],
-    dst: Int[Tensor, " E"],
+    type_ebed: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
     num_edges: int | None = None,
-) -> Float[Tensor, "E C"]:
+) -> torch.Tensor:
     """
     Build per-edge type features by summing src/dst embeddings.
 
@@ -113,7 +109,7 @@ def build_edge_type_feat(
 
     Returns
     -------
-    Float[Tensor, "E C"]
+    torch.Tensor
         Per-edge type features with shape (E, C).
     """
     if num_edges is None:
@@ -197,10 +193,10 @@ class EdgeFeatureCache(NamedTuple):
         self,
         *,
         ebed_dim_full: int,
-        coeff_index_m: Int[Tensor, " D_m_trunc"],
+        coeff_index_m: torch.Tensor,
         key_lmax: int,
         key_mmax: int,
-    ) -> Float[Tensor, "E D_m_trunc D"]:
+    ) -> torch.Tensor:
         """
         Fetch (or build once) the row-projected Wigner-D blocks for m-major layout.
 
@@ -221,7 +217,7 @@ class EdgeFeatureCache(NamedTuple):
 
         Returns
         -------
-        Float[Tensor, "E D_m_trunc D"]
+        torch.Tensor
             Projected rotation matrix with shape (E, D_m_trunc, D).
         """
         cache_key = f"{int(key_lmax)}:{int(key_mmax)}"
@@ -232,11 +228,11 @@ class EdgeFeatureCache(NamedTuple):
         if cached is not None:
             return cached
 
-        D_full: Float[Tensor, "E D D"] = self.D_full
+        D_full = self.D_full  # (E, D, D)
         if D_full is None:
             raise ValueError("EdgeFeatureCache.D_full is None")
-        D_block: Float[Tensor, "E D D"] = D_full[:, :ebed_dim_full, :ebed_dim_full]
-        D_to_m: Float[Tensor, "E D_m_trunc D"] = D_block.index_select(1, coeff_index_m)
+        D_block = D_full[:, :ebed_dim_full, :ebed_dim_full]  # (E, D, D)
+        D_to_m = D_block.index_select(1, coeff_index_m)  # (E, D_m_trunc, D)
         cache_dict[cache_key] = D_to_m
         return D_to_m
 
@@ -244,10 +240,10 @@ class EdgeFeatureCache(NamedTuple):
         self,
         *,
         ebed_dim_full: int,
-        coeff_index_m: Int[Tensor, " D_m_trunc"],
+        coeff_index_m: torch.Tensor,
         key_lmax: int,
         key_mmax: int,
-    ) -> Float[Tensor, "E D D_m_trunc"]:
+    ) -> torch.Tensor:
         """
         Fetch (or build once) the column-projected Wigner-D^T blocks for inverse rotation.
 
@@ -268,7 +264,7 @@ class EdgeFeatureCache(NamedTuple):
 
         Returns
         -------
-        Float[Tensor, "E D D_m_trunc"]
+        torch.Tensor
             Projected inverse rotation matrix with shape (E, D, D_m_trunc).
         """
         cache_key = (int(key_lmax), int(key_mmax))
@@ -279,13 +275,11 @@ class EdgeFeatureCache(NamedTuple):
         if cached is not None:
             return cached
 
-        Dt_full: Float[Tensor, "E D D"] = self.Dt_full
+        Dt_full = self.Dt_full  # (E, D, D)
         if Dt_full is None:
             raise ValueError("EdgeFeatureCache.Dt_full is None")
-        Dt_block: Float[Tensor, "E D D"] = Dt_full[:, :ebed_dim_full, :ebed_dim_full]
-        Dt_from_m: Float[Tensor, "E D D_m_trunc"] = Dt_block.index_select(
-            2, coeff_index_m
-        )
+        Dt_block = Dt_full[:, :ebed_dim_full, :ebed_dim_full]  # (E, D, D)
+        Dt_from_m = Dt_block.index_select(2, coeff_index_m)  # (E, D, D_m_trunc)
         cache_dict[cache_key] = Dt_from_m
         return Dt_from_m
 
@@ -560,29 +554,29 @@ class RadialBasis(nn.Module):
 
         self.envelope = C2CutoffEnvelope(rcut=self.rcut, exponent=self.exponent)
 
-    def forward(self, r: Float[Tensor, "N 1"]) -> Float[Tensor, "N n_rbf"]:
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
         """
         Compute radial basis functions.
 
         Parameters
         ----------
-        r : Float[Tensor, "N 1"]
+        r : torch.Tensor
             Pair distances with shape (N, 1) in Å, where N is the number of pairs.
 
         Returns
         -------
-        Float[Tensor, "N n_rbf"]
+        torch.Tensor
             Radial basis multiplied by C^2 cutoff envelope with shape (N, n_rbf).
             The output is smoothly truncated to zero at r = rcut.
         """
         # === Step 1. Bessel Basis via Sinc ===
         # phi_n(r) = w_n * sinc(w_n * r / π)
         # Shape: (N, 1) * (1, n_radial) -> (N, n_radial)
-        x: Float[Tensor, "N n_rbf"] = r * self.freqs
-        raw: Float[Tensor, "N n_rbf"] = self.freqs * torch.sinc(x / math.pi)
+        x = r * self.freqs  # (N, n_rbf)
+        raw = self.freqs * torch.sinc(x / math.pi)  # (N, n_rbf)
 
         # === Step 2. Apply C^2 envelope for smooth cutoff ===
-        envelope: Float[Tensor, "N 1"] = self.envelope(r)
+        envelope = self.envelope(r)  # (N, 1)
         return raw * envelope
 
     def serialize(self) -> dict[str, Any]:
@@ -690,8 +684,8 @@ class GeometricInitialEmbedding(nn.Module):
         *,
         n_nodes: int,
         edge_cache: EdgeFeatureCache,
-        radial_feat: Float[Tensor, "E lmax C"],
-    ) -> Float[Tensor, "N D C"]:
+        radial_feat: torch.Tensor,
+    ) -> torch.Tensor:
         """
         Parameters
         ----------
@@ -704,7 +698,7 @@ class GeometricInitialEmbedding(nn.Module):
 
         Returns
         -------
-        Float[Tensor, "N D C"]
+        torch.Tensor
             Initial features to add with shape (N, D, C). l=0 is guaranteed zero.
         """
         # === Step 1. Early exit ===
@@ -720,9 +714,9 @@ class GeometricInitialEmbedding(nn.Module):
 
         device = edge_cache.edge_vec.device
         dtype = edge_cache.edge_vec.dtype
-        out: Float[Tensor, "N D C"] = torch.zeros(
+        out = torch.zeros(
             n_nodes, self.ebed_dim, self.channels, device=device, dtype=dtype
-        )
+        )  # (N, D, C)
         if self.lmax == 0:
             return out
 
@@ -731,22 +725,20 @@ class GeometricInitialEmbedding(nn.Module):
         # col_index maps each row to its m=0 column index for that l-block.
         # Advanced indexing pairs (row_index[i], col_index[i]) so each row pulls
         # the correct m=0 value for its own l.
-        Dt_full: Float[Tensor, "E D D"] = edge_cache.Dt_full
-        d_col: Float[Tensor, "E D_minus_1"] = Dt_full[:, self.row_index, self.col_index]
+        Dt_full = edge_cache.Dt_full  # (E, D, D)
+        d_col = Dt_full[:, self.row_index, self.col_index]  # (E, D-1)
 
         # === Step 3. Broadcast radial features per row ===
         # radial_index maps each packed row to its (l-1) radial slot.
         # This repeats the same radial feature across the (2l+1) rows of the l-block.
-        radial_row: Float[Tensor, "E D_minus_1 C"] = radial_feat.index_select(
-            1, self.radial_index
-        )
-        msg_global: Float[Tensor, "E D_minus_1 C"] = d_col.unsqueeze(-1) * radial_row
+        radial_row = radial_feat.index_select(1, self.radial_index)  # (E, D-1, C)
+        msg_global = d_col.unsqueeze(-1) * radial_row  # (E, D-1, C)
 
         # === Step 4. Scatter to nodes and normalize ===
         # Avoid advanced-index writeback (out[:, row_index, :]) which produces a copy.
-        msg_out: Float[Tensor, "N D_minus_1 C"] = out.new_zeros(
+        msg_out = out.new_zeros(
             n_nodes, self.row_index.numel(), self.channels
-        )
+        )  # (N, D-1, C)
         msg_out.index_add_(0, edge_cache.dst, msg_global)
         out[:, self.row_index, :] = msg_out
         out.mul_(edge_cache.inv_sqrt_deg)
@@ -940,9 +932,9 @@ class EnvironmentInitialEmbedding(nn.Module):
         self,
         *,
         edge_cache: EdgeFeatureCache,
-        atype_flat: Int[Tensor, " N"],
+        atype_flat: torch.Tensor,
         n_nodes: int,
-    ) -> Float[Tensor, "N 2_channels"]:
+    ) -> torch.Tensor:
         """
         Compute environment FiLM logits for l=0 conditioning.
 
@@ -950,14 +942,14 @@ class EnvironmentInitialEmbedding(nn.Module):
         ----------
         edge_cache : EdgeFeatureCache
             Edge cache containing src, dst, edge_vec, edge_rbf, edge_env.
-        atype_flat : Int[Tensor, "N"]
+        atype_flat : torch.Tensor
             Flattened atom types with shape (N,), where N = nf * nloc.
         n_nodes : int
             Number of nodes (N = nf * nloc).
 
         Returns
         -------
-        Float[Tensor, "N 2_channels"]
+        torch.Tensor
             FiLM logits with shape (N, 2*channels).
         """
         num_edges = edge_cache.src.numel()
@@ -967,65 +959,57 @@ class EnvironmentInitialEmbedding(nn.Module):
             )
 
         src, dst = edge_cache.src, edge_cache.dst
-        edge_vec: Float[Tensor, "E 3"] = edge_cache.edge_vec
-        edge_rbf: Float[Tensor, "E n_radial"] = edge_cache.edge_rbf
-        edge_env: Float[Tensor, "E 1"] = edge_cache.edge_env
+        edge_vec = edge_cache.edge_vec  # (E, 3)
+        edge_rbf = edge_cache.edge_rbf  # (E, n_radial)
+        edge_env = edge_cache.edge_env  # (E, 1)
 
         # === Step 1. Construct r_tilde = [s, s*r_hat] ===
         # s = edge_env * (1/r), r_hat = edge_vec / r
-        r_sq: Float[Tensor, "E 1"] = (edge_vec * edge_vec).sum(dim=-1, keepdim=True)
-        inv_r: Float[Tensor, "E 1"] = torch.rsqrt(r_sq.clamp(min=self.eps * self.eps))
-        s: Float[Tensor, "E 1"] = edge_env * inv_r
-        r_hat: Float[Tensor, "E 3"] = edge_vec * inv_r
-        r_tilde: Float[Tensor, "E 4"] = torch.cat([s, s * r_hat], dim=-1)
+        r_sq = (edge_vec * edge_vec).sum(dim=-1, keepdim=True)  # (E, 1)
+        inv_r = torch.rsqrt(r_sq.clamp(min=self.eps * self.eps))  # (E, 1)
+        s = edge_env * inv_r  # (E, 1)
+        r_hat = edge_vec * inv_r  # (E, 3)
+        r_tilde = torch.cat([s, s * r_hat], dim=-1)  # (E, 4)
 
         # === Step 2. Compute G network input and output ===
         # Use independent type embeddings (decoupled from main type embedding)
-        atype_src: Int[Tensor, " E"] = atype_flat.index_select(0, src)
-        atype_dst: Int[Tensor, " E"] = atype_flat.index_select(0, dst)
-        type_src: Float[Tensor, "E type_dim"] = self.env_type_embed(atype_src)
-        type_dst: Float[Tensor, "E type_dim"] = self.env_type_embed(atype_dst)
+        atype_src = atype_flat.index_select(0, src)  # (E,)
+        atype_dst = atype_flat.index_select(0, dst)  # (E,)
+        type_src = self.env_type_embed(atype_src)  # (E, type_dim)
+        type_dst = self.env_type_embed(atype_dst)  # (E, type_dim)
 
         # Project edge_rbf to rbf_out_dim (two-layer MLP)
-        rbf_proj: Float[Tensor, "E rbf_out_dim"] = self.rbf_proj_layer2(
+        rbf_proj = self.rbf_proj_layer2(
             self.rbf_proj_layer1(edge_rbf)
-        )
+        )  # (E, rbf_out_dim)
 
         # G network input: concat projected RBF and type embeddings
-        g_input: Float[Tensor, "E g_in_dim"] = torch.cat(
-            [rbf_proj, type_src, type_dst], dim=-1
-        )
-        g: Float[Tensor, "E embed_dim"] = self.g_layer2(self.g_layer1(g_input))
+        g_input = torch.cat([rbf_proj, type_src, type_dst], dim=-1)  # (E, g_in_dim)
+        g = self.g_layer2(self.g_layer1(g_input))  # (E, embed_dim)
 
         # === Step 3. Aggregate outer product by destination node ===
         # outer = r_tilde[:, :, None] * g[:, None, :]  # (E, 4, embed_dim)
-        outer: Float[Tensor, "E 4 embed_dim"] = torch.einsum("ei,ej->eij", r_tilde, g)
-        outer_flat: Float[Tensor, "E 4_embed_dim"] = outer.reshape(
-            num_edges, 4 * self.embed_dim
-        )
-        env_agg: Float[Tensor, "N 4_embed_dim"] = outer_flat.new_zeros(
-            n_nodes, 4 * self.embed_dim
-        )
+        outer = torch.einsum("ei,ej->eij", r_tilde, g)  # (E, 4, embed_dim)
+        outer_flat = outer.reshape(num_edges, 4 * self.embed_dim)  # (E, 4*embed_dim)
+        env_agg = outer_flat.new_zeros(n_nodes, 4 * self.embed_dim)  # (N, 4*embed_dim)
         env_agg.index_add_(0, dst, outer_flat)
-        env_agg: Float[Tensor, "N 4 embed_dim"] = env_agg.reshape(
-            n_nodes, 4, self.embed_dim
-        )
+        env_agg = env_agg.reshape(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)
 
         # === Step 4. Normalization by actual neighbor count ===
         # Use cached deg from edge_cache (already computed in build_edge_cache)
-        deg_clamped: Float[Tensor, " N"] = edge_cache.deg.clamp(min=1.0)
-        deg_scale: Float[Tensor, "N 1 1"] = torch.rsqrt(deg_clamped).reshape(-1, 1, 1)
+        deg_clamped = edge_cache.deg.clamp(min=1.0)  # (N,)
+        deg_scale = torch.rsqrt(deg_clamped).reshape(-1, 1, 1)  # (N, 1, 1)
         env_agg = env_agg * deg_scale
 
         # === Step 5. D matrix construction: D = env_agg^T @ env_agg[:,:,:axis_dim] ===
-        env_agg_t: Float[Tensor, "N embed_dim 4"] = env_agg.permute(0, 2, 1)
-        env_agg_axis: Float[Tensor, "N 4 axis_dim"] = env_agg[:, :, : self.axis_dim]
-        D: Float[Tensor, "N embed_dim axis_dim"] = torch.bmm(env_agg_t, env_agg_axis)
+        env_agg_t = env_agg.permute(0, 2, 1)  # (N, embed_dim, 4)
+        env_agg_axis = env_agg[:, :, : self.axis_dim]  # (N, 4, axis_dim)
+        D = torch.bmm(env_agg_t, env_agg_axis)  # (N, embed_dim, axis_dim)
 
         # === Step 6. Output projection for FiLM logits ===
-        D_flat: Float[Tensor, "N embed_dim_x_axis_dim"] = D.reshape(
+        D_flat = D.reshape(
             n_nodes, self.embed_dim * self.axis_dim
-        )
+        )  # (N, embed_dim*axis_dim)
         return self.output_proj(D_flat)
 
     def serialize(self) -> dict[str, Any]:
@@ -1237,22 +1221,20 @@ class WignerDCalculator(nn.Module):
         # === Step 3. Precompute indices for Z_full construction ===
         self._precompute_z_indices()
 
-    def forward(
-        self, rot_mat: Float[Tensor, "E 3 3"]
-    ) -> tuple[Float[Tensor, "E D D"], Float[Tensor, "E D D"]]:
+    def forward(self, rot_mat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute Wigner-D blocks for a batch of rotation matrices.
 
         Parameters
         ----------
-        rot_mat : Float[Tensor, "E 3 3"]
+        rot_mat : torch.Tensor
             Rotation matrices with shape (E, 3, 3), global->local.
 
         Returns
         -------
-        D_full : Float[Tensor, "E D D"]
+        D_full : torch.Tensor
             Block-diagonal matrix with shape (E, D, D) where D=(lmax+1)^2.
-        Dt_full : Float[Tensor, "E D D"]
+        Dt_full : torch.Tensor
             Transpose of D_full.
         """
         rot_mat = rot_mat.to(dtype=self.dtype)
@@ -1265,19 +1247,17 @@ class WignerDCalculator(nn.Module):
         # === Step 2. Build block-diagonal Z matrices ===
         # Each Z_full has shape (E, dim_full, dim_full)
         with nvtx_range("WignerD/z_rotation"):
-            Za_full: Float[Tensor, "E D D"] = self._build_z_rotation(alpha)
-            Zb_full: Float[Tensor, "E D D"] = self._build_z_rotation(beta)
-            Zc_full: Float[Tensor, "E D D"] = self._build_z_rotation(gamma)
+            Za_full = self._build_z_rotation(alpha)  # (E, D, D)
+            Zb_full = self._build_z_rotation(beta)  # (E, D, D)
+            Zc_full = self._build_z_rotation(gamma)  # (E, D, D)
 
         # === Step 3. Compute D_full via single matmul chain ===
         # D^{(l)}(R) = Z(alpha) @ J^T @ Z(beta) @ J @ Z(gamma)
         with nvtx_range("WignerD/matmul"):
-            J_full: Float[Tensor, "D D"] = self.J_full
-            Jt_full: Float[Tensor, "D D"] = self.Jt_full
-            D_full: Float[Tensor, "E D D"] = (
-                Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full
-            )
-            Dt_full: Float[Tensor, "E D D"] = D_full.transpose(-1, -2).contiguous()
+            J_full = self.J_full  # (D, D)
+            Jt_full = self.Jt_full  # (D, D)
+            D_full = Za_full @ Jt_full @ Zb_full @ J_full @ Zc_full  # (E, D, D)
+            Dt_full = D_full.transpose(-1, -2).contiguous()  # (E, D, D)
 
         return D_full, Dt_full
 
@@ -1556,7 +1536,7 @@ class WignerDCalculator(nn.Module):
             out += sign * pref / denom * (cos_b**p_cos) * (sin_b**p_sin)
         return out
 
-    def _build_z_rotation(self, angle: Float[Tensor, " E"]) -> Float[Tensor, "E D D"]:
+    def _build_z_rotation(self, angle: torch.Tensor) -> torch.Tensor:
         """
         Build block-diagonal Z rotation matrix in real spherical harmonics basis.
 
@@ -1572,28 +1552,28 @@ class WignerDCalculator(nn.Module):
 
         Parameters
         ----------
-        angle : Float[Tensor, "E"]
+        angle : torch.Tensor
             Rotation angles with shape (E,).
 
         Returns
         -------
-        Float[Tensor, "E D D"]
+        torch.Tensor
             Block-diagonal rotation matrices with shape (E, D, D).
         """
-        m0_indices: Int[Tensor, " lmax_plus_1"] = self.m0_indices
-        m_values: Float[Tensor, " n_blocks"] = self.m_values
-        pos_indices: Int[Tensor, " n_blocks"] = self.pos_indices
-        neg_indices: Int[Tensor, " n_blocks"] = self.neg_indices
+        m0_indices = self.m0_indices  # (lmax+1,)
+        m_values = self.m_values  # (n_blocks,)
+        pos_indices = self.pos_indices  # (n_blocks,)
+        neg_indices = self.neg_indices  # (n_blocks,)
 
         # === Step 1. Allocate Z matrix ===
         n_edges = angle.shape[0]
-        Z: Float[Tensor, "E D D"] = torch.zeros(
+        Z = torch.zeros(
             n_edges,
             self.dim_full,
             self.dim_full,
             dtype=angle.dtype,
             device=angle.device,
-        )
+        )  # (E, D, D)
 
         # === Step 2. Set m=0 diagonal elements to 1 ===
         # Z[:, m0_idx, m0_idx] = 1 for each l's center element
@@ -1603,9 +1583,9 @@ class WignerDCalculator(nn.Module):
         if m_values.numel() > 0:
             # Compute cos(m*angle) and sin(m*angle) for all (l,m) pairs
             # angles_m: (E, n_blocks) where n_blocks = total (l,m) pairs with m>0
-            angles_m: Float[Tensor, "E n_blocks"] = angle[:, None] * m_values[None, :]
-            c: Float[Tensor, "E n_blocks"] = torch.cos(angles_m)
-            s: Float[Tensor, "E n_blocks"] = torch.sin(angles_m)
+            angles_m = angle[:, None] * m_values[None, :]  # (E, n_blocks)
+            c = torch.cos(angles_m)  # (E, n_blocks)
+            s = torch.sin(angles_m)  # (E, n_blocks)
 
             # Fill the 2x2 rotation blocks:
             #   Z[pos, pos] =  cos(m*theta)
@@ -1765,7 +1745,7 @@ def edge_cache_to_dtype(
     )
 
 
-def safe_norm(x: Float[Tensor, "N 3"], eps: float = 1e-7) -> Float[Tensor, "N 1"]:
+def safe_norm(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
     """
     Compute vector norm with an epsilon lower bound.
 
@@ -1773,14 +1753,14 @@ def safe_norm(x: Float[Tensor, "N 3"], eps: float = 1e-7) -> Float[Tensor, "N 1"
 
     Parameters
     ----------
-    x : Float[Tensor, "N 3"]
+    x : torch.Tensor
         Input tensor with shape (N, 3), where N is the number of vectors.
     eps : float
         Lower bound for the norm.
 
     Returns
     -------
-    Float[Tensor, "N 1"]
+    torch.Tensor
         Norm with shape (N, 1), clamped to be >= eps.
     """
     in_dtype = x.dtype
@@ -2264,10 +2244,10 @@ def init_edge_rot_mat(edge_vec: torch.Tensor) -> torch.Tensor:
 
 
 def init_edge_rot_mat_frisvad(
-    edge_vec: Float[Tensor, "E 3"],
-    edge_len: Float[Tensor, "E 1"] | None = None,
+    edge_vec: torch.Tensor,
+    edge_len: torch.Tensor | None = None,
     eps: float = 1e-7,
-) -> Float[Tensor, "E 3 3"]:
+) -> torch.Tensor:
     """
     Compute rotation matrices that align each edge to the local + Z axis.
 
@@ -2316,7 +2296,7 @@ def init_edge_rot_mat_frisvad(
 
     Returns
     -------
-    Float[Tensor, "E 3 3"]
+    torch.Tensor
         Rotation matrices with shape (E, 3, 3).
     """
     # === Step 1. Normalize edge direction (local z) ===
@@ -2325,41 +2305,39 @@ def init_edge_rot_mat_frisvad(
         edge_len = safe_norm(edge_vec, eps)
     else:
         edge_len = edge_len.clamp(min=eps)
-    z_hat: Float[Tensor, "E 3"] = edge_vec / edge_len
-    nx: Float[Tensor, "E 1"] = z_hat[..., 0:1]
-    ny: Float[Tensor, "E 1"] = z_hat[..., 1:2]
-    nz: Float[Tensor, "E 1"] = z_hat[..., 2:3]
+    z_hat = edge_vec / edge_len  # (E, 3)
+    nx = z_hat[..., 0:1]  # (E, 1)
+    ny = z_hat[..., 1:2]  # (E, 1)
+    nz = z_hat[..., 2:3]  # (E, 1)
 
     # === Step 2. Frisvad closed-form orthonormal basis (non-singular) ===
     # The closed-form uses a = 1 / (1 + nz), which is singular at nz = -1.
     # Compute it with a safe denominator, then select by a singular mask.
     # Use a fixed threshold for singular detection (1e-6 is sufficient for all precisions).
     singular_threshold = 1.0e-6
-    singular: Float[Tensor, "E 1"] = nz < (-1.0 + singular_threshold)
+    singular = nz < (-1.0 + singular_threshold)  # (E, 1)
 
-    denom: Float[Tensor, "E 1"] = 1.0 + nz
-    denom_safe: Float[Tensor, "E 1"] = torch.where(
-        singular, torch.ones_like(denom), denom
-    )
-    a: Float[Tensor, "E 1"] = 1.0 / denom_safe
-    b: Float[Tensor, "E 1"] = -nx * ny * a
+    denom = 1.0 + nz  # (E, 1)
+    denom_safe = torch.where(singular, torch.ones_like(denom), denom)  # (E, 1)
+    a = 1.0 / denom_safe  # (E, 1)
+    b = -nx * ny * a  # (E, 1)
 
-    x_main: Float[Tensor, "E 3"] = torch.cat([1.0 - nx * nx * a, b, -nx], dim=-1)
-    y_main: Float[Tensor, "E 3"] = torch.cat([b, 1.0 - ny * ny * a, -ny], dim=-1)
+    x_main = torch.cat([1.0 - nx * nx * a, b, -nx], dim=-1)  # (E, 3)
+    y_main = torch.cat([b, 1.0 - ny * ny * a, -ny], dim=-1)  # (E, 3)
 
     # === Step 3. Strict fallback for the singular neighborhood (z_hat ~= -Z) ===
     # Build x_hat/y_hat from the current z_hat so that:
     #   x_hat ⟂ z_hat, y_hat ⟂ z_hat, and (x_hat, y_hat, z_hat) is right-handed.
     # In the singular neighborhood near -Z, ref = +X is guaranteed not parallel to z_hat.
-    ref: Float[Tensor, "E 3"] = torch.tensor(
+    ref = torch.tensor(
         [1.0, 0.0, 0.0], dtype=edge_vec.dtype, device=edge_vec.device
-    ).expand_as(edge_vec)
-    x_fb: Float[Tensor, "E 3"] = torch.cross(ref, z_hat, dim=-1)
+    ).expand_as(edge_vec)  # (E, 3)
+    x_fb = torch.cross(ref, z_hat, dim=-1)  # (E, 3)
     x_fb = x_fb / safe_norm(x_fb, eps)
-    y_fb: Float[Tensor, "E 3"] = torch.cross(z_hat, x_fb, dim=-1)
+    y_fb = torch.cross(z_hat, x_fb, dim=-1)  # (E, 3)
     y_fb = y_fb / safe_norm(y_fb, eps)
 
-    mask3: Float[Tensor, "E 3"] = singular.expand_as(edge_vec)
+    mask3 = singular.expand_as(edge_vec)  # (E, 3)
     x_hat = torch.where(mask3, x_fb, x_main)
     y_hat = torch.where(mask3, y_fb, y_main)
 
@@ -2369,5 +2347,5 @@ def init_edge_rot_mat_frisvad(
 
     # === Step 4. Stack rows to form global->local rotation ===
     # Row-stacking ensures v_local = R @ v_global.
-    rot_mat: Float[Tensor, "E 3 3"] = torch.stack([x_hat, y_hat, z_hat], dim=-2)
+    rot_mat = torch.stack([x_hat, y_hat, z_hat], dim=-2)  # (E, 3, 3)
     return rot_mat
