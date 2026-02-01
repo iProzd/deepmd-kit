@@ -25,12 +25,18 @@ from torch.utils.data.distributed import (
     DistributedSampler,
 )
 
+from deepmd.dpmodel.utils.neighbor_stat import (
+    NeighborStatOP,
+)
 from deepmd.pt.modifier import (
     BaseModifier,
 )
 from deepmd.pt.utils import (
     dp_random,
     env,
+)
+from deepmd.pt.utils.auto_batch_size import (
+    AutoBatchSize,
 )
 from deepmd.pt.utils.dataset import (
     DeepmdDataSetForLoader,
@@ -62,6 +68,14 @@ def setup_seed(seed: int | list[int] | tuple[int, ...]) -> None:
     dp_random.seed(seed)
 
 
+def _format_system_label(system_dir: str) -> str:
+    """Build a short label from a system directory path."""
+    parts = system_dir.rstrip("/").split("/")
+    if len(parts) >= 2:
+        return "/".join(parts[-2:])
+    return parts[-1] if parts else system_dir
+
+
 class DpLoaderSet(Dataset):
     """A dataset for storing DataLoaders to multiple Systems.
 
@@ -73,6 +87,8 @@ class DpLoaderSet(Dataset):
             Max frame count in a batch.
     type_map
             Gives the name of different atom types
+    gnn_batch_info
+            Optional graph batch info with keys: n_node, n_edge, rcut.
     seed
             Random seed for dataloader
     shuffle
@@ -87,6 +103,7 @@ class DpLoaderSet(Dataset):
         seed: int | None = None,
         shuffle: bool = True,
         modifier: BaseModifier | None = None,
+        gnn_batch_info: dict[str, int | float] | None = None,
     ) -> None:
         if seed is not None:
             setup_seed(seed)
@@ -115,48 +132,147 @@ class DpLoaderSet(Dataset):
         self.sampler_list: list[DistributedSampler] = []
         self.index = []
         self.total_batch = 0
+        self.max_edges: list[int] | None = None
 
         self.dataloaders = []
         self.batch_sizes = []
         if isinstance(batch_size, str):
-            if batch_size == "auto":
-                rule = 32
-                ceiling = True
-            elif batch_size.startswith("auto:"):
-                rule = int(batch_size.split(":")[1])
-                ceiling = True
-            elif batch_size.startswith("max:"):
-                rule = int(batch_size.split(":")[1])
-                ceiling = False
-            elif batch_size.startswith("filter:"):
-                # remove system with more than `filter` atoms
-                rule = int(batch_size.split(":")[1])
-                len_before = len(self.systems)
-                self.systems = [
-                    system for system in self.systems if system._natoms <= rule
-                ]
-                len_after = len(self.systems)
-                if len_before != len_after:
-                    log.warning(
-                        f"Remove {len_before - len_after} systems with more than {rule} atoms"
-                    )
-                if len(self.systems) == 0:
-                    raise ValueError(
-                        f"No system left after removing systems with more than {rule} atoms"
-                    )
-                ceiling = False
-            else:
-                raise ValueError(f"Unsupported batch size rule: {batch_size}")
-            for ii in self.systems:
-                ni = ii._natoms
-                bsi = rule // ni
-                if ceiling:
-                    if bsi * ni < rule:
-                        bsi += 1
+            if batch_size == "gnnmax" or batch_size.startswith("gnnmax:"):
+                # === Parse node/edge limits ===
+                if batch_size == "gnnmax":
+                    # Auto mode: read n_node/n_edge from model config
+                    if gnn_batch_info is None:
+                        raise ValueError(
+                            "batch_size='gnnmax' requires gnn_batch_info from model"
+                        )
+                    if "n_node" not in gnn_batch_info or "n_edge" not in gnn_batch_info:
+                        raise ValueError(
+                            "batch_size='gnnmax' requires model to have n_node and n_edge parameters"
+                        )
+                    node_limit = int(gnn_batch_info["n_node"])
+                    edge_limit = int(gnn_batch_info["n_edge"])
+                    if node_limit <= 0 or edge_limit <= 0:
+                        raise ValueError(
+                            "batch_size='gnnmax' requires positive n_node and n_edge in model"
+                        )
                 else:
-                    if bsi == 0:
-                        bsi = 1
-                self.batch_sizes.append(bsi)
+                    # Explicit mode: gnnmax:node,edge
+                    rule = batch_size.split(":", 1)[1]
+                    if "," not in rule:
+                        raise ValueError(
+                            "gnnmax requires format gnnmax:node,edge with positive integers"
+                        )
+                    node_str, edge_str = rule.split(",", 1)
+                    node_limit = int(node_str)
+                    edge_limit = int(edge_str)
+                    if node_limit <= 0 or edge_limit <= 0:
+                        raise ValueError(
+                            "gnnmax requires positive node and edge limits in gnnmax:node,edge"
+                        )
+
+                    # Validate against model params if provided
+                    if "n_node" in gnn_batch_info and "n_edge" in gnn_batch_info:
+                        model_node = int(gnn_batch_info.get("n_node", 0))
+                        model_edge = int(gnn_batch_info.get("n_edge", 0))
+                        if model_node <= 0 or model_edge <= 0:
+                            raise ValueError(
+                                "gnnmax requires positive n_node and n_edge in gnn_batch_info"
+                            )
+                        if model_node != node_limit or model_edge != edge_limit:
+                            raise ValueError(
+                                "gnnmax node/edge must match model n_node/n_edge when provided"
+                            )
+
+                if gnn_batch_info is None or "rcut" not in gnn_batch_info:
+                    raise ValueError("gnnmax requires rcut in gnn_batch_info")
+                rcut = float(gnn_batch_info["rcut"])
+
+                # === Step 1. Compute per-system max edge count ===
+                max_edges = [
+                    max(1, compute_max_edge_per_frame(system, rcut))
+                    for system in self.systems
+                ]
+                self.max_edges = max_edges
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+                # === Step 2. Validate fixed-shape feasibility ===
+                max_nodes = [system._natoms for system in self.systems]
+                max_node = max(max_nodes)
+                max_edge = max(max_edges)
+                if node_limit < max_node or edge_limit < max_edge:
+                    idx_node = (
+                        max_nodes.index(max_node) if node_limit < max_node else None
+                    )
+                    idx_edge = (
+                        max_edges.index(max_edge) if edge_limit < max_edge else None
+                    )
+                    idx = idx_node if idx_node is not None else idx_edge
+                    system = self.systems[idx]
+                    system_label = _format_system_label(system.system)
+                    raise ValueError(
+                        "gnnmax node/edge limits are too small for fixed-shape batching: "
+                        f"system={system_label} n_node={system._natoms} max_edge={max_edges[idx]} "
+                        f"node_limit={node_limit} edge_limit={edge_limit}. "
+                        f"Increase gnnmax:node,edge to at least node_limit>={max_node}, "
+                        f"edge_limit>={max_edge}."
+                    )
+
+                # === Step 3. Determine batch size by node/edge limits ===
+                for system, max_edge in zip(self.systems, max_edges):
+                    ni = system._natoms
+                    bsi_node = node_limit // ni
+                    bsi_edge = edge_limit // max_edge
+                    if bsi_node == 0 or bsi_edge == 0:
+                        system_label = _format_system_label(system.system)
+                        raise ValueError(
+                            "gnnmax node/edge limits are too small for fixed-shape batching: "
+                            f"system={system_label} n_node={ni} max_edge={max_edge} "
+                            f"node_limit={node_limit} edge_limit={edge_limit}. "
+                            f"Increase gnnmax:node,edge to at least node_limit>={max_node}, "
+                            f"edge_limit>={max_edge}."
+                        )
+                    bsi = min(bsi_node, bsi_edge)
+                    self.batch_sizes.append(bsi)
+            else:
+                if batch_size == "auto":
+                    rule = 32
+                    ceiling = True
+                elif batch_size.startswith("auto:"):
+                    rule = int(batch_size.split(":")[1])
+                    ceiling = True
+                elif batch_size.startswith("max:"):
+                    rule = int(batch_size.split(":")[1])
+                    ceiling = False
+                elif batch_size.startswith("filter:"):
+                    # remove system with more than `filter` atoms
+                    rule = int(batch_size.split(":")[1])
+                    len_before = len(self.systems)
+                    self.systems = [
+                        system for system in self.systems if system._natoms <= rule
+                    ]
+                    len_after = len(self.systems)
+                    if len_before != len_after:
+                        log.warning(
+                            f"Remove {len_before - len_after} systems with more than {rule} atoms"
+                        )
+                    if len(self.systems) == 0:
+                        raise ValueError(
+                            f"No system left after removing systems with more than {rule} atoms"
+                        )
+                    ceiling = False
+                else:
+                    raise ValueError(f"Unsupported batch size rule: {batch_size}")
+                for ii in self.systems:
+                    ni = ii._natoms
+                    bsi = rule // ni
+                    if ceiling:
+                        if bsi * ni < rule:
+                            bsi += 1
+                    else:
+                        if bsi == 0:
+                            bsi = 1
+                    self.batch_sizes.append(bsi)
         elif isinstance(batch_size, list):
             self.batch_sizes = batch_size
         else:
@@ -236,6 +352,7 @@ class DpLoaderSet(Dataset):
                 ],
                 prob,
                 [ss._data_system.pbc for ss in self.systems],
+                e_max=self.max_edges,
             )
 
     def preload_and_modify_all_data_torch(self) -> None:
@@ -304,3 +421,70 @@ def get_sampler_from_params(_data: Any, _params: dict[str, Any]) -> Any:
     else:
         _sampler = get_weighted_sampler(_data, "prob_sys_size")
     return _sampler
+
+
+def compute_max_edge_per_frame(system: DeepmdDataSetForLoader, rcut: float) -> int:
+    """
+    Compute the maximal number of valid edges per frame for a system.
+
+    Parameters
+    ----------
+    system : DeepmdDataSetForLoader
+        The data system wrapper.
+    rcut : float
+        The cutoff radius in Angstrom.
+
+    Returns
+    -------
+    int
+        The maximal number of valid edges per frame.
+    """
+    data = system._data_system
+    ntypes = data.get_ntypes()
+    op = NeighborStatOP(ntypes, rcut, data.mixed_type)
+    auto_batch_size = AutoBatchSize()
+    max_edge = 0
+
+    def _execute_with_edge(
+        coord: np.ndarray,
+        atype: np.ndarray,
+        cell: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        minrr2, max_nnei, edge_per_frame = op.call_with_edge_stats(
+            torch.from_numpy(coord).to(env.DEVICE),
+            torch.from_numpy(atype).to(env.DEVICE),
+            torch.from_numpy(cell).to(env.DEVICE) if cell is not None else None,
+        )
+        minrr2 = minrr2.detach().cpu().numpy()
+        max_nnei = max_nnei.detach().cpu().numpy()
+        edge_per_frame = edge_per_frame.detach().cpu().numpy()
+        return minrr2, max_nnei, edge_per_frame
+
+    # Suppress auto batch size logs
+    batch_logger = logging.getLogger("deepmd.utils.batch_size")
+    old_level = batch_logger.level
+    batch_logger.setLevel(logging.WARNING)
+    try:
+        # Iterate sets and collect max edge count
+        for set_dir in data.dirs:
+            data_set = data._load_set(set_dir)
+            _, _, edge_per_frame = auto_batch_size.execute_all(
+                _execute_with_edge,
+                data_set["coord"].shape[0],
+                data.get_natoms(),
+                data_set["coord"],
+                data_set["type"],
+                data_set["box"] if data.pbc else None,
+            )
+            max_edge = max(max_edge, int(np.max(edge_per_frame)))
+    finally:
+        batch_logger.setLevel(old_level)
+
+    system_label = "/".join(system.system.rstrip("/").split("/")[-2:])
+    log.debug(
+        "System Stats for GNN: System=%s n_atom=%d max_n_edge=%d",
+        system_label,
+        data.get_natoms(),
+        max_edge,
+    )
+    return max_edge

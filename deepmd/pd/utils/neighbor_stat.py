@@ -70,6 +70,29 @@ class NeighborStatOP(paddle.nn.Layer):
         paddle.Tensor
             The maximal number of neighbors
         """
+        min_rr2, nnei = self._compute_nnei(coord, atype, cell)
+        max_nnei = paddle.max(nnei, axis=1)
+        return min_rr2, max_nnei
+
+    def call_with_edge_stats(
+        self,
+        coord: paddle.Tensor,
+        atype: paddle.Tensor,
+        cell: paddle.Tensor | None,
+    ) -> tuple[paddle.Tensor, paddle.Tensor, paddle.Tensor]:
+        """Calculate neighbor statistics with per-frame edge counts."""
+        min_rr2, nnei = self._compute_nnei(coord, atype, cell)
+        max_nnei = paddle.max(nnei, axis=1)
+        edge_per_frame = paddle.sum(paddle.sum(nnei, axis=-1), axis=1)
+        return min_rr2, max_nnei, edge_per_frame
+
+    def _compute_nnei(
+        self,
+        coord: paddle.Tensor,
+        atype: paddle.Tensor,
+        cell: paddle.Tensor | None,
+    ) -> tuple[paddle.Tensor, paddle.Tensor]:
+        """Compute minimal distance and per-atom neighbor counts."""
         nframes = coord.shape[0]
         coord = coord.reshape([nframes, -1, 3])
         nloc = coord.shape[1]
@@ -87,14 +110,10 @@ class NeighborStatOP(paddle.nn.Layer):
         assert list(diff.shape) == [nframes, nloc, nall, 3]
         # remove the diagonal elements
         mask = paddle.eye(nloc, nall).to(dtype=paddle.bool, device=diff.place)
-        # diff[:, mask] = float("inf")
-        # diff.masked_fill_(
-        #     paddle.broadcast_to(mask.unsqueeze([0, -1]), diff.shape),
-        #     paddle.to_tensor(float("inf")),
-        # )
         diff[paddle.broadcast_to(mask.unsqueeze([0, -1]), diff.shape)] = float("inf")
         rr2 = paddle.sum(paddle.square(diff), axis=-1)
         min_rr2 = paddle.min(rr2, axis=-1)
+
         # count the number of neighbors
         if not self.mixed_types:
             mask = rr2 < self.rcut**2
@@ -109,8 +128,7 @@ class NeighborStatOP(paddle.nn.Layer):
             nnei = paddle.sum(
                 mask & ((extend_atype >= 0).unsqueeze(1)), axis=-1
             ).reshape([nframes, nloc, 1])
-        max_nnei = paddle.max(nnei, axis=1)
-        return min_rr2, max_nnei
+        return min_rr2, nnei
 
 
 class NeighborStat(BaseNeighborStat):
@@ -166,6 +184,25 @@ class NeighborStat(BaseNeighborStat):
                 )
                 yield np.max(max_nnei, axis=0), np.min(minrr2), jj
 
+    def iterator_with_edge(
+        self, data: DeepmdDataSystem
+    ) -> Iterator[tuple[np.ndarray, float, int, str]]:
+        """Iterator method producing neighbor statistics with edge counts."""
+        for ii in range(len(data.system_dirs)):
+            for jj in data.data_systems[ii].dirs:
+                data_set = data.data_systems[ii]
+                data_set_data = data_set._load_set(jj)
+                minrr2, max_nnei, edge_per_frame = self.auto_batch_size.execute_all(
+                    self._execute_with_edge,
+                    data_set_data["coord"].shape[0],
+                    data_set.get_natoms(),
+                    data_set_data["coord"],
+                    data_set_data["type"],
+                    data_set_data["box"] if data_set.pbc else None,
+                )
+                max_edge = int(np.max(edge_per_frame))
+                yield np.max(max_nnei, axis=0), np.min(minrr2), max_edge, jj
+
     def _execute(
         self,
         coord: np.ndarray,
@@ -192,3 +229,21 @@ class NeighborStat(BaseNeighborStat):
         minrr2 = minrr2.numpy()
         max_nnei = max_nnei.numpy()
         return minrr2, max_nnei
+
+    def _execute_with_edge(
+        self,
+        coord: np.ndarray,
+        atype: np.ndarray,
+        cell: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Execute the operation and return edge counts."""
+        with paddle.no_grad():
+            minrr2, max_nnei, edge_per_frame = self.op.call_with_edge_stats(
+                paddle.to_tensor(coord, place=DEVICE),
+                paddle.to_tensor(atype, place=DEVICE),
+                paddle.to_tensor(cell, place=DEVICE) if cell is not None else None,
+            )
+        minrr2 = minrr2.numpy()
+        max_nnei = max_nnei.numpy()
+        edge_per_frame = edge_per_frame.numpy()
+        return minrr2, max_nnei, edge_per_frame

@@ -113,6 +113,24 @@ def get_trainer(
 ) -> training.Trainer:
     multi_task = "model_dict" in config.get("model", {})
 
+    def gnn_batch_info_from_model(
+        model_params: dict[str, Any],
+    ) -> dict[str, int | float] | None:
+        info: dict[str, int | float] = {}
+        n_node = model_params.get("n_node")
+        n_edge = model_params.get("n_edge")
+        if n_node is not None:
+            info["n_node"] = int(n_node)
+        if n_edge is not None:
+            info["n_edge"] = int(n_edge)
+
+        descriptor = model_params.get("descriptor", {})
+        rcut = descriptor.get("rcut")
+        if rcut is not None:
+            info["rcut"] = float(rcut)
+
+        return info or None
+
     def prepare_trainer_input_single(
         model_params_single: dict[str, Any],
         data_dict_single: dict[str, Any],
@@ -148,6 +166,7 @@ def get_trainer(
             stat_file_path_single = DPPath(stat_file_path_single, "a")
 
         rank_seed = [rank, seed % (2**32)] if seed is not None else None
+        gnn_batch_info = gnn_batch_info_from_model(model_params_single)
 
         def _make_dp_loader_set(
             systems: str | list[str],
@@ -162,6 +181,7 @@ def get_trainer(
                 model_params_single["type_map"],
                 seed=rank_seed,
                 modifier=modifier,
+                gnn_batch_info=gnn_batch_info,
             )
 
         # LMDB path: single string → LmdbDataset
@@ -172,6 +192,7 @@ def get_trainer(
                 model_params_single["type_map"],
                 training_dataset_params["batch_size"],
                 auto_prob_style=auto_prob,
+                gnn_batch_info=gnn_batch_info,
             )
             if (
                 validation_systems is not None
@@ -182,6 +203,7 @@ def get_trainer(
                     validation_systems,
                     model_params_single["type_map"],
                     validation_dataset_params["batch_size"],
+                    gnn_batch_info=gnn_batch_info,
                 )
             elif validation_systems is not None:
                 validation_data_single = _make_dp_loader_set(

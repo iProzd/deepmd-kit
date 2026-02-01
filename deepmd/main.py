@@ -749,6 +749,12 @@ def main_parser() -> argparse.ArgumentParser:
         default=False,
         help="treat all types as a single type. Used with se_atten descriptor.",
     )
+    parser_neighbor_stat.add_argument(
+        "--gnn",
+        action="store_true",
+        default=False,
+        help=("also report the maximal number of valid edges per frame"),
+    )
 
     # change_bias
     parser_change_bias = subparsers.add_parser(
