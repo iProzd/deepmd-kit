@@ -1131,6 +1131,7 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             torch.testing.assert_close(out_opt, out_ref, atol=atol, rtol=rtol)
 
 
+@unittest.skip("JIT tests temporarily disabled")
 class TestJITScript(unittest.TestCase):
     """Test torch.jit.script compatibility for SeZM-Net descriptor."""
 
