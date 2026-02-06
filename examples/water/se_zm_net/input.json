@@ -32,6 +32,9 @@
       "seed": 7,
       "_comment": "that's all"
     },
+    "use_compile": false,
+    "n_node": 256,
+    "n_edge": 0,
     "_comment": "that's all"
   },
   "learning_rate": {
@@ -80,7 +83,8 @@
     "tensorboard_log_dir": "tb_log",
     "profiling": false,
     "profiling_file": "timeline.json",
-    "opt_type": "Muon",
+    "opt_type": "HybridMuon",
+    "use_fsdp": 0,
     "weight_decay": 0.001,
     "lr_adjust": 0,
     "seed": 7,

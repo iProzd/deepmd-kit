@@ -46,6 +46,26 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
 - `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is ignored; SeZM-Net always uses `sezm_ener`.
 - Internally it is built as `make_model(SeZMNetAtomicModel)`.
 
+### Optional compile path (fixed-shape sparse edges)
+
+SeZM-Net supports an optional **fixed-shape edge** path that enables `torch.compile` while preserving
+the standard DeePMD neighbor list behavior:
+
+- Enable with `model.use_compile = true`.
+- Set `model.n_node` to the fixed node count used for padding (must satisfy `n_node >= nf * nloc`).
+- Optional: set `model.n_edge` to cap the fixed edge count. `n_edge=0` means
+  `n_node * nsel` (default). When `n_edge>0`, valid edges are **globally sorted
+  by distance** and only the shortest `n_edge` are kept; extra edges are dropped
+  (padding is added if fewer are available).
+- The model still builds the DeePMD neighbor list, then **packs it into a fixed-shape edge list**
+  `(src, dst, edge_vec, edge_mask)` with size `n_edge` (or `n_node * nsel` when `n_edge=0`).
+- The descriptor accepts the fixed edge list directly and runs a **pure tensor graph**.
+- When `use_compile=false` (default), the normal DeePMD neighbor list path is used.
+- `use_compile` / `n_node` are model-level flags; the descriptor config remains unchanged.
+
+This path is designed for second-order derivatives during training; all geometry (edge vectors,
+Wigner-D, radial basis) remains differentiable, and padded edges are fully masked.
+
 ---
 
 ## High-Level Architecture
@@ -59,7 +79,7 @@ Standard DeePMD nlist path:
        ├─ edges: (src, dst) global indices, edge_vec
        ├─ edge_type_feat: per-edge type embedding (src+dst)
        ├─ edge_rbf: Bessel radial basis via sinc × C² envelope
-       ├─ edge_sw: C² cutoff envelope weights (flattened to valid edges)
+       ├─ edge_env: C² cutoff envelope weights (flattened to valid edges)
        ├─ D_full, Dt_full: block-diagonal Wigner-D matrices
        └─ inv_sqrt_deg: inverse sqrt degree for normalization
 
@@ -267,7 +287,7 @@ Let `E` be the number of valid edges:
 - `edge_type_feat`: `(E, C)` per-edge type embeddings (src+dst)
 - `edge_vec`: `(E, 3)` in Å
 - `edge_rbf`: `(E, n_radial)` Bessel radial basis via sinc × C² envelope (trainable frequencies)
-- `edge_sw`: `(E, 1)` C² cutoff envelope weights flattened to valid edges
+- `edge_env`: `(E, 1)` C² cutoff envelope weights flattened to valid edges
 - `D_full`: `(E, D, D)` block-diagonal Wigner-D matrix
 - `Dt_full`: transpose of `D_full`
 - `inv_sqrt_deg`: `(N, 1, 1)` inverse sqrt degree for graph-style normalization
@@ -524,7 +544,7 @@ The coefficients satisfy `E(0)=1, E(1)=0, E'(1)=0, E''(1)=0`, ensuring C² conti
 The C² envelope is applied in two places:
 
 1. In `RadialBasis.forward()`: multiplied into the radial basis functions
-2. As `edge_sw`: applied to all edge messages
+2. As `edge_env`: applied to all edge messages
 
 This double-guarantee ensures:
 

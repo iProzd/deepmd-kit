@@ -319,6 +319,10 @@ def get_sezm_net_model(model_params: dict) -> BaseModel:
         preset_out_bias, model_params["type_map"]
     )
     data_stat_protect = model_params.get("data_stat_protect", 1e-2)
+    use_compile = bool(model_params.get("use_compile", False))
+    use_tf32 = bool(model_params.get("use_tf32", False))
+    n_node = model_params.get("n_node")
+    n_edge = model_params.get("n_edge", 0)
 
     model = SeZMNetModel(
         descriptor=descriptor,
@@ -328,6 +332,10 @@ def get_sezm_net_model(model_params: dict) -> BaseModel:
         pair_exclude_types=pair_exclude_types,
         preset_out_bias=preset_out_bias,
         data_stat_protect=data_stat_protect,
+        use_compile=use_compile,
+        use_tf32=use_tf32,
+        n_node=n_node,
+        n_edge=n_edge,
     )
     model.model_def_script = json.dumps(model_params_old)
     return model

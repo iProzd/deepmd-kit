@@ -2597,6 +2597,23 @@ def sezm_net_model_args() -> Argument:
         "Store arbitrary key-value pairs with branch-specific information. "
         "Used only in multitask models."
     )
+    doc_use_compile = (
+        "If True, use fixed-shape edges and torch.compile in the SeZM-Net model. "
+        "Only supported in the PyTorch backend."
+    )
+    doc_use_tf32 = (
+        "If True, enable TF32 matmul precision when use_compile=True. "
+        "Only supported in the PyTorch backend."
+    )
+    doc_n_node = (
+        "Fixed number of nodes used by the compile path. Must be >= nf*nloc "
+        "when use_compile=True."
+    )
+    doc_n_edge = (
+        "Fixed number of edges used by the compile path. "
+        "0 means n_node * nsel. When set, edges are globally sorted by distance "
+        "and the longest ones are dropped (padding if needed)."
+    )
 
     ca = Argument(
         "SeZM-Net",
@@ -2611,6 +2628,34 @@ def sezm_net_model_args() -> Argument:
                 [],
                 [fitting_variant_type_args()],
                 doc=doc_fitting,
+            ),
+            Argument(
+                "use_compile",
+                bool,
+                optional=True,
+                default=False,
+                doc=doc_only_pt_supported + doc_use_compile,
+            ),
+            Argument(
+                "use_tf32",
+                bool,
+                optional=True,
+                default=False,
+                doc=doc_only_pt_supported + doc_use_tf32,
+            ),
+            Argument(
+                "n_node",
+                int,
+                optional=True,
+                default=256,
+                doc=doc_only_pt_supported + doc_n_node,
+            ),
+            Argument(
+                "n_edge",
+                int,
+                optional=True,
+                default=0,
+                doc=doc_only_pt_supported + doc_n_edge,
             ),
             Argument(
                 "model_branch_alias",

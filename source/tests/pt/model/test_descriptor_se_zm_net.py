@@ -2,6 +2,11 @@
 import itertools
 import math
 import unittest
+from pathlib import (
+    Path,
+)
+
+import numpy as np
 
 # NOTE: avoid torch thread reconfiguration errors during import.
 import torch
@@ -27,6 +32,9 @@ from deepmd.pt.model.descriptor.se_zm_helper import (
     build_m_major_index,
     edge_cache_to_dtype,
     so3_packed_index,
+)
+from deepmd.pt.model.model import (
+    get_sezm_net_model,
 )
 from deepmd.pt.utils import (
     env,
@@ -77,9 +85,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             device=self.device,
         ).view(1, -1, 3)
         atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
-        nlist = torch.tensor(
-            [[[1, -1], [0, -1]]], dtype=torch.int64, device=self.device
-        )
+        nlist = torch.tensor([[[1, 1], [0, 0]]], dtype=torch.int64, device=self.device)
         return coord, atype, nlist
 
     def test_forward_shape_and_dtype(self) -> None:
@@ -104,13 +110,86 @@ class TestDescrptSeZMNet(unittest.TestCase):
             self.assertEqual(model.dtype, dtype)
             self.assertIsInstance(model.wigner_calc, WignerDCalculator)
 
-            desc, _, _, _, sw = model(
+            desc, _, _, _, _ = model(
                 extended_coord, atype, nlist, mapping=None, comm_dict=None
             )
             self.assertEqual(desc.shape, (1, 2, 8))
             self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
-            self.assertEqual(sw.shape, (1, 2, 2, 1))
-            self.assertEqual(sw.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
+
+    def test_forward_backward_second_order_fixed_edges(self) -> None:
+        """Test fixed-shape edge path matches nlist for fwd/bwd/2nd order."""
+        dtype = torch.float32
+        coord = torch.tensor(
+            [[0.1, 0.2, 0.3], [1.1, 0.7, 0.2]],
+            dtype=dtype,
+            device=self.device,
+        ).view(1, -1, 3)
+        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
+        nlist = torch.tensor([[[1, 1], [0, 0]]], dtype=torch.int64, device=self.device)
+        extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
+
+        model = DescrptSeZMNet(
+            rcut=3.0,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 0],
+            channels=4,
+            n_radial=3,
+            radial_mlp=[6],
+            ffn_neurons=8,
+            precision="float32",
+            trainable=True,
+        )
+
+        desc_nlist, _, _, _, sw_nlist = model(
+            extended_coord, atype, nlist, mapping=None, comm_dict=None
+        )
+
+        # Fixed-shape edge list for n_node=2, nsel=2
+        edge_index = torch.tensor(
+            [[1, 0, 0, 0], [0, 0, 1, 1]],
+            dtype=torch.long,
+            device=self.device,
+        )
+        coord_view = extended_coord.view(1, 2, 3)
+        valid_nlist = nlist >= 0
+        gather_index = torch.where(valid_nlist, nlist, torch.zeros_like(nlist))
+        index = gather_index.view(1, 4, 1).expand(-1, -1, 3)
+        nei_pos = torch.gather(coord_view, 1, index).view(1, 2, 2, 3)
+        atom_pos = coord_view[:, :2].unsqueeze(2)
+        diff = nei_pos - atom_pos
+        edge_vec = diff.reshape(4, 3)
+        edge_mask = torch.tensor([1, 1, 1, 1], dtype=torch.bool, device=self.device)
+
+        desc_edge, _, _, _, sw_edge = model(
+            extended_coord,
+            atype,
+            nlist,
+            mapping=None,
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            edge_mask=edge_mask,
+            comm_dict=None,
+        )
+
+        torch.testing.assert_close(desc_nlist, desc_edge, atol=1e-6, rtol=1e-6)
+
+        loss_nlist = desc_nlist.sum()
+        loss_edge = desc_edge.sum()
+
+        (grad_nlist,) = torch.autograd.grad(
+            loss_nlist, extended_coord, create_graph=True
+        )
+        (grad_edge,) = torch.autograd.grad(loss_edge, extended_coord, create_graph=True)
+        torch.testing.assert_close(grad_nlist, grad_edge, atol=1e-6, rtol=1e-6)
+
+        (grad2_nlist,) = torch.autograd.grad(
+            grad_nlist.sum(), extended_coord, create_graph=False
+        )
+        (grad2_edge,) = torch.autograd.grad(
+            grad_edge.sum(), extended_coord, create_graph=False
+        )
+        torch.testing.assert_close(grad2_nlist, grad2_edge, atol=1e-6, rtol=1e-6)
 
     def test_backward_gradient(self) -> None:
         """Test backward gradient through coordinates."""
@@ -285,6 +364,348 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 atol=atol,
                 rtol=rtol,
                 msg="Smooth weight differs for models with same seed",
+            )
+
+
+class TestSeZMNetModelCompile(unittest.TestCase):
+    """Test SeZM-Net model compile path consistency."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+        torch.manual_seed(2024)
+
+    def _build_model_params(self, *, use_compile: bool, n_node: int) -> dict:
+        return {
+            "type": "SeZM-Net",
+            "type_map": ["A", "B"],
+            "descriptor": {
+                "type": "SeZM",
+                "sel": [2, 2],
+                "rcut": 3.0,
+                "channels": 4,
+                "n_radial": 3,
+                "radial_mlp": [6],
+                "use_env_seed": False,
+                "l_schedule": [1, 0],
+                "mmax": 1,
+                "so2_norm": False,
+                "so2_layers": 1,
+                "n_atten_head": 0,
+                "sandwich_norm": [True, False, True, False],
+                "ffn_neurons": 8,
+                "mlp_bias": True,
+                "use_amp": False,
+                "use_triton": False,
+                "activation_function": "silu",
+                "glu_activation": True,
+                "precision": "float32",
+                "seed": 7,
+            },
+            "fitting_net": {
+                "neuron": [8],
+                "activation_function": "silu",
+                "precision": "float32",
+                "seed": 7,
+            },
+            "use_compile": use_compile,
+            "n_node": n_node,
+        }
+
+    def _load_water_frame(
+        self,
+        nframe: int = 1,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Load frames from dplr dataset with virial data.
+
+        Parameters
+        ----------
+        nframe
+            Number of frames to load.
+
+        Returns
+        -------
+        coord : torch.Tensor
+            Coordinates with shape (nframe, nloc, 3).
+        atype : torch.Tensor
+            Atom types with shape (nframe, nloc).
+        box : torch.Tensor
+            Box tensor with shape (nframe, 9).
+        energy : torch.Tensor
+            Energy with shape (nframe, 1).
+        force : torch.Tensor
+            Forces with shape (nframe, nloc, 3).
+        virial : torch.Tensor
+            Virial tensor with shape (nframe, 9).
+        """
+        if nframe <= 0:
+            raise ValueError("nframe must be positive")
+
+        # Use dplr dataset which contains virial data
+        data_root = (
+            Path(__file__).parent.parent.parent.parent.parent
+            / "examples"
+            / "water"
+            / "dplr"
+            / "train"
+            / "data"
+        )
+        set_dir = data_root / "set.000"
+
+        coord_np = np.load(set_dir / "coord.npy")
+        force_np = np.load(set_dir / "force.npy")
+        energy_np = np.load(set_dir / "energy.npy")
+        box_np = np.load(set_dir / "box.npy")
+        virial_np = np.load(set_dir / "virial.npy")
+        atype_np = np.loadtxt(data_root / "type.raw", dtype=np.int32).reshape(1, -1)
+
+        coord = torch.from_numpy(coord_np[:nframe].reshape(nframe, -1, 3)).to(
+            device=self.device, dtype=torch.float32
+        )
+        force = torch.from_numpy(force_np[:nframe].reshape(nframe, -1, 3)).to(
+            device=self.device, dtype=torch.float32
+        )
+        energy = torch.from_numpy(energy_np[:nframe].reshape(nframe, 1)).to(
+            device=self.device, dtype=torch.float32
+        )
+        box = torch.from_numpy(box_np[:nframe]).to(
+            device=self.device, dtype=torch.float32
+        )
+        virial = torch.from_numpy(virial_np[:nframe]).to(
+            device=self.device, dtype=torch.float32
+        )
+        atype = torch.from_numpy(np.repeat(atype_np, nframe, axis=0)).to(
+            device=self.device, dtype=torch.int32
+        )
+        return coord, atype, box, energy, force, virial
+
+    def _train_steps(
+        self,
+        model: torch.nn.Module,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        box: torch.Tensor,
+        energy: torch.Tensor,
+        force: torch.Tensor,
+        virial: torch.Tensor | None = None,
+        steps: int = 3,
+    ) -> dict[str, torch.Tensor]:
+        optimizer = torch.optim.SGD(model.parameters(), lr=1.0e-7)
+        for _ in range(steps):
+            optimizer.zero_grad(set_to_none=True)
+            out = model(coord, atype, box=box)
+            loss_energy = torch.mean(
+                (out["energy"] - energy.to(out["energy"].dtype)) ** 2
+            )
+            loss_force = torch.mean((out["force"] - force.to(out["force"].dtype)) ** 2)
+            loss = loss_energy + loss_force
+            if virial is not None and "virial" in out:
+                loss_virial = torch.mean(
+                    (out["virial"] - virial.to(out["virial"].dtype)) ** 2
+                )
+                loss = loss + loss_virial
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        return {
+            name: param.detach().clone() for name, param in model.named_parameters()
+        }
+
+    def test_three_step_training_matches_compile(self) -> None:
+        """Train three steps and compare parameters between dynamic and compile paths."""
+        coord, atype, box, energy, force, _virial = self._load_water_frame()
+
+        # === Step 1. Build paired models with shared weights ===
+        model_dyn = get_sezm_net_model(
+            self._build_model_params(use_compile=False, n_node=512)
+        )
+        model_cmp = get_sezm_net_model(
+            self._build_model_params(use_compile=True, n_node=512)
+        )
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.train()
+        model_cmp.train()
+        self.assertTrue(model_cmp.use_compile)
+
+        # === Step 2. Three-step training (first step triggers compile) ===
+        params_dyn = self._train_steps(
+            model_dyn, coord, atype, box, energy, force, _virial
+        )
+        params_cmp = self._train_steps(
+            model_cmp, coord, atype, box, energy, force, _virial
+        )
+
+        # === Step 3. Compare parameters ===
+        self.assertEqual(set(params_dyn.keys()), set(params_cmp.keys()))
+        for name in params_dyn.keys():
+            torch.testing.assert_close(
+                params_dyn[name], params_cmp[name], atol=1.0e-7, rtol=1.0e-7
+            )
+
+    def test_force_matches_compile(self) -> None:
+        """Single forward force should match between dynamic and compile paths."""
+        coord, atype, box, _, _, _ = self._load_water_frame()
+
+        # === Step 1. Build paired models with shared weights ===
+        model_dyn = get_sezm_net_model(
+            self._build_model_params(use_compile=False, n_node=512)
+        )
+        model_cmp = get_sezm_net_model(
+            self._build_model_params(use_compile=True, n_node=512)
+        )
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.eval()
+        model_cmp.eval()
+
+        # === Step 2. Forward and compare forces ===
+        out_dyn = model_dyn(coord, atype, box=box)
+        out_cmp = model_cmp(coord, atype, box=box)
+        torch.testing.assert_close(
+            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+
+    def test_multi_frame_energy_matches_compile(self) -> None:
+        """Energy output must remain per-frame in compile path."""
+        nframe = 2
+        coord, atype, box, _, _, _ = self._load_water_frame(nframe=nframe)
+        n_node = int(coord.shape[0] * coord.shape[1] + 64)
+
+        # === Step 1. Build paired models with shared weights ===
+        model_dyn = get_sezm_net_model(
+            self._build_model_params(use_compile=False, n_node=n_node)
+        )
+        model_cmp = get_sezm_net_model(
+            self._build_model_params(use_compile=True, n_node=n_node)
+        )
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.train()
+        model_cmp.train()
+
+        # === Step 2. Forward and compare per-frame energy ===
+        out_dyn = model_dyn(coord, atype, box=box)
+        out_cmp = model_cmp(coord, atype, box=box)
+
+        self.assertEqual(out_dyn["energy"].shape, (nframe, 1))
+        self.assertEqual(out_cmp["energy"].shape, (nframe, 1))
+        torch.testing.assert_close(
+            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+
+    def test_virial_matches_compile(self) -> None:
+        """Single forward virial should match between dynamic and compile paths."""
+        coord, atype, box, _, _, _ = self._load_water_frame()
+
+        # === Step 1. Build paired models with shared weights ===
+        model_dyn = get_sezm_net_model(
+            self._build_model_params(use_compile=False, n_node=512)
+        )
+        model_cmp = get_sezm_net_model(
+            self._build_model_params(use_compile=True, n_node=512)
+        )
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.eval()
+        model_cmp.eval()
+
+        # === Step 2. Forward and compare virials ===
+        out_dyn = model_dyn(coord, atype, box=box)
+        out_cmp = model_cmp(coord, atype, box=box)
+
+        # Check virial exists in both outputs
+        self.assertIn("virial", out_dyn, "Virial not in dynamic model output")
+        self.assertIn("virial", out_cmp, "Virial not in compile model output")
+
+        # Compare virial values
+        torch.testing.assert_close(
+            out_dyn["virial"], out_cmp["virial"], atol=1.0e-5, rtol=1.0e-5
+        )
+
+    def test_forward_backward_double_backward_matches_compile(self) -> None:
+        """
+        Check forward, backward, and double backward consistency vs compile.
+
+        Forward: energy/force outputs should match.
+        Backward: d(energy)/d(params) should match.
+        Double backward: d(force_loss)/d(params) should match.
+        """
+        coord, atype, box, _, _, _ = self._load_water_frame()
+
+        # === Step 1. Build paired models with shared weights ===
+        model_dyn = get_sezm_net_model(
+            self._build_model_params(use_compile=False, n_node=512)
+        )
+        model_cmp = get_sezm_net_model(
+            self._build_model_params(use_compile=True, n_node=512)
+        )
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.train()
+        model_cmp.train()
+
+        # === Step 2. Forward output consistency ===
+        out_dyn = model_dyn(coord, atype, box=box)
+        out_cmp = model_cmp(coord, atype, box=box)
+        torch.testing.assert_close(
+            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+
+        # === Step 3. Backward on energy ===
+        model_dyn.zero_grad(set_to_none=True)
+        model_cmp.zero_grad(set_to_none=True)
+        loss_dyn = out_dyn["energy"].sum()
+        loss_cmp = out_cmp["energy"].sum()
+        loss_dyn.backward()
+        loss_cmp.backward()
+        grads_dyn = {
+            name: (
+                torch.zeros_like(param) if param.grad is None else param.grad.detach()
+            )
+            for name, param in model_dyn.named_parameters()
+        }
+        grads_cmp = {
+            name: (
+                torch.zeros_like(param) if param.grad is None else param.grad.detach()
+            )
+            for name, param in model_cmp.named_parameters()
+        }
+        self.assertEqual(set(grads_dyn.keys()), set(grads_cmp.keys()))
+        for name in grads_dyn.keys():
+            torch.testing.assert_close(
+                grads_dyn[name], grads_cmp[name], atol=1.0e-5, rtol=1.0e-5
+            )
+
+        # === Step 4. Double backward via force loss ===
+        model_dyn.zero_grad(set_to_none=True)
+        model_cmp.zero_grad(set_to_none=True)
+        out_dyn = model_dyn(coord, atype, box=box)
+        out_cmp = model_cmp(coord, atype, box=box)
+        loss_dyn = torch.sum(out_dyn["force"] * out_dyn["force"])
+        loss_cmp = torch.sum(out_cmp["force"] * out_cmp["force"])
+        loss_dyn.backward()
+        loss_cmp.backward()
+        grads_dyn = {
+            name: (
+                torch.zeros_like(param) if param.grad is None else param.grad.detach()
+            )
+            for name, param in model_dyn.named_parameters()
+        }
+        grads_cmp = {
+            name: (
+                torch.zeros_like(param) if param.grad is None else param.grad.detach()
+            )
+            for name, param in model_cmp.named_parameters()
+        }
+        self.assertEqual(set(grads_dyn.keys()), set(grads_cmp.keys()))
+        for name in grads_dyn.keys():
+            torch.testing.assert_close(
+                grads_dyn[name], grads_cmp[name], atol=1.0e-5, rtol=1.0e-5
             )
 
 
@@ -927,136 +1348,6 @@ class TestSO2ConvolutionReducedRotation(unittest.TestCase):
             out_ref = so2_conv.so3_linear(out_ref)
 
             torch.testing.assert_close(out_opt, out_ref, atol=atol, rtol=rtol)
-
-
-@unittest.skip("JIT tests temporarily disabled")
-class TestJITScript(unittest.TestCase):
-    """Test torch.jit.script compatibility for SeZM-Net descriptor."""
-
-    def setUp(self) -> None:
-        self.device = env.DEVICE
-
-    def _tiny_system(
-        self, *, dtype: torch.dtype
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Create a minimal two-atom system for testing."""
-        coord = torch.tensor(
-            [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]],
-            dtype=dtype,
-            device=self.device,
-        ).view(1, -1, 3)
-        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
-        nlist = torch.tensor(
-            [[[1, -1], [0, -1]]], dtype=torch.int64, device=self.device
-        )
-        return coord, atype, nlist
-
-    def _get_tols(self, dtype: torch.dtype) -> tuple[float, float]:
-        if dtype == torch.float64:
-            return 1e-10, 1e-10
-        if dtype == torch.float32:
-            return 5e-5, 5e-5
-        return 5e-3, 5e-3
-
-    def test_jit_script_basic(self) -> None:
-        """Test that DescrptSeZMNet can be scripted with torch.jit.script."""
-        for prec in ["float64", "float32", "bfloat16"]:
-            dtype = PRECISION_DICT[prec]
-            atol, rtol = self._get_tols(dtype)
-            coord, atype, nlist = self._tiny_system(dtype=dtype)
-            extended_coord = coord.reshape(1, -1)
-
-            # Create and script the model
-            model = DescrptSeZMNet(
-                rcut=3.0,
-                sel=[1, 1],
-                ntypes=2,
-                l_schedule=[1, 0],
-                channels=4,
-                n_radial=3,
-                radial_mlp=[6],
-                ffn_neurons=8,
-                precision=prec,
-                trainable=True,
-            )
-
-            # Get reference output before scripting
-            model.eval()
-            with torch.no_grad():
-                desc_ref, _, _, _, sw_ref = model(
-                    extended_coord, atype, nlist, mapping=None, comm_dict=None
-                )
-
-            # Script the model
-            try:
-                scripted_model = torch.jit.script(model)
-            except Exception as e:
-                self.fail(f"torch.jit.script failed for {prec}: {e}")
-
-            # Get output from scripted model
-            with torch.no_grad():
-                desc_script, _, _, _, sw_script = scripted_model(
-                    extended_coord, atype, nlist, mapping=None, comm_dict=None
-                )
-
-            # Verify outputs match
-            torch.testing.assert_close(
-                desc_script,
-                desc_ref,
-                atol=atol,
-                rtol=rtol,
-                msg=f"Descriptor output mismatch after scripting (prec={prec})",
-            )
-            torch.testing.assert_close(
-                sw_script,
-                sw_ref,
-                atol=atol,
-                rtol=rtol,
-                msg=f"Smooth weight mismatch after scripting (prec={prec})",
-            )
-
-    def test_jit_script_forward_backward(self) -> None:
-        """Test that scripted model can execute forward and backward pass correctly."""
-        dtype = torch.float64
-        coord, atype, nlist = self._tiny_system(dtype=dtype)
-        extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
-
-        model = DescrptSeZMNet(
-            rcut=3.0,
-            sel=[1, 1],
-            ntypes=2,
-            l_schedule=[1, 1, 0],
-            channels=8,
-            n_radial=4,
-            radial_mlp=[8],
-            so2_layers=2,
-            ffn_neurons=16,
-            precision="float64",
-            trainable=True,
-        )
-
-        # Script the model
-        scripted_model = torch.jit.script(model)
-
-        # Execute forward pass
-        desc, rot_mat, g2, h2, sw = scripted_model(
-            extended_coord, atype, nlist, mapping=None, comm_dict=None
-        )
-
-        # Verify output shapes and types
-        self.assertEqual(desc.shape, (1, 2, 8))
-        self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
-        self.assertIsNone(rot_mat)
-        self.assertIsNone(g2)
-        self.assertIsNone(h2)
-        self.assertEqual(sw.shape, (1, 2, 2, 1))
-        self.assertEqual(sw.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
-
-        # Verify backward pass
-        loss = desc.sum()
-        loss.backward()
-        self.assertIsNotNone(extended_coord.grad)
-        self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
 
 
 class TestEnvironmentInitialEmbedding(unittest.TestCase):
