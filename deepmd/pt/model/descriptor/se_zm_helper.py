@@ -304,12 +304,14 @@ class RadialMLP(nn.Module):
     ------------
     Linear → LayerNorm → Activation for all hidden layers,
     with the final layer being a plain Linear (no LN, no activation).
-    The first layer's bias is initialized to zero.
 
     Notes
     -----
-    LayerNorm provides stable gradients. The first layer bias is zero-initialized
-    to ensure smooth gradient flow at initialization.
+    All bias terms are disabled (Linear bias=False, LayerNorm bias=False) to
+    guarantee ``RadialMLP(0) = 0``. This is required because the compile path
+    pads masked edges with zero ``edge_rbf``; any non-zero bias would leak
+    spurious features into GIE scatter, causing energy divergence between
+    compile and non-compile paths.
     """
 
     def __init__(
@@ -337,21 +339,21 @@ class RadialMLP(nn.Module):
             linear = MLPLayer(
                 mlp_layers[i],
                 mlp_layers[i + 1],
-                bias=True,
+                bias=False,
                 activation_function=None,
                 precision=self.precision,
                 seed=child_seed(seed, i),
                 trainable=trainable,
             )
-            # First layer: zero-initialize bias for smooth gradient flow
-            if i == 0 and linear.bias is not None:
-                nn.init.zeros_(linear.bias)
             modules.append(linear)
             # Last layer: no LayerNorm/activation
             if i < n_layers - 2:
                 modules.append(
                     nn.LayerNorm(
-                        mlp_layers[i + 1], dtype=self.dtype, device=self.device
+                        mlp_layers[i + 1],
+                        bias=False,
+                        dtype=self.dtype,
+                        device=self.device,
                     )
                 )
                 modules.append(ActivationFn(self.activation_function))

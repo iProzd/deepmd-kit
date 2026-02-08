@@ -602,3 +602,132 @@ SeZM follows the **new-style descriptor interface** (same as `dpa3`), using `ext
 - Implements the required `BaseDescriptor` interface (forward, stats accessors, (de)serialization, neighbor info, exclusion updates).
 - `_ENV_DIM = 1` for `EnvMatStatSe` compatibility; statistics are stored but not used in forward.
 - Not implemented: `share_params()`, `change_type_map()`.
+
+---
+
+## Quick VRAM Estimation Formulas
+
+This section provides formulas for quick GPU memory estimation given known model parameters. DeePMD-kit prints total parameter count `P` at training start; combine `P` with the config values below to estimate VRAM.
+
+### Notation
+
+| Symbol | Meaning                                          | Source       |
+| ------ | ------------------------------------------------ | ------------ |
+| P      | Total trainable parameters (printed by DeePMD)   | training log |
+| N      | Number of atoms per frame                        | system       |
+| nnei   | Max neighbors (sel)                              | config       |
+| E      | Number of edges = N × nnei                       | derived      |
+| L      | Max angular momentum (max of l_schedule)         | config       |
+| D      | Spherical harmonics dimension = (L+1)²           | derived      |
+| C      | Channel width                                    | config       |
+| F      | FFN hidden dimension (ffn_neurons)               | config       |
+| B      | Number of interaction blocks (len of l_schedule) | config       |
+| b      | Bytes per element (4 for FP32, 2 for FP16/BF16)  | dtype        |
+
+### 1. Parameter Memory
+
+Parameter count `P` is already known from training log.
+
+```
+M_param = P × b
+```
+
+For Adam optimizer, training requires 4 copies (param + grad + momentum + variance):
+
+```
+M_train_param = 4 × P × b
+```
+
+> Example: P = 2M, FP32 → M_param ≈ 8 MB, M_train_param ≈ 32 MB.
+> Parameter memory is typically negligible compared to activation memory.
+
+### 2. Activation Memory (Inference)
+
+Activation memory is dominated by **edge-level tensors**. The two major components:
+
+#### 2.1 Persistent Edge Cache (computed once, shared across all blocks)
+
+```
+M_wigner  = 2 × E × D² × b          # D_full + Dt_full (Wigner-D matrices)
+M_radial  = B × E × D × C × b       # radial_feat, one per block (different lmax truncation)
+M_cache   = M_wigner + M_radial      # small terms (edge_vectors, envelope, etc.) ignored
+```
+
+> M_wigner uses D = (L+1)² where L = max(l_schedule). Each block's radial_feat uses its own D_block = (l_block+1)², but for quick estimation use D for all blocks (upper bound).
+
+#### 2.2 Per-Block Transient Peak (only one block active at a time during inference)
+
+```
+M_so2conv = E × D × C × b           # SO2Conv intermediate (rotation + message)
+M_ffn     = E × D × 2F × b          # FFN up-projection (GLU doubles width)
+M_block   = max(M_so2conv, M_ffn)    # peak of the two stages (not simultaneous)
+```
+
+> If 2F > C (typical: F=96, C=64 → 2F=192 > 64), FFN dominates the per-block peak.
+
+#### 2.3 Total Inference VRAM
+
+```
+M_infer ≈ M_param + M_cache + M_block
+        = P×b + (2×E×D² + B×E×D×C)×b + E×D×max(C, 2F)×b
+```
+
+Simplified (dropping P×b which is small):
+
+```
+M_infer ≈ E × D × b × [2D + (B+1)×C + max(C, 2F)]
+                         ^^^   ^^^^^     ^^^^^^^^^^
+                       Wigner  radial    transient
+```
+
+### 3. Activation Memory (Training)
+
+During training, autograd saves intermediate tensors for backward across **all** blocks simultaneously. Each block saves approximately:
+
+```
+M_saved_per_block ≈ k × E × D × C × b
+```
+
+where k ≈ 4–6 accounts for: pre-norm input, SO2Conv intermediates (rotation result, message), FFN up-projection, residual inputs.
+
+```
+M_train_act ≈ M_cache + B × k × E × D × C × b
+```
+
+Total training VRAM:
+
+```
+M_train ≈ M_train_param + M_train_act
+        = 4×P×b + [2×E×D² + B×(1+k)×E×D×C] × b
+```
+
+Simplified:
+
+```
+M_train ≈ E × D × b × [2D + B×(1+k)×C]     (k ≈ 5)
+```
+
+> Training is roughly **5–8× inference** due to saved activations across all blocks.
+
+### 4. Scaling Summary
+
+| Factor       | Scaling                                   | Note                                 |
+| ------------ | ----------------------------------------- | ------------------------------------ |
+| N (atoms)    | **Linear**                                | E = N × nnei                         |
+| nnei         | **Linear**                                | E = N × nnei                         |
+| C (channels) | **Linear**                                | dominates edge features E×D×C        |
+| L (lmax)     | **Quadratic**                             | D = (L+1)², Wigner-D is E×D²         |
+| B (blocks)   | **Linear** (train) / **Constant** (infer) | train saves all blocks; infer reuses |
+| F (ffn)      | **Linear**                                | only affects transient peak          |
+
+### 5. Quick Reference Formula (FP32)
+
+For a quick ballpark in **MB**, with FP32 (b=4):
+
+```
+M_infer (MB) ≈ N × nnei × (L+1)² × [2(L+1)² + (B+1)×C + 2F] × 4 / 1e6
+
+M_train (MB) ≈ N × nnei × (L+1)² × [2(L+1)² + B×6×C] × 4 / 1e6 + 4P×4/1e6
+```
+
+> **Bottleneck**: Edge-level tensors (E×D×C) and Wigner-D matrices (E×D²) dominate. For larger systems, reducing nnei or L yields the most significant memory savings.
