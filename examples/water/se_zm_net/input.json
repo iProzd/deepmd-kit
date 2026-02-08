@@ -19,7 +19,6 @@
       "ffn_neurons": 96,
       "mlp_bias": true,
       "use_amp": true,
-      "use_triton": false,
       "activation_function": "silu",
       "glu_activation": true,
       "precision": "float32",

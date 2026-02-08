@@ -79,9 +79,6 @@ from .se_zm_helper import (
     nvtx_range,
     safe_numpy_to_tensor,
 )
-from .se_zm_triton import (
-    is_triton_available,
-)
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -173,10 +170,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
         the memory usage, while persevering model accuracy.
-    use_triton
-        If True and Triton is available, use fused Triton kernels for performance-
-        critical operations. Only effective on CUDA devices.
-        Falls back to PyTorch if Triton is unavailable.
     exclude_types
         List of excluded type pairs.
     precision
@@ -229,7 +222,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         precision: str = "float32",
         mlp_bias: bool = True,
         use_amp: bool = True,
-        use_triton: bool = False,
         exclude_types: list[tuple[int, int]] | None = None,
         eps: float = 1e-7,
         trainable: bool = True,
@@ -281,17 +273,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.use_amp = bool(use_amp)  # and self.training
         self.trainable = bool(trainable)
         self.seed = seed
-
-        # === Triton acceleration ===
-        if use_triton and not is_triton_available():
-            import warnings
-
-            warnings.warn(
-                "use_triton=True but Triton is not available. Falling back to PyTorch implementation.",
-                stacklevel=2,
-            )
-            use_triton = False
-        self.use_triton = bool(use_triton)
 
         # === Env seed parameters ===
         self.use_env_seed = bool(use_env_seed)
@@ -450,7 +431,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     activation_function=self.activation_function,
                     glu_activation=self.glu_activation,
                     mlp_bias=self.mlp_bias,
-                    use_triton=self.use_triton,
                     eps=self.eps,
                     dtype=self.dtype,
                     seed=child_seed(seed_blocks, block_idx),
@@ -1203,7 +1183,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "mlp_bias": self.mlp_bias,
                 "use_amp": self.use_amp,
-                "use_triton": self.use_triton,
                 "exclude_types": self.exclude_types,
                 "eps": self.eps,
                 "trainable": self.trainable,

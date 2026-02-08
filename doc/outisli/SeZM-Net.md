@@ -207,8 +207,6 @@ An optional module that provides physical inductive bias for l=0 features using 
    - Scatter-sum by destination node: `env_agg.index_add_(0, dst, outer_flat)`
    - Normalize by neighbor count (degree normalization)
 
-- **Triton optimization**: When `use_triton=True` and Triton is available on CUDA, a fused kernel computes the outer-product and scatter-sum in one pass, avoiding the `(E, 4, embed_dim)` intermediate tensor. Backward and double-backward are implemented as custom Triton kernels to keep force training on the Triton path.
-
 4. **D matrix construction**: Captures local geometry via matrix product:
    - `D = env_agg^T @ env_agg[:, :, :axis_dim]` with shape `(N, embed_dim, axis_dim)`
 
@@ -228,11 +226,6 @@ An optional module that provides physical inductive bias for l=0 features using 
 - Neighbor count normalization uses actual degree, not `inv_sqrt_deg` from edge cache
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
 - **Near-identity start** is guaranteed by small strengths with zero-initialized logits
-
-### 10. Runtime acceleration flags and serialization
-
-- `use_triton` is serialized for the descriptor and its internal modules that have Triton paths.
-- Inference uses the saved flag and automatically falls back to PyTorch when Triton is unavailable or CUDA is not present.
 
 ---
 
@@ -473,7 +466,6 @@ Key arguments:
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
-- `use_triton: bool` — If True and Triton is available, use fused Triton kernels for outer-product scatter-sum in EnvironmentInitialEmbedding, including custom backward/double-backward. This reduces memory usage by avoiding large intermediate tensors. Only effective on CUDA devices. Falls back to PyTorch if Triton is unavailable (default: False)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
@@ -560,16 +552,6 @@ and the edge-aligned local frame. The block-diagonal matrices are computed by
 - For each degree `l`, real SH channels are ordered by `m=-l..+l` (index `i = m + l`).
 - `D_full` is block-diagonal with block `l` occupying indices `[l^2 : (l+1)^2)`.
 - `Dt_full = D_full^T` is the inverse rotation (local->global).
-
-#### Z-rotation Triton optimization
-
-When `use_triton=True` and Triton is available on CUDA, `WignerDCalculator._build_z_rotation()` uses a fused Triton kernel to construct the block-diagonal Z rotation matrices. This replaces the slow Python/advanced-indexing filling (`Z[:, idx, idx] = ...`) with a single kernel launch that writes all sparse entries in one pass.
-
-- **Forward**: Triton kernel stores `K = n_m0 + 4*n_blk` entries per edge (m=0 diagonals + 2x2 rotation blocks for m>0) into the flattened `Z_flat` tensor, then reshapes to `(E, D, D)`.
-- **Backward**: Uses pure PyTorch operations (gather + analytical gradients) to preserve double-backward correctness for force training.
-- **JIT compatibility**: The Triton path is skipped during `torch.jit.script()` via `torch.jit.is_scripting()` check.
-
-The matmul chain `D_full = Za @ Jt @ Zb @ J @ Zc` remains unchanged; only the Z matrix construction is accelerated.
 
 #### Usage in message passing
 

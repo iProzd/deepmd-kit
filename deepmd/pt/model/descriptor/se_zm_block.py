@@ -57,10 +57,6 @@ from .se_zm_helper import (
     project_Dt_from_m,
     safe_numpy_to_tensor,
 )
-from .se_zm_triton import (
-    so2_baseline_scatter_triton,
-    so2_head_scatter_triton,
-)
 
 
 class GatedActivation(nn.Module):
@@ -1209,8 +1205,6 @@ class SO2Convolution(nn.Module):
     mlp_bias
         Whether to use bias in SO2Linear (l=0 bias), GatedActivation (gate linear bias),
         and ReducedSeparableRMSNorm (centering bias).
-    use_triton
-        Whether to use Triton kernels for scatter operations.
     eps
         Small epsilon for gate-side RMSNorm.
     dtype
@@ -1231,7 +1225,6 @@ class SO2Convolution(nn.Module):
         so2_layers: int = 1,
         n_atten_head: int = 0,
         mlp_bias: bool = True,
-        use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -1260,7 +1253,6 @@ class SO2Convolution(nn.Module):
             None if self.n_atten_head == 0 else int(self.channels // self.n_atten_head)
         )
         self.mlp_bias = bool(mlp_bias)
-        self.use_triton = bool(use_triton)
         self.eps = float(eps)
         self.ebed_dim_full = get_so3_dim_of_lmax(self.lmax)
         self.dtype = dtype
@@ -1530,19 +1522,11 @@ class SO2Convolution(nn.Module):
         with nvtx_range("SO2Conv/aggregate"):
             if self.n_atten_head == 0:
                 # Baseline path: fused envelope-weighted scatter add -> degree norm
-                # Custom backward/gradgrad keeps force training in Triton.
-                if self.use_triton and x_message.is_cuda:
-                    out = so2_baseline_scatter_triton(
-                        x_message, edge_cache.edge_env, dst, x.shape[0]
-                    )
-                    out = out.to(dtype=self.dtype)
-                    out.mul_(edge_cache.inv_sqrt_deg)
-                else:
-                    x_message = x_message * edge_cache.edge_env.unsqueeze(-1)
-                    out = x.new_zeros(x.shape).to(dtype=self.compute_dtype)
-                    out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
-                    out = out.to(dtype=self.dtype)
-                    out.mul_(edge_cache.inv_sqrt_deg)
+                x_message = x_message * edge_cache.edge_env.unsqueeze(-1)
+                out = x.new_zeros(x.shape).to(dtype=self.compute_dtype)
+                out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
+                out = out.to(dtype=self.dtype)
+                out.mul_(edge_cache.inv_sqrt_deg)
             else:
                 # === Step 5.1. Extract scalar features for gating ===
                 x_l0 = x[:, 0, :]  # (N, C)
@@ -1582,28 +1566,23 @@ class SO2Convolution(nn.Module):
                     E, self.ebed_dim_full, self.n_atten_head, self.head_dim
                 )
 
-                # Custom backward/gradgrad keeps force training in Triton.
-                # Triton kernels internally cast to fp32 for accumulation.
-                if self.use_triton and V.is_cuda:
-                    out_heads = so2_head_scatter_triton(V, edge_weight, dst, x.shape[0])
-                else:
-                    # Multiply in V's dtype (cheap), then cast contribution for stable accumulation
-                    edge_weight_4d = edge_weight.reshape(  # (E, 1, H, 1)
-                        E, 1, self.n_atten_head, 1
-                    )
-                    msg = V * edge_weight_4d  # (E, D, H, head_dim)
-                    msg_acc = msg.to(  # (E, D, H, head_dim)
-                        dtype=compute_dtype
-                    )
-                    out_heads = torch.zeros(  # (N, D, H, head_dim)
-                        x.shape[0],
-                        self.ebed_dim_full,
-                        self.n_atten_head,
-                        self.head_dim,
-                        device=x.device,
-                        dtype=compute_dtype,
-                    )
-                    out_heads.index_add_(0, dst, msg_acc)
+                # Multiply in V's dtype (cheap), then cast contribution for stable accumulation
+                edge_weight_4d = edge_weight.reshape(  # (E, 1, H, 1)
+                    E, 1, self.n_atten_head, 1
+                )
+                msg = V * edge_weight_4d  # (E, D, H, head_dim)
+                msg_acc = msg.to(  # (E, D, H, head_dim)
+                    dtype=compute_dtype
+                )
+                out_heads = torch.zeros(  # (N, D, H, head_dim)
+                    x.shape[0],
+                    self.ebed_dim_full,
+                    self.n_atten_head,
+                    self.head_dim,
+                    device=x.device,
+                    dtype=compute_dtype,
+                )
+                out_heads.index_add_(0, dst, msg_acc)
 
                 # === Step 5.4. Apply degree normalization ===
                 out = out_heads.reshape(  # (N, D, C)
@@ -1631,7 +1610,6 @@ class SO2Convolution(nn.Module):
                 "so2_layers": self.so2_layers,
                 "n_atten_head": self.n_atten_head,
                 "mlp_bias": self.mlp_bias,
-                "use_triton": self.use_triton,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,
@@ -1896,8 +1874,6 @@ class SeZMInteractionBlock(nn.Module):
         - GatedActivation: gate linear bias
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
-    use_triton
-        Whether to use Triton kernels for scatter operations.
     eps
         Small epsilon for numerical stability.
     dtype
@@ -1925,7 +1901,6 @@ class SeZMInteractionBlock(nn.Module):
         activation_function: str,
         glu_activation: bool = True,
         mlp_bias: bool = True,
-        use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -1950,7 +1925,6 @@ class SeZMInteractionBlock(nn.Module):
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
-        self.use_triton = bool(use_triton)
         self.eps = float(eps)
         self.dtype = dtype
         self.precision = RESERVED_PRECISION_DICT[dtype]
@@ -2016,7 +1990,6 @@ class SeZMInteractionBlock(nn.Module):
             so2_layers=self.so2_layers,
             n_atten_head=n_atten_head,
             mlp_bias=self.mlp_bias,
-            use_triton=self.use_triton,
             eps=self.eps,
             dtype=dtype,
             seed=seed_so2_conv,
@@ -2111,7 +2084,6 @@ class SeZMInteractionBlock(nn.Module):
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,
-                "use_triton": self.use_triton,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,

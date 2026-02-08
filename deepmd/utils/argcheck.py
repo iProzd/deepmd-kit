@@ -390,11 +390,6 @@ def descrpt_se_zm_args() -> list[Argument]:
         "If True, use GLU-style gating in FFN (e.g., silu -> swiglu, gelu -> geglu). "
         "This can improve model expressiveness with slightly increased parameters."
     )
-    doc_use_triton = (
-        "If True and Triton is available, use fused Triton kernels for performance-"
-        "critical operations. Only effective on CUDA devices. "
-        "Falls back to PyTorch if Triton is unavailable."
-    )
     doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
     doc_trainable = "If the parameters in the descriptor are trainable."
@@ -485,13 +480,6 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_mlp_bias,
         ),
         Argument("use_amp", bool, optional=True, default=True, doc=doc_use_amp),
-        Argument(
-            "use_triton",
-            bool,
-            optional=True,
-            default=False,
-            doc=doc_only_pt_supported + doc_use_triton,
-        ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
         Argument("seed", [int, None], optional=True, doc=doc_seed),
         Argument(

@@ -814,9 +814,6 @@ class EnvironmentInitialEmbedding(nn.Module):
         Parameter dtype.
     trainable : bool
         Whether parameters are trainable.
-    use_triton : bool
-        If True and Triton is available, use fused Triton kernels for performance-
-        critical operations. Only effective on CUDA devices.
     seed : int | list[int] | None
         Random seed for reproducibility.
     """
@@ -1176,10 +1173,6 @@ class WignerDCalculator(nn.Module):
         Small epsilon for numerical stability.
     dtype : torch.dtype
         Floating-point dtype for output matrices.
-    use_triton : bool
-        If True and Triton is available, use fused Triton kernel for Z-rotation
-        matrix construction. Only effective on CUDA devices. Backward uses
-        PyTorch trig inside the custom autograd wrapper.
     """
 
     def __init__(
