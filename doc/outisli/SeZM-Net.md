@@ -96,15 +96,18 @@ Standard DeePMD nlist path:
       ├─ slice x to ebed_dim(l_schedule[i]) (discard higher-l if needed)
       ├─ SeparableRMSNorm (pre-SO2)
       ├─ SO(2) Convolution (enabled for ALL lmax, including lmax=0)
-      │  ├─ Multi-layer SO(2) mixing
+      │  ├─ Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)
       │  └─ Final SO3Linear channel mixing
       ├─ Residual
-      ├─ SeparableRMSNorm (pre-FFN)
-      └─ Full Equivariant FFN (operates on ALL degrees l=0..lmax)
-         ├─ SO3Linear (in projection)
-         ├─ GatedActivation (per-l independent gates from l=0)
-         └─ SO3Linear (out projection)
-        + Residual
+      └─ FFN subblock sequence (ffn_blocks iterations):
+         for j in range(ffn_blocks):
+           ├─ SeparableRMSNorm (pre-FFN)
+           ├─ Full Equivariant FFN (operates on ALL degrees l=0..lmax)
+           │  ├─ SO3Linear (in projection)
+           │  ├─ GatedActivation (per-l independent gates from l=0)
+           │  └─ SO3Linear (out projection)
+           ├─ Optional LayerScale (per-channel, init 1e-3)
+           └─ Residual
 
   Output (forward, promoted dtype):
     └─ Extract x(l=0) from block output
@@ -159,6 +162,13 @@ Standard DeePMD nlist path:
 
 - Uses the edge-local m-major reduced layout controlled by `mmax`.
 - Stacks `SO2Linear` with optional `GatedActivation(mmax=...)` for `so2_layers`.
+- Each SO(2) layer uses **pre-norm + residual + LayerScale**:
+  - `residual = x_local`
+  - `x_local = inter_norm(x_local)` (pre-norm; Identity when `so2_norm=False`)
+  - `x_local = so2_linear(x_local)`
+  - bias correction (layer 0 only, when bias exists)
+  - `x_local = non_linear(x_local)`
+  - `x_local = residual + layer_scale * x_local` (scalar LayerScale when `layer_scale=True`, otherwise bare residual)
 - Ends with a `SO3LinearV2` channel mixer before aggregation.
 - `SO2Linear` uses a single block-diagonal matmul over all m groups:
   - m=0 block: unconstrained linear over `(l=0..lmax)` coefficients
@@ -192,8 +202,9 @@ This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5`.
 ### 8. Stability defaults
 
 - Residual branches start near-identity: the output projections of both SO(2) convolution and Equivariant FFN are zero-initialized (weights + bias).
+- When `layer_scale=True`, both SO(2) residual branches (per-layer scalar, init 1e-3) and FFN residual branches (per-channel vector, init 1e-3) use learnable LayerScale for training stability.
 - Attention aggregation runs in promoted dtype (fp32) with per-head temperature `tau` and `alpha_msg` for message feedback.
-- Multi-layer SO(2) stacks optionally insert a reduced-layout separable RMSNorm between layers (except the last) when `so2_norm=True`. This keeps truncated m-major activations balanced but is disabled by default.
+- Multi-layer SO(2) stacks use pre-norm residual connections. When `so2_norm=True`, a reduced-layout separable RMSNorm is applied as pre-norm before each SO(2) layer (except the last, which uses Identity). This keeps truncated m-major activations balanced but is disabled by default.
 
 ### 9. Optional environment matrix initial embedding (EnvironmentInitialEmbedding)
 
@@ -324,14 +335,16 @@ For each edge `(src -> dst)`:
    - `radial_feat = radial_feat + edge_type_feat.unsqueeze(1)` with shape `(E, lmax+1, C)`
    - Per-block truncated `radial_feat[:, : l_i+1, :]` is prebuilt according to `l_schedule`
 3. **Modulate local features**: multiply by radial/type features
-4. **Multi-layer SO(2) mixing**: for each layer in `so2_linears`:
+4. **Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)**: for each layer in `so2_linears`:
+   - Save residual: `residual = x_local`
+   - Pre-norm: apply `inter_norm(x_local)` (ReducedSeparableRMSNorm when `so2_norm=True`, Identity otherwise; last layer always Identity)
    - Apply `SO2Linear` (group by `|m|`):
      - `m=0`: standard linear with additive bias (modulated by radial weights and cutoff to preserve strict smoothness on first layer); bias uses in-place add on preallocated output
      - `|m|>0`: 2x2 complex mixing on `(-m, +m)` pairs treated as `(Re, Im)`
-   - If `so2_norm=True`, apply `ReducedSeparableRMSNorm` (m-major truncated layout) between layers (not after the last)
-   - Apply `GatedActivation(mmax=...)` between layers (not after the last):
+   - Apply `non_linear` (GatedActivation between layers, Identity for last layer):
      - l=0: SiLU activation
      - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
+   - LayerScale + Residual: `x_local = residual + scale * x_local` (scalar scale, init 1e-3 when `layer_scale=True`; bare residual otherwise)
 5. **Final SO(3) channel mixing**: apply `SO3LinearV2` to mix channels across all degrees (zero-initialized for residual stability)
 6. **Rotate back (reduced)**:
    - reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
@@ -398,17 +411,19 @@ SeZMInteractionBlock:
   if so2_post_norm:
       y = post_so2_norm(y)
   x = x_res + y
-  x_res = x
 
-  # === Path 2: Equivariant FFN ===
-  if ffn_pre_norm:
-      x_pre = pre_ffn_norm(x)
-  else:
-      x_pre = x
-  y = ffn(x_pre)
-  if ffn_post_norm:
-      y = post_ffn_norm(y)
-  x = x_res + y
+  # === Path 2: FFN subblock sequence (ffn_blocks iterations) ===
+  for i in range(ffn_blocks):
+      if ffn_pre_norm:
+          x_pre = pre_ffn_norms[i](x)
+      else:
+          x_pre = x
+      y = ffns[i](x_pre)
+      if ffn_post_norm:
+          y = post_ffn_norms[i](y)
+      if layer_scale:
+          y = y * ffn_layer_scales[i]   # per-channel, init 1e-3
+      x = x + y
 
   return x
 ```
@@ -416,9 +431,10 @@ SeZMInteractionBlock:
 Components:
 
 - `pre_so2_norm`: `SeparableRMSNorm` applied before SO(2) convolution
-- `so2_conv`: `SO2Convolution` with multi-layer SO(2) mixing and final SO(3) channel mixing
-- `pre_ffn_norm`: `SeparableRMSNorm` applied before FFN
-- `ffn`: `EquivariantFFN` with SO(3) linear projections and gated activation
+- `so2_conv`: `SO2Convolution` with pre-norm residual SO(2) mixing, optional per-layer scalar LayerScale, and final SO(3) channel mixing
+- `pre_ffn_norms[i]`: `SeparableRMSNorm` applied before each FFN subblock
+- `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and gated activation
+- `ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
 
 ---
 
@@ -478,13 +494,16 @@ Key arguments:
 - `channels: int` — Channels per (l,m) coefficient, i.e. feature dimension per degree (default: 64)
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
-- `so2_norm: bool` — If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. When False (default), no normalization is applied between layers
+- `so2_norm: bool` — If True, apply ReducedSeparableRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
+- `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
 - `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, channels must be divisible by `n_atten_head`, and per-head edge gating is applied with input-side RMSNorm and learnable temperature (radial path stays raw).
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
+- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, SeparableRMSNorm centering bias) (default: True)
+- `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-layer scalar (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)
 

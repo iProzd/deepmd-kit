@@ -375,6 +375,11 @@ def descrpt_se_zm_args() -> list[Argument]:
     )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
     doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
+    doc_ffn_blocks = "Number of FFN sublayers per interaction block."
+    doc_layer_scale = (
+        "If True, apply per-channel learnable LayerScale (init 1e-3) on each FFN "
+        "residual branch for training stability in deep networks."
+    )
     doc_n_atten_head = (
         "Number of gated attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
@@ -449,6 +454,13 @@ def descrpt_se_zm_args() -> list[Argument]:
         Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
         Argument("so2_layers", int, optional=True, default=3, doc=doc_so2_layers),
         Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
+        Argument(
+            "ffn_blocks",
+            int,
+            optional=True,
+            default=1,
+            doc=doc_only_pt_supported + doc_ffn_blocks,
+        ),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
         Argument(
             "sandwich_norm",
@@ -478,6 +490,13 @@ def descrpt_se_zm_args() -> list[Argument]:
             optional=True,
             default=True,
             doc=doc_only_pt_supported + doc_mlp_bias,
+        ),
+        Argument(
+            "layer_scale",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_layer_scale,
         ),
         Argument("use_amp", bool, optional=True, default=True, doc=doc_use_amp),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),

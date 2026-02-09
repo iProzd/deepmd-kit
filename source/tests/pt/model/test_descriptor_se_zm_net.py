@@ -104,6 +104,8 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 ffn_neurons=16,
+                ffn_blocks=2,
+                layer_scale=True,
                 precision=prec,
                 trainable=True,
             )
@@ -137,6 +139,8 @@ class TestDescrptSeZMNet(unittest.TestCase):
             n_radial=3,
             radial_mlp=[6],
             ffn_neurons=8,
+            ffn_blocks=2,
+            layer_scale=True,
             precision="float32",
             trainable=True,
         )
@@ -206,6 +210,8 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 n_radial=3,
                 radial_mlp=[6],
                 ffn_neurons=8,
+                ffn_blocks=2,
+                layer_scale=True,
                 precision=prec,
                 trainable=True,
             )
@@ -233,6 +239,8 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 radial_mlp=[8],
                 so2_layers=2,
                 ffn_neurons=16,
+                ffn_blocks=2,
+                layer_scale=True,
                 precision=prec,
                 trainable=True,
             )
@@ -292,6 +300,8 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 radial_mlp=[8],
                 so2_layers=2,
                 ffn_neurons=16,
+                ffn_blocks=2,
+                layer_scale=True,
                 precision=prec,
                 trainable=True,
                 seed=seed,
@@ -307,6 +317,8 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 radial_mlp=[8],
                 so2_layers=2,
                 ffn_neurons=16,
+                ffn_blocks=2,
+                layer_scale=True,
                 precision=prec,
                 trainable=True,
                 seed=seed,
@@ -393,7 +405,9 @@ class TestSeZMNetModelCompile(unittest.TestCase):
                 "n_atten_head": 0,
                 "sandwich_norm": [True, False, True, False],
                 "ffn_neurons": 8,
+                "ffn_blocks": 2,
                 "mlp_bias": True,
+                "layer_scale": True,
                 "use_amp": False,
                 "use_triton": False,
                 "activation_function": "silu",
@@ -675,10 +689,14 @@ class TestSeZMNetModelCompile(unittest.TestCase):
             )
             for name, param in model_cmp.named_parameters()
         }
+        # Inductor Triton kernels use different reduction order vs eager,
+        # so float32 gradients can differ by ~1e-3 on GPU.
+        grad_atol = 1.0e-5 if self.device == torch.device("cpu") else 2.0e-3
+        grad_rtol = 1.0e-5 if self.device == torch.device("cpu") else 1.0e-4
         self.assertEqual(set(grads_dyn.keys()), set(grads_cmp.keys()))
         for name in grads_dyn.keys():
             torch.testing.assert_close(
-                grads_dyn[name], grads_cmp[name], atol=1.0e-5, rtol=1.0e-5
+                grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
 
         # === Step 4. Double backward via force loss ===
@@ -705,7 +723,7 @@ class TestSeZMNetModelCompile(unittest.TestCase):
         self.assertEqual(set(grads_dyn.keys()), set(grads_cmp.keys()))
         for name in grads_dyn.keys():
             torch.testing.assert_close(
-                grads_dyn[name], grads_cmp[name], atol=1.0e-5, rtol=1.0e-5
+                grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
 
 

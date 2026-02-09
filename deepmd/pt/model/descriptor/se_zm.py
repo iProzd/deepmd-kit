@@ -149,6 +149,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Number of SO(2) mixing layers per block.
     ffn_neurons
         Hidden sizes for the equivariant FFN in each block and the final scalar output FFN.
+    ffn_blocks
+        Number of FFN subblocks per interaction block.
     n_atten_head
         Number of gated attention heads when aggregating messages in SO(2) convolution.
         0 applies a plain envelope-weighted scatter-sum; >0 enables per-head edge gating.
@@ -163,6 +165,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         - SO2Convolution: attention projections: proj_dst, proj_rad, proj_msg
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
+    layer_scale
+        If True, apply per-channel learnable LayerScale (init 1e-3) on each FFN
+        residual branch for training stability in deep networks.
     activation_function
         Activation function used by deepmd EmbeddingNet.
     glu_activation
@@ -216,12 +221,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         so2_norm: bool = False,
         so2_layers: int = 3,
         ffn_neurons: int = 96,
+        ffn_blocks: int = 1,
         n_atten_head: int = 0,
         sandwich_norm: list[bool] | None = None,
         activation_function: str = "silu",
         glu_activation: bool = True,
         precision: str = "float32",
         mlp_bias: bool = True,
+        layer_scale: bool = False,
         use_amp: bool = True,
         exclude_types: list[tuple[int, int]] | None = None,
         eps: float = 1e-7,
@@ -252,6 +259,9 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
         self.ffn_neurons = int(ffn_neurons)
+        self.ffn_blocks = int(ffn_blocks)
+        if self.ffn_blocks < 1:
+            raise ValueError("`ffn_blocks` must be >= 1")
         self.n_atten_head = int(n_atten_head)
         if sandwich_norm is None:
             sandwich_norm = [True, False, True, False]
@@ -271,6 +281,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.device = env.DEVICE
         self.compute_dtype = get_promoted_dtype(self.dtype)
         self.mlp_bias = bool(mlp_bias)
+        self.layer_scale = bool(layer_scale)
         self.use_amp = bool(use_amp)  # and self.training
         self.trainable = bool(trainable)
         self.seed = seed
@@ -350,8 +361,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 trainable=self.trainable,
             )
             film_strength_init = 0.01
+            # Use 1D tensor (not scalar) for FSDP2 compatibility
             self.film_scale_strength_log = nn.Parameter(
-                torch.tensor(
+                torch.full(
+                    (1,),
                     math.log(film_strength_init),
                     dtype=self.compute_dtype,
                     device=self.device,
@@ -359,7 +372,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 requires_grad=self.trainable,
             )
             self.film_shift_strength_log = nn.Parameter(
-                torch.tensor(
+                torch.full(
+                    (1,),
                     math.log(film_strength_init),
                     dtype=self.compute_dtype,
                     device=self.device,
@@ -424,6 +438,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
                     ffn_neurons=self.ffn_neurons,
+                    ffn_blocks=self.ffn_blocks,
+                    layer_scale=self.layer_scale,
                     n_atten_head=self.n_atten_head,
                     so2_pre_norm=self.so2_pre_norm,
                     so2_post_norm=self.so2_post_norm,
@@ -1488,6 +1504,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,
                 "ffn_neurons": self.ffn_neurons,
+                "ffn_blocks": self.ffn_blocks,
+                "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "sandwich_norm": self.sandwich_norm,
                 "activation_function": self.activation_function,

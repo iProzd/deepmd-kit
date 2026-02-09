@@ -1178,9 +1178,9 @@ class SO2Convolution(nn.Module):
     """
     Linearized SO(2) convolution with precomputed edge cache.
 
-    Supports multi-layer SO(2) mixing:
-    - so2_layers=1: Standard single-layer SO2Linear
-    - so2_layers>=2: SO2Linear -> (Edge-gated Non-linearity -> SO2Linear) x (n-1)
+    Supports multi-layer SO(2) mixing with pre-norm residual connections:
+    - so2_layers=1: Standard single-layer SO2Linear (no residual)
+    - so2_layers>=2: Pre-norm -> SO2Linear -> Non-linearity -> LayerScale + Residual
 
     The intermediate non-linearity uses edge invariants (radial features) to
     generate gates, enabling the model to learn more expressive edge-wise
@@ -1195,10 +1195,13 @@ class SO2Convolution(nn.Module):
     channels
         Number of channels per (l, m) coefficient.
     so2_norm
-        If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
-        When False (default), no normalization is applied between layers.
+        If True, apply intermediate ReducedSeparableRMSNorm as pre-norm before
+        each SO(2) mixing layer. When False (default), pre-norm is Identity.
     so2_layers
         Number of SO2Linear layers per convolution (default: 2).
+    layer_scale
+        If True, apply per-layer learnable LayerScale (scalar, init 1e-3) on each
+        SO(2) residual branch for training stability in deep networks.
     n_atten_head
         Number of gated attention heads when aggregating messages in SO(2) convolution.
         0 means a plain envelope-weighted scatter-sum is applied.
@@ -1223,6 +1226,7 @@ class SO2Convolution(nn.Module):
         channels: int,
         so2_norm: bool = False,
         so2_layers: int = 1,
+        layer_scale: bool = False,
         n_atten_head: int = 0,
         mlp_bias: bool = True,
         eps: float = 1e-7,
@@ -1242,6 +1246,7 @@ class SO2Convolution(nn.Module):
         self.so2_layers = int(so2_layers)
         if self.so2_layers < 1:
             raise ValueError("`so2_layers` must be >= 1")
+        self.layer_scale = bool(layer_scale)
         self.n_atten_head = int(n_atten_head)
         if self.n_atten_head < 0:
             raise ValueError("`n_atten_head` must be non-negative")
@@ -1329,7 +1334,21 @@ class SO2Convolution(nn.Module):
         non_linearities.append(nn.Identity())
         self.non_linearities = nn.ModuleList(non_linearities)
 
-        # === Step 6. Optional head-wise gating components ===
+        # === Step 6. Optional per-layer LayerScale for SO(2) residual branches ===
+        if self.layer_scale:
+            self.so2_layer_scales = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.ones(1, dtype=self.dtype, device=self.device) * 1e-3,
+                        requires_grad=trainable,
+                    )
+                    for _ in range(self.so2_layers)
+                ]
+            )
+        else:
+            self.so2_layer_scales = None
+
+        # === Step 7. Optional head-wise gating components ===
         # Edge gate: normalized dst/msg logits, radial stays raw to preserve geometry.
         self.norm_dst_for_gate: ScalarRMSNorm | None = None
         self.norm_msg_for_gate: ScalarRMSNorm | None = None
@@ -1430,7 +1449,7 @@ class SO2Convolution(nn.Module):
             self.gate_tau_log = None
             self.msg_gate_alpha_log = None
 
-        # === Step 7. Final SO3Linear to mix channels ===
+        # === Step 8. Final SO3Linear to mix channels ===
         self.so3_linear = SO3Linear(
             lmax=self.lmax,
             in_channels=self.channels,
@@ -1489,11 +1508,13 @@ class SO2Convolution(nn.Module):
             ]
             x_local.mul_(rad_feat)
 
-        # === Step 3. Multi-layer SO(2) mixing ===
+        # === Step 3. Multi-layer SO(2) mixing (pre-norm + residual + LayerScale) ===
         with nvtx_range("SO2Conv/so2_layers"):
             for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
                 zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
             ):
+                residual = x_local
+                x_local = inter_norm(x_local)
                 x_local = so2_linear(x_local)
 
                 if layer_idx == 0 and so2_linear.bias0 is not None:
@@ -1502,8 +1523,12 @@ class SO2Convolution(nn.Module):
                     )
                     x_local[:, 0, :].add_(bias_correction)
 
-                x_local = inter_norm(x_local)
                 x_local = non_linear(x_local)
+
+                if self.so2_layer_scales is not None:
+                    x_local = residual + self.so2_layer_scales[layer_idx] * x_local
+                else:
+                    x_local = residual + x_local
 
         # === Step 4. Rotate back to global frame ===
         with nvtx_range("SO2Conv/rotate_back"):
@@ -1608,6 +1633,7 @@ class SO2Convolution(nn.Module):
                 "channels": self.channels,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,
+                "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "mlp_bias": self.mlp_bias,
                 "eps": self.eps,
@@ -1832,7 +1858,7 @@ class EquivariantFFN(nn.Module):
 
 class SeZMInteractionBlock(nn.Module):
     """
-    SeZM interaction block: pre/post-norm, SO(2) conv, full equivariant FFN.
+    SeZM interaction block: pre/post-norm, SO(2) conv, multi-block equivariant FFN.
 
     The FFN operates on ALL degrees (l=0 to lmax), using a gated activation where
     scalar features (l=0) control the gating of higher-degree features (l>0).
@@ -1858,11 +1884,16 @@ class SeZMInteractionBlock(nn.Module):
     so2_post_norm
         If True, apply post-norm on SO(2) output before the residual add.
     ffn_pre_norm
-        If True, apply pre-norm before FFN.
+        If True, apply pre-norm before each FFN subblock.
     ffn_post_norm
-        If True, apply post-norm on FFN output before the residual add.
+        If True, apply post-norm on each FFN subblock output before the residual add.
     ffn_neurons
-        Hidden layer sizes for FFN.
+        Hidden dimension for each FFN subblock.
+    ffn_blocks
+        Number of FFN subblocks per block.
+    layer_scale
+        If True, apply per-channel learnable LayerScale (init 1e-3) on each FFN
+        residual branch for training stability in deep networks.
     activation_function
         Activation function for l=0 components.
     glu_activation
@@ -1898,6 +1929,8 @@ class SeZMInteractionBlock(nn.Module):
         ffn_pre_norm: bool = True,
         ffn_post_norm: bool = False,
         ffn_neurons: int = 96,
+        ffn_blocks: int = 1,
+        layer_scale: bool = False,
         activation_function: str,
         glu_activation: bool = True,
         mlp_bias: bool = True,
@@ -1922,11 +1955,16 @@ class SeZMInteractionBlock(nn.Module):
         self.ffn_pre_norm = bool(ffn_pre_norm)
         self.ffn_post_norm = bool(ffn_post_norm)
         self.ffn_neurons = int(ffn_neurons)
+        self.ffn_blocks = int(ffn_blocks)
+        if self.ffn_blocks < 1:
+            raise ValueError("`ffn_blocks` must be >= 1")
+        self.layer_scale = bool(layer_scale)
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
         self.eps = float(eps)
         self.dtype = dtype
+        self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
         self.compute_dtype = get_promoted_dtype(self.dtype)
 
@@ -1934,6 +1972,7 @@ class SeZMInteractionBlock(nn.Module):
         seed_so2_conv = child_seed(seed, 0)
         seed_ffn = child_seed(seed, 1)
 
+        # === Step 1. SO(2) convolution branch norms ===
         if self.so2_pre_norm:
             self.pre_so2_norm: nn.Module = SeparableRMSNorm(
                 self.lmax,
@@ -1958,36 +1997,13 @@ class SeZMInteractionBlock(nn.Module):
         else:
             self.post_so2_norm = nn.Identity()
 
-        if self.ffn_pre_norm:
-            self.pre_ffn_norm: nn.Module = SeparableRMSNorm(
-                self.lmax,
-                self.channels,
-                centering=self.mlp_bias,
-                eps=eps,
-                dtype=self.compute_dtype,
-                trainable=trainable,
-            )
-        else:
-            self.pre_ffn_norm = nn.Identity()
-
-        if self.ffn_post_norm:
-            self.post_ffn_norm: nn.Module = SeparableRMSNorm(
-                self.lmax,
-                self.channels,
-                centering=self.mlp_bias,
-                eps=eps,
-                dtype=self.compute_dtype,
-                trainable=trainable,
-            )
-        else:
-            self.post_ffn_norm = nn.Identity()
-
         self.so2_conv = SO2Convolution(
             lmax=self.lmax,
             mmax=self.mmax,
             channels=self.channels,
             so2_norm=self.so2_norm,
             so2_layers=self.so2_layers,
+            layer_scale=self.layer_scale,
             n_atten_head=n_atten_head,
             mlp_bias=self.mlp_bias,
             eps=self.eps,
@@ -1996,17 +2012,74 @@ class SeZMInteractionBlock(nn.Module):
             trainable=trainable,
         )
 
-        self.ffn = EquivariantFFN(
-            lmax=self.lmax,
-            channels=self.channels,
-            hidden_channels=ffn_neurons,
-            dtype=dtype,
-            activation_function=activation_function,
-            glu_activation=self.glu_activation,
-            mlp_bias=self.mlp_bias,
-            trainable=trainable,
-            seed=seed_ffn,
-        )
+        # === Step 2. FFN subblock sequence ===
+        pre_ffn_norms: list[nn.Module] = []
+        post_ffn_norms: list[nn.Module] = []
+        ffns: list[EquivariantFFN] = []
+
+        for i in range(self.ffn_blocks):
+            seed_ffn_i = child_seed(seed_ffn, i)
+
+            if self.ffn_pre_norm:
+                pre_ffn_norms.append(
+                    SeparableRMSNorm(
+                        self.lmax,
+                        self.channels,
+                        centering=self.mlp_bias,
+                        eps=eps,
+                        dtype=self.compute_dtype,
+                        trainable=trainable,
+                    )
+                )
+            else:
+                pre_ffn_norms.append(nn.Identity())
+
+            if self.ffn_post_norm:
+                post_ffn_norms.append(
+                    SeparableRMSNorm(
+                        self.lmax,
+                        self.channels,
+                        centering=self.mlp_bias,
+                        eps=eps,
+                        dtype=self.compute_dtype,
+                        trainable=trainable,
+                    )
+                )
+            else:
+                post_ffn_norms.append(nn.Identity())
+
+            ffns.append(
+                EquivariantFFN(
+                    lmax=self.lmax,
+                    channels=self.channels,
+                    hidden_channels=ffn_neurons,
+                    dtype=dtype,
+                    activation_function=activation_function,
+                    glu_activation=self.glu_activation,
+                    mlp_bias=self.mlp_bias,
+                    trainable=trainable,
+                    seed=seed_ffn_i,
+                )
+            )
+
+        self.pre_ffn_norms = nn.ModuleList(pre_ffn_norms)
+        self.post_ffn_norms = nn.ModuleList(post_ffn_norms)
+        self.ffns = nn.ModuleList(ffns)
+
+        # Optional per-channel LayerScale on each FFN residual branch
+        if self.layer_scale:
+            self.ffn_layer_scales = nn.ParameterList(
+                [
+                    nn.Parameter(
+                        torch.ones(self.channels, dtype=self.dtype, device=self.device)
+                        * 1e-3,
+                        requires_grad=trainable,
+                    )
+                    for _ in range(self.ffn_blocks)
+                ]
+            )
+        else:
+            self.ffn_layer_scales = None
 
     def forward(
         self,
@@ -2029,38 +2102,34 @@ class SeZMInteractionBlock(nn.Module):
         torch.Tensor
             Updated features with shape (N, D, C).
         """
-        x_res = x  # (N, D, C)
-
-        # === Step 1. Pre-Norm (SO2) ===
+        # === Step 1. SO(2) convolution branch ===
         with nvtx_range("SeZMBlock/pre_norm"):
-            x_pre = self.pre_so2_norm(x)  # (N, D, C)
+            x_pre = self.pre_so2_norm(x)
 
-        # === Step 2. SO(2) convolution ===
         with nvtx_range("SeZMBlock/so2_conv"):
-            y = self.so2_conv(x_pre, edge_cache, radial_feat)  # (N, D, C)
+            y = self.so2_conv(x_pre, edge_cache, radial_feat)
 
-        # === Step 3. Post-Norm (SO2) ===
         with nvtx_range("SeZMBlock/post_so2_norm"):
             y = self.post_so2_norm(y)
 
-        # === Step 4. Residual connection (SO2) ===
-        x = x_res + y
-        x_res = x
+        x = x + y
 
-        # === Step 5. Pre-Norm (FFN) ===
-        with nvtx_range("SeZMBlock/pre_ffn_norm"):
-            x_pre = self.pre_ffn_norm(x)
+        # === Step 2. FFN sublayer sequence ===
+        for i in range(self.ffn_blocks):
+            with nvtx_range(f"SeZMBlock/ffn_{i}/pre_norm"):
+                x_pre = self.pre_ffn_norms[i](x)
 
-        # === Step 6. Nodewise Feed-Forward ===
-        with nvtx_range("SeZMBlock/ffn"):
-            y = self.ffn(x_pre)
+            with nvtx_range(f"SeZMBlock/ffn_{i}/ffn"):
+                y = self.ffns[i](x_pre)
 
-        # === Step 7. Post-Norm (FFN) ===
-        with nvtx_range("SeZMBlock/post_ffn_norm"):
-            y = self.post_ffn_norm(y)
+            with nvtx_range(f"SeZMBlock/ffn_{i}/post_norm"):
+                y = self.post_ffn_norms[i](y)
 
-        # === Step 8. Residual connection (FFN) ===
-        x = x_res + y
+            if self.ffn_layer_scales is not None:
+                y = y * self.ffn_layer_scales[i]
+
+            x = x + y
+
         return x
 
     def serialize(self) -> dict[str, Any]:
@@ -2081,9 +2150,11 @@ class SeZMInteractionBlock(nn.Module):
                 "ffn_pre_norm": self.ffn_pre_norm,
                 "ffn_post_norm": self.ffn_post_norm,
                 "ffn_neurons": self.ffn_neurons,
+                "ffn_blocks": self.ffn_blocks,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,
+                "layer_scale": self.layer_scale,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,
