@@ -90,7 +90,9 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         self.n_node = int(n_node) if n_node is not None else None
         self.n_edge = int(n_edge)
         self._compiled = False
-        self.compiled_compute: torch.nn.Module | None = None
+        # Store compiled_compute outside the nn.Module tree so that
+        # FSDP2 / DDP do not shard or sync its duplicated parameters.
+        object.__setattr__(self, "compiled_compute", None)
         if self.use_compile:
             if self.n_node is None or self.n_node <= 0:
                 raise ValueError("n_node must be positive when use_compile=True")
@@ -447,7 +449,9 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
 
         if not torch.cuda.is_available():
             # CPU fallback: use aot_eager for compatibility
-            self.compiled_compute = torch.compile(traced, backend="aot_eager")
+            object.__setattr__(
+                self, "compiled_compute", torch.compile(traced, backend="aot_eager")
+            )
         else:
             # GPU: use inductor with full performance options
             # These options enable aggressive optimizations:
@@ -472,7 +476,9 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                 "shape_padding": not is_multi_gpu,
                 "max_fusion_size": 16,
             }
-            self.compiled_compute = torch.compile(traced, options=compile_options)
+            object.__setattr__(
+                self, "compiled_compute", torch.compile(traced, options=compile_options)
+            )
         self._compiled = True
 
     def compile_compute_func(
