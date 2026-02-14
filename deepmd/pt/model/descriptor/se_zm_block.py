@@ -2103,26 +2103,26 @@ class SeZMInteractionBlock(nn.Module):
             Updated features with shape (N, D, C).
         """
         # === Step 1. SO(2) convolution branch ===
-        with nvtx_range("SeZMBlock/pre_norm"):
+        with nvtx_range("pre_norm"):
             x_pre = self.pre_so2_norm(x)
 
-        with nvtx_range("SeZMBlock/so2_conv"):
+        with nvtx_range("so2_conv"):
             y = self.so2_conv(x_pre, edge_cache, radial_feat)
 
-        with nvtx_range("SeZMBlock/post_so2_norm"):
+        with nvtx_range("post_so2_norm"):
             y = self.post_so2_norm(y)
 
         x = x + y
 
         # === Step 2. FFN sublayer sequence ===
         for i in range(self.ffn_blocks):
-            with nvtx_range(f"SeZMBlock/ffn_{i}/pre_norm"):
+            with nvtx_range(f"ffn_{i}/pre_norm"):
                 x_pre = self.pre_ffn_norms[i](x)
 
-            with nvtx_range(f"SeZMBlock/ffn_{i}/ffn"):
+            with nvtx_range(f"ffn_{i}/ffn"):
                 y = self.ffns[i](x_pre)
 
-            with nvtx_range(f"SeZMBlock/ffn_{i}/post_norm"):
+            with nvtx_range(f"ffn_{i}/post_norm"):
                 y = self.post_ffn_norms[i](y)
 
             if self.ffn_layer_scales is not None:

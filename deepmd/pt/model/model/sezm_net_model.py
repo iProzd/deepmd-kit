@@ -229,7 +229,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
 
             # === Step 1. Cast inputs to correct dtype ===
             with nvtx_range("SeZMNet/input_type_cast"):
-                cc, bb, fp, ap, input_prec = self.input_type_cast(
+                cc, bb, fp, ap, input_prec = self._input_type_cast(
                     coord, box=box, fparam=fparam, aparam=aparam
                 )
                 del coord, box, fparam, aparam
@@ -263,7 +263,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                 )
 
             with nvtx_range("SeZMNet/output_type_cast"):
-                model_predict = self.output_type_cast(model_predict, input_prec)
+                model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
 
     def forward_common_compile(
@@ -284,7 +284,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         with nvtx_range("SeZMNet/forward_common_compile"):
             # === Step 1. Cast inputs to correct dtype ===
             with nvtx_range("SeZMNet/input_type_cast"):
-                cc, bb, fp, ap, input_prec = self.input_type_cast(
+                cc, bb, fp, ap, input_prec = self._input_type_cast(
                     coord, box=box, fparam=fparam, aparam=aparam
                 )
                 del coord, box, fparam, aparam
@@ -395,7 +395,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
 
             # === Step 10. Output type cast ===
             with nvtx_range("SeZMNet/output_type_cast"):
-                model_predict = self.output_type_cast(model_predict, input_prec)
+                model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
 
     def trace_and_compile(
@@ -1029,7 +1029,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
             output_def["force"] = out_def_data["energy_derv_r"].squeeze(-2)
         if self.do_grad_c("energy"):
             output_def["virial"] = out_def_data["energy_derv_c_redu"].squeeze(-2)
-            output_def["atom_virial"] = out_def_data["energy_derv_c"].squeeze(-3)
+            output_def["atom_virial"] = out_def_data["energy_derv_c"].squeeze(-2)
         if "mask" in out_def_data:
             output_def["mask"] = out_def_data["mask"]
 
