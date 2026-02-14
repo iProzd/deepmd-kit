@@ -357,7 +357,11 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_l_schedule = "Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored."
     doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
     doc_m_schedule = "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored."
-    doc_channels = "Channels per (l,m) coefficient, i.e. feature dimension per degree."
+    doc_channels = "Total channels per (l,m) coefficient."
+    doc_n_focus = (
+        "Number of parallel focus streams. Per-stream width is "
+        "`focus_dim = channels // n_focus`; `channels` must be divisible by `n_focus`."
+    )
     doc_n_radial = "Number of radial basis functions."
     doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended."
     doc_so2_norm = (
@@ -377,14 +381,22 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
     doc_ffn_blocks = "Number of FFN sublayers per interaction block."
     doc_layer_scale = (
-        "If True, apply per-channel learnable LayerScale (init 1e-3) on each FFN "
-        "residual branch for training stability in deep networks."
+        "If True, apply learnable LayerScale (init 1e-3) on residual branches: "
+        "SO(2) branch uses per-focus-channel scales "
+        "(shape `(n_focus, channels//n_focus)`) on each SO(2) mixing layer, "
+        "and FFN branch uses per-channel scales (shape `(channels,)`) on each "
+        "FFN residual branch."
+    )
+    doc_focus_compete = (
+        "If True, enable multi-focus softmax competition inside SO(2) convolution. "
+        "Competition logits are built from l=0 scalar channels and applied across focus streams."
     )
     doc_n_atten_head = (
         "Number of gated attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
-        "channels must be divisible by `n_atten_head` and per-head edge gating "
-        "with sample-RMS normalized logits and learnable temperature is applied."
+        "the per-focus stream width `focus_dim = channels // n_focus` must be "
+        "divisible by `n_atten_head`, and per-head edge "
+        "gating with sample-RMS normalized logits and learnable temperature is applied."
     )
     doc_use_amp = (
         "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "
@@ -436,6 +448,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
         ),
         Argument("channels", int, optional=True, default=64, doc=doc_channels),
+        Argument("n_focus", int, optional=True, default=1, doc=doc_n_focus),
         Argument("n_radial", int, optional=True, default=10, doc=doc_n_radial),
         Argument(
             "radial_mlp",
@@ -460,6 +473,9 @@ def descrpt_se_zm_args() -> list[Argument]:
             optional=True,
             default=1,
             doc=doc_only_pt_supported + doc_ffn_blocks,
+        ),
+        Argument(
+            "focus_compete", bool, optional=True, default=False, doc=doc_focus_compete
         ),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
         Argument(

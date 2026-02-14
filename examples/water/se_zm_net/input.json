@@ -1,21 +1,37 @@
 {
   "model": {
     "type": "SeZM-Net",
-    "type_map": ["O", "H"],
+    "type_map": [
+      "O",
+      "H"
+    ],
     "descriptor": {
       "type": "SeZM",
       "sel": 120,
       "rcut": 6.0,
       "channels": 64,
+      "n_focus": 1,
+      "focus_compete": false,
       "n_radial": 10,
-      "radial_mlp": [64],
+      "radial_mlp": [
+        64
+      ],
       "use_env_seed": true,
-      "l_schedule": [3, 3, 2],
+      "l_schedule": [
+        3,
+        3,
+        2
+      ],
       "mmax": 2,
       "so2_norm": false,
       "so2_layers": 3,
       "n_atten_head": 0,
-      "sandwich_norm": [true, false, true, false],
+      "sandwich_norm": [
+        true,
+        false,
+        true,
+        false
+      ],
       "ffn_neurons": 96,
       "ffn_blocks": 1,
       "mlp_bias": true,
@@ -28,7 +44,11 @@
       "_comment": "that's all"
     },
     "fitting_net": {
-      "neuron": [256, 256, 256],
+      "neuron": [
+        256,
+        256,
+        256
+      ],
       "activation_function": "silu",
       "precision": "float32",
       "seed": 7,
@@ -59,12 +79,18 @@
   "training": {
     "stat_file": "./se_zm_net.hdf5",
     "training_data": {
-      "systems": ["../data/data_0", "../data/data_1", "../data/data_2"],
+      "systems": [
+        "../data/data_0",
+        "../data/data_1",
+        "../data/data_2"
+      ],
       "batch_size": 1,
       "_comment": "that's all"
     },
     "validation_data": {
-      "systems": ["../data/data_3"],
+      "systems": [
+        "../data/data_3"
+      ],
       "batch_size": 1,
       "numb_btch": 1,
       "_comment": "that's all"

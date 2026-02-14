@@ -12,6 +12,19 @@ This implementation is designed around two non-negotiables:
 
 Core math utilities live in `se_zm_helper.py`, while per-block message passing
 is implemented in `se_zm_block.py`.
+
+Runtime flow at a glance:
+1) Build edge cache and radial features once.
+2) Run interaction blocks with shared geometric caches.
+3) Return scalar (`l=0`) descriptor channels for fitting.
+
+Layout notes
+------------
+- Node-level backbone features use contiguous `(N, D, F, Cf)` where
+  `D=(lmax+1)^2`, `F=n_focus`, `Cf=channels//n_focus`.
+- Node-level equivariant operators use `(N, D, F, Cf)` convention.
+- Edge-level SO(2) internal operators keep m-major reduced layout
+  `(E, F, D_m_trunc, Cf)`.
 """
 
 from __future__ import (
@@ -101,6 +114,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
     """
     SeZM: Smooth equivariant ZBL Message-passing Network descriptor for DeePMD-kit.
 
+    Execution outline
+    -----------------
+    1. Build a per-forward `EdgeFeatureCache` (geometry, envelope, Wigner-D).
+    2. Build radial/type edge features once and reuse across blocks.
+    3. Run `SeZMInteractionBlock` stack with optional l/m schedules.
+    4. Extract scalar channels and apply the final scalar FFN.
+
     Parameters
     ----------
     rcut
@@ -126,7 +146,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         `m_schedule[i] <= l_schedule[i]` for every block. A non-increasing schedule is
         recommended but not required. If set, `mmax` will be ignored.
     channels
-        Channels per (l,m) coefficient, i.e. feature dimension per degree.
+        Total channels per (l,m) coefficient.
+    n_focus
+        Number of parallel focus streams. The per-stream channel width is
+        ``focus_dim = channels // n_focus``. Must divide ``channels`` exactly.
     n_radial
         Number of radial basis functions.
     radial_mlp
@@ -151,9 +174,15 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Hidden sizes for the equivariant FFN in each block and the final scalar output FFN.
     ffn_blocks
         Number of FFN subblocks per interaction block.
+    focus_compete
+        If True, enable cross-focus softmax competition inside SO(2) convolution.
+        Competition logits are built from l=0 scalar channels before SO(2) mixing
+        and applied after SO(2) stack to scale full irreps uniformly per focus.
     n_atten_head
         Number of gated attention heads when aggregating messages in SO(2) convolution.
         0 applies a plain envelope-weighted scatter-sum; >0 enables per-head edge gating.
+        When enabled, the per-focus stream width
+        ``focus_dim = channels // n_focus`` must be divisible by ``n_atten_head``.
     sandwich_norm
         Pre/post-norm switches for [SO(2), FFN] residual branches in order:
         [so2_pre, so2_post, ffn_pre, ffn_post], shared across all blocks.
@@ -166,8 +195,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
     layer_scale
-        If True, apply per-channel learnable LayerScale (init 1e-3) on each FFN
-        residual branch for training stability in deep networks.
+        If True, apply learnable LayerScale (init 1e-3) on residual branches:
+        - SO(2) branch: per-focus-channel scales `(n_focus, focus_dim)`
+          on each SO(2) mixing layer.
+        - FFN branch: per-channel scales `(channels,)` on each FFN subblock.
     activation_function
         Activation function used by deepmd EmbeddingNet.
     glu_activation
@@ -189,8 +220,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Whether parameters are trainable.
     seed
         Random seed(s).
-    ntypes
-        Number of element types.
     type_map
         Type names.
 
@@ -215,6 +244,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         mmax: int | None = 2,
         m_schedule: list[int] | None = None,
         channels: int = 64,
+        n_focus: int = 1,
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
         use_env_seed: bool = True,
@@ -222,6 +252,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         so2_layers: int = 3,
         ffn_neurons: int = 96,
         ffn_blocks: int = 1,
+        focus_compete: bool = False,
         n_atten_head: int = 0,
         sandwich_norm: list[bool] | None = None,
         activation_function: str = "silu",
@@ -252,6 +283,15 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.ndescrpt = int(self.nnei * self._ENV_DIM)
 
         self.channels = int(channels)
+        self.n_focus = int(n_focus)
+        if self.n_focus < 1:
+            raise ValueError("`n_focus` must be >= 1")
+        if self.channels % self.n_focus != 0:
+            raise ValueError(
+                f"`channels` ({self.channels}) must be divisible by `n_focus` ({self.n_focus})"
+            )
+        self.focus_dim = self.channels // self.n_focus
+        self.focus_compete = bool(focus_compete)
         self.n_radial = int(n_radial)
         if radial_mlp is None:
             radial_mlp = [64]
@@ -263,6 +303,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         if self.ffn_blocks < 1:
             raise ValueError("`ffn_blocks` must be >= 1")
         self.n_atten_head = int(n_atten_head)
+        if self.n_atten_head > 0 and self.focus_dim % self.n_atten_head != 0:
+            raise ValueError(
+                "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
+            )
         if sandwich_norm is None:
             sandwich_norm = [True, False, True, False]
         if not isinstance(sandwich_norm, (list, tuple)) or len(sandwich_norm) != 4:
@@ -350,12 +394,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             )
             self.film_scale_norm = ScalarRMSNorm(
                 channels=self.channels,
+                n_focus=1,
                 eps=self.eps,
                 dtype=self.compute_dtype,
                 trainable=self.trainable,
             )
             self.film_shift_norm = ScalarRMSNorm(
                 channels=self.channels,
+                n_focus=1,
                 eps=self.eps,
                 dtype=self.compute_dtype,
                 trainable=self.trainable,
@@ -435,6 +481,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     lmax=l_b,
                     mmax=m_b,
                     channels=self.channels,
+                    n_focus=self.n_focus,
+                    focus_compete=self.focus_compete,
                     so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
                     ffn_neurons=self.ffn_neurons,
@@ -612,8 +660,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                 )  # (N, 2*C)
                 scale_logits, shift_logits = film.chunk(2, dim=-1)  # (N, C), (N, C)
-                scale_hat = self.film_scale_norm(scale_logits)  # (N, C)
-                shift_hat = self.film_shift_norm(shift_logits)  # (N, C)
+                # ScalarRMSNorm is unified to focus-aware layout (B, F, C).
+                # Env FiLM remains a single scalar stream, so F=1 here.
+                scale_hat = self.film_scale_norm(scale_logits.unsqueeze(1)).squeeze(
+                    1
+                )  # (N, C)
+                shift_hat = self.film_shift_norm(shift_logits.unsqueeze(1)).squeeze(
+                    1
+                )  # (N, C)
                 scale_strength = torch.exp(self.film_scale_strength_log)
                 shift_strength = torch.exp(self.film_shift_strength_log)
                 scale = 1.0 + scale_strength * torch.tanh(scale_hat)  # (N, C)
@@ -621,8 +675,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 x0_out = x0 * scale + shift
 
         # === Step 8. Build l=0 features ===
-        x = type_ebed.new_zeros(n_nodes, ebed_dim_0, self.channels)  # (N, D, C)
-        x[:, 0, :] = x0_out
+        x = type_ebed.new_zeros(
+            n_nodes, ebed_dim_0, self.n_focus, self.focus_dim
+        )  # (N, D, F, Cf)
+        x[:, 0, :, :] = x0_out.reshape(n_nodes, self.n_focus, self.focus_dim)
 
         # === Step 9. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
@@ -632,7 +688,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                     edge_cache=edge_cache,
                     radial_feat=radial_feat[:, 1:, :],
-                )
+                ).reshape(n_nodes, ebed_dim_0, self.n_focus, self.focus_dim)
 
         # === Step 10. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
@@ -645,12 +701,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     radial_feat[:, :rad_len, :] for rad_len in self.rad_sizes_per_block
                 ]  # list of (E, lmax+1, C)
             else:
-                rad_feat_per_block = None
+                rad_feat_per_block = []
 
         # === Step 11. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
-            x = x.to(dtype=self.dtype)  # (N, D, C)
-            if edge_cache.src.numel() > 0 and rad_feat_per_block is not None:
+            x = x.to(dtype=self.dtype)  # (N, D, F, Cf)
+            if edge_cache.src.numel() > 0:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
                     x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
@@ -659,12 +715,16 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # Extract l=0 scalar features and apply FFN in promoted dtype.
         # Residual keeps the output close to identity with zero-initialized FFN output.
         with nvtx_range("output_ffn"):
-            x_scalar = x[:, 0:1, :].to(dtype=self.compute_dtype)  # (N, 1, C)
+            x_scalar = (
+                x[:, 0:1, :, :]
+                .reshape(n_nodes, 1, 1, self.channels)
+                .to(dtype=self.compute_dtype)
+            )  # (N, 1, 1, C)
             x_scalar = x_scalar + self.output_ffn(x_scalar)
 
         # === Step 13. Reshape to (nf, nloc, channels) and return ===
         descriptor = rearrange(
-            x_scalar, "(nf nloc) 1 C -> nf nloc C", nf=nf, nloc=nloc
+            x_scalar, "(nf nloc) 1 1 C -> nf nloc C", nf=nf, nloc=nloc
         )  # (nf, nloc, C)
         return (
             descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
@@ -776,8 +836,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                 )  # (N, 2*C)
                 scale_logits, shift_logits = film.chunk(2, dim=-1)  # (N, C), (N, C)
-                scale_hat = self.film_scale_norm(scale_logits)  # (N, C)
-                shift_hat = self.film_shift_norm(shift_logits)  # (N, C)
+                # ScalarRMSNorm is unified to focus-aware layout (B, F, C).
+                # Env FiLM remains a single scalar stream, so F=1 here.
+                scale_hat = self.film_scale_norm(scale_logits.unsqueeze(1)).squeeze(
+                    1
+                )  # (N, C)
+                shift_hat = self.film_shift_norm(shift_logits.unsqueeze(1)).squeeze(
+                    1
+                )  # (N, C)
                 scale_strength = torch.exp(self.film_scale_strength_log)
                 shift_strength = torch.exp(self.film_shift_strength_log)
                 scale = 1.0 + scale_strength * torch.tanh(scale_hat)  # (N, C)
@@ -785,8 +851,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 x0_out = x0 * scale + shift
 
         # === Step 7. Build l=0 features ===
-        x = type_ebed.new_zeros(n_nodes, ebed_dim_0, self.channels)  # (N, D, C)
-        x[:, 0, :] = x0_out
+        x = type_ebed.new_zeros(
+            n_nodes, ebed_dim_0, self.n_focus, self.focus_dim
+        )  # (N, D, F, Cf)
+        x[:, 0, :, :] = x0_out.reshape(n_nodes, self.n_focus, self.focus_dim)
 
         # === Step 8. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
@@ -795,7 +863,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                     edge_cache=edge_cache,
                     radial_feat=radial_feat[:, 1:, :],
-                )
+                ).reshape(n_nodes, ebed_dim_0, self.n_focus, self.focus_dim)
 
         # === Step 9. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
@@ -804,29 +872,34 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     edge_cache.edge_type_feat, "E C -> E 1 C"
                 )
 
-        rad_feat_per_block = None
         if radial_feat is not None:
             radial_feat = radial_feat.to(dtype=self.dtype)
             rad_feat_per_block = [
                 radial_feat[:, :rad_len, :] for rad_len in self.rad_sizes_per_block
             ]
+        else:
+            rad_feat_per_block = []
 
         # === Step 10. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
-            x = x.to(dtype=self.dtype)  # (N, D, C)
-            if edge_cache.src.numel() > 0 and rad_feat_per_block is not None:
+            x = x.to(dtype=self.dtype)  # (N, D, F, Cf)
+            if edge_cache.src.numel() > 0:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
                     x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
 
         # === Step 11. Final l=0 output mixing ===
         with nvtx_range("output_ffn"):
-            x_scalar = x[:, 0:1, :].to(dtype=self.compute_dtype)  # (N, 1, C)
+            x_scalar = (
+                x[:, 0:1, :, :]
+                .reshape(n_nodes, 1, 1, self.channels)
+                .to(dtype=self.compute_dtype)
+            )  # (N, 1, 1, C)
             x_scalar = x_scalar + self.output_ffn(x_scalar)
 
         # === Step 12. Reshape to (nf, nloc, channels) and return ===
         descriptor = rearrange(
-            x_scalar, "(nf nloc) 1 C -> nf nloc C", nf=nf, nloc=nloc
+            x_scalar, "(nf nloc) 1 1 C -> nf nloc C", nf=nf, nloc=nloc
         )  # (nf, nloc, C)
         return (
             descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
@@ -840,7 +913,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self,
         x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
-        radial_feat_per_block: list[torch.Tensor] | None,
+        radial_feat_per_block: list[torch.Tensor],
     ) -> torch.Tensor:
         """
         Run the interaction blocks.
@@ -848,24 +921,21 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Parameters
         ----------
         x
-            Initial node features with shape (N, D, C).
+            Initial node features with shape (N, D, F, Cf).
         edge_cache
             Per-edge cache.
         radial_feat_per_block
-            List of per-block radial features already truncated to l_schedule[i]+1,
-            or None if no edges.
+            List of per-block radial features already truncated to l_schedule[i]+1.
 
         Returns
         -------
         torch.Tensor
-            Output features with shape (N, D, C).
+            Output features with shape (N, D, F, Cf).
         """
         # Blocks with pyramid l-schedule slicing
         for i, block in enumerate(self.blocks):
-            x = x[:, : self.ebed_dims[i], :]
-            blk_radial = (
-                None if radial_feat_per_block is None else radial_feat_per_block[i]
-            )
+            x = x[:, : self.ebed_dims[i], :, :]
+            blk_radial = radial_feat_per_block[i]
             with nvtx_range(f"block_{i}"):
                 x = block(x, edge_cache, blk_radial)
         return x
@@ -943,7 +1013,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # DeePMD uses -1 for padding in nlist. torch.gather cannot index -1, so we
         # replace padding indices with 0 (any valid index works since padding positions
         # are masked out by `keep`). This avoids the extra cat operation for sentinel.
-        with nvtx_range("edge_cache/geometry"):
+        with nvtx_range("geometry"):
             valid_nlist = nlist >= 0  # (nf, nloc, nnei)
             keep = valid_nlist & pair_keep_mask  # (nf, nloc, nnei)
 
@@ -969,7 +1039,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 2. C^2 envelope weight `sw` ===
         # sw is the C^2-continuous cutoff envelope weight in [0, 1], applied per neighbor pair.
-        with nvtx_range("edge_cache/envelope"):
+        with nvtx_range("envelope"):
             sw = self.c2_envelope(length)  # (nf, nloc, nnei, 1)
             sw = sw * rearrange(keep, "nf nloc nnei -> nf nloc nnei 1").to(
                 dtype=sw.dtype
@@ -983,7 +1053,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         # edge_env=0 (from C2CutoffEnvelope), so their messages naturally vanish.
         # This avoids the dynamic-output-size `nonzero` kernel and enables smoother
         # degree/normalization (no discontinuous edge count jumps at rcut boundary).
-        with nvtx_range("edge_cache/filter"):
+        with nvtx_range("filter"):
             edge_keep = rearrange(  # (nf*nloc*nnei,)
                 keep, "nf nloc nnei -> (nf nloc nnei)"
             )
@@ -1032,7 +1102,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         #   f_idx   in [0, nf)
         #   loc_idx in [0, nloc)
         #   neighbor index from nlist (extended axis)
-        with nvtx_range("edge_cache/index"):
+        with nvtx_range("index"):
             nlist_flat = nlist.reshape(-1)  # (nf*nloc*nnei,)
             edge_idx_flat = edge_idx.to(dtype=torch.long)  # (E,)
             valid_f_idx = edge_idx_flat // (nloc * nnei)  # (E,)
@@ -1067,22 +1137,22 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 5. Gather per-edge geometry ===
         # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
-        with nvtx_range("edge_cache/edge_geom"):
+        with nvtx_range("edge_geom"):
             diff_flat = diff.reshape(-1, 3)  # (nf*nloc*nnei, 3)
             length_flat = length.reshape(-1, 1)  # (nf*nloc*nnei, 1)
             edge_vec = diff_flat[edge_idx]  # (E, 3)
             edge_len = length_flat[edge_idx]  # (E, 1)
 
         # === Step 6. Radial basis (envelope already baked in) ===
-        with nvtx_range("edge_cache/radial_basis"):
+        with nvtx_range("radial_basis"):
             edge_rbf = self.radial_basis(edge_len)  # (E, n_radial)
 
         # === Step 7. Wigner-D blocks ===
-        with nvtx_range("edge_cache/rot_mat"):
+        with nvtx_range("rot_mat"):
             rot_mat = init_edge_rot_mat_frisvad(  # (E, 3, 3)
                 edge_vec, edge_len=edge_len, eps=self.eps
             )
-        with nvtx_range("edge_cache/wigner_d"):
+        with nvtx_range("wigner_d"):
             D_full, Dt_full = self.wigner_calc(rot_mat)  # (E, D, D), (E, D, D)
 
         edge_type_feat = build_edge_type_feat(  # (E, C)
@@ -1091,7 +1161,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 8. Neighbor normalization (destination degree) ===
         # Compute inverse sqrt degree for graph-style message normalization.
-        with nvtx_range("edge_cache/degree"):
+        with nvtx_range("degree"):
             deg = torch.zeros(
                 n_nodes, dtype=edge_vec.dtype, device=edge_vec.device
             )  # (N,)
@@ -1164,17 +1234,17 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         edge_vec = edge_vec + (1.0 - edge_keep_f) * edge_vec.new_tensor([0.0, 0.0, 1.0])
 
         # === Step 3. Edge length, envelope, and radial basis ===
-        with nvtx_range("edge_cache/envelope"):
+        with nvtx_range("envelope"):
             edge_len = safe_norm(edge_vec, self.eps)
             edge_env = self.c2_envelope(edge_len) * edge_keep_f  # (E, 1)
             edge_rbf = self.radial_basis(edge_len) * edge_keep_f  # (E, n_radial)
 
         # === Step 4. Rotation blocks ===
-        with nvtx_range("edge_cache/rot_mat"):
+        with nvtx_range("rot_mat"):
             rot_mat = init_edge_rot_mat_frisvad(
                 edge_vec, edge_len=edge_len, eps=self.eps
             )
-        with nvtx_range("edge_cache/wigner_d"):
+        with nvtx_range("wigner_d"):
             D_full, Dt_full = self.wigner_calc(rot_mat)
 
         # === Step 5. Edge type features ===
@@ -1184,7 +1254,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         edge_type_feat = edge_type_feat * edge_keep_f.to(dtype=edge_type_feat.dtype)
 
         # === Step 6. Neighbor normalization ===
-        with nvtx_range("edge_cache/degree"):
+        with nvtx_range("degree"):
             deg = torch.zeros(
                 n_nodes, dtype=edge_vec.dtype, device=edge_vec.device
             )  # (N,)
@@ -1496,6 +1566,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 "mmax": self.mmax,
                 "m_schedule": self.m_schedule,
                 "channels": self.channels,
+                "n_focus": self.n_focus,
+                "focus_compete": self.focus_compete,
                 "n_radial": self.n_radial,
                 "radial_mlp": self.radial_mlp,
                 "use_env_seed": self.use_env_seed,

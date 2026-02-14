@@ -6,6 +6,11 @@ This module collects shared building blocks and math utilities, including:
 - edge caches, radial bases/envelopes, and initial embeddings
 - edge-frame construction and Wigner-D rotation blocks
 - SO(3) index/projection helpers and dtype/serialization utilities
+
+Role boundary:
+- this file owns geometry/math helpers and reusable cache containers;
+- `se_zm_block.py` owns feature transforms and message-passing operators;
+- `se_zm.py` owns descriptor orchestration and per-forward cache building.
 """
 
 from __future__ import (
@@ -61,22 +66,30 @@ if TYPE_CHECKING:
 
 
 def init_trunc_normal_fan_in_out(
-    weight: torch.Tensor, seed: int | list[int] | None
+    weight: torch.Tensor,
+    seed: int | list[int] | None,
+    scale: float = 1.0,
 ) -> None:
     """Initialize weight with truncated normal distribution.
 
-    Uses Xavier-like variance scaling: std = 1.0 / sqrt(fan_in + fan_out).
+    Uses Xavier-like variance scaling: std = scale / sqrt(fan_in + fan_out).
     Truncation at +/-3*std prevents extreme outliers.
 
     Parameters
     ----------
     weight : torch.Tensor
-        Weight tensor with shape (fan_in, fan_out).
+        Weight tensor with shape (out_features, in_features).
     seed : int | list[int] | None
         Random seed for reproducibility.
+    scale : float, default=1.0
+        Multiplicative scale factor in the standard deviation numerator.
     """
-    fan_in, fan_out = weight.shape
-    std = 1.0 / math.sqrt(fan_in + fan_out)
+    if weight.ndim != 2:
+        raise ValueError("`weight` must be a 2D tensor")
+    if scale <= 0:
+        raise ValueError("`scale` must be positive")
+    fan_out, fan_in = weight.shape
+    std = float(scale) / math.sqrt(fan_in + fan_out)
     nn.init.trunc_normal_(
         weight,
         mean=0.0,
@@ -171,9 +184,11 @@ class EdgeFeatureCache(NamedTuple):
     Dt_full
         Transpose of D_full with shape (E, D, D). None if not available.
     D_to_m_cache
-        Lazy cache for projected D matrices keyed by (lmax, mmax).
+        Lazy cache for projected D matrices keyed by a normalized
+        `(lmax, mmax)` identifier.
     Dt_from_m_cache
-        Lazy cache for projected Dt matrices keyed by (lmax, mmax).
+        Lazy cache for projected Dt matrices keyed by a normalized
+        `(lmax, mmax)` identifier.
     """
 
     src: torch.Tensor

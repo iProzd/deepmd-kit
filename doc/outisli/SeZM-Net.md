@@ -93,24 +93,18 @@ Standard DeePMD nlist path:
 
   Interaction blocks (pyramid schedule):
     for block i:
-      ├─ slice x to ebed_dim(l_schedule[i]) (discard higher-l if needed)
-      ├─ SeparableRMSNorm (pre-SO2)
-      ├─ SO(2) Convolution (enabled for ALL lmax, including lmax=0)
-      │  ├─ Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)
-      │  └─ Final SO3Linear channel mixing
-      ├─ Residual
-      └─ FFN subblock sequence (ffn_blocks iterations):
-         for j in range(ffn_blocks):
-           ├─ SeparableRMSNorm (pre-FFN)
-           ├─ Full Equivariant FFN (operates on ALL degrees l=0..lmax)
-           │  ├─ SO3Linear (in projection)
-           │  ├─ GatedActivation (per-l independent gates from l=0)
-           │  └─ SO3Linear (out projection)
-           ├─ Optional LayerScale (per-channel, init 1e-3)
-           └─ Residual
+      ├─ slice D to ebed_dim(l_schedule[i]) (discard higher-l if needed)
+      ├─ main tensor layout is fixed as (N, D, F, Cf), contiguous
+      ├─ SeparableRMSNorm (pre-SO2, per-focus on (N, D, F, Cf))
+      ├─ Multi-Focus SO(2) Convolution (enabled for ALL lmax, including lmax=0)
+      │  ├─ `pre_focus_mix`: full-channel mixing on (N, D, C)
+      │  ├─ rotate/bmm in full width (E, D, C), then SO2 stack on strided (E, F, Dm, Cf)
+      │  └─ `post_focus_mix` on (N, 1, D, C)
+      └─ FFN subblock sequence (ffn_blocks iterations, global C via view, no permute)
 
   Output (forward, promoted dtype):
-    └─ Extract x(l=0) from block output
+    └─ Extract x(l=0) from global block output
+    └─ reshape to (N, 1, 1, C)
     └─ Convert to promoted dtype (float32+)
     └─ Scalar FFN (lmax=0) for channel mixing
        └─ Residual: x0 + FFN(x0)
@@ -146,16 +140,25 @@ Standard DeePMD nlist path:
 - **Degree Balancing** for `l>0`: each degree `l` contributes equally to the variance, regardless of the number of m components (`2l+1`). This is achieved by weighting each m component by `1/(2l+1)`.
 - Centering and bias are applied only to `l=0`; `l>0` remains zero-mean.
 - Per-l affine scales are expanded to all coefficients via a precomputed degree index.
-- Memory optimization: fused einsum avoids allocating an intermediate `(N, D-1, C)` tensor.
+- Memory optimization: fused einsum avoids allocating an intermediate `(N, D-1, F, C)` tensor.
 
-### 3. SO3LinearV2
+### 3. SO3Linear
 
 - Degree-wise channel mixing with `weight[l]` shared across all `m` in the `l` block.
 - Implemented as `index_select(expand_index)` + `einsum`; bias only for `l=0`.
 
+### Multi-focus SO2 + global FFN
+
+- `channels` is split as `C = F * Cf`, where `F = n_focus` and `Cf = focus_dim`.
+- Backbone tensor stays in a single contiguous layout `(N, D, F, Cf)` across all blocks.
+- SO(2) pre/post norms operate directly on `(N, D, F, Cf)` (per-focus semantics unchanged).
+- Geometry cache (`edge_vec`, `edge_rbf`, `D_full`, `Dt_full`) is still built once per forward and shared across all focus streams.
+- Radial features keep `(E, L, C)` and are consumed by SO(2) without an explicit focus split.
+- FFN branch uses `view(N, D, C) <-> view(N, D, F, Cf)` only; no layout permute is required.
+
 ### 4. Full equivariant FFN
 
-- `SO3LinearV2 -> GatedActivation -> SO3LinearV2` with a residual connection.
+- `SO3Linear -> GatedActivation -> SO3Linear` with a residual connection.
 - Gates are derived from `l=0` scalars (one gate per `l`) and expanded across all `m`.
 
 ### 5. Multi-layer SO(2) convolution
@@ -169,11 +172,12 @@ Standard DeePMD nlist path:
   - bias correction (layer 0 only, when bias exists)
   - `x_local = non_linear(x_local)`
   - `x_local = residual + layer_scale * x_local` (scalar LayerScale when `layer_scale=True`, otherwise bare residual)
-- Ends with a `SO3LinearV2` channel mixer before aggregation.
+- Ends with a `SO3Linear` channel mixer before aggregation.
 - `SO2Linear` uses a single block-diagonal matmul over all m groups:
   - m=0 block: unconstrained linear over `(l=0..lmax)` coefficients
   - |m|>0 blocks: constrained complex coupling `[W_u, -W_v; W_v, W_u]`
   - This reduces kernel launches while preserving SO(2) equivariance.
+  - All learnable weights use `(out, in)` layout (matching `nn.Linear` convention); no transpose needed during weight assembly.
   - Weights are stored as raw parameters (no activation/bias); only the l=0 bias is separate.
 
 ### 6. Deterministic initialization
@@ -183,8 +187,19 @@ Standard DeePMD nlist path:
 - SO2Linear weights use truncated normal init with std `1/sqrt(fan_in + fan_out)`, cut at +/-3\*std.
 - For |m|>0 blocks, an extra `1/sqrt(2)` scale is applied to preserve SO(2) coupling energy.
 - SO3Linear weights use truncated normal init with variance `2/fan_in`, cut at +/-3\*std.
+- `FocusLinear`, `SO3Linear`, and `SO2Linear` all support an optional `init_std` parameter: when given, weights are initialized with `Normal(0, init_std)` instead of the default scheme. Use `init_std=0.0` for zero initialization (e.g., residual output projections).
 
-### 7. Gate initialization strategy
+### 7. Unified weight layout convention
+
+All learnable weight matrices use `(..., C_out, C_in)` layout (output-before-input), matching the standard `nn.Linear(out_features, in_features)` convention:
+
+- `FocusLinear`: `(F, C_out, C_in)` with `einsum("bfi,foi->bfo")`
+- `SO3Linear`: `(F, lmax+1, C_out, C_in)` with `einsum("ndfi,fdci->ndfc")`
+- `SO2Linear`: learnable params `weight_m0` as `(F, num_l*Cout, num_l*Cin)`, `weight_m[i]` as `(F, 2*num_l*Cout, num_l*Cin)`; assembled weight as `(F, D_m*Cout, D_m*Cin)` with `einsum("efi,foi->efo")`
+
+This convention ensures that `shape[-1]` is always the input channel dimension, which is important for Muon optimizer compatibility (Newton-Schulz orthogonalization in input space when reshaping >2D weights to 2D via `(numel // shape[-1], shape[-1])`).
+
+### 8. Gate initialization strategy
 
 All gate projections use a consistent initialization:
 
@@ -199,14 +214,14 @@ This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5`.
 - Unbiased feature scaling: the model learns which features to suppress/amplify from the loss signal
 - Edge gates start at `~0.5` with small `alpha_msg`, avoiding early saturation
 
-### 8. Stability defaults
+### 9. Stability defaults
 
 - Residual branches start near-identity: the output projections of both SO(2) convolution and Equivariant FFN are zero-initialized (weights + bias).
-- When `layer_scale=True`, both SO(2) residual branches (per-layer scalar, init 1e-3) and FFN residual branches (per-channel vector, init 1e-3) use learnable LayerScale for training stability.
+- When `layer_scale=True`, both SO(2) residual branches (per-focus-channel, init 1e-3) and FFN residual branches (per-channel vector, init 1e-3) use learnable LayerScale for training stability.
 - Attention aggregation runs in promoted dtype (fp32) with per-head temperature `tau` and `alpha_msg` for message feedback.
 - Multi-layer SO(2) stacks use pre-norm residual connections. When `so2_norm=True`, a reduced-layout separable RMSNorm is applied as pre-norm before each SO(2) layer (except the last, which uses Identity). This keeps truncated m-major activations balanced but is disabled by default.
 
-### 9. Optional environment matrix initial embedding (EnvironmentInitialEmbedding)
+### 10. Optional environment matrix initial embedding (EnvironmentInitialEmbedding)
 
 An optional module that provides physical inductive bias for l=0 features using a 4D environment matrix approach. When `use_env_seed=True`:
 
@@ -264,12 +279,19 @@ An optional module that provides physical inductive bias for l=0 features using 
 
 ### Node features `x`
 
-The core tensor is:
+The backbone tensor is:
 
-- `x`: `torch.Tensor` with shape `(N, D, C)`
+- `x`: `torch.Tensor` with shape `(N, D, F, Cf)` (contiguous)
   - `N = nf * nloc`
-  - `C = channels`
+  - `F = n_focus`
+  - `Cf = focus_dim`
+  - `C = channels = F * Cf`
   - `D = ebed_dim = (lmax + 1)^2 = sum_{l=0..lmax} (2l + 1)` is the SO(3) embedding dimension
+
+View conventions used inside blocks:
+
+- `x.view(N, D, C)` for full-channel rotate/bmm and FFN mixing
+- `x.view(N, D, F, Cf)` for per-focus SO(2) pre/post norms
 
 Packing convention:
 
@@ -326,16 +348,24 @@ Implementation detail:
 
 For each edge `(src -> dst)`:
 
-1. **Rotate to local frame (reduced)**: The edge-local path uses the **m-major reduced layout**
-   controlled by `mmax`. Rotation computes only the required coefficients:
+1. **Pre-focus mixing (full C width, node-side)**:
+   - `x = pre_focus_mix(x.unsqueeze(2)).squeeze(2)` with `n_focus=1`
+   - this is channel-only mixing per `(l,m)` and keeps SO(3) equivariance
+2. **Rotate to local frame (full C width first)**:
    - project once per `(lmax, mmax)` via cached `project_D_to_m(D_full, coeff_index_m)`
-     (shared by all blocks; TorchScript-friendly)
-2. **Type feature fusion (once, outside blocks)**:
+   - `x_src = x.index_select(0, src)` gives `(E, D, C)`
+   - `x_local = bmm(D_to_m, x_src)` gives `(E, D_m, C)` (high-efficiency GEMM)
+3. **Type feature fusion (once, outside blocks)**:
    - `edge_type_feat = type_ebed[src] + type_ebed[dst]` with shape `(E, C)`
    - `radial_feat = radial_feat + edge_type_feat.unsqueeze(1)` with shape `(E, lmax+1, C)`
    - Per-block truncated `radial_feat[:, : l_i+1, :]` is prebuilt according to `l_schedule`
-3. **Modulate local features**: multiply by radial/type features
-4. **Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)**: for each layer in `so2_linears`:
+4. **Modulate local features**:
+   - `rad_feat = radial_feat[:, degree_index_m, :]` with shape `(E, D_m, C)`
+   - `x_local *= rad_feat`
+5. **Convert to SO(2) internal layout**:
+   - `x_local.view(E, D_m, F, Cf).transpose(1, 2)` gives strided `(E, F, D_m, Cf)`
+   - no explicit contiguous call here
+6. **Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)**: for each layer in `so2_linears`:
    - Save residual: `residual = x_local`
    - Pre-norm: apply `inter_norm(x_local)` (ReducedSeparableRMSNorm when `so2_norm=True`, Identity otherwise; last layer always Identity)
    - Apply `SO2Linear` (group by `|m|`):
@@ -345,28 +375,44 @@ For each edge `(src -> dst)`:
      - l=0: SiLU activation
      - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
    - LayerScale + Residual: `x_local = residual + scale * x_local` (scalar scale, init 1e-3 when `layer_scale=True`; bare residual otherwise)
-5. **Final SO(3) channel mixing**: apply `SO3LinearV2` to mix channels across all degrees (zero-initialized for residual stability)
-6. **Rotate back (reduced)**:
+7. **Cross-focus competition (optional)**:
+   - Enabled only when `focus_compete=True and n_focus>1`
+   - Use scalar-invariant source captured before SO(2) stack: `focus_gate_src = x_local_pre[:, :, 0, :]`
+   - Compute logits with per-focus scalar projection and temperature:
+     - `logits = focus_compete_proj(ScalarRMSNorm(focus_gate_src))`
+     - `alpha = softmax(logits / tau, dim=focus)`
+   - Apply label smoothing to avoid dead focuses:
+     - `alpha = (1 - eps) * alpha + eps / n_focus` (internal default `eps=0.02`)
+   - Apply invariant weights to full irreps: `x_local *= alpha[:, :, None, None]`
+8. **Rotate back preparation**:
+   - `x_local.transpose(1, 2).contiguous().view(E, D_m, C)`
+9. **Rotate back (reduced)**:
    - reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
-7. **Aggregate with optional head gates**:
-   - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
-   - `n_atten_head > 0`:
-     - **Edge gate**:
-       - `dst_logits = proj_dst(RMSNorm(x_l0))`
-       - `radial_logits = proj_rad(radial_l0)` (no normalization on radial path)
-       - `msg_logits = proj_msg(RMSNorm(msg_l0))`
-       - `edge_logits = dst_logits[dst] + radial_logits + alpha_msg * msg_logits`
-       - `g = sigmoid(edge_logits / tau)` with learnable `alpha_msg` (init ~ 1e-3) and `tau` (init 1)
-     - Weight: `w = edge_env * g` (all gate math and scatter aggregation in promoted dtype, fp32)
-     - Split value into `H = n_atten_head` heads, scale by `w`, `index_add` by `dst`
-     - Apply `inv_sqrt_deg`
+   - `x_message = bmm(Dt_from_m, x_local)` gives `(E, D, C)`
+10. **Aggregate with optional head gates**:
+
+- `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
+- `n_atten_head > 0`:
+  - **Edge gate**:
+    - `dst_logits = proj_dst(RMSNorm(x_l0))`
+    - `radial_logits = proj_rad(radial_l0)` (no normalization on radial path)
+    - `msg_logits = proj_msg(RMSNorm(msg_l0))`
+    - `edge_logits = dst_logits[dst] + radial_logits + alpha_msg * msg_logits`
+  - `g = sigmoid(edge_logits / tau)` with learnable `alpha_msg` (init ~ 1e-3) and `tau` (init 1)
+  - Weight: `w = edge_env * g` (all gate math and scatter aggregation in promoted dtype, fp32)
+  - Split value into `H = n_atten_head` heads, scale by `w`, `index_add` by `dst`
+  - Apply `inv_sqrt_deg`
+
+11. **Post-focus mixing**:
+
+- `out = post_focus_mix(out.unsqueeze(2)).squeeze(2)` with `n_focus=1`, mixing full channel width `C`
 
 ### Full Equivariant FFN
 
 The `EquivariantFFN` class implements:
 
 ```python
-# Input projection (SO3LinearV2)
+# Input projection (SO3Linear)
 h = so3_linear_1(x)  # (N, D, C) -> (N, D, hidden_channels)
 
 # GatedActivation with per-l independent gates
@@ -377,7 +423,7 @@ gates = index_select(gating_scalars, expand_index)  # (N, D-1, C)
 ht = h[:, 1:, :] * gates  # gate l>0 features with per-l gates
 h = torch.cat([h0, ht], dim=1)
 
-# Output projection (SO3LinearV2)
+# Output projection (SO3Linear)
 out = so3_linear_2(h)  # (N, D, hidden_channels) -> (N, D, C)
 ```
 
@@ -396,42 +442,42 @@ Key properties:
 The `SeZMInteractionBlock` implements a clean two-path residual structure:
 
 ```text
-SeZMInteractionBlock:
-  x_res = x
+SeZMInteractionBlock:  # x shape: (N, D, F, Cf)
+  C = F * Cf
 
   # === Path 1: SO(2) Convolution ===
-  if so2_pre_norm:
-      x_pre = pre_so2_norm(x)
-  else:
-      x_pre = x
-  if edge_cache.src.numel() > 0:
-      y = so2_conv(x_pre, edge_cache)
-  else:
-      y = x_pre
-  if so2_post_norm:
-      y = post_so2_norm(y)
-  x = x_res + y
+  x_pre = pre_so2_norm(x)                          # (N, D, F, Cf)
+  y = so2_conv(view(x_pre, N, D, C), edge_cache, radial_feat)  # (N, D, C)
+  y = post_so2_norm(view(y, N, D, F, Cf))         # (N, D, F, Cf)
+  x = x + y
 
   # === Path 2: FFN subblock sequence (ffn_blocks iterations) ===
+  x_ffn = view(x, N, D, C).unsqueeze(1)      # (N, 1, D, C)
   for i in range(ffn_blocks):
-      if ffn_pre_norm:
-          x_pre = pre_ffn_norms[i](x)
-      else:
-          x_pre = x
+      x_pre = pre_ffn_norms[i](view(x_ffn, N, D, 1, C))
+      x_pre = view(x_pre, N, 1, D, C)
       y = ffns[i](x_pre)
-      if ffn_post_norm:
-          y = post_ffn_norms[i](y)
+      y = post_ffn_norms[i](view(y, N, D, 1, C))
+      y = view(y, N, 1, D, C)
       if layer_scale:
           y = y * ffn_layer_scales[i]   # per-channel, init 1e-3
-      x = x + y
+      x_ffn = x_ffn + y
 
-  return x
+  return view(x_ffn.squeeze(1), N, D, F, Cf)
+```
+
+Descriptor-level wrapper around each block:
+
+```text
+x = block_i(x, edge_cache, radial_feat_i)  # block internally does:
+                                            # pre-norm -> SO2(full C rotate) ->
+                                            # FFN(view-only reshape)
 ```
 
 Components:
 
 - `pre_so2_norm`: `SeparableRMSNorm` applied before SO(2) convolution
-- `so2_conv`: `SO2Convolution` with pre-norm residual SO(2) mixing, optional per-layer scalar LayerScale, and final SO(3) channel mixing
+- `so2_conv`: `SO2Convolution` with pre-norm residual SO(2) mixing, optional per-focus-channel LayerScale, and final SO(3) channel mixing
 - `pre_ffn_norms[i]`: `SeparableRMSNorm` applied before each FFN subblock
 - `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and gated activation
 - `ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
@@ -491,23 +537,26 @@ Key arguments:
 - `l_schedule: list[int] | None` — Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored
 - `mmax: int | None` — Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax
 - `m_schedule: list[int] | None` — Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored
-- `channels: int` — Channels per (l,m) coefficient, i.e. feature dimension per degree (default: 64)
+- `channels: int` — Total channels per (l,m) coefficient (default: 64)
+- `n_focus: int` — Number of parallel focus streams. Internal width is `focus_dim = channels // n_focus`; channels must be divisible by `n_focus` (default: 1)
+- `focus_compete: bool` — If True, enable cross-focus softmax competition in SO(2) convolution. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus (default: False)
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
 - `so2_norm: bool` — If True, apply ReducedSeparableRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
-- `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, channels must be divisible by `n_atten_head`, and per-head edge gating is applied with input-side RMSNorm and learnable temperature (radial path stays raw).
+- `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and per-head edge gating is applied with input-side RMSNorm and learnable temperature (radial path stays raw).
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
 - `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, SeparableRMSNorm centering bias) (default: True)
-- `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-layer scalar (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
+- `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
+Note: `focus_softmax_tau` (default `1.0`) and `focus_label_smoothing` (default `0.02`) are internal `SO2Convolution` parameters and are not exposed in descriptor top-level config.
 
 ### Interface Compatibility Notes
 
@@ -627,6 +676,8 @@ Why caching matters:
 What is cached / reused:
 
 - All per-edge tensors needed by all blocks (geometry, radial basis, envelope, Wigner-D blocks).
+- Focus streams do not duplicate geometric caches. `n_focus` only adds a feature axis;
+  `edge_vec`, `edge_rbf`, `D_full`, and `Dt_full` remain on the original edge axis.
 - `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused via a single `embedding_bag` reduction and **per-block truncated slices** are prebuilt according to `l_schedule`.
 
 - Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `(lmax, mmax)`, shared by all blocks and available in both eager and TorchScript.
