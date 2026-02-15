@@ -373,9 +373,10 @@ def descrpt_se_zm_args() -> list[Argument]:
         "- SO3Linear: l=0 bias\n"
         "- SO2Linear: l=0 bias\n"
         "- GatedActivation: gate linear bias\n"
-        "- SO2Convolution: attention projections (proj_dst, proj_rad, proj_msg)\n"
         "- SeparableRMSNorm: centering bias\n"
-        "- ReducedSeparableRMSNorm: centering bias"
+        "- ReducedSeparableRMSNorm: centering bias\n"
+        "Attention projections in SO2Convolution "
+        "(attn_radial_bias_proj, attn_output_gate_proj) are always bias-free."
     )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
     doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
@@ -392,11 +393,12 @@ def descrpt_se_zm_args() -> list[Argument]:
         "Competition logits are built from l=0 scalar channels and applied across focus streams."
     )
     doc_n_atten_head = (
-        "Number of gated attention heads when aggregating messages in SO(2) "
+        "Number of attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
         "the per-focus stream width `focus_dim = channels // n_focus` must be "
-        "divisible by `n_atten_head`, and per-head edge "
-        "gating with sample-RMS normalized logits and learnable temperature is applied."
+        "divisible by `n_atten_head`, and envelope-aware grouped softmax attention "
+        "with output-side head gate is applied. Competition uses `edge_env**0.5` "
+        "while value amplitude uses `edge_env`."
     )
     doc_use_amp = (
         "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "

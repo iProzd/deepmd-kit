@@ -152,6 +152,87 @@ def build_edge_type_feat(
     )
 
 
+def segment_softmax_with_env_weight(
+    logits: torch.Tensor,
+    edge_env: torch.Tensor,
+    dst: torch.Tensor,
+    n_nodes: int,
+    eps: float,
+    env_logit_power: float,
+) -> torch.Tensor:
+    """
+    Compute destination-wise stable softmax with cutoff envelope weighting.
+
+    Parameters
+    ----------
+    logits
+        Attention logits with shape (E, F, H).
+    edge_env
+        Cutoff envelope weights with shape (E, 1) or (E,).
+    dst
+        Destination node indices with shape (E,).
+    n_nodes
+        Number of nodes.
+    eps
+        Small epsilon for denominator stability.
+    env_logit_power
+        Envelope exponent used in attention competition:
+        ``unnormalized = exp(logits - grouped_max) * w(edge_env)``,
+        where ``w(x) = (x + eps)**env_logit_power - eps**env_logit_power``
+        for ``x >= 0``.
+
+    Returns
+    -------
+    torch.Tensor
+        Normalized edge weights with shape (E, F, H).
+    """
+    n_edge, n_focus, n_head = logits.shape
+    n_channel = n_focus * n_head
+    eps_f = float(eps)
+    logit_power = float(env_logit_power)
+
+    # === Step 1. Flatten (F, H) to reduce index tensor traffic ===
+    logits_2d = logits.reshape(n_edge, n_channel)
+    edge_env_1d = edge_env.squeeze(-1).to(dtype=logits.dtype)
+    edge_env_nonneg = edge_env_1d.clamp_min(0.0)
+    eps_power = eps_f**logit_power
+    edge_weight = ((edge_env_nonneg + eps_f).pow(logit_power) - eps_power).clamp_min(
+        0.0
+    )
+    edge_weight = edge_weight.reshape(n_edge, 1)
+    has_weight = edge_weight > 0.0
+    logits_for_max = torch.where(
+        has_weight,
+        logits_2d,
+        torch.full_like(logits_2d, float("-inf")),
+    )
+
+    # === Step 2. Destination-wise max for stable exponentials ===
+    group_max = torch.full(
+        (n_nodes, n_channel),
+        float("-inf"),
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    group_max.index_reduce_(0, dst, logits_for_max, reduce="amax", include_self=True)
+    edge_max = group_max.index_select(0, dst)
+    edge_max = torch.where(
+        torch.isfinite(edge_max), edge_max, torch.zeros_like(edge_max)
+    )
+
+    # === Step 3. Destination-wise normalization ===
+    unnormalized = torch.exp(logits_2d - edge_max) * edge_weight
+    denom = torch.zeros(
+        n_nodes,
+        n_channel,
+        dtype=logits.dtype,
+        device=logits.device,
+    )
+    denom.index_add_(0, dst, unnormalized)
+    alpha = unnormalized / (denom.index_select(0, dst) + eps_f)
+    return alpha.reshape(n_edge, n_focus, n_head)
+
+
 class EdgeFeatureCache(NamedTuple):
     """
     Global edge feature cache created once per forward().

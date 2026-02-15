@@ -58,6 +58,7 @@ from .se_zm_helper import (
     project_D_to_m,
     project_Dt_from_m,
     safe_numpy_to_tensor,
+    segment_softmax_with_env_weight,
 )
 
 
@@ -1472,7 +1473,9 @@ class SO2Convolution(nn.Module):
     4. `so2_layers` stacked local mixers:
        `inter_norm -> SO2Linear -> non_linearity -> residual(+LayerScale)`.
     5. rotate local -> global with cached `Dt_from_m`.
-    6. edge aggregation (plain envelope scatter or head-wise gated scatter).
+    6. edge aggregation (plain envelope scatter or envelope-aware grouped
+       softmax attention with envelope-weighted competition, value envelope
+       decay, and output-side head gate).
     7. `post_focus_mix`: full-channel mixing on aggregated messages.
 
     Equivariance is preserved because both `pre_focus_mix` and `post_focus_mix`
@@ -1503,10 +1506,10 @@ class SO2Convolution(nn.Module):
         If True, apply per-layer learnable LayerScale (per-focus-channel,
         init 1e-3) on each SO(2) residual branch.
     n_atten_head
-        Number of gated attention heads used during aggregation.
+        Number of attention heads used during aggregation.
         - 0: plain envelope-weighted scatter-sum.
-        - >0: head-wise gated aggregation with normalized node/message scalar
-          logits and raw radial scalar logits.
+        - >0: envelope-aware grouped softmax attention with output-side head
+          gates.
         Requires ``focus_dim % n_atten_head == 0``.
     mlp_bias
         Whether to use bias in SO2Linear (l=0 bias), GatedActivation (gate linear bias),
@@ -1554,6 +1557,7 @@ class SO2Convolution(nn.Module):
         self.focus_compete = bool(focus_compete)
         self.focus_softmax_tau = 1.0
         self.focus_label_smoothing = 0.02
+        self.attn_env_logit_power = 0.5
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
         if self.so2_layers < 1:
@@ -1671,93 +1675,46 @@ class SO2Convolution(nn.Module):
         else:
             self.so2_layer_scales = None
 
-        # === Step 7. Optional head-wise gating components ===
-        # Edge gate: normalized dst/msg logits, radial stays raw to preserve geometry.
-        self.norm_dst_for_gate: ScalarRMSNorm | None = None
-        self.norm_msg_for_gate: ScalarRMSNorm | None = None
-        self.proj_dst: FocusLinear | None = None
-        self.proj_rad: FocusLinear | None = None
-        self.proj_msg: FocusLinear | None = None
-        self.gate_tau_log: nn.Parameter | None = None
-        self.msg_gate_alpha_log: nn.Parameter | None = None
+        # === Step 7. Optional attention projections (n_atten_head > 0) ===
+        self.attn_qk_norm: ScalarRMSNorm | None = None
+        self.attn_radial_bias_proj: FocusLinear | None = None
+        self.attn_output_gate_norm: ScalarRMSNorm | None = None
+        self.attn_output_gate_proj: FocusLinear | None = None
         if self.n_atten_head > 0:
-            self.norm_dst_for_gate = ScalarRMSNorm(
+            self.attn_qk_norm = ScalarRMSNorm(
                 channels=self.focus_dim,
                 n_focus=self.n_focus,
                 eps=self.eps,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
-            self.norm_msg_for_gate = ScalarRMSNorm(
-                channels=self.focus_dim,
-                n_focus=self.n_focus,
-                eps=self.eps,
-                dtype=self.compute_dtype,
-                trainable=trainable,
-            )
-            # Edge gate projections: dst/msg scalars normalized, radial scalars raw
-            # Small init_std keeps gate logits near zero at init => sigmoid(0) ≈ 0.5
-            self.proj_dst = FocusLinear(
+            self.attn_radial_bias_proj = FocusLinear(
                 in_channels=self.focus_dim,
                 out_channels=self.n_atten_head,
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
-                bias=self.mlp_bias,
-                seed=child_seed(seed_gate, 0),
-                trainable=trainable,
-                init_std=0.01,
-            )
-            self.proj_rad = FocusLinear(
-                in_channels=self.focus_dim,
-                out_channels=self.n_atten_head,
-                n_focus=self.n_focus,
-                dtype=self.compute_dtype,
-                bias=self.mlp_bias,
+                bias=False,
                 seed=child_seed(seed_gate, 1),
                 trainable=trainable,
                 init_std=0.01,
             )
-            self.proj_msg = FocusLinear(
+            self.attn_output_gate_norm = ScalarRMSNorm(
+                channels=self.focus_dim,
+                n_focus=self.n_focus,
+                eps=self.eps,
+                dtype=self.compute_dtype,
+                trainable=trainable,
+            )
+            self.attn_output_gate_proj = FocusLinear(
                 in_channels=self.focus_dim,
                 out_channels=self.n_atten_head,
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
-                bias=self.mlp_bias,
-                seed=child_seed(seed_gate, 4),
+                bias=False,
+                seed=child_seed(seed_gate, 2),
                 trainable=trainable,
                 init_std=0.01,
             )
-            self.gate_tau_log = nn.Parameter(
-                torch.zeros(
-                    self.n_focus,
-                    self.n_atten_head,
-                    dtype=self.compute_dtype,
-                    device=self.device,
-                )
-            )
-            gen_alpha = get_generator(child_seed(seed_gate, 14))
-            alpha_mean = math.log(0.01)
-            alpha_std = 0.05 if self.n_atten_head > 1 else 0.0
-            alpha_log = torch.empty(
-                (self.n_focus, self.n_atten_head),
-                device=self.device,
-                dtype=self.compute_dtype,
-            )
-            if alpha_std == 0.0:
-                alpha_log.fill_(alpha_mean)
-            else:
-                nn.init.trunc_normal_(
-                    alpha_log,
-                    mean=alpha_mean,
-                    std=alpha_std,
-                    a=alpha_mean - 3.0 * alpha_std,
-                    b=alpha_mean + 3.0 * alpha_std,
-                    generator=gen_alpha,
-                )
-            self.msg_gate_alpha_log = nn.Parameter(alpha_log)
-        else:
-            self.gate_tau_log = None
-            self.msg_gate_alpha_log = None
 
         # === Step 7.5. Optional cross-focus competition ===
         self.focus_compete_norm: ScalarRMSNorm | None = None
@@ -1776,7 +1733,7 @@ class SO2Convolution(nn.Module):
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
                 bias=self.mlp_bias,
-                seed=child_seed(seed_gate, 2),
+                seed=child_seed(seed_gate, 3),
                 trainable=trainable,
                 init_std=0.01,
             )
@@ -1935,56 +1892,56 @@ class SO2Convolution(nn.Module):
                 out = x.new_zeros(x.shape, dtype=self.compute_dtype)
                 out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
                 out.mul_(edge_cache.inv_sqrt_deg.to(dtype=self.compute_dtype))
-                out = out.to(dtype=self.dtype)
+                out = out.to(dtype=self.dtype)  # (N, D, C)
             else:
-                # === Step 8.1. Extract scalar features for gating ===
-                x_l0 = x[:, 0, :].reshape(
+                # === Step 8.1. Build attention logits from scalar channels ===
+                compute_dtype = self.compute_dtype
+                x_l0_node = x[:, 0, :].reshape(
                     n_node, self.n_focus, self.focus_dim
                 )  # (N, F, Cf)
+                qk_scalar = self.attn_qk_norm(x_l0_node.to(dtype=compute_dtype))
+                q_edge = qk_scalar.index_select(0, dst).reshape(
+                    n_edge, self.n_focus, self.n_atten_head, self.head_dim
+                )  # (E, F, H, Dh)
+                k_edge = qk_scalar.index_select(0, src).reshape(
+                    n_edge, self.n_focus, self.n_atten_head, self.head_dim
+                )  # (E, F, H, Dh)
                 radial_l0 = radial_feat[:, 0, :].reshape(
                     n_edge, self.n_focus, self.focus_dim
                 )  # (E, F, Cf)
-                msg_l0 = x_message[:, 0, :].reshape(
-                    n_edge, self.n_focus, self.focus_dim
-                )  # (E, F, Cf)
-
-                # === Step 8.2. Compute edge gate (fp32+ logits path) ===
-                # Edge gate logits: dst/msg normalized inputs, radial stays raw
-                compute_dtype = self.compute_dtype
-                dst_logits = self.proj_dst(self.norm_dst_for_gate(x_l0)).to(
-                    dtype=compute_dtype
-                )
-                radial_logits = self.proj_rad(radial_l0).to(dtype=compute_dtype)
-                msg_logits = self.proj_msg(self.norm_msg_for_gate(msg_l0)).to(
-                    dtype=compute_dtype
-                )
-                msg_alpha = torch.exp(self.msg_gate_alpha_log).unsqueeze(0)
-                edge_logits = (
-                    dst_logits.index_select(0, dst)
-                    + radial_logits
-                    + msg_alpha * msg_logits
+                radial_bias = self.attn_radial_bias_proj(
+                    radial_l0.to(dtype=compute_dtype)
                 )  # (E, F, H)
-                tau = torch.exp(self.gate_tau_log).unsqueeze(0)
-                edge_gate = torch.sigmoid(edge_logits / tau)  # (E, F, H)
-                edge_weight = (
-                    edge_cache.edge_env.to(dtype=compute_dtype).unsqueeze(1) * edge_gate
-                )
+                attn_logits = (q_edge * k_edge).sum(-1) * (self.head_dim**-0.5)
+                attn_logits = attn_logits + radial_bias
 
-                # === Step 8.3. Head-wise scatter aggregation (fp32+ accumulation) ===
-                # Mixed-precision strategy: V stays in its native dtype (bf16/fp32/fp64),
-                E = x_message.shape[0]
-                V = x_message.reshape(
-                    E,
+                # === Step 8.2. Destination-wise stable softmax with envelope-aware competition ===
+                attn_alpha = segment_softmax_with_env_weight(
+                    logits=attn_logits,
+                    edge_env=edge_cache.edge_env.to(dtype=compute_dtype),
+                    dst=dst,
+                    n_nodes=n_node,
+                    eps=self.eps,
+                    env_logit_power=self.attn_env_logit_power,
+                )  # (E, F, H)
+
+                # === Step 8.3. Head-wise value aggregation with envelope amplitude decay ===
+                value_heads = x_message.reshape(
+                    n_edge,
                     self.ebed_dim_full,
                     self.n_focus,
                     self.n_atten_head,
                     self.head_dim,
-                )  # (E, D, F, H, Dh)
-                edge_weight_5d = edge_weight.reshape(
-                    E, 1, self.n_focus, self.n_atten_head, 1
-                )  # (E, 1, F, H, 1)
-                msg = V * edge_weight_5d
-                msg_acc = msg.to(dtype=compute_dtype)
+                ).to(dtype=compute_dtype)  # (E, D, F, H, Dh)
+                env_value_weight = edge_cache.edge_env.to(dtype=compute_dtype).squeeze(
+                    -1
+                )  # (E,)
+                weighted_value = value_heads * attn_alpha.reshape(
+                    n_edge, 1, self.n_focus, self.n_atten_head, 1
+                )
+                weighted_value = weighted_value * env_value_weight.reshape(
+                    n_edge, 1, 1, 1, 1
+                )
                 out_heads = torch.zeros(
                     n_node,
                     self.ebed_dim_full,
@@ -1994,19 +1951,27 @@ class SO2Convolution(nn.Module):
                     device=x.device,
                     dtype=compute_dtype,
                 )  # (N, D, F, H, Dh)
-                out_heads.index_add_(0, dst, msg_acc)
+                out_heads.index_add_(0, dst, weighted_value)
 
-                # === Step 8.4. Apply degree normalization ===
-                out = out_heads.reshape(
-                    n_node, self.ebed_dim_full, self.channels
+                # === Step 8.4. Output-side head gate (G1 style) ===
+                attn_output_gate = torch.sigmoid(
+                    self.attn_output_gate_proj(
+                        self.attn_output_gate_norm(x_l0_node.to(dtype=compute_dtype))
+                    )
+                )  # (N, F, H)
+                out_heads = out_heads * attn_output_gate.reshape(
+                    n_node, 1, self.n_focus, self.n_atten_head, 1
+                )  # (N, D, F, H, Dh)
+
+                # === Step 8.5. Merge heads (softmax path has no degree norm) ===
+                out = out_heads.reshape(n_node, self.ebed_dim_full, self.channels).to(
+                    dtype=self.dtype
                 )  # (N, D, C)
-                out.mul_(edge_cache.inv_sqrt_deg.to(dtype=compute_dtype))
-                out = out.to(dtype=self.dtype)
 
         # === Step 9. Final channel mixing ===
         with nvtx_range("SO2Conv/post_focus_mix"):
             out = self.post_focus_mix(out.unsqueeze(2)).squeeze(2)
-        return out
+        return out  # (N, D, C)
 
     def serialize(self) -> dict[str, Any]:
         trainable = all(p.requires_grad for p in self.parameters())
@@ -2275,8 +2240,9 @@ class SeZMInteractionBlock(nn.Module):
     so2_layers
         Number of SO(2) mixing layers.
     n_atten_head
-        Number of gated attention heads when aggregating messages in SO(2) convolution.
-        0 means no attention is used.
+        Number of attention heads when aggregating messages in SO(2) convolution.
+        0 means no attention is used; >0 enables envelope-aware grouped softmax
+        attention with output-side head gate.
     so2_pre_norm
         If True, apply pre-norm before SO(2) convolution.
     so2_post_norm

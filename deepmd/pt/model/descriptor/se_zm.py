@@ -179,8 +179,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         Competition logits are built from l=0 scalar channels before SO(2) mixing
         and applied after SO(2) stack to scale full irreps uniformly per focus.
     n_atten_head
-        Number of gated attention heads when aggregating messages in SO(2) convolution.
-        0 applies a plain envelope-weighted scatter-sum; >0 enables per-head edge gating.
+        Number of attention heads when aggregating messages in SO(2) convolution.
+        0 applies a plain envelope-weighted scatter-sum; >0 enables
+        envelope-aware grouped softmax attention with output-side head gate.
+        Competition is weighted by ``edge_env**0.5`` and value amplitude is
+        scaled by ``edge_env``.
         When enabled, the per-focus stream width
         ``focus_dim = channels // n_focus`` must be divisible by ``n_atten_head``.
     sandwich_norm
@@ -191,9 +194,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         - SO3Linear: l=0 bias
         - SO2Linear: l=0 bias
         - GatedActivation: gate linear bias
-        - SO2Convolution: attention projections: proj_dst, proj_rad, proj_msg
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
+        Attention projections in SO2Convolution
+        (attn_radial_bias_proj, attn_output_gate_proj) are always bias-free.
     layer_scale
         If True, apply learnable LayerScale (init 1e-3) on residual branches:
         - SO(2) branch: per-focus-channel scales `(n_focus, focus_dim)`
@@ -629,16 +633,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 pair_keep_mask=pair_keep_mask,
             )
 
-        # === Step 5. Optional short-range gating hook ===
-        with nvtx_range("zbl_gating"):
-            type_ebed = self._apply_zbl_gating_hook(type_ebed, edge_cache)
-
         lmax_0 = self.l_schedule[0]
         ebed_dim_0 = get_so3_dim_of_lmax(lmax_0)  # (lmax+1)^2
         x0 = type_ebed  # (N, C)
         x0_out = x0  # (N, C)
 
-        # === Step 6. Compute radial features once (fp32+) ===
+        # === Step 5. Compute radial features once (fp32+) ===
         # Shape: (E, (lmax+1)*C) -> (E, lmax+1, C)
         radial_feat = None
         with nvtx_range("radial_embedding"):
@@ -650,7 +650,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     C=self.channels,
                 )  # (E, lmax+1, C)
 
-        # === Step 7. Env FiLM conditioning (optional, fp32+) ===
+        # === Step 6. Env FiLM conditioning (optional, fp32+) ===
         with nvtx_range("env_film"):
             if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
                 atype_flat = atype_loc.reshape(-1)  # (N,)
@@ -674,13 +674,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 shift = shift_strength * torch.tanh(shift_hat)  # (N, C)
                 x0_out = x0 * scale + shift
 
-        # === Step 8. Build l=0 features ===
+        # === Step 7. Build l=0 features ===
         x = type_ebed.new_zeros(
             n_nodes, ebed_dim_0, self.n_focus, self.focus_dim
         )  # (N, D, F, Cf)
         x[:, 0, :, :] = x0_out.reshape(n_nodes, self.n_focus, self.focus_dim)
 
-        # === Step 9. Geometric Initial Embedding (fp32+) ===
+        # === Step 8. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
             if self.gie is not None and radial_feat is not None:
                 # GIE only needs l>=1, slice radial_feat[:, 1:, :]
@@ -690,7 +690,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     radial_feat=radial_feat[:, 1:, :],
                 ).reshape(n_nodes, ebed_dim_0, self.n_focus, self.focus_dim)
 
-        # === Step 10. Fuse edge type features into radial features (fp32+) ===
+        # === Step 9. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
             if radial_feat is not None:
                 radial_feat = radial_feat + rearrange(
@@ -703,7 +703,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             else:
                 rad_feat_per_block = []
 
-        # === Step 11. Convert to self.dtype and run blocks ===
+        # === Step 10. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
             x = x.to(dtype=self.dtype)  # (N, D, F, Cf)
             if edge_cache.src.numel() > 0:
@@ -711,7 +711,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 with self._compute_mode_ctx(extended_coord.device):
                     x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
 
-        # === Step 12. Final l=0 output mixing ===
+        # === Step 11. Final l=0 output mixing ===
         # Extract l=0 scalar features and apply FFN in promoted dtype.
         # Residual keeps the output close to identity with zero-initialized FFN output.
         with nvtx_range("output_ffn"):
@@ -722,7 +722,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             )  # (N, 1, 1, C)
             x_scalar = x_scalar + self.output_ffn(x_scalar)
 
-        # === Step 13. Reshape to (nf, nloc, channels) and return ===
+        # === Step 12. Reshape to (nf, nloc, channels) and return ===
         descriptor = rearrange(
             x_scalar, "(nf nloc) 1 1 C -> nf nloc C", nf=nf, nloc=nloc
         )  # (nf, nloc, C)
@@ -806,16 +806,12 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 edge_mask=edge_mask,
             )
 
-        # === Step 4. Optional short-range gating hook ===
-        with nvtx_range("zbl_gating"):
-            type_ebed = self._apply_zbl_gating_hook(type_ebed, edge_cache)
-
         lmax_0 = self.l_schedule[0]
         ebed_dim_0 = get_so3_dim_of_lmax(lmax_0)  # (lmax+1)^2
         x0 = type_ebed  # (N, C)
         x0_out = x0  # (N, C)
 
-        # === Step 5. Compute radial features once (fp32+) ===
+        # === Step 4. Compute radial features once (fp32+) ===
         radial_feat = None
         with nvtx_range("radial_embedding"):
             if edge_cache.src.numel() > 0:
@@ -826,7 +822,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     C=self.channels,
                 )  # (E, lmax+1, C)
 
-        # === Step 6. Env FiLM conditioning (optional, fp32+) ===
+        # === Step 5. Env FiLM conditioning (optional, fp32+) ===
         with nvtx_range("env_film"):
             if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
                 atype_flat = atype_loc.reshape(-1)  # (N,)
@@ -850,13 +846,13 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 shift = shift_strength * torch.tanh(shift_hat)  # (N, C)
                 x0_out = x0 * scale + shift
 
-        # === Step 7. Build l=0 features ===
+        # === Step 6. Build l=0 features ===
         x = type_ebed.new_zeros(
             n_nodes, ebed_dim_0, self.n_focus, self.focus_dim
         )  # (N, D, F, Cf)
         x[:, 0, :, :] = x0_out.reshape(n_nodes, self.n_focus, self.focus_dim)
 
-        # === Step 8. Geometric Initial Embedding (fp32+) ===
+        # === Step 7. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
             if self.gie is not None and radial_feat is not None:
                 x = x + self.gie(
@@ -865,7 +861,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     radial_feat=radial_feat[:, 1:, :],
                 ).reshape(n_nodes, ebed_dim_0, self.n_focus, self.focus_dim)
 
-        # === Step 9. Fuse edge type features into radial features (fp32+) ===
+        # === Step 8. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
             if radial_feat is not None:
                 radial_feat = radial_feat + rearrange(
@@ -880,7 +876,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         else:
             rad_feat_per_block = []
 
-        # === Step 10. Convert to self.dtype and run blocks ===
+        # === Step 9. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
             x = x.to(dtype=self.dtype)  # (N, D, F, Cf)
             if edge_cache.src.numel() > 0:
@@ -888,7 +884,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                 with self._compute_mode_ctx(extended_coord.device):
                     x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
 
-        # === Step 11. Final l=0 output mixing ===
+        # === Step 10. Final l=0 output mixing ===
         with nvtx_range("output_ffn"):
             x_scalar = (
                 x[:, 0:1, :, :]
@@ -897,7 +893,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             )  # (N, 1, 1, C)
             x_scalar = x_scalar + self.output_ffn(x_scalar)
 
-        # === Step 12. Reshape to (nf, nloc, channels) and return ===
+        # === Step 11. Reshape to (nf, nloc, channels) and return ===
         descriptor = rearrange(
             x_scalar, "(nf nloc) 1 1 C -> nf nloc C", nf=nf, nloc=nloc
         )  # (nf, nloc, C)
@@ -1363,27 +1359,6 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             )
 
         self.mmax = int(self.m_schedule[0])
-
-    def _apply_zbl_gating_hook(
-        self, type_ebed: torch.Tensor, edge_cache: EdgeFeatureCache
-    ) -> torch.Tensor:
-        """
-        Placeholder hook for ZBL gating (not implemented).
-
-        Parameters
-        ----------
-        type_ebed
-            Scalar features with shape (N, C).
-        edge_cache
-            Per-edge cache.
-
-        Returns
-        -------
-        torch.Tensor
-            Updated scalar features with shape (N, C).
-        """
-        del edge_cache
-        return type_ebed
 
     @contextmanager
     def _compute_mode_ctx(self, device: torch.device) -> Generator[None, None, None]:

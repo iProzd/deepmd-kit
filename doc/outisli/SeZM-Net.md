@@ -212,13 +212,13 @@ This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5`.
 
 - Maximum gradient flow: `sigmoid'(0.5) = 0.25` is the maximum derivative value
 - Unbiased feature scaling: the model learns which features to suppress/amplify from the loss signal
-- Edge gates start at `~0.5` with small `alpha_msg`, avoiding early saturation
+- Output-side head gates start near `~0.5`, avoiding early saturation
 
 ### 9. Stability defaults
 
 - Residual branches start near-identity: the output projections of both SO(2) convolution and Equivariant FFN are zero-initialized (weights + bias).
 - When `layer_scale=True`, both SO(2) residual branches (per-focus-channel, init 1e-3) and FFN residual branches (per-channel vector, init 1e-3) use learnable LayerScale for training stability.
-- Attention aggregation runs in promoted dtype (fp32) with per-head temperature `tau` and `alpha_msg` for message feedback.
+- Attention aggregation runs in promoted dtype (fp32) and uses destination-wise stable softmax (group max subtraction) with envelope-weighted unnormalized scores.
 - Multi-layer SO(2) stacks use pre-norm residual connections. When `so2_norm=True`, a reduced-layout separable RMSNorm is applied as pre-norm before each SO(2) layer (except the last, which uses Identity). This keeps truncated m-major activations balanced but is disabled by default.
 
 ### 10. Optional environment matrix initial embedding (EnvironmentInitialEmbedding)
@@ -393,15 +393,18 @@ For each edge `(src -> dst)`:
 
 - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
 - `n_atten_head > 0`:
-  - **Edge gate**:
-    - `dst_logits = proj_dst(RMSNorm(x_l0))`
-    - `radial_logits = proj_rad(radial_l0)` (no normalization on radial path)
-    - `msg_logits = proj_msg(RMSNorm(msg_l0))`
-    - `edge_logits = dst_logits[dst] + radial_logits + alpha_msg * msg_logits`
-  - `g = sigmoid(edge_logits / tau)` with learnable `alpha_msg` (init ~ 1e-3) and `tau` (init 1)
-  - Weight: `w = edge_env * g` (all gate math and scatter aggregation in promoted dtype, fp32)
-  - Split value into `H = n_atten_head` heads, scale by `w`, `index_add` by `dst`
-  - Apply `inv_sqrt_deg`
+  - **Edge attention logits**:
+    - `q, k` come from normalized node scalar channel `x_l0` and are split by heads
+    - `logits = dot(q_dst, k_src) / sqrt(head_dim) + attn_radial_bias_proj(radial_l0)`
+  - **Stable grouped softmax with envelope-weighted competition**:
+    - destination-wise max subtraction for numerical stability
+    - `unnormalized = exp(logits - grouped_max) * edge_env^p` (default `p=0.5`)
+    - normalize per destination (`index_add` denominator)
+  - Split value into `H = n_atten_head` heads, scale by `alpha * edge_env`, `index_add` by `dst`
+  - Apply output-side head gate (G1 style):
+    - `gate = sigmoid(attn_output_gate_proj(attn_output_gate_norm(x_l0_node)))`
+    - gate is head-specific and query-dependent
+  - Merge heads back to `(N, D, C)` (**no `inv_sqrt_deg` on this path**)
 
 11. **Post-focus mixing**:
 
@@ -546,7 +549,7 @@ Key arguments:
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
-- `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and per-head edge gating is applied with input-side RMSNorm and learnable temperature (radial path stays raw).
+- `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and envelope-aware grouped softmax attention with output-side head gate is applied. Competition uses `edge_env^0.5`; value amplitude uses `edge_env`.
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
