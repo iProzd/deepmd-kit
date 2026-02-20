@@ -903,7 +903,9 @@ class TestSO2LinearEquivariance(unittest.TestCase):
         out_before = so2_linear(x)
 
         with torch.no_grad():
-            so2_linear.weight_m0[0].add_(0.2)
+            # weight_m0 shape: (num_in, F*num_out). Focus 0 occupies cols [:num_out].
+            num_out_m0 = (so2_linear.lmax + 1) * so2_linear.out_channels
+            so2_linear.weight_m0[:, :num_out_m0].add_(0.2)
 
         out_after = so2_linear(x)
         torch.testing.assert_close(

@@ -144,8 +144,9 @@ Standard DeePMD nlist path:
 
 ### 3. SO3Linear
 
-- Degree-wise channel mixing with `weight[l]` shared across all `m` in the `l` block.
-- Implemented as `index_select(expand_index)` + `einsum`; bias only for `l=0`.
+- `SO3Linear` keeps per-focus independent mixing on `(N, D, F, C)` and stores
+  weight as `(lmax+1, Cin, F*Cout)` (focus folded on output side).
+- Implemented as `index_select(expand_index)` + `einsum`; bias is applied only for `l=0`.
 
 ### Multi-focus SO2 + global FFN
 
@@ -177,7 +178,7 @@ Standard DeePMD nlist path:
   - m=0 block: unconstrained linear over `(l=0..lmax)` coefficients
   - |m|>0 blocks: constrained complex coupling `[W_u, -W_v; W_v, W_u]`
   - This reduces kernel launches while preserving SO(2) equivariance.
-  - All learnable weights use `(out, in)` layout (matching `nn.Linear` convention); no transpose needed during weight assembly.
+  - All learnable weights use `(in, out)` layout; focus dimension `F` is folded on the output (cols) side.
   - Weights are stored as raw parameters (no activation/bias); only the l=0 bias is separate.
 
 ### 6. Deterministic initialization
@@ -186,31 +187,31 @@ Standard DeePMD nlist path:
 - If `seed=None`, initialization follows the global RNG.
 - SO2Linear weights use truncated normal init with std `1/sqrt(fan_in + fan_out)`, cut at +/-3\*std.
 - For |m|>0 blocks, an extra `1/sqrt(2)` scale is applied to preserve SO(2) coupling energy.
-- SO3Linear weights use truncated normal init with variance `2/fan_in`, cut at +/-3\*std.
+- SO3Linear uses truncated normal init with std `1/sqrt(fan_in + fan_out)`, cut at +/-3\*std.
 - `FocusLinear`, `SO3Linear`, and `SO2Linear` all support an optional `init_std` parameter: when given, weights are initialized with `Normal(0, init_std)` instead of the default scheme. Use `init_std=0.0` for zero initialization (e.g., residual output projections).
 
 ### 7. Unified weight layout convention
 
-All learnable weight matrices keep output-before-input ordering, and focus-aware
-modules use folded parameter storage:
+All learnable weight matrices use **(in, out) convention** (rows = fan_in, cols = fan_out),
+and focus-aware modules fold the focus dimension `F` on the **output (cols) side**:
 
 - `FocusLinear`
-  - stored weight: `(F * C_out, C_in)` — 2D, Muon
-  - runtime view: `(F, C_out, C_in)` with `einsum("bfi,foi->bfo")`
+  - stored weight: `(C_in, F * C_out)` — 2D, Muon
+  - runtime view: `(C_in, F, C_out)` with `einsum("bfi,ifo->bfo")`
 - `SO3Linear`
-  - stored weight: `(F * (lmax+1), C_out, C_in)` — 3D, per-(focus, l) slice Muon
-  - stored bias: `(F * C_out,)` — 1D, Adam
-  - runtime view: `(F, lmax+1, C_out, C_in)` via zero-cost reshape, then `einsum("ndfi,fdci->ndfc")`
-  - In HybridMuon slice mode, each `(C_out, C_in)` slice gets independent NS update
-    with correct rectangular scale (no cross-l or cross-focus coupling)
-  - `SO3Linear` is used with `F=1` in SeZM-Net blocks
+  - stored weight: `(lmax+1, Cin, F * Cout)` — 3D, per-l slice Muon
+  - stored bias: `(F * Cout,)` — 1D, Adam
+  - runtime view: `(D, Cin, F, Cout)` via `index_select`, then `einsum("ndfi,difo->ndfo")`
+  - focus streams stay independent in compute while focus is folded on the output side for Muon scaling
 - `SO2Linear`
-  - stored `weight_m0`: `(F * (num_l*Cout), num_l*Cin)` — 2D, Muon
-  - stored `weight_m[i]`: `(F * (2*num_l*Cout), num_l*Cin)` — 2D, Muon
-  - runtime view: `(F, ..., ...)`, assembled to `(F, D_m*Cout, D_m*Cin)` and applied by `einsum("efi,foi->efo")`
+  - stored `weight_m0`: `(num_l*Cin, F * num_l*Cout)` — 2D, Muon
+  - stored `weight_m[i]`: `(num_l*Cin, F * 2*num_l*Cout)` — 2D, Muon
+  - runtime view: assembled to `(D_m*Cin, F, D_m*Cout)` and applied by `einsum("efi,ifo->efo")`
 
-This storage layout ensures each semantically independent weight block gets its own
-Muon NS update without artificial cross-l or cross-focus coupling.
+This (in, out) storage layout ensures Muon's rectangular correction `scale = sqrt(max(1, rows/cols))`
+stays at 1.0 when `Cin <= F*Cout` (typical case), avoiding step-size inflation.
+Each semantically independent weight block gets its own Muon NS update without
+artificial cross-l or cross-focus coupling.
 
 ### 8. Gate initialization strategy
 

@@ -68,9 +68,9 @@ class FocusLinear(nn.Module):
 
     Notes
     -----
-    Parameters are stored in folded form to avoid an explicit focus axis in
-    optimizer-visible shapes:
-    - weight: (n_focus * out_channels, in_channels)
+    Parameters are stored in (in, out) convention to match Muon's rectangular
+    correction assumption (rows=fan_in, cols=fan_out):
+    - weight: (in_channels, n_focus * out_channels)
     - bias: (n_focus * out_channels,)
 
     Parameters
@@ -114,8 +114,8 @@ class FocusLinear(nn.Module):
         self.device = env.DEVICE
         self.weight = nn.Parameter(
             torch.empty(
-                self.n_focus * self.out_channels,
                 self.in_channels,
+                self.n_focus * self.out_channels,
                 device=self.device,
                 dtype=self.dtype,
             )
@@ -151,8 +151,8 @@ class FocusLinear(nn.Module):
         torch.Tensor
             Projected tensor with shape (B, F, Cout).
         """
-        weight = self.weight.view(self.n_focus, self.out_channels, self.in_channels)
-        out = torch.einsum("bfi,foi->bfo", x, weight)
+        weight = self.weight.view(self.in_channels, self.n_focus, self.out_channels)
+        out = torch.einsum("bfi,ifo->bfo", x, weight)
         if self.bias is not None:
             bias = self.bias.view(self.n_focus, self.out_channels)
             out = out + bias.unsqueeze(0)
@@ -920,22 +920,21 @@ class ScalarRMSNorm(nn.Module):
 
 class SO3Linear(nn.Module):
     """
-    Degree-wise linear self-interaction using einsum for efficiency.
+    Focus-aware degree-wise linear self-interaction.
 
-    This vectorized implementation avoids Python loops by using torch.einsum
-    and index_select. The key insight is that weights are shared across all
-    m components within each l-block.
+    This vectorized implementation avoids Python loops by using ``torch.einsum``
+    and ``index_select``. The key insight is that weights are shared across all
+    ``m`` components within each ``l`` block.
 
-    NOTE
-    ----
-    - weight storage: (F*(lmax+1), C_out, C_in) — 3D, per-(focus, l) independent
-    - bias storage: (F*C_out,), only applied to l=0 (scalar) components
-    - runtime view restores weight to (F, lmax+1, C_out, C_in) via zero-cost reshape
-    - In HybridMuon slice mode, each (C_out, C_in) slice gets independent NS update
-      with correct rectangular scale (no cross-l or cross-focus coupling)
-    - expand_index maps each packed (l,m) position to its l value for lookup
-    - einsum `ndfi,fdci->ndfc` keeps the whole multi-focus path vectorized
-    - No Python loops over focus streams or spherical coefficients
+    Notes
+    -----
+    - Weight storage: ``(lmax+1, C_in, F*C_out)``.
+    - Bias storage: ``(F*C_out,)``, only applied to ``l=0`` scalar components.
+    - Runtime view restores weights to ``(lmax+1, C_in, F, C_out)`` via reshape.
+    - ``expand_index`` maps each packed ``(l,m)`` position to its ``l`` value.
+    - Einsum ``ndfi,difo->ndfo`` keeps the whole multi-focus path vectorized.
+    - In HybridMuon slice mode, each ``(C_in, F*C_out)`` slice gets independent
+      NS update with stable rectangular scaling.
 
     Parameters
     ----------
@@ -945,6 +944,8 @@ class SO3Linear(nn.Module):
         Number of input channels per (l, m) coefficient.
     out_channels
         Number of output channels per (l, m) coefficient.
+    n_focus
+        Number of focus streams.
     dtype
         Parameter dtype.
     mlp_bias
@@ -982,14 +983,14 @@ class SO3Linear(nn.Module):
         self.ebed_dim = get_so3_dim_of_lmax(self.lmax)
         self.mlp_bias = bool(mlp_bias)
 
-        # === Step 1. Per-focus, per-l weight matrix ===
-        # Storage: (F*(lmax+1), C_out, C_in); runtime view: (F, lmax+1, C_out, C_in).
+        # === Step 1. Per-l weight matrix with focus folded on output axis ===
+        # Storage: (lmax+1, C_in, F*C_out); runtime view: (lmax+1, C_in, F, C_out).
         num_l = self.lmax + 1
         self.weight = nn.Parameter(
             torch.empty(
-                self.n_focus * num_l,
-                self.out_channels,
+                num_l,
                 self.in_channels,
+                self.n_focus * self.out_channels,
                 dtype=self.dtype,
                 device=self.device,
             )
@@ -1005,12 +1006,11 @@ class SO3Linear(nn.Module):
                     generator=get_generator(seed),
                 )
         else:
-            for focus_idx in range(self.n_focus):
-                for l_idx in range(num_l):
-                    init_trunc_normal_fan_in_out(
-                        self.weight[focus_idx * num_l + l_idx],
-                        child_seed(seed, 1000 + focus_idx * num_l + l_idx),
-                    )
+            for l_idx in range(num_l):
+                init_trunc_normal_fan_in_out(
+                    self.weight[l_idx],
+                    child_seed(seed, 1000 + l_idx),
+                )
 
         # === Step 2. Bias only for l=0 (scalar components) ===
         if self.mlp_bias:
@@ -1046,19 +1046,21 @@ class SO3Linear(nn.Module):
         torch.Tensor
             Order-wise mixed features with shape (N, D, F, C_out).
         """
-        # === Step 1. Expand weight from l-blocks to packed D layout ===
-        # (F*(lmax+1), C_out, C_in) -> (F, lmax+1, C_out, C_in)
+        # === Step 1. Expand per-l weights to packed coefficient layout ===
+        # (L, Cin, F*Cout) -> (L, Cin, F, Cout)
         weight = self.weight.view(
-            self.n_focus,
             self.lmax + 1,
-            self.out_channels,
             self.in_channels,
-        )
-        # (F, lmax+1, C_out, C_in) -> (F, D, C_out, C_in)
-        weight_expanded = torch.index_select(weight, dim=1, index=self.expand_index)
+            self.n_focus,
+            self.out_channels,
+        )  # (L, Cin, F, Cout)
+        # (L, Cin, F, Cout) -> (D, Cin, F, Cout)
+        weight_expanded = torch.index_select(
+            weight, dim=0, index=self.expand_index
+        )  # (D, Cin, F, Cout)
 
         # === Step 2. Per-focus, per-degree channel mixing ===
-        out = torch.einsum("ndfi,fdci->ndfc", x, weight_expanded)
+        out = torch.einsum("ndfi,difo->ndfo", x, weight_expanded)
 
         # === Step 3. Add l=0 bias ===
         if self.bias is not None:
@@ -1261,24 +1263,24 @@ class SO2Linear(nn.Module):
             self._m_ranges = []
 
         # === Step 2. Learnable weight parameters ===
-        # weight_m0: folded (F*num_l*Cout, num_l*Cin) storage.
-        #   Runtime view: (F, num_l*Cout, num_l*Cin).
+        # weight_m0: folded (num_l*Cin, F*num_l*Cout) storage — (in, out) convention.
+        #   Runtime view: (num_l*Cin, F, num_l*Cout).
         #   Cross-l mixing is allowed because m=0 coefficients are real.
         num_m0 = self.lmax + 1
         num_in_m0 = num_m0 * self.in_channels
         num_out_m0 = num_m0 * self.out_channels
         self.weight_m0 = nn.Parameter(
             torch.empty(
-                self.n_focus * num_out_m0,
                 num_in_m0,
+                self.n_focus * num_out_m0,
                 device=self.device,
                 dtype=self.dtype,
             )
         )
-        weight_m0_view = self.weight_m0.view(self.n_focus, num_out_m0, num_in_m0)
+        weight_m0_view = self.weight_m0.view(num_in_m0, self.n_focus, num_out_m0)
         for focus_idx in range(self.n_focus):
             init_trunc_normal_fan_in_out(
-                weight_m0_view[focus_idx], child_seed(seed, 1000 + focus_idx)
+                weight_m0_view[:, focus_idx, :], child_seed(seed, 1000 + focus_idx)
             )
         if self.mlp_bias:
             self.bias0: nn.Parameter | None = nn.Parameter(
@@ -1291,12 +1293,11 @@ class SO2Linear(nn.Module):
         else:
             self.bias0 = None
 
-        # weight_m[i]: folded (F*2*num_l*Cout, num_l*Cin) storage.
-        #   Runtime view: (F, 2*num_l*Cout, num_l*Cin).
+        # weight_m[i]: folded (num_l*Cin, F*2*num_l*Cout) storage — (in, out) convention.
+        #   Runtime view: (num_l*Cin, F, 2*num_l*Cout).
         #   The factor of 2 comes from storing W_u and W_v concatenated along the
         #   output axis. _build_so2_weight() splits them and fills the 2x2 block.
-        #   Layout: (out, in) convention. Scaling by 1/sqrt(2) compensates for
-        #   the doubled parameter count.
+        #   Scaling by 1/sqrt(2) compensates for the doubled parameter count.
         self.weight_m: nn.ParameterList = nn.ParameterList()
         for m in range(1, self.mmax + 1):
             num_l = self.lmax - m + 1
@@ -1304,16 +1305,16 @@ class SO2Linear(nn.Module):
             num_out = 2 * num_l * self.out_channels
             weight = nn.Parameter(
                 torch.empty(
-                    self.n_focus * num_out,
                     num_in,
+                    self.n_focus * num_out,
                     device=self.device,
                     dtype=self.dtype,
                 )
             )
-            weight_view = weight.view(self.n_focus, num_out, num_in)
+            weight_view = weight.view(num_in, self.n_focus, num_out)
             for focus_idx in range(self.n_focus):
                 init_trunc_normal_fan_in_out(
-                    weight_view[focus_idx],
+                    weight_view[:, focus_idx, :],
                     child_seed(seed, 2000 + m * 100 + focus_idx),
                 )
             # Apply scaling for SO(2) equivariance
@@ -1327,8 +1328,8 @@ class SO2Linear(nn.Module):
         # Each |m|>0 group occupies two sub-blocks (neg, pos) in the flattened
         # weight matrix. Pre-computing the row/col ranges avoids repeated
         # arithmetic in the hot path.
-        # Tuple layout: (neg_i0, neg_i1, pos_i0, pos_i1,   <- input col ranges
-        #                neg_o0, neg_o1, pos_o0, pos_o1)   <- output row ranges
+        # Tuple layout: (neg_i0, neg_i1, pos_i0, pos_i1,   <- input row ranges
+        #                neg_o0, neg_o1, pos_o0, pos_o1)   <- output col ranges
         self._m0_in = (self.lmax + 1) * self.in_channels
         self._m0_out = (self.lmax + 1) * self.out_channels
         self._block_slices: list[tuple[int, int, int, int, int, int, int, int]] = []
@@ -1361,41 +1362,43 @@ class SO2Linear(nn.Module):
         """
         Assemble the per-focus block-diagonal SO(2) weight matrix.
 
-        The flattened weight has shape ``(F, D_m*Cout, D_m*Cin)`` where both
-        axes follow the same m-major coefficient ordering. Off-diagonal blocks
-        (cross-|m|) are zero, enforcing SO(2) equivariance.
+        The flattened weight has shape ``(D_m*Cin, F, D_m*Cout)`` (in, out)
+        where both axes follow the same m-major coefficient ordering.
+        Off-diagonal blocks (cross-|m|) are zero, enforcing SO(2) equivariance.
 
         Returns
         -------
         torch.Tensor
-            Weight with shape (F, D_m*Cout, D_m*Cin).
+            Weight with shape (D_m*Cin, F, D_m*Cout).
         """
-        out_total = self.reduced_dim * self.out_channels
         in_total = self.reduced_dim * self.in_channels
-        weight = self.weight_m0.new_zeros(self.n_focus, out_total, in_total)
-        num_out_m0 = (self.lmax + 1) * self.out_channels
+        out_total = self.reduced_dim * self.out_channels
+        weight = self.weight_m0.new_zeros(in_total, self.n_focus, out_total)
         num_in_m0 = (self.lmax + 1) * self.in_channels
-        weight_m0 = self.weight_m0.view(self.n_focus, num_out_m0, num_in_m0)
+        num_out_m0 = (self.lmax + 1) * self.out_channels
+        weight_m0 = self.weight_m0.view(num_in_m0, self.n_focus, num_out_m0)
 
-        # m=0 block: already in (F, Cout_blk, Cin_blk) layout, no transpose needed.
-        weight[:, : self._m0_out, : self._m0_in] = weight_m0
+        # m=0 block: (Cin_blk, F, Cout_blk) — (in, out) convention.
+        weight[: self._m0_in, :, : self._m0_out] = weight_m0
 
         # |m|>0 blocks: fill the 2x2 SO(2) coupling structure.
-        # For each |m|, the learnable param w has shape (F, 2*out_blk, in_blk)
+        # For each |m|, the learnable param w has shape (in_blk, F, 2*out_blk)
         # which is split into W_u and W_v along the output axis.
         for m_idx, w in enumerate(self.weight_m):
             ni0, ni1, pi0, pi1, no0, no1, po0, po1 = self._block_slices[m_idx]
+            ib = ni1 - ni0  # in_block size
             ob = no1 - no0  # out_block size
-            w = w.view(self.n_focus, 2 * ob, ni1 - ni0)
-            w_u = w[:, :ob, :]  # (F, out_blk, in_blk)
-            w_v = w[:, ob:, :]  # (F, out_blk, in_blk)
-            # Fill the 2x2 coupling: [ W_u, -W_v ]
-            #                        [ W_v,  W_u ]
-            # Row = output (neg/pos), Col = input (neg/pos).
-            weight[:, no0:no1, ni0:ni1] = w_u  # neg_out <- neg_in
-            weight[:, no0:no1, pi0:pi1] = -w_v  # neg_out <- pos_in
-            weight[:, po0:po1, ni0:ni1] = w_v  # pos_out <- neg_in
-            weight[:, po0:po1, pi0:pi1] = w_u  # pos_out <- pos_in
+            w = w.view(ib, self.n_focus, 2 * ob)
+            w_u = w[:, :, :ob]  # (in_blk, F, out_blk)
+            w_v = w[:, :, ob:]  # (in_blk, F, out_blk)
+            # Fill the 2x2 coupling:
+            #   Row = input (neg/pos), Col = output (neg/pos).
+            #   [ W_u^T, -W_v^T ]^T  =>  row=neg_in: W_u to neg_out, W_v to pos_out
+            #   [ W_v^T,  W_u^T ]^T  =>  row=pos_in: -W_v to neg_out, W_u to pos_out
+            weight[ni0:ni1, :, no0:no1] = w_u  # neg_in -> neg_out
+            weight[ni0:ni1, :, po0:po1] = w_v  # neg_in -> pos_out
+            weight[pi0:pi1, :, no0:no1] = -w_v  # pos_in -> neg_out
+            weight[pi0:pi1, :, po0:po1] = w_u  # pos_in -> pos_out
         return weight
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1427,8 +1430,8 @@ class SO2Linear(nn.Module):
                 self._cached_weight = weight.detach()
 
         # === Step 3. Batched matmul over focus streams + reshape back ===
-        # einsum "efi,foi->efo": (E,F,D_m*Cin) x (F,D_m*Cout,D_m*Cin) -> (E,F,D_m*Cout)
-        out_flat = torch.einsum("efi,foi->efo", x_flat, weight)
+        # einsum "efi,ifo->efo": (E,F,D_m*Cin) x (D_m*Cin,F,D_m*Cout) -> (E,F,D_m*Cout)
+        out_flat = torch.einsum("efi,ifo->efo", x_flat, weight)
         out = out_flat.reshape(
             n_edge, self.n_focus, self.reduced_dim, self.out_channels
         )
@@ -2131,6 +2134,7 @@ class EquivariantFFN(nn.Module):
             lmax=self.lmax,
             in_channels=self.channels,
             out_channels=linear1_out_channels,
+            n_focus=1,
             dtype=dtype,
             mlp_bias=self.mlp_bias,
             trainable=trainable,
@@ -2155,6 +2159,7 @@ class EquivariantFFN(nn.Module):
             lmax=self.lmax,
             in_channels=self.hidden_channels,
             out_channels=self.channels,
+            n_focus=1,
             dtype=dtype,
             mlp_bias=self.mlp_bias,
             trainable=trainable,
