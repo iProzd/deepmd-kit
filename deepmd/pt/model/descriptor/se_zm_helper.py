@@ -646,7 +646,7 @@ class RadialBasis(nn.Module):
             device=self.device,
             dtype=self.dtype,
         ) * (math.pi / self.rcut)
-        self.freqs = nn.Parameter(
+        self.adam_freqs = nn.Parameter(
             rearrange(freqs, "n_radial -> 1 n_radial"), requires_grad=True
         )
 
@@ -670,8 +670,8 @@ class RadialBasis(nn.Module):
         # === Step 1. Bessel Basis via Sinc ===
         # phi_n(r) = w_n * sinc(w_n * r / π)
         # Shape: (N, 1) * (1, n_radial) -> (N, n_radial)
-        x = r * self.freqs  # (N, n_rbf)
-        raw = self.freqs * torch.sinc(x / math.pi)  # (N, n_rbf)
+        x = r * self.adam_freqs  # (N, n_rbf)
+        raw = self.adam_freqs * torch.sinc(x / math.pi)  # (N, n_rbf)
 
         # === Step 2. Apply C^2 envelope for smooth cutoff ===
         envelope = self.envelope(r)  # (N, 1)
@@ -679,14 +679,17 @@ class RadialBasis(nn.Module):
 
     def serialize(self) -> dict[str, Any]:
         """Serialize RadialBasis including trainable frequencies."""
+        state = self.state_dict()
         return {
             "@class": "RadialBasis",
-            "@version": 1,  # keep 1 at devel stage
-            "rcut": self.rcut,
-            "n_radial": self.n_radial,
-            "exponent": self.exponent,
-            "precision": RESERVED_PRECISION_DICT[self.dtype],
-            "freqs": np_safe(self.freqs),
+            "@version": 1,
+            "config": {
+                "rcut": self.rcut,
+                "n_radial": self.n_radial,
+                "exponent": self.exponent,
+                "precision": RESERVED_PRECISION_DICT[self.dtype],
+            },
+            "@variables": {key: np_safe(value) for key, value in state.items()},
         }
 
     @classmethod
@@ -699,17 +702,25 @@ class RadialBasis(nn.Module):
         version = int(data.pop("@version"))
         if version != 1:
             raise ValueError(f"Unsupported RadialBasis version: {version}")
-        precision = data["precision"]
+        config = data.pop("config", data)
+        variables = data.pop("@variables", None)
+        precision = config["precision"]
         dtype = PRECISION_DICT[precision]
         obj = cls(
-            rcut=float(data["rcut"]),
-            n_radial=int(data["n_radial"]),
-            exponent=int(data.get("exponent", 7)),
+            rcut=float(config["rcut"]),
+            n_radial=int(config["n_radial"]),
+            exponent=int(config.get("exponent", 7)),
             dtype=dtype,
         )
-        obj.freqs.data.copy_(
-            safe_numpy_to_tensor(data["freqs"], device=obj.device, dtype=obj.dtype)
-        )
+        if variables is not None:
+            template = obj.state_dict()
+            state = {
+                key: safe_numpy_to_tensor(
+                    value, device=template[key].device, dtype=template[key].dtype
+                )
+                for key, value in variables.items()
+            }
+            obj.load_state_dict(state)
         return obj
 
 

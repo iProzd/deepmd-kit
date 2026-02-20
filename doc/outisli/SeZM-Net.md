@@ -191,13 +191,26 @@ Standard DeePMD nlist path:
 
 ### 7. Unified weight layout convention
 
-All learnable weight matrices use `(..., C_out, C_in)` layout (output-before-input), matching the standard `nn.Linear(out_features, in_features)` convention:
+All learnable weight matrices keep output-before-input ordering, and focus-aware
+modules use folded parameter storage:
 
-- `FocusLinear`: `(F, C_out, C_in)` with `einsum("bfi,foi->bfo")`
-- `SO3Linear`: `(F, lmax+1, C_out, C_in)` with `einsum("ndfi,fdci->ndfc")`
-- `SO2Linear`: learnable params `weight_m0` as `(F, num_l*Cout, num_l*Cin)`, `weight_m[i]` as `(F, 2*num_l*Cout, num_l*Cin)`; assembled weight as `(F, D_m*Cout, D_m*Cin)` with `einsum("efi,foi->efo")`
+- `FocusLinear`
+  - stored weight: `(F * C_out, C_in)` — 2D, Muon
+  - runtime view: `(F, C_out, C_in)` with `einsum("bfi,foi->bfo")`
+- `SO3Linear`
+  - stored weight: `(F * (lmax+1), C_out, C_in)` — 3D, per-(focus, l) slice Muon
+  - stored bias: `(F * C_out,)` — 1D, Adam
+  - runtime view: `(F, lmax+1, C_out, C_in)` via zero-cost reshape, then `einsum("ndfi,fdci->ndfc")`
+  - In HybridMuon slice mode, each `(C_out, C_in)` slice gets independent NS update
+    with correct rectangular scale (no cross-l or cross-focus coupling)
+  - `SO3Linear` is used with `F=1` in SeZM-Net blocks
+- `SO2Linear`
+  - stored `weight_m0`: `(F * (num_l*Cout), num_l*Cin)` — 2D, Muon
+  - stored `weight_m[i]`: `(F * (2*num_l*Cout), num_l*Cin)` — 2D, Muon
+  - runtime view: `(F, ..., ...)`, assembled to `(F, D_m*Cout, D_m*Cin)` and applied by `einsum("efi,foi->efo")`
 
-This convention ensures that `shape[-1]` is always the input channel dimension, which is important for Muon optimizer compatibility (Newton-Schulz orthogonalization in input space when reshaping >2D weights to 2D via `(numel // shape[-1], shape[-1])`).
+This storage layout ensures each semantically independent weight block gets its own
+Muon NS update without artificial cross-l or cross-focus coupling.
 
 ### 8. Gate initialization strategy
 
@@ -395,7 +408,7 @@ For each edge `(src -> dst)`:
 - `n_atten_head > 0`:
   - **Edge attention logits**:
     - `q, k` come from normalized node scalar channel `x_l0` and are split by heads
-    - `logits = dot(q_dst, k_src) / sqrt(head_dim) + attn_radial_bias_proj(radial_l0)`
+    - `logits = dot(q_dst, k_src) / sqrt(head_dim) + attn_radial_logit_proj(radial_l0)`
   - **Stable grouped softmax with envelope-weighted competition**:
     - destination-wise max subtraction for numerical stability
     - `unnormalized = exp(logits - grouped_max) * edge_env^p` (default `p=0.5`)
@@ -463,7 +476,7 @@ SeZMInteractionBlock:  # x shape: (N, D, F, Cf)
       y = post_ffn_norms[i](view(y, N, D, 1, C))
       y = view(y, N, 1, D, C)
       if layer_scale:
-          y = y * ffn_layer_scales[i]   # per-channel, init 1e-3
+          y = y * adam_ffn_layer_scales[i]   # per-channel, init 1e-3
       x_ffn = x_ffn + y
 
   return view(x_ffn.squeeze(1), N, D, F, Cf)
@@ -483,7 +496,7 @@ Components:
 - `so2_conv`: `SO2Convolution` with pre-norm residual SO(2) mixing, optional per-focus-channel LayerScale, and final SO(3) channel mixing
 - `pre_ffn_norms[i]`: `SeparableRMSNorm` applied before each FFN subblock
 - `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and gated activation
-- `ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
+- `adam_ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
 
 ---
 
@@ -557,6 +570,20 @@ Key arguments:
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)
+
+Optimizer routing note:
+
+- HybridMuon uses name-based routing to separate Adam / AdamW / Muon paths (case-insensitive):
+  - final effective parameter name segment containing `bias` → Adam (no weight decay)
+  - final effective parameter name segment starting with `adam_` → Adam (no weight decay)
+  - final effective parameter name segment starting with `adamw_` → AdamW (decoupled weight decay)
+  - trailing numeric `ParameterList` indices are ignored when deriving the effective segment
+  - all other parameters follow shape-based routing (2D → Muon, otherwise → AdamW)
+- SeZM norm/layer-scale/frequency parameters use `adam_` prefixes (`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adam_freqs`) so HybridMuon routes them to Adam (no weight decay).
+- For HybridMuon with SeZM-Net, recommended routing mode is `muon_mode = "slice"`:
+  - 2D weights (SO2Linear, FocusLinear): Muon (same as mode=2d)
+  - 3D SO3Linear `(F*(lmax+1), C_out, C_in)`: per-(focus, l) independent Muon with correct rectangular scale
+  - `adam_`/`bias` parameters: Adam (name-based routing takes priority)
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 Note: `focus_softmax_tau` (default `1.0`) and `focus_label_smoothing` (default `0.02`) are internal `SO2Convolution` parameters and are not exposed in descriptor top-level config.

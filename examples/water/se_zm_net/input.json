@@ -112,6 +112,7 @@
     "profiling": false,
     "profiling_file": "timeline.json",
     "opt_type": "HybridMuon",
+    "muon_mode": "2d",
     "zero_stage": 0,
     "weight_decay": 0.001,
     "lr_adjust": 0,

@@ -197,7 +197,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
         Attention projections in SO2Convolution
-        (attn_radial_bias_proj, attn_output_gate_proj) are always bias-free.
+        (attn_radial_logit_proj, attn_output_gate_proj) are always bias-free.
     layer_scale
         If True, apply learnable LayerScale (init 1e-3) on residual branches:
         - SO(2) branch: per-focus-channel scales `(n_focus, focus_dim)`

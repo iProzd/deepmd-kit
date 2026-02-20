@@ -66,6 +66,13 @@ class FocusLinear(nn.Module):
     """
     Per-focus linear projection on the last feature axis.
 
+    Notes
+    -----
+    Parameters are stored in folded form to avoid an explicit focus axis in
+    optimizer-visible shapes:
+    - weight: (n_focus * out_channels, in_channels)
+    - bias: (n_focus * out_channels,)
+
     Parameters
     ----------
     in_channels
@@ -107,8 +114,7 @@ class FocusLinear(nn.Module):
         self.device = env.DEVICE
         self.weight = nn.Parameter(
             torch.empty(
-                self.n_focus,
-                self.out_channels,
+                self.n_focus * self.out_channels,
                 self.in_channels,
                 device=self.device,
                 dtype=self.dtype,
@@ -123,8 +129,7 @@ class FocusLinear(nn.Module):
         if bias:
             self.bias: nn.Parameter | None = nn.Parameter(
                 torch.zeros(
-                    self.n_focus,
-                    self.out_channels,
+                    self.n_focus * self.out_channels,
                     device=self.device,
                     dtype=self.dtype,
                 )
@@ -146,9 +151,11 @@ class FocusLinear(nn.Module):
         torch.Tensor
             Projected tensor with shape (B, F, Cout).
         """
-        out = torch.einsum("bfi,foi->bfo", x, self.weight)
+        weight = self.weight.view(self.n_focus, self.out_channels, self.in_channels)
+        out = torch.einsum("bfi,foi->bfo", x, weight)
         if self.bias is not None:
-            out = out + self.bias.unsqueeze(0)
+            bias = self.bias.view(self.n_focus, self.out_channels)
+            out = out + bias.unsqueeze(0)
         return out
 
 
@@ -442,8 +449,9 @@ class SeparableRMSNorm(nn.Module):
         self.eps = float(eps)
 
         # === Step 1. Learnable Parameters ===
-        # Per-focus, per-l affine weights with shape (F, lmax+1, C)
-        self.weight = nn.Parameter(
+        # Per-focus, per-l affine scales with shape (F, lmax+1, C)
+        # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
+        self.adam_scale = nn.Parameter(
             torch.ones(
                 self.n_focus,
                 self.lmax + 1,
@@ -524,8 +532,10 @@ class SeparableRMSNorm(nn.Module):
         )
         x0 = x0 * inv_rms0
 
-        weight0 = self.weight[:, 0, :].reshape(1, 1, self.n_focus, -1)  # (1, 1, F, C)
-        x0 = x0 * weight0
+        scale0 = self.adam_scale[:, 0, :].reshape(
+            1, 1, self.n_focus, -1
+        )  # (1, 1, F, C)
+        x0 = x0 * scale0
         if self.bias is not None:
             bias0 = self.bias.reshape(1, 1, self.n_focus, -1)  # (1, 1, F, C)
             x0 = x0 + bias0
@@ -543,7 +553,7 @@ class SeparableRMSNorm(nn.Module):
         xt = xt * inv_rmst
 
         wt = torch.index_select(  # (F, D-1, C)
-            self.weight, dim=1, index=self.expand_index
+            self.adam_scale, dim=1, index=self.expand_index
         )
         xt = xt * wt.permute(1, 0, 2).reshape(1, wt.shape[1], self.n_focus, wt.shape[2])
 
@@ -665,7 +675,8 @@ class ReducedSeparableRMSNorm(nn.Module):
         self.register_buffer("balance_weight", weights, persistent=True)
 
         if self.affine:
-            self.weight = nn.Parameter(
+            # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
+            self.adam_scale = nn.Parameter(
                 torch.ones(
                     self.n_focus,
                     self.lmax + 1,
@@ -687,7 +698,7 @@ class ReducedSeparableRMSNorm(nn.Module):
                 else None
             )
         else:
-            self.register_parameter("weight", None)
+            self.register_parameter("adam_scale", None)
             self.register_parameter("bias0", None)
 
         for p in self.parameters():
@@ -718,8 +729,8 @@ class ReducedSeparableRMSNorm(nn.Module):
         x0 = x0 * inv_rms0
 
         if xt.numel() == 0:
-            if self.affine and self.weight is not None:
-                x0.mul_(self.weight[:, 0, :].reshape(1, self.n_focus, 1, -1))
+            if self.affine and self.adam_scale is not None:
+                x0.mul_(self.adam_scale[:, 0, :].reshape(1, self.n_focus, 1, -1))
                 if self.centering and self.bias0 is not None:
                     x0 += self.bias0.reshape(1, self.n_focus, 1, -1)
             return x0.to(dtype=in_dtype)
@@ -730,9 +741,9 @@ class ReducedSeparableRMSNorm(nn.Module):
         inv_rmst = torch.rsqrt(mean_var + self.eps).unsqueeze(-1).unsqueeze(-1)
         xt = xt * inv_rmst
 
-        if self.affine and self.weight is not None:
+        if self.affine and self.adam_scale is not None:
             w = torch.index_select(  # (D_m_trunc, C)
-                self.weight, dim=1, index=self.degree_index_m
+                self.adam_scale, dim=1, index=self.degree_index_m
             )
             w0 = w[:, 0, :].reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
             wt = w[:, 1:, :].reshape(
@@ -832,7 +843,8 @@ class ScalarRMSNorm(nn.Module):
         self.device = env.DEVICE
         self.eps = float(eps)
 
-        self.weight = nn.Parameter(
+        # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
+        self.adam_scale = nn.Parameter(
             torch.ones(
                 self.n_focus,
                 self.channels,
@@ -862,7 +874,7 @@ class ScalarRMSNorm(nn.Module):
         inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
         x = x * inv_rms
 
-        x = x * self.weight.unsqueeze(0)
+        x = x * self.adam_scale.unsqueeze(0)
         return x.to(dtype=in_dtype)
 
     def serialize(self) -> dict[str, Any]:
@@ -916,8 +928,11 @@ class SO3Linear(nn.Module):
 
     NOTE
     ----
-    - weight shape: (F, lmax+1, C_out, C_in) for per-focus, per-l transforms
-    - bias shape: (F, C_out), only applied to l=0 (scalar) components
+    - weight storage: (F*(lmax+1), C_out, C_in) — 3D, per-(focus, l) independent
+    - bias storage: (F*C_out,), only applied to l=0 (scalar) components
+    - runtime view restores weight to (F, lmax+1, C_out, C_in) via zero-cost reshape
+    - In HybridMuon slice mode, each (C_out, C_in) slice gets independent NS update
+      with correct rectangular scale (no cross-l or cross-focus coupling)
     - expand_index maps each packed (l,m) position to its l value for lookup
     - einsum `ndfi,fdci->ndfc` keeps the whole multi-focus path vectorized
     - No Python loops over focus streams or spherical coefficients
@@ -968,11 +983,11 @@ class SO3Linear(nn.Module):
         self.mlp_bias = bool(mlp_bias)
 
         # === Step 1. Per-focus, per-l weight matrix ===
-        # Shape: (F, lmax+1, C_out, C_in).
+        # Storage: (F*(lmax+1), C_out, C_in); runtime view: (F, lmax+1, C_out, C_in).
+        num_l = self.lmax + 1
         self.weight = nn.Parameter(
             torch.empty(
-                self.n_focus,
-                self.lmax + 1,
+                self.n_focus * num_l,
                 self.out_channels,
                 self.in_channels,
                 dtype=self.dtype,
@@ -990,11 +1005,10 @@ class SO3Linear(nn.Module):
                     generator=get_generator(seed),
                 )
         else:
-            num_l = self.lmax + 1
             for focus_idx in range(self.n_focus):
                 for l_idx in range(num_l):
                     init_trunc_normal_fan_in_out(
-                        self.weight[focus_idx, l_idx],
+                        self.weight[focus_idx * num_l + l_idx],
                         child_seed(seed, 1000 + focus_idx * num_l + l_idx),
                     )
 
@@ -1002,8 +1016,7 @@ class SO3Linear(nn.Module):
         if self.mlp_bias:
             self.bias: nn.Parameter | None = nn.Parameter(
                 torch.zeros(
-                    self.n_focus,
-                    self.out_channels,
+                    self.n_focus * self.out_channels,
                     dtype=self.dtype,
                     device=self.device,
                 )
@@ -1034,17 +1047,23 @@ class SO3Linear(nn.Module):
             Order-wise mixed features with shape (N, D, F, C_out).
         """
         # === Step 1. Expand weight from l-blocks to packed D layout ===
-        # (F, lmax+1, C_out, C_in) -> (F, D, C_out, C_in)
-        weight_expanded = torch.index_select(
-            self.weight, dim=1, index=self.expand_index
+        # (F*(lmax+1), C_out, C_in) -> (F, lmax+1, C_out, C_in)
+        weight = self.weight.view(
+            self.n_focus,
+            self.lmax + 1,
+            self.out_channels,
+            self.in_channels,
         )
+        # (F, lmax+1, C_out, C_in) -> (F, D, C_out, C_in)
+        weight_expanded = torch.index_select(weight, dim=1, index=self.expand_index)
 
         # === Step 2. Per-focus, per-degree channel mixing ===
         out = torch.einsum("ndfi,fdci->ndfc", x, weight_expanded)
 
         # === Step 3. Add l=0 bias ===
         if self.bias is not None:
-            out[:, 0, :, :] = out[:, 0, :, :] + self.bias.unsqueeze(0)
+            bias = self.bias.view(self.n_focus, self.out_channels)
+            out[:, 0, :, :] = out[:, 0, :, :] + bias.unsqueeze(0)
 
         return out
 
@@ -1242,29 +1261,29 @@ class SO2Linear(nn.Module):
             self._m_ranges = []
 
         # === Step 2. Learnable weight parameters ===
-        # weight_m0: (F, num_l*Cout, num_l*Cin) — unconstrained m=0 block.
+        # weight_m0: folded (F*num_l*Cout, num_l*Cin) storage.
+        #   Runtime view: (F, num_l*Cout, num_l*Cin).
         #   Cross-l mixing is allowed because m=0 coefficients are real.
         num_m0 = self.lmax + 1
         num_in_m0 = num_m0 * self.in_channels
         num_out_m0 = num_m0 * self.out_channels
         self.weight_m0 = nn.Parameter(
             torch.empty(
-                self.n_focus,
-                num_out_m0,
+                self.n_focus * num_out_m0,
                 num_in_m0,
                 device=self.device,
                 dtype=self.dtype,
             )
         )
+        weight_m0_view = self.weight_m0.view(self.n_focus, num_out_m0, num_in_m0)
         for focus_idx in range(self.n_focus):
             init_trunc_normal_fan_in_out(
-                self.weight_m0[focus_idx], child_seed(seed, 1000 + focus_idx)
+                weight_m0_view[focus_idx], child_seed(seed, 1000 + focus_idx)
             )
         if self.mlp_bias:
             self.bias0: nn.Parameter | None = nn.Parameter(
                 torch.zeros(
-                    self.n_focus,
-                    self.out_channels,
+                    self.n_focus * self.out_channels,
                     device=self.device,
                     dtype=self.dtype,
                 )
@@ -1272,7 +1291,8 @@ class SO2Linear(nn.Module):
         else:
             self.bias0 = None
 
-        # weight_m[i]: (F, 2*num_l*Cout, num_l*Cin) — SO(2)-constrained |m|>0 blocks.
+        # weight_m[i]: folded (F*2*num_l*Cout, num_l*Cin) storage.
+        #   Runtime view: (F, 2*num_l*Cout, num_l*Cin).
         #   The factor of 2 comes from storing W_u and W_v concatenated along the
         #   output axis. _build_so2_weight() splits them and fills the 2x2 block.
         #   Layout: (out, in) convention. Scaling by 1/sqrt(2) compensates for
@@ -1284,16 +1304,16 @@ class SO2Linear(nn.Module):
             num_out = 2 * num_l * self.out_channels
             weight = nn.Parameter(
                 torch.empty(
-                    self.n_focus,
-                    num_out,
+                    self.n_focus * num_out,
                     num_in,
                     device=self.device,
                     dtype=self.dtype,
                 )
             )
+            weight_view = weight.view(self.n_focus, num_out, num_in)
             for focus_idx in range(self.n_focus):
                 init_trunc_normal_fan_in_out(
-                    weight[focus_idx],
+                    weight_view[focus_idx],
                     child_seed(seed, 2000 + m * 100 + focus_idx),
                 )
             # Apply scaling for SO(2) equivariance
@@ -1353,9 +1373,12 @@ class SO2Linear(nn.Module):
         out_total = self.reduced_dim * self.out_channels
         in_total = self.reduced_dim * self.in_channels
         weight = self.weight_m0.new_zeros(self.n_focus, out_total, in_total)
+        num_out_m0 = (self.lmax + 1) * self.out_channels
+        num_in_m0 = (self.lmax + 1) * self.in_channels
+        weight_m0 = self.weight_m0.view(self.n_focus, num_out_m0, num_in_m0)
 
         # m=0 block: already in (F, Cout_blk, Cin_blk) layout, no transpose needed.
-        weight[:, : self._m0_out, : self._m0_in] = self.weight_m0
+        weight[:, : self._m0_out, : self._m0_in] = weight_m0
 
         # |m|>0 blocks: fill the 2x2 SO(2) coupling structure.
         # For each |m|, the learnable param w has shape (F, 2*out_blk, in_blk)
@@ -1363,6 +1386,7 @@ class SO2Linear(nn.Module):
         for m_idx, w in enumerate(self.weight_m):
             ni0, ni1, pi0, pi1, no0, no1, po0, po1 = self._block_slices[m_idx]
             ob = no1 - no0  # out_block size
+            w = w.view(self.n_focus, 2 * ob, ni1 - ni0)
             w_u = w[:, :ob, :]  # (F, out_blk, in_blk)
             w_v = w[:, ob:, :]  # (F, out_blk, in_blk)
             # Fill the 2x2 coupling: [ W_u, -W_v ]
@@ -1411,7 +1435,8 @@ class SO2Linear(nn.Module):
 
         # === Step 4. Bias on l=0 scalar index ===
         if self.bias0 is not None:
-            out[:, :, 0, :] = out[:, :, 0, :] + self.bias0.unsqueeze(0)
+            bias0 = self.bias0.view(self.n_focus, self.out_channels)
+            out[:, :, 0, :] = out[:, :, 0, :] + bias0.unsqueeze(0)
         return out
 
     def serialize(self) -> dict[str, Any]:
@@ -1657,7 +1682,7 @@ class SO2Convolution(nn.Module):
 
         # === Step 6. Optional per-layer LayerScale for SO(2) residual branches ===
         if self.layer_scale:
-            self.so2_layer_scales = nn.ParameterList(
+            self.adam_so2_layer_scales = nn.ParameterList(
                 [
                     nn.Parameter(
                         torch.ones(
@@ -1673,11 +1698,11 @@ class SO2Convolution(nn.Module):
                 ]
             )
         else:
-            self.so2_layer_scales = None
+            self.adam_so2_layer_scales = None
 
         # === Step 7. Optional attention projections (n_atten_head > 0) ===
         self.attn_qk_norm: ScalarRMSNorm | None = None
-        self.attn_radial_bias_proj: FocusLinear | None = None
+        self.attn_radial_logit_proj: FocusLinear | None = None
         self.attn_output_gate_norm: ScalarRMSNorm | None = None
         self.attn_output_gate_proj: FocusLinear | None = None
         if self.n_atten_head > 0:
@@ -1688,7 +1713,7 @@ class SO2Convolution(nn.Module):
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
-            self.attn_radial_bias_proj = FocusLinear(
+            self.attn_radial_logit_proj = FocusLinear(
                 in_channels=self.focus_dim,
                 out_channels=self.n_atten_head,
                 n_focus=self.n_focus,
@@ -1835,15 +1860,19 @@ class SO2Convolution(nn.Module):
                 x_local = so2_linear(x_local)
 
                 if layer_idx == 0 and so2_linear.bias0 is not None:
-                    bias_correction = so2_linear.bias0.unsqueeze(0) * (
+                    # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
+                    bias0 = so2_linear.bias0.view(
+                        self.n_focus, self.focus_dim
+                    ).unsqueeze(0)
+                    bias_correction = bias0 * (
                         rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1) - 1.0
                     )  # (E, F, Cf)
                     x_local[:, :, 0, :].add_(bias_correction)
 
                 x_local = non_linear(x_local)
 
-                if self.so2_layer_scales is not None:
-                    scale = self.so2_layer_scales[layer_idx].reshape(
+                if self.adam_so2_layer_scales is not None:
+                    scale = self.adam_so2_layer_scales[layer_idx].reshape(
                         1, self.n_focus, 1, self.focus_dim
                     )
                     x_local = residual + scale * x_local
@@ -1909,7 +1938,7 @@ class SO2Convolution(nn.Module):
                 radial_l0 = radial_feat[:, 0, :].reshape(
                     n_edge, self.n_focus, self.focus_dim
                 )  # (E, F, Cf)
-                radial_bias = self.attn_radial_bias_proj(
+                radial_bias = self.attn_radial_logit_proj(
                     radial_l0.to(dtype=compute_dtype)
                 )  # (E, F, H)
                 attn_logits = (q_edge * k_edge).sum(-1) * (self.head_dim**-0.5)
@@ -2121,6 +2150,7 @@ class EquivariantFFN(nn.Module):
         )
 
         # === Second SO3Linear for channel mixing ===
+        # Zero-initialized so residual path starts near-identity.
         self.so3_linear_2 = SO3Linear(
             lmax=self.lmax,
             in_channels=self.hidden_channels,
@@ -2129,6 +2159,7 @@ class EquivariantFFN(nn.Module):
             mlp_bias=self.mlp_bias,
             trainable=trainable,
             seed=seed_so3_out,
+            init_std=0.0,
         )
 
         for p in self.parameters():
@@ -2447,7 +2478,7 @@ class SeZMInteractionBlock(nn.Module):
 
         # Optional per-channel LayerScale on each FFN residual branch
         if self.layer_scale:
-            self.ffn_layer_scales = nn.ParameterList(
+            self.adam_ffn_layer_scales = nn.ParameterList(
                 [
                     nn.Parameter(
                         torch.ones(self.channels, dtype=self.dtype, device=self.device)
@@ -2458,7 +2489,7 @@ class SeZMInteractionBlock(nn.Module):
                 ]
             )
         else:
-            self.ffn_layer_scales = None
+            self.adam_ffn_layer_scales = None
 
     def forward(
         self,
@@ -2508,8 +2539,8 @@ class SeZMInteractionBlock(nn.Module):
             with nvtx_range(f"ffn_{i}/post_norm"):
                 y = self.post_ffn_norms[i](y)
 
-            if self.ffn_layer_scales is not None:
-                y = y * self.ffn_layer_scales[i]
+            if self.adam_ffn_layer_scales is not None:
+                y = y * self.adam_ffn_layer_scales[i]
 
             x_ffn = x_ffn + y
 
