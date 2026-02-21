@@ -1707,9 +1707,9 @@ class SO2Convolution(nn.Module):
         self.attn_qk_norm: ScalarRMSNorm | None = None
         self.attn_q_proj: FocusLinear | None = None
         self.attn_k_proj: FocusLinear | None = None
-        self.attn_radial_logit_proj: FocusLinear | None = None
+        self.adamw_attn_logit_w: nn.Parameter | None = None
         self.attn_output_gate_norm: ScalarRMSNorm | None = None
-        self.attn_output_gate_proj: FocusLinear | None = None
+        self.adamw_attn_gate_w: nn.Parameter | None = None
         if self.n_atten_head > 0:
             self.attn_qk_norm = ScalarRMSNorm(
                 channels=self.focus_dim,
@@ -1736,15 +1736,21 @@ class SO2Convolution(nn.Module):
                 seed=child_seed(seed_gate, 1),
                 trainable=trainable,
             )
-            self.attn_radial_logit_proj = FocusLinear(
-                in_channels=self.focus_dim,
-                out_channels=self.n_atten_head,
-                n_focus=self.n_focus,
-                dtype=self.compute_dtype,
-                bias=False,
-                seed=child_seed(seed_gate, 2),
-                trainable=trainable,
-                init_std=0.01,
+            self.adamw_attn_logit_w = nn.Parameter(
+                torch.empty(
+                    self.focus_dim,
+                    self.n_focus,
+                    self.n_atten_head,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                ),
+                requires_grad=trainable,
+            )
+            nn.init.normal_(
+                self.adamw_attn_logit_w,
+                mean=0.0,
+                std=0.01,
+                generator=get_generator(child_seed(seed_gate, 2)),
             )
             self.attn_output_gate_norm = ScalarRMSNorm(
                 channels=self.focus_dim,
@@ -1753,15 +1759,21 @@ class SO2Convolution(nn.Module):
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
-            self.attn_output_gate_proj = FocusLinear(
-                in_channels=self.focus_dim,
-                out_channels=self.n_atten_head,
-                n_focus=self.n_focus,
-                dtype=self.compute_dtype,
-                bias=False,
-                seed=child_seed(seed_gate, 3),
-                trainable=trainable,
-                init_std=0.01,
+            self.adamw_attn_gate_w = nn.Parameter(
+                torch.empty(
+                    self.focus_dim,
+                    self.n_focus,
+                    self.n_atten_head,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                ),
+                requires_grad=trainable,
+            )
+            nn.init.normal_(
+                self.adamw_attn_gate_w,
+                mean=0.0,
+                std=0.01,
+                generator=get_generator(child_seed(seed_gate, 3)),
             )
 
         # === Step 7.5. Optional cross-focus competition ===
@@ -1963,8 +1975,10 @@ class SO2Convolution(nn.Module):
                 radial_l0 = radial_feat[:, 0, :].reshape(
                     n_edge, self.n_focus, self.focus_dim
                 )  # (E, F, Cf)
-                radial_bias = self.attn_radial_logit_proj(
-                    radial_l0.to(dtype=compute_dtype)
+                radial_bias = torch.einsum(
+                    "efi,ifo->efo",
+                    radial_l0.to(dtype=compute_dtype),
+                    self.adamw_attn_logit_w,
                 )  # (E, F, H)
                 attn_logits = (q_edge * k_edge).sum(-1) * (self.head_dim**-0.5)
                 attn_logits = attn_logits + radial_bias
@@ -2009,8 +2023,10 @@ class SO2Convolution(nn.Module):
 
                 # === Step 8.4. Output-side head gate (G1 style) ===
                 attn_output_gate = torch.sigmoid(
-                    self.attn_output_gate_proj(
-                        self.attn_output_gate_norm(x_l0_node.to(dtype=compute_dtype))
+                    torch.einsum(
+                        "nfi,ifo->nfo",
+                        self.attn_output_gate_norm(x_l0_node.to(dtype=compute_dtype)),
+                        self.adamw_attn_gate_w,
                     )
                 )  # (N, F, H)
                 out_heads = out_heads * attn_output_gate.reshape(

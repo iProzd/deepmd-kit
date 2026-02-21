@@ -31,6 +31,9 @@ if TYPE_CHECKING:
 from deepmd.pt.model.atomic_model.sezm_net_atomic_model import (
     SeZMNetAtomicModel,
 )
+from deepmd.pt.model.descriptor.se_zm_helper import (
+    nvtx_range,
+)
 from deepmd.pt.model.model.dp_model import (
     DPModelCommon,
 )
@@ -48,9 +51,6 @@ from deepmd.pt.utils import (
 )
 from deepmd.pt.utils.nlist import (
     extend_input_and_build_neighbor_list,
-)
-from deepmd.pt.utils.nvtx import (
-    nvtx_range,
 )
 
 SeZMNetModel_ = make_model(SeZMNetAtomicModel)
