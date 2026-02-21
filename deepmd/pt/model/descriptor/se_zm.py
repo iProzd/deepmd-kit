@@ -121,33 +121,21 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
     Parameters
     ----------
-    rcut
-        Cutoff radius in Å.
+    ntypes
+        Number of element types.
     sel
         Maximum number of neighbors per type within `rcut`.
         - int: broadcast to all types, e.g. sel=100 with ntypes=2 → [100, 100]
         - list[int]: sel[i] is the maximum number of type i atoms within `rcut`
-    ntypes
-        Number of element types.
-    lmax
-        Maximum degree, only used when `l_schedule` is None.
-    n_blocks
-        Number of blocks (only used when `l_schedule` is None).
-    l_schedule
-        Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing.
-        If set, lmax and n_blocks will be ignored.
-    mmax
-        Maximum SO(2) order (|m|), only used when `m_schedule` is None.
-        If None, defaults to the per-block `lmax` (i.e. `m_schedule = l_schedule`).
-    m_schedule
-        Schedule of mmax per block, e.g. [2, 2, 1, 0]. Must satisfy
-        `m_schedule[i] <= l_schedule[i]` for every block. A non-increasing schedule is
-        recommended but not required. If set, `mmax` will be ignored.
+    rcut
+        Cutoff radius in Å.
+    env_exp
+        C^2 cutoff envelope exponents `[rbf_env_exp, edge_env_exp]`.
+        - `rbf_env_exp`: Controls radial basis function envelope decay.
+        - `edge_env_exp`: Controls message passing edge weight envelope decay.
+        Larger values give weaker suppression (values stay near 1.0 longer).
     channels
         Total channels per (l,m) coefficient.
-    n_focus
-        Number of parallel focus streams. The per-stream channel width is
-        ``focus_dim = channels // n_focus``. Must divide ``channels`` exactly.
     n_radial
         Number of radial basis functions.
     radial_mlp
@@ -163,15 +151,28 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         `type_dim=clamp(channels//4, 8, 32)`,
         `rbf_out_dim=max(32, embed_dim-2*type_dim)`,
         `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))`.
+    lmax
+        Maximum degree, only used when `l_schedule` is None.
+    l_schedule
+        Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing.
+        If set, lmax and n_blocks will be ignored.
+    mmax
+        Maximum SO(2) order (|m|), only used when `m_schedule` is None.
+        If None, defaults to the per-block `lmax` (i.e. `m_schedule = l_schedule`).
+    m_schedule
+        Schedule of mmax per block, e.g. [2, 2, 1, 0]. Must satisfy
+        `m_schedule[i] <= l_schedule[i]` for every block. A non-increasing schedule is
+        recommended but not required. If set, `mmax` will be ignored.
+    n_blocks
+        Number of blocks (only used when `l_schedule` is None).
     so2_norm
         If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers per block.
-    ffn_neurons
-        Hidden sizes for the equivariant FFN in each block and the final scalar output FFN.
-    ffn_blocks
-        Number of FFN subblocks per interaction block.
+    n_focus
+        Number of parallel focus streams. The per-stream channel width is
+        ``focus_dim = channels // n_focus``. Must divide ``channels`` exactly.
     focus_compete
         If True, enable cross-focus softmax competition inside SO(2) convolution.
         Competition logits are built from l=0 scalar channels before SO(2) mixing
@@ -184,6 +185,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         scaled by ``edge_env``.
         When enabled, the per-focus stream width
         ``focus_dim = channels // n_focus`` must be divisible by ``n_atten_head``.
+    ffn_neurons
+        Hidden sizes for the equivariant FFN in each block and the final scalar output FFN.
+    ffn_blocks
+        Number of FFN subblocks per interaction block.
     sandwich_norm
         Pre/post-norm switches for [SO(2), FFN] residual branches in order:
         [so2_pre, so2_post, ffn_pre, ffn_post], shared across all blocks.
@@ -239,43 +244,50 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
     def __init__(
         self,
-        rcut: float,
-        sel: list[int] | int,
         ntypes: int,
-        lmax: int = 2,
-        n_blocks: int = 2,
-        l_schedule: list[int] | None = None,
-        mmax: int | None = 2,
-        m_schedule: list[int] | None = None,
+        sel: list[int] | int,
+        rcut: float,
+        env_exp: list[int] | None = None,
         channels: int = 64,
-        n_focus: int = 1,
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
         use_env_seed: bool = True,
+        lmax: int = 2,
+        l_schedule: list[int] | None = None,
+        mmax: int | None = None,
+        m_schedule: list[int] | None = None,
+        n_blocks: int = 2,
         so2_norm: bool = False,
-        so2_layers: int = 3,
+        so2_layers: int = 4,
+        n_focus: int = 1,
+        focus_compete: bool = True,
+        n_atten_head: int = 0,
         ffn_neurons: int = 96,
         ffn_blocks: int = 1,
-        focus_compete: bool = False,
-        n_atten_head: int = 0,
         sandwich_norm: list[bool] | None = None,
+        mlp_bias: bool = True,
+        layer_scale: bool = False,
         activation_function: str = "silu",
         glu_activation: bool = True,
-        precision: str = "float32",
-        mlp_bias: bool = False,
-        layer_scale: bool = False,
         use_amp: bool = True,
         exclude_types: list[tuple[int, int]] | None = None,
+        precision: str = "float32",
         eps: float = 1e-7,
         trainable: bool = True,
         seed: int | list[int] | None = None,
         type_map: list[str] | None = None,
         **kwargs: Any,
     ) -> None:
-        del kwargs
         super().__init__()
 
         self.rcut = float(rcut)
+        if env_exp is None:
+            env_exp = [7, 5]
+        if len(env_exp) != 2:
+            raise ValueError(
+                "`env_exp` must be a list of two integers: [rbf_env_exp, edge_env_exp]"
+            )
+        self.env_exp = [int(x) for x in env_exp]
         self.eps = float(eps)
 
         if isinstance(sel, int):
@@ -440,7 +452,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             self.rcut,
             self.n_radial,
             dtype=self.compute_dtype,  # force fp32+
-            exponent=7,
+            exponent=self.env_exp[0],
         )
 
         # === Shared radial embedding: RBF -> per-l radial features ===
@@ -458,7 +470,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         )
 
         # === C^2 cutoff envelope for edge weight ===
-        self.c2_envelope = C2CutoffEnvelope(rcut=self.rcut, exponent=5)
+        self.c2_envelope = C2CutoffEnvelope(rcut=self.rcut, exponent=self.env_exp[1])
 
         wigner_lmax = self.l_schedule[0]
         # force fp32+
@@ -468,7 +480,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             dtype=self.compute_dtype,
         )
 
-        if self.l_schedule[0] > 0:
+        self.use_gie = self.l_schedule[0] > 0
+        if self.use_gie:
             self.gie = GeometricInitialEmbedding(
                 lmax=self.l_schedule[0],
                 channels=self.channels,
@@ -651,7 +664,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 6. Env FiLM conditioning (optional, fp32+) ===
         with nvtx_range("env_film"):
-            if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
+            if self.use_env_seed and edge_cache.src.numel() > 0:
                 atype_flat = atype_loc.reshape(-1)  # (N,)
                 film = self.env_seed_embedding(
                     edge_cache=edge_cache,
@@ -681,7 +694,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 8. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
-            if self.gie is not None and radial_feat is not None:
+            if self.use_gie and radial_feat is not None:
                 # GIE only needs l>=1, slice radial_feat[:, 1:, :]
                 x = x + self.gie(
                     n_nodes=n_nodes,
@@ -823,7 +836,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 5. Env FiLM conditioning (optional, fp32+) ===
         with nvtx_range("env_film"):
-            if self.env_seed_embedding is not None and edge_cache.src.numel() > 0:
+            if self.use_env_seed and edge_cache.src.numel() > 0:
                 atype_flat = atype_loc.reshape(-1)  # (N,)
                 film = self.env_seed_embedding(
                     edge_cache=edge_cache,
@@ -853,7 +866,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
 
         # === Step 7. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
-            if self.gie is not None and radial_feat is not None:
+            if self.use_gie and radial_feat is not None:
                 x = x + self.gie(
                     n_nodes=n_nodes,
                     edge_cache=edge_cache,
@@ -1530,9 +1543,10 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
             "type": "SeZM",
             "@version": 1,
             "config": {
-                "rcut": self.rcut,
-                "sel": self.sel,
                 "ntypes": self.ntypes,
+                "sel": self.sel,
+                "rcut": self.rcut,
+                "env_exp": self.env_exp,
                 "type_map": self.type_map,
                 "lmax": self.lmax,
                 "n_blocks": self.n_blocks,

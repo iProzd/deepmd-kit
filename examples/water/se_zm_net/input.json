@@ -9,9 +9,11 @@
       "type": "SeZM",
       "sel": 120,
       "rcut": 6.0,
+      "env_exp": [
+        7,
+        5
+      ],
       "channels": 64,
-      "n_focus": 1,
-      "focus_compete": false,
       "n_radial": 10,
       "radial_mlp": [
         64
@@ -22,23 +24,25 @@
         3,
         2
       ],
-      "mmax": 2,
+      "mmax": 1,
       "so2_norm": false,
-      "so2_layers": 3,
+      "so2_layers": 4,
+      "n_focus": 1,
+      "focus_compete": true,
       "n_atten_head": 0,
+      "ffn_neurons": 96,
+      "ffn_blocks": 1,
       "sandwich_norm": [
         true,
         false,
         true,
         false
       ],
-      "ffn_neurons": 96,
-      "ffn_blocks": 1,
-      "mlp_bias": false,
+      "mlp_bias": true,
       "layer_scale": false,
-      "use_amp": true,
       "activation_function": "silu",
       "glu_activation": true,
+      "use_amp": true,
       "precision": "float32",
       "seed": 7,
       "_comment": "that's all"
@@ -61,9 +65,9 @@
   },
   "learning_rate": {
     "type": "exp",
-    "decay_steps": 5000,
     "start_lr": 3e-3,
     "stop_lr": 1e-6,
+    "decay_steps": 5000,
     "_comment": "that's all"
   },
   "loss": {

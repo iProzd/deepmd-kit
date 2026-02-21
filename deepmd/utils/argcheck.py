@@ -347,47 +347,43 @@ def descrpt_se_a_args() -> list[Argument]:
     doc=doc_only_pt_supported + doc_se_zm,
 )
 def descrpt_se_zm_args() -> list[Argument]:
+    # Follows exact order of docstring in se_zm.py DescrptSeZMNet class
     doc_sel = 'The maximum number of neighbors. It can be:\n\n\
     - `int`: the total maximum number of neighbors within `rcut` (all types combined)\n\n\
     - `list[int]`: sel[i] specifies the maximum number of type-i neighbors within `rcut`\n\n\
     - `str`: Can be "auto:factor" or "auto". "factor" is a float number larger than 1. This option will automatically determine the `sel`. In detail it counts the maximal number of neighbors with in the cutoff radius for each type of neighbor, then multiply the maximum by the "factor". Finally the number is wrapped up to 4 divisible. The option "auto" is equivalent to "auto:1.1".'
     doc_rcut = "The cut-off radius."
+    doc_env_exp = (
+        "C^2 cutoff envelope exponents `[rbf_env_exp, edge_env_exp]`. "
+        "`rbf_env_exp` controls radial basis function envelope decay; "
+        "`edge_env_exp` controls message passing edge weight envelope decay. "
+        "Larger values give weaker suppression."
+    )
+    doc_channels = "Total channels per (l,m) coefficient."
+    doc_n_radial = "Number of radial basis functions."
+    doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended."
+    doc_use_env_seed = (
+        "If True, apply environment matrix initial embedding as FiLM conditioning on "
+        "l=0 features using 4D [s, s*r_hat] representation. Internal dimensions are "
+        "derived from channels: embed_dim=min(channels, 128), "
+        "axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1), "
+        "type_dim=clamp(channels//4, 8, 32), "
+        "rbf_out_dim=max(32, embed_dim-2*type_dim), "
+        "hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))."
+    )
     doc_lmax = "Maximum degree, only used when `l_schedule` is None."
-    doc_n_blocks = "Number of blocks (only used when `l_schedule` is None)."
     doc_l_schedule = "Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored."
     doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
     doc_m_schedule = "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored."
-    doc_channels = "Total channels per (l,m) coefficient."
-    doc_n_focus = (
-        "Number of parallel focus streams. Per-stream width is "
-        "`focus_dim = channels // n_focus`; `channels` must be divisible by `n_focus`."
-    )
-    doc_n_radial = "Number of radial basis functions."
-    doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended."
+    doc_n_blocks = "Number of blocks (only used when `l_schedule` is None)."
     doc_so2_norm = (
         "If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. "
         "When False (default), no normalization is applied between layers."
     )
-    doc_mlp_bias = (
-        "Whether to use bias in equivariant layers. When False, removes bias from:\n"
-        "- SO3Linear: l=0 bias\n"
-        "- SO2Linear: l=0 bias\n"
-        "- GatedActivation: gate linear bias\n"
-        "- SeparableRMSNorm: centering bias\n"
-        "- ReducedSeparableRMSNorm: centering bias\n"
-        "- EnvironmentInitialEmbedding MLPs: rbf_proj_layer1/2 and g_layer1/2\n"
-        "Attention projections in SO2Convolution "
-        "(attn_radial_bias_proj, attn_output_gate_proj) are always bias-free."
-    )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
-    doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
-    doc_ffn_blocks = "Number of FFN sublayers per interaction block."
-    doc_layer_scale = (
-        "If True, apply learnable LayerScale (init 1e-3) on residual branches: "
-        "SO(2) branch uses per-focus-channel scales "
-        "(shape `(n_focus, channels//n_focus)`) on each SO(2) mixing layer, "
-        "and FFN branch uses per-channel scales (shape `(channels,)`) on each "
-        "FFN residual branch."
+    doc_n_focus = (
+        "Number of parallel focus streams. Per-stream width is "
+        "`focus_dim = channels // n_focus`; `channels` must be divisible by `n_focus`."
     )
     doc_focus_compete = (
         "If True, enable multi-focus softmax competition inside SO(2) convolution. "
@@ -401,57 +397,58 @@ def descrpt_se_zm_args() -> list[Argument]:
         "with output-side head gate is applied. Competition uses `edge_env**0.5` "
         "while value amplitude uses `edge_env`."
     )
+    doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
+    doc_ffn_blocks = "Number of FFN sublayers per interaction block."
+    doc_sandwich_norm = (
+        "Pre/post-norm switches for residual branches. Use [so2_pre, so2_post, ffn_pre, ffn_post] to "
+        "enable pre-norm before and post-norm after SO(2) and FFN operations."
+    )
+    doc_mlp_bias = (
+        "Whether to use bias in equivariant layers. When False, removes bias from:\n"
+        "- SO3Linear: l=0 bias\n"
+        "- SO2Linear: l=0 bias\n"
+        "- GatedActivation: gate linear bias\n"
+        "- SeparableRMSNorm: centering bias\n"
+        "- ReducedSeparableRMSNorm: centering bias\n"
+        "- EnvironmentInitialEmbedding MLPs: rbf_proj_layer1/2 and g_layer1/2\n"
+        "Attention projections in SO2Convolution "
+        "(attn_radial_bias_proj, attn_output_gate_proj) are always bias-free."
+    )
+    doc_layer_scale = (
+        "If True, apply learnable LayerScale (init 1e-3) on residual branches: "
+        "SO(2) branch uses per-focus-channel scales "
+        "(shape `(n_focus, channels//n_focus)`) on each SO(2) mixing layer, "
+        "and FFN branch uses per-channel scales (shape `(channels,)`) on each "
+        "FFN residual branch."
+    )
+    doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_glu_activation = (
+        "If True, use GLU-style gating in FFN (e.g., silu -> swiglu, gelu -> geglu). "
+        "This can improve model expressiveness with slightly increased parameters."
+    )
     doc_use_amp = (
         "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "
         "This does not provide accelerations under fp32 precision but will decrease "
         "the memory usage, while preserving model accuracy."
     )
-    doc_glu_activation = (
-        "If True, use GLU-style gating in FFN (e.g., silu -> swiglu, gelu -> geglu). "
-        "This can improve model expressiveness with slightly increased parameters."
-    )
-    doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_exclude_types = "The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1."
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
+    doc_eps = "Small epsilon for numerical stability in division and normalization."
     doc_trainable = "If the parameters in the descriptor are trainable."
     doc_seed = "Random seed for parameter initialization."
-    doc_exclude_types = "The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1."
-    doc_eps = "Small epsilon for numerical stability in division and normalization."
-    doc_use_env_seed = (
-        "If True, apply environment matrix initial embedding as FiLM conditioning on "
-        "l=0 features using 4D [s, s*r_hat] representation. Internal dimensions are "
-        "derived from channels: embed_dim=min(channels, 128), "
-        "axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1), "
-        "type_dim=clamp(channels//4, 8, 32), "
-        "rbf_out_dim=max(32, embed_dim-2*type_dim), "
-        "hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))."
-    )
-    doc_sandwich_norm = (
-        "Pre/post-norm switches for residual branches. Use [so2_pre, so2_post, ffn_pre, ffn_post] to "
-        "enable pre-norm before and post-norm after SO(2) and FFN operations."
-    )
-
     return [
         Argument(
             "sel", [int, list[int], str], optional=True, default="auto", doc=doc_sel
         ),
         Argument("rcut", float, optional=True, default=6.0, doc=doc_rcut),
-        Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
-        Argument("n_blocks", int, optional=True, default=2, doc=doc_n_blocks),
         Argument(
-            "l_schedule", list[int], optional=True, default=None, doc=doc_l_schedule
-        ),
-        Argument(
-            "mmax",
-            [int, None],
+            "env_exp",
+            list[int],
             optional=True,
-            default=None,
-            doc=doc_mmax,
-        ),
-        Argument(
-            "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
+            default=[7, 5],
+            doc=doc_env_exp,
         ),
         Argument("channels", int, optional=True, default=64, doc=doc_channels),
-        Argument("n_focus", int, optional=True, default=1, doc=doc_n_focus),
         Argument("n_radial", int, optional=True, default=10, doc=doc_n_radial),
         Argument(
             "radial_mlp",
@@ -467,8 +464,28 @@ def descrpt_se_zm_args() -> list[Argument]:
             default=True,
             doc=doc_only_pt_supported + doc_use_env_seed,
         ),
+        Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
+        Argument(
+            "l_schedule", list[int], optional=True, default=None, doc=doc_l_schedule
+        ),
+        Argument(
+            "mmax",
+            [int, None],
+            optional=True,
+            default=None,
+            doc=doc_mmax,
+        ),
+        Argument(
+            "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
+        ),
+        Argument("n_blocks", int, optional=True, default=2, doc=doc_n_blocks),
         Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
-        Argument("so2_layers", int, optional=True, default=3, doc=doc_so2_layers),
+        Argument("so2_layers", int, optional=True, default=4, doc=doc_so2_layers),
+        Argument("n_focus", int, optional=True, default=1, doc=doc_n_focus),
+        Argument(
+            "focus_compete", bool, optional=True, default=True, doc=doc_focus_compete
+        ),
+        Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
         Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
         Argument(
             "ffn_blocks",
@@ -478,15 +495,25 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_ffn_blocks,
         ),
         Argument(
-            "focus_compete", bool, optional=True, default=False, doc=doc_focus_compete
-        ),
-        Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
-        Argument(
             "sandwich_norm",
             list[bool],
             optional=True,
             default=[True, False, True, False],
             doc=doc_only_pt_supported + doc_sandwich_norm,
+        ),
+        Argument(
+            "mlp_bias",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_only_pt_supported + doc_mlp_bias,
+        ),
+        Argument(
+            "layer_scale",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_layer_scale,
         ),
         Argument(
             "activation_function",
@@ -502,24 +529,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             default=True,
             doc=doc_only_pt_supported + doc_glu_activation,
         ),
-        Argument("precision", str, optional=True, default="float32", doc=doc_precision),
-        Argument(
-            "mlp_bias",
-            bool,
-            optional=True,
-            default=False,
-            doc=doc_only_pt_supported + doc_mlp_bias,
-        ),
-        Argument(
-            "layer_scale",
-            bool,
-            optional=True,
-            default=False,
-            doc=doc_only_pt_supported + doc_layer_scale,
-        ),
         Argument("use_amp", bool, optional=True, default=True, doc=doc_use_amp),
-        Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
-        Argument("seed", [int, None], optional=True, doc=doc_seed),
         Argument(
             "exclude_types",
             list[list[int]],
@@ -527,6 +537,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             default=[],
             doc=doc_exclude_types,
         ),
+        Argument("precision", str, optional=True, default="float32", doc=doc_precision),
         Argument(
             "eps",
             float,
@@ -534,6 +545,8 @@ def descrpt_se_zm_args() -> list[Argument]:
             default=1e-7,
             doc=doc_only_pt_supported + doc_eps,
         ),
+        Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
+        Argument("seed", [int, None], optional=True, doc=doc_seed),
     ]
 
 

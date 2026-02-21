@@ -112,6 +112,7 @@ class FocusLinear(nn.Module):
         self.n_focus = int(n_focus)
         self.dtype = dtype
         self.device = env.DEVICE
+        self.use_bias = bool(bias)
         self.weight = nn.Parameter(
             torch.empty(
                 self.in_channels,
@@ -126,7 +127,7 @@ class FocusLinear(nn.Module):
         else:
             bound = 1.0 / math.sqrt(self.in_channels)
             nn.init.uniform_(self.weight, -bound, bound, generator=gen)
-        if bias:
+        if self.use_bias:
             self.bias: nn.Parameter | None = nn.Parameter(
                 torch.zeros(
                     self.n_focus * self.out_channels,
@@ -153,7 +154,7 @@ class FocusLinear(nn.Module):
         """
         weight = self.weight.view(self.in_channels, self.n_focus, self.out_channels)
         out = torch.einsum("bfi,ifo->bfo", x, weight)
-        if self.bias is not None:
+        if self.use_bias:
             bias = self.bias.view(self.n_focus, self.out_channels)
             out = out + bias.unsqueeze(0)
         return out
@@ -536,7 +537,7 @@ class SeparableRMSNorm(nn.Module):
             1, 1, self.n_focus, -1
         )  # (1, 1, F, C)
         x0 = x0 * scale0
-        if self.bias is not None:
+        if self.centering:
             bias0 = self.bias.reshape(1, 1, self.n_focus, -1)  # (1, 1, F, C)
             x0 = x0 + bias0
 
@@ -729,9 +730,9 @@ class ReducedSeparableRMSNorm(nn.Module):
         x0 = x0 * inv_rms0
 
         if xt.numel() == 0:
-            if self.affine and self.adam_scale is not None:
+            if self.affine:
                 x0.mul_(self.adam_scale[:, 0, :].reshape(1, self.n_focus, 1, -1))
-                if self.centering and self.bias0 is not None:
+                if self.centering:
                     x0 += self.bias0.reshape(1, self.n_focus, 1, -1)
             return x0.to(dtype=in_dtype)
 
@@ -741,7 +742,7 @@ class ReducedSeparableRMSNorm(nn.Module):
         inv_rmst = torch.rsqrt(mean_var + self.eps).unsqueeze(-1).unsqueeze(-1)
         xt = xt * inv_rmst
 
-        if self.affine and self.adam_scale is not None:
+        if self.affine:
             w = torch.index_select(  # (D_m_trunc, C)
                 self.adam_scale, dim=1, index=self.degree_index_m
             )
@@ -751,7 +752,7 @@ class ReducedSeparableRMSNorm(nn.Module):
             )  # (1, F, D_m_trunc-1, C)
             x0.mul_(w0)
             xt.mul_(wt)
-            if self.centering and self.bias0 is not None:
+            if self.centering:
                 bias0 = self.bias0.reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
                 x0 += bias0
 
@@ -1063,7 +1064,7 @@ class SO3Linear(nn.Module):
         out = torch.einsum("ndfi,difo->ndfo", x, weight_expanded)
 
         # === Step 3. Add l=0 bias ===
-        if self.bias is not None:
+        if self.mlp_bias:
             bias = self.bias.view(self.n_focus, self.out_channels)
             out[:, 0, :, :] = out[:, 0, :, :] + bias.unsqueeze(0)
 
@@ -1437,7 +1438,7 @@ class SO2Linear(nn.Module):
         )
 
         # === Step 4. Bias on l=0 scalar index ===
-        if self.bias0 is not None:
+        if self.mlp_bias:
             bias0 = self.bias0.view(self.n_focus, self.out_channels)
             out[:, :, 0, :] = out[:, :, 0, :] + bias0.unsqueeze(0)
         return out
@@ -1559,9 +1560,9 @@ class SO2Convolution(nn.Module):
         mmax: int | None = None,
         channels: int,
         n_focus: int = 1,
-        focus_compete: bool = False,
+        focus_compete: bool = True,
         so2_norm: bool = False,
-        so2_layers: int = 1,
+        so2_layers: int = 4,
         layer_scale: bool = False,
         n_atten_head: int = 0,
         mlp_bias: bool = True,
@@ -1778,7 +1779,8 @@ class SO2Convolution(nn.Module):
 
         # === Step 7.5. Optional cross-focus competition ===
         self.focus_compete_norm: ScalarRMSNorm | None = None
-        self.focus_compete_proj: FocusLinear | None = None
+        self.adamw_focus_compete_w: nn.Parameter | None = None
+        self.focus_compete_bias: nn.Parameter | None = None
         if self.focus_compete and self.n_focus > 1:
             self.focus_compete_norm = ScalarRMSNorm(
                 channels=self.focus_dim,
@@ -1787,16 +1789,30 @@ class SO2Convolution(nn.Module):
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
-            self.focus_compete_proj = FocusLinear(
-                in_channels=self.focus_dim,
-                out_channels=1,
-                n_focus=self.n_focus,
-                dtype=self.compute_dtype,
-                bias=self.mlp_bias,
-                seed=child_seed(seed_gate, 4),
-                trainable=trainable,
-                init_std=0.01,
+            self.adamw_focus_compete_w = nn.Parameter(
+                torch.empty(
+                    self.focus_dim,
+                    self.n_focus,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                ),
+                requires_grad=trainable,
             )
+            nn.init.normal_(
+                self.adamw_focus_compete_w,
+                mean=0.0,
+                std=0.01,
+                generator=get_generator(child_seed(seed_gate, 4)),
+            )
+            if self.mlp_bias:
+                self.focus_compete_bias = nn.Parameter(
+                    torch.zeros(
+                        self.n_focus,
+                        dtype=self.compute_dtype,
+                        device=self.device,
+                    ),
+                    requires_grad=trainable,
+                )
 
         # === Step 8. Pre-focus channel mixing ===
         # This mixes the full channel width before focus slicing.
@@ -1906,7 +1922,7 @@ class SO2Convolution(nn.Module):
 
                 x_local = non_linear(x_local)
 
-                if self.adam_so2_layer_scales is not None:
+                if self.layer_scale:
                     scale = self.adam_so2_layer_scales[layer_idx].reshape(
                         1, self.n_focus, 1, self.focus_dim
                     )
@@ -1917,9 +1933,13 @@ class SO2Convolution(nn.Module):
         # === Step 5.5. Cross-focus softmax competition ===
         if self.focus_compete and self.n_focus > 1:
             focus_gate_src = focus_gate_src.to(dtype=self.compute_dtype)
-            focus_logits = self.focus_compete_proj(
-                self.focus_compete_norm(focus_gate_src)
-            ).squeeze(-1)
+            focus_logits = torch.einsum(
+                "efi,if->ef",
+                self.focus_compete_norm(focus_gate_src),
+                self.adamw_focus_compete_w,
+            )
+            if self.mlp_bias:
+                focus_logits = focus_logits + self.focus_compete_bias.unsqueeze(0)
             alpha = torch.softmax(focus_logits / self.focus_softmax_tau, dim=1).to(
                 dtype=x_local.dtype
             )
@@ -2362,9 +2382,9 @@ class SeZMInteractionBlock(nn.Module):
         mmax: int | None = None,
         channels: int,
         n_focus: int = 1,
-        focus_compete: bool = False,
+        focus_compete: bool = True,
         so2_norm: bool = False,
-        so2_layers: int = 2,
+        so2_layers: int = 4,
         n_atten_head: int = 0,
         so2_pre_norm: bool = True,
         so2_post_norm: bool = False,
@@ -2582,7 +2602,7 @@ class SeZMInteractionBlock(nn.Module):
             with nvtx_range(f"ffn_{i}/post_norm"):
                 y = self.post_ffn_norms[i](y)
 
-            if self.adam_ffn_layer_scales is not None:
+            if self.layer_scale:
                 y = y * self.adam_ffn_layer_scales[i]
 
             x_ffn = x_ffn + y

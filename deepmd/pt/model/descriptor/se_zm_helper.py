@@ -1026,7 +1026,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         axis_dim: int = 8,
         type_dim: int = 16,
         hidden_dim: int = 64,
-        mlp_bias: bool = False,
+        mlp_bias: bool = True,
         activation_function: str = "silu",
         eps: float = 1e-7,
         dtype: torch.dtype,
