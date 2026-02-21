@@ -29,6 +29,9 @@ from deepmd.pt.model.descriptor.base_descriptor import (
 from deepmd.pt.model.task import (
     BaseFitting,
 )
+from deepmd.pt.model.task.sezm_ener import (
+    SeZMNetEnergyFittingNet,
+)
 from deepmd.utils.spin import (
     Spin,
 )
@@ -296,9 +299,19 @@ def get_sezm_net_model(model_params: dict) -> BaseModel:
     model_params = copy.deepcopy(model_params)
     model_params.setdefault("descriptor", {})
     model_params.setdefault("fitting_net", {})
-    model_params["fitting_net"]["type"] = "ener"
+
     ntypes = len(model_params["type_map"])
-    descriptor, fitting, _ = _get_standard_model_components(model_params, ntypes)
+    model_params["descriptor"]["ntypes"] = ntypes
+    model_params["descriptor"]["type_map"] = copy.deepcopy(model_params["type_map"])
+    descriptor = BaseDescriptor(**model_params["descriptor"])
+
+    fitting_net = copy.deepcopy(model_params["fitting_net"])
+    fitting_net.pop("type", None)
+    fitting_net["ntypes"] = descriptor.get_ntypes()
+    fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
+    fitting_net["mixed_types"] = descriptor.mixed_types()
+    fitting_net["dim_descrpt"] = descriptor.get_dim_out()
+    fitting = SeZMNetEnergyFittingNet(**fitting_net)
     atom_exclude_types = model_params.get("atom_exclude_types", [])
     pair_exclude_types = model_params.get("pair_exclude_types", [])
     preset_out_bias = model_params.get("preset_out_bias")

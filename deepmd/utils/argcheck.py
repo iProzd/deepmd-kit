@@ -354,44 +354,66 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_rcut = "The cut-off radius."
     doc_lmax = "Maximum degree, only used when `l_schedule` is None."
     doc_n_blocks = "Number of blocks (only used when `l_schedule` is None)."
-    doc_l_schedule = (
-        "Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. "
-        "If set, lmax and n_blocks will be ignored."
-    )
+    doc_l_schedule = "Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored."
     doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
-    doc_m_schedule = (
-        "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. "
-        "If set, `mmax` will be ignored."
-    )
+    doc_m_schedule = "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored."
     doc_channels = "Channels per (l,m) coefficient, i.e. feature dimension per degree."
     doc_n_radial = "Number of radial basis functions."
-    doc_radial_mlp = (
-        "Hidden layer sizes for radial networks. An output layer of size "
-        "(l_schedule[0]+1)*channels will be automatically appended."
-    )
+    doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended."
     doc_so2_norm = (
         "If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. "
         "When False (default), no normalization is applied between layers."
     )
+    doc_mlp_bias = (
+        "Whether to use bias in equivariant layers. When False, removes bias from:\n"
+        "- SO3Linear: l=0 bias\n"
+        "- SO2Linear: l=0 bias\n"
+        "- GatedActivation: gate linear bias\n"
+        "- SO2Convolution: attention projections (proj_dst, proj_rad, proj_msg)\n"
+        "- SeparableRMSNorm: centering bias\n"
+        "- ReducedSeparableRMSNorm: centering bias"
+    )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
-    doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block."
+    doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
     doc_n_atten_head = (
         "Number of gated attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
-        "channels must be divisible by `n_atten_head` and head-wise gating "
-        "(2*sigmoid on edges, sigmoid on post head gate, no softmax) is applied."
+        "channels must be divisible by `n_atten_head` and per-head edge gating "
+        "with sample-RMS normalized logits and learnable temperature is applied."
     )
     doc_use_amp = (
         "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "
         "This does not provide accelerations under fp32 precision but will decrease "
         "the memory usage, while preserving model accuracy."
     )
+    doc_glu_activation = (
+        "If True, use GLU-style gating in FFN (e.g., silu -> swiglu, gelu -> geglu). "
+        "This can improve model expressiveness with slightly increased parameters."
+    )
+    doc_use_triton = (
+        "If True and Triton is available, use fused Triton kernels for performance-"
+        "critical operations. Only effective on CUDA devices. "
+        "Falls back to PyTorch if Triton is unavailable."
+    )
     doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
     doc_trainable = "If the parameters in the descriptor are trainable."
     doc_seed = "Random seed for parameter initialization."
     doc_exclude_types = "The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1."
-    doc_env_protection = "Protection parameter to prevent division by zero errors during environment matrix calculations."
+    doc_eps = "Small epsilon for numerical stability in division and normalization."
+    doc_use_env_seed = (
+        "If True, apply environment matrix initial embedding as FiLM conditioning on "
+        "l=0 features using 4D [s, s*r_hat] representation. Internal dimensions are "
+        "derived from channels: embed_dim=min(channels, 128), "
+        "axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1), "
+        "type_dim=clamp(channels//4, 8, 32), "
+        "rbf_out_dim=max(32, embed_dim-2*type_dim), "
+        "hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))."
+    )
+    doc_sandwich_norm = (
+        "Pre/post-norm switches for residual branches. Use [so2_pre, so2_post, ffn_pre, ffn_post] to "
+        "enable pre-norm before and post-norm after SO(2) and FFN operations."
+    )
 
     return [
         Argument(
@@ -426,42 +448,20 @@ def descrpt_se_zm_args() -> list[Argument]:
             "use_env_seed",
             bool,
             optional=True,
-            default=False,
-            doc=doc_only_pt_supported
-            + "If True, apply environment matrix initial embedding as FiLM conditioning on l=0 features using 4D [s, s*r_hat] representation.",
-        ),
-        Argument(
-            "env_seed_embed_dim",
-            int,
-            optional=True,
-            default=64,
-            doc=doc_only_pt_supported
-            + "Output dimension of the G network in environment initial embedding. "
-            + "Other dimensions are derived: axis_dim=min(8, max(4, env_seed_embed_dim//2)), "
-            + "type_dim=min(16, max(8, env_seed_embed_dim//2)), hidden_dim=min(64, max(32, 2*env_seed_embed_dim)).",
-        ),
-        Argument(
-            "env_seed_scale_delta",
-            float,
-            optional=True,
-            default=0.5,
-            doc=doc_only_pt_supported
-            + "Symmetric FiLM scale delta around 1 for env_seed. The scale is "
-            + "`1 + env_seed_scale_delta * (2*sigmoid(scale_logits) - 1)` with "
-            + "logits zero-initialized (identity at init).",
-        ),
-        Argument(
-            "env_seed_norm",
-            str,
-            optional=True,
-            default="sqrt_deg",
-            doc=doc_only_pt_supported
-            + "Normalization mode for env_agg aggregation: 'deg' (1/degree) or 'sqrt_deg' (1/sqrt(degree)).",
+            default=True,
+            doc=doc_only_pt_supported + doc_use_env_seed,
         ),
         Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
-        Argument("so2_layers", int, optional=True, default=2, doc=doc_so2_layers),
-        Argument("ffn_neurons", int, optional=True, default=128, doc=doc_ffn_neurons),
+        Argument("so2_layers", int, optional=True, default=3, doc=doc_so2_layers),
+        Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
+        Argument(
+            "sandwich_norm",
+            list[bool],
+            optional=True,
+            default=[True, False, True, False],
+            doc=doc_only_pt_supported + doc_sandwich_norm,
+        ),
         Argument(
             "activation_function",
             str,
@@ -469,17 +469,28 @@ def descrpt_se_zm_args() -> list[Argument]:
             default="silu",
             doc=doc_activation_function,
         ),
+        Argument(
+            "glu_activation",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_only_pt_supported + doc_glu_activation,
+        ),
         Argument("precision", str, optional=True, default="float32", doc=doc_precision),
-        Argument("use_amp", bool, optional=True, default=False, doc=doc_use_amp),
+        Argument(
+            "mlp_bias",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_only_pt_supported + doc_mlp_bias,
+        ),
+        Argument("use_amp", bool, optional=True, default=True, doc=doc_use_amp),
         Argument(
             "use_triton",
             bool,
             optional=True,
             default=False,
-            doc=doc_only_pt_supported
-            + "If True and Triton is available, use fused Triton kernels for performance-"
-            + "critical operations. Only effective on "
-            + "CUDA devices. Falls back to PyTorch if Triton is unavailable.",
+            doc=doc_only_pt_supported + doc_use_triton,
         ),
         Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
         Argument("seed", [int, None], optional=True, doc=doc_seed),
@@ -491,11 +502,11 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_exclude_types,
         ),
         Argument(
-            "env_protection",
+            "eps",
             float,
             optional=True,
             default=1e-7,
-            doc=doc_only_pt_supported + doc_env_protection,
+            doc=doc_only_pt_supported + doc_eps,
         ),
     ]
 
@@ -1147,10 +1158,7 @@ def dpa2_repinit_args() -> list[Argument]:
         f"When `type_one_side` is False, the input is `input_t = concat([tebd_j, tebd_i])`. {doc_only_pt_supported} When `type_one_side` is True, the input is `input_t = tebd_j`. "
         "The output is `out_ij = embedding_t(input_t) * embedding_s(r_ij) + embedding_s(r_ij)` for the pair-wise representation of atom i with neighbor j."
     )
-    doc_set_davg_zero = (
-        "Set the normalization average to zero. "
-        "This option should be set when `atom_ener` in the energy fitting is used."
-    )
+    doc_set_davg_zero = "Set the normalization average to zero. This option should be set when `atom_ener` in the energy fitting is used."
     doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
     doc_type_one_side = r"If true, the embedding network parameters vary by types of neighbor atoms only, so there will be $N_\text{types}$ sets of embedding network parameters. Otherwise, the embedding network parameters vary by types of centric atoms and types of neighbor atoms, so there will be $N_\text{types}^2$ sets of embedding network parameters."
     doc_resnet_dt = 'Whether to use a "Timestep" in the skip connection.'
@@ -1320,15 +1328,8 @@ def dpa2_repformer_args() -> list[Argument]:
     doc_update_residual = (
         "When update using residual mode, the initial std of residual vector weights."
     )
-    doc_update_residual_init = (
-        "When update using residual mode, "
-        "the initialization mode of residual vector weights."
-        "Supported modes are: ['norm', 'const']."
-    )
-    doc_set_davg_zero = (
-        "Set the normalization average to zero. "
-        "This option should be set when `atom_ener` in the energy fitting is used."
-    )
+    doc_update_residual_init = "When update using residual mode, the initialization mode of residual vector weights.Supported modes are: ['norm', 'const']."
+    doc_set_davg_zero = "Set the normalization average to zero. This option should be set when `atom_ener` in the energy fitting is used."
     doc_trainable_ln = (
         "Whether to use trainable shift and scale weights in layer normalization."
     )
@@ -2015,6 +2016,11 @@ def fitting_ener() -> list[Argument]:
     ]
 
 
+@fitting_args_plugin.register("sezm_ener", doc=doc_ener)
+def fitting_sezm_ener() -> list[Argument]:
+    return fitting_ener()
+
+
 @fitting_args_plugin.register("dos", doc=doc_dos)
 def fitting_dos() -> list[Argument]:
     doc_numb_fparam = "The dimension of the frame parameter. If set to >0, file `fparam.npy` should be included to provided the input fparams."
@@ -2589,7 +2595,10 @@ def sezm_net_model_args() -> Argument:
     doc_descrpt = (
         "The descriptor of atomic environment. User-provided (SeZM is recommended)."
     )
-    doc_fitting = "The fitting of physical properties. Forced to ener."
+    doc_fitting = (
+        "The fitting of physical properties. The `type` field is ignored; "
+        "SeZM-Net always uses sezm_ener (GLU fitting)."
+    )
     doc_model_branch_alias = (
         "List of aliases for this model branch. "
         "Multiple aliases can be defined, and any alias can reference this branch throughout the model usage. "
@@ -3940,11 +3949,7 @@ If MPI is used, the value should be considered as the batch size per task.'
 - "prob_uniform"  : the probability all the systems are equal, namely 1.0/self.get_nsystems()\n\n\
 - "prob_sys_size" : the probability of a system is proportional to the number of batches in the system\n\n\
 - "prob_sys_size;stt_idx:end_idx:weight;stt_idx:end_idx:weight;..." : the list of systems is divided into blocks. A block is specified by `stt_idx:end_idx:weight`, where `stt_idx` is the starting index of the system, `end_idx` is then ending (not including) index of the system, the probabilities of the systems in this block sums up to `weight`, and the relatively probabilities within this block is proportional to the number of batches in the system.'
-    doc_sys_probs = (
-        "A list of float if specified. "
-        "Should be of the same length as `systems`, "
-        "specifying the probability of each system."
-    )
+    doc_sys_probs = "A list of float if specified. Should be of the same length as `systems`, specifying the probability of each system."
 
     args = [
         Argument(
@@ -4020,11 +4025,7 @@ def validation_data_args() -> list[
 - "prob_uniform"  : the probability all the systems are equal, namely 1.0/self.get_nsystems()\n\n\
 - "prob_sys_size" : the probability of a system is proportional to the number of batches in the system\n\n\
 - "prob_sys_size;stt_idx:end_idx:weight;stt_idx:end_idx:weight;..." : the list of systems is divided into blocks. A block is specified by `stt_idx:end_idx:weight`, where `stt_idx` is the starting index of the system, `end_idx` is then ending (not including) index of the system, the probabilities of the systems in this block sums up to `weight`, and the relatively probabilities within this block is proportional to the number of batches in the system.'
-    doc_sys_probs = (
-        "A list of float if specified. "
-        "Should be of the same length as `systems`, "
-        "specifying the probability of each system."
-    )
+    doc_sys_probs = "A list of float if specified. Should be of the same length as `systems`, specifying the probability of each system."
     doc_numb_btch = "An integer that specifies the number of batches to be sampled for each validation period."
 
     args = [
@@ -4075,10 +4076,7 @@ def validation_data_args() -> list[
         ),
     ]
 
-    doc_validation_data = (
-        "Configurations of validation data. Similar to that of training data, "
-        "except that a `numb_btch` argument may be configured"
-    )
+    doc_validation_data = "Configurations of validation data. Similar to that of training data, except that a `numb_btch` argument may be configured"
     return Argument(
         "validation_data",
         dict,

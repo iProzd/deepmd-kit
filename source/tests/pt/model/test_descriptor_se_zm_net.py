@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import itertools
+import math
 import unittest
 
 # NOTE: avoid torch thread reconfiguration errors during import.
@@ -23,6 +24,7 @@ from deepmd.pt.model.descriptor.se_zm_block import (
 from deepmd.pt.model.descriptor.se_zm_helper import (
     EdgeFeatureCache,
     WignerDCalculator,
+    build_edge_type_feat,
     build_m_major_index,
     edge_cache_to_dtype,
     so3_packed_index,
@@ -80,6 +82,20 @@ class TestDescrptSeZMNet(unittest.TestCase):
             [[[1, -1], [0, -1]]], dtype=torch.int64, device=self.device
         )
         return coord, atype, nlist
+
+    def test_build_edge_type_feat_matches_sum(self) -> None:
+        """Test that embedding_bag matches explicit src+dst sum."""
+        dtype = torch.float32
+        type_ebed = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+            dtype=dtype,
+            device=self.device,
+        )
+        src = torch.tensor([0, 1, 2], dtype=torch.long, device=self.device)
+        dst = torch.tensor([1, 2, 0], dtype=torch.long, device=self.device)
+        expected = type_ebed.index_select(0, src) + type_ebed.index_select(0, dst)
+        actual = build_edge_type_feat(type_ebed, src, dst)
+        torch.testing.assert_close(actual, expected)
 
     def test_forward_shape_and_dtype(self) -> None:
         """Test that forward produces correct shape and dtype."""
@@ -209,7 +225,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 ffn_neurons=8,
                 precision=prec,
                 use_env_seed=True,
-                env_seed_embed_dim=8,
                 trainable=False,
             )
             data = model.serialize()
@@ -311,11 +326,9 @@ class TestDescrptSeZMNet(unittest.TestCase):
             )
 
     def _set_identity_so2(self, conv: SO2Convolution) -> None:
-        linear_m0 = conv.so2_linears[0].linear_m0
+        weight_m0 = conv.so2_linears[0].weight_m0
         eye = torch.eye(conv.channels, device=self.device, dtype=conv.dtype)
-        linear_m0.matrix.data.copy_(eye)
-        if linear_m0.bias is not None:
-            linear_m0.bias.data.zero_()
+        weight_m0.data.copy_(eye)
         conv.so2_linears[0].bias0.data.zero_()
         weight = conv.so3_linear.weight
         weight.data.zero_()
@@ -387,24 +400,22 @@ class TestDescrptSeZMNet(unittest.TestCase):
         self._set_identity_so2(conv)
         assert conv.proj_dst is not None
         assert conv.proj_rad is not None
-        assert conv.proj_head is not None
         assert conv.proj_msg is not None
         assert conv.norm_dst_for_gate is not None
         assert conv.norm_msg_for_gate is not None
+        assert conv.msg_gate_alpha_log is not None
+        assert conv.gate_tau_log is not None
         conv.proj_dst.matrix.data.fill_(1.0)
         conv.proj_rad.matrix.data.fill_(1.0)
-        conv.proj_head.matrix.data.fill_(1.0)
         conv.proj_msg.matrix.data.fill_(1.0)
         if conv.proj_dst.bias is not None:
             conv.proj_dst.bias.data.zero_()
         if conv.proj_rad.bias is not None:
             conv.proj_rad.bias.data.zero_()
-        if conv.proj_head.bias is not None:
-            conv.proj_head.bias.data.zero_()
         if conv.proj_msg.bias is not None:
             conv.proj_msg.bias.data.zero_()
-        if conv.msg_gate_scale_raw is not None:
-            conv.msg_gate_scale_raw.data.fill_(0.0)
+        conv.msg_gate_alpha_log.data.fill_(0.0)
+        conv.gate_tau_log.data.fill_(0.0)
 
         x = torch.tensor(
             [[[1.0, 2.0, 3.0, 4.0]], [[5.0, 6.0, 7.0, 8.0]]],
@@ -438,17 +449,17 @@ class TestDescrptSeZMNet(unittest.TestCase):
         x_l0 = x[:, 0, :].contiguous()  # (N, C) in self.dtype
         radial_l0 = radial_feat[:, 0, :].contiguous()  # (E, C) in self.dtype
         msg_l0 = x_global[:, 0, :].contiguous()
-        # Edge gate: dst normalized, radial unchanged, msg normalized with bounded feedback
+        # Edge gate: normalized inputs, raw logits with learnable alpha and temperature
         b = conv.proj_dst(conv.norm_dst_for_gate(x_l0))
         s = conv.proj_rad(radial_l0)
         m = conv.proj_msg(conv.norm_msg_for_gate(msg_l0))
-        msg_gate_scale = conv.msg_gate_scale_max * torch.sigmoid(
-            conv.msg_gate_scale_raw
-        )
-        edge_logits = b.index_select(0, dst) + s + msg_gate_scale.to(dtype) * m
-        g = 2.0 * torch.sigmoid(edge_logits.to(torch.float32).clamp(-6.0, 6.0)).to(
-            dtype
-        )
+        b = b.to(torch.float32)
+        s = s.to(torch.float32)
+        m = m.to(torch.float32)
+        alpha = torch.exp(conv.msg_gate_alpha_log).to(torch.float32)
+        tau = torch.exp(conv.gate_tau_log).to(torch.float32)
+        edge_logits = b.index_select(0, dst) + s + alpha.view(1, -1) * m
+        g = torch.sigmoid(edge_logits / tau.view(1, -1)).to(dtype)
         w = edge_env.view(-1, 1) * g
         head_dim = conv.head_dim
         assert head_dim is not None
@@ -459,12 +470,6 @@ class TestDescrptSeZMNet(unittest.TestCase):
             2, 1, conv.n_atten_head, head_dim, device=self.device, dtype=torch.float32
         )
         expected.index_add_(0, dst, msg.to(torch.float32))
-        # Head gate: 2 * sigmoid with normalization, fp32 sigmoid + clamp
-        head_logits = conv.proj_head(conv.norm_dst_for_head(x_l0))
-        alpha = 2.0 * torch.sigmoid(head_logits.to(torch.float32).clamp(-6.0, 6.0))
-        gamma_eff = 2.0 * torch.sigmoid(conv.gamma_head_raw)
-        alpha = alpha * gamma_eff.view(1, -1)
-        expected = expected * alpha.view(-1, 1, conv.n_atten_head, 1)
         # Apply degree normalization (consistent with baseline path)
         expected = expected.view(2, 1, conv.channels) * inv_sqrt_deg.to(torch.float32)
         expected = expected.to(dtype)
@@ -1172,8 +1177,6 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 ffn_neurons=16,
                 precision=prec,
                 use_env_seed=True,
-                env_seed_embed_dim=16,
-                env_seed_scale_delta=0.3,
                 trainable=True,
             )
             self.assertTrue(model.use_env_seed)
@@ -1203,7 +1206,6 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 ffn_neurons=8,
                 precision=prec,
                 use_env_seed=True,
-                env_seed_embed_dim=8,
                 trainable=True,
             )
             desc, *_ = model(extended_coord, atype, nlist, mapping=None, comm_dict=None)
@@ -1230,7 +1232,6 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 ffn_neurons=16,
                 precision=prec,
                 use_env_seed=True,
-                env_seed_embed_dim=16,
                 trainable=True,
             )
 
@@ -1258,7 +1259,7 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
             )
 
     def test_env_seed_identity_at_init(self) -> None:
-        """Test that FiLM starts as identity at initialization."""
+        """Test that FiLM strengths start small at initialization."""
         for prec in ["float64", "float32"]:
             dtype = PRECISION_DICT[prec]
             coord, atype, nlist = self._tiny_system(dtype=dtype)
@@ -1281,8 +1282,20 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
             model_no_env = DescrptSeZMNet(use_env_seed=False, **base_kwargs)
             model_env = DescrptSeZMNet(
                 use_env_seed=True,
-                env_seed_embed_dim=16,
                 **base_kwargs,
+            )
+
+            self.assertIsNone(model_no_env.env_seed_embedding)
+            self.assertIsNotNone(model_env.env_seed_embedding)
+            self.assertIsNotNone(model_env.film_scale_strength_log)
+            self.assertIsNotNone(model_env.film_shift_strength_log)
+            torch.testing.assert_close(
+                model_env.film_scale_strength_log.detach(),
+                torch.full_like(model_env.film_scale_strength_log, math.log(1.0e-2)),
+            )
+            torch.testing.assert_close(
+                model_env.film_shift_strength_log.detach(),
+                torch.full_like(model_env.film_shift_strength_log, math.log(1.0e-2)),
             )
 
             desc_no, *_ = model_no_env(
@@ -1291,15 +1304,8 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
             desc_env, *_ = model_env(
                 extended_coord, atype, nlist, mapping=None, comm_dict=None
             )
-
-            atol, rtol = self._get_tols(dtype)
-            torch.testing.assert_close(
-                desc_no,
-                desc_env,
-                atol=atol,
-                rtol=rtol,
-                msg="FiLM should start as identity",
-            )
+            self.assertTrue(torch.isfinite(desc_no).all().item())
+            self.assertTrue(torch.isfinite(desc_env).all().item())
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA not available")

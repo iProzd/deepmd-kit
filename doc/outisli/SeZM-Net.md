@@ -43,9 +43,8 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
 
 - Set `model.type = "SeZM-Net"` (aliases: `"se_zm_net"`, `"se_zm-net"`, `"sezm-net"`) to select the SeZM-Net model scaffold. Aliases are resolved during configuration validation.
 - `loss.type` still follows the fitting target (e.g., `"ener"`).
-- The current scaffold reuses the standard energy model path and DeePMD-kit neighbor list builder, but isolates the entry point for future replacement.
-- Internally it is built as `make_model(SeZMNetAtomicModel)` and currently mirrors the Energy atomic model behavior.
-- `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is forced to `ener` for this model branch.
+- `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is ignored; SeZM-Net always uses `sezm_ener`.
+- Internally it is built as `make_model(SeZMNetAtomicModel)`.
 
 ---
 
@@ -54,44 +53,59 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
 Text diagram (single forward pass):
 
 ```
-Inputs (extended_coord, extended_atype, nlist, mapping)
-  └─ EdgeFeatureCache (built once)
-       ├─ edges: (src, dst), edge_vec
+Standard DeePMD nlist path:
+  Inputs: extended_coord, extended_atype, nlist, mapping
+    └─ EdgeFeatureCache (built once via build_edge_cache)
+       ├─ edges: (src, dst) global indices, edge_vec
        ├─ edge_type_feat: per-edge type embedding (src+dst)
-       ├─ edge_rbf: Bessel radial basis via sinc × C² envelope (trainable frequencies)
-       ├─ edge_sw: C² cutoff envelope weights in flattened edge layout
+       ├─ edge_rbf: Bessel radial basis via sinc × C² envelope
+       ├─ edge_sw: C² cutoff envelope weights (flattened to valid edges)
        ├─ D_full, Dt_full: block-diagonal Wigner-D matrices
        └─ inv_sqrt_deg: inverse sqrt degree for normalization
 
-Radial embedding (computed once):
-  └─ radial_feat: (E, lmax+1, C) via RadialMLP(edge_rbf)
-     └─ fused once with edge_type_feat after GIE
+  Radial embedding (computed once):
+    └─ radial_feat: (E, lmax+1, C) via RadialMLP(edge_rbf)
+       └─ fused once with edge_type_feat after GIE
 
-Node init:
-  ├─ l=0: Type embedding + (optional) EnvironmentInitialEmbedding
-  └─ l>0: Zonal (m=0) initial embedding via cached Wigner-D + radial_feat[:, 1:, :]
+  Node init:
+    ├─ l=0: Type embedding + (optional) EnvironmentInitialEmbedding
+    └─ l>0: Zonal (m=0) initial embedding via cached Wigner-D + radial_feat[:, 1:, :]
 
-Interaction blocks (pyramid schedule):
-  for block i:
-    ├─ slice x to ebed_dim(l_schedule[i]) (discard higher-l if needed)
-    ├─ SeparableRMSNorm (pre-SO2)
-    ├─ SO(2) Convolution (enabled for ALL lmax, including lmax=0)
-    │  ├─ Multi-layer SO(2) mixing
-    │  └─ Final SO3Linear channel mixing
-    ├─ Residual
-    ├─ SeparableRMSNorm (pre-FFN)
-    └─ Full Equivariant FFN (operates on ALL degrees l=0..lmax)
-       ├─ SO3Linear (in projection)
-       ├─ GatedActivation (per-l independent gates from l=0)
-       └─ SO3Linear (out projection)
-      + Residual
+  Interaction blocks (pyramid schedule):
+    for block i:
+      ├─ slice x to ebed_dim(l_schedule[i]) (discard higher-l if needed)
+      ├─ SeparableRMSNorm (pre-SO2)
+      ├─ SO(2) Convolution (enabled for ALL lmax, including lmax=0)
+      │  ├─ Multi-layer SO(2) mixing
+      │  └─ Final SO3Linear channel mixing
+      ├─ Residual
+      ├─ SeparableRMSNorm (pre-FFN)
+      └─ Full Equivariant FFN (operates on ALL degrees l=0..lmax)
+         ├─ SO3Linear (in projection)
+         ├─ GatedActivation (per-l independent gates from l=0)
+         └─ SO3Linear (out projection)
+        + Residual
 
-Output (forward, promoted dtype):
-  └─ Extract x(l=0) from block output
-  └─ Convert to promoted dtype (float32+)
-  └─ Final SO3Linear (lmax=0) for channel mixing
-     └─ (nf, nloc, channels)
+  Output (forward, promoted dtype):
+    └─ Extract x(l=0) from block output
+    └─ Convert to promoted dtype (float32+)
+    └─ Scalar FFN (lmax=0) for channel mixing
+       └─ Residual: x0 + FFN(x0)
+       └─ (nf, nloc, channels)
 ```
+
+---
+
+## SeZM-Net Fitting (GLU)
+
+- The fitting net uses the same configuration keys as the standard energy fitting
+  (`neuron`, `activation_function`, `precision`, `seed`, ...).
+- `neuron = []` is valid and means a direct linear projection from descriptor
+  dimension to scalar energy.
+- When `neuron` is non-empty, each hidden layer is a GLU block:
+  `Linear(in, 2*hidden) -> split -> value * act(gate)`.
+  This makes the internal hidden width double the user-specified value
+  (e.g., `hidden=256` becomes `512` before split).
 
 ---
 
@@ -126,11 +140,19 @@ Output (forward, promoted dtype):
 - Uses the edge-local m-major reduced layout controlled by `mmax`.
 - Stacks `SO2Linear` with optional `GatedActivation(mmax=...)` for `so2_layers`.
 - Ends with a `SO3LinearV2` channel mixer before aggregation.
+- `SO2Linear` uses a single block-diagonal matmul over all m groups:
+  - m=0 block: unconstrained linear over `(l=0..lmax)` coefficients
+  - |m|>0 blocks: constrained complex coupling `[W_u, -W_v; W_v, W_u]`
+  - This reduces kernel launches while preserving SO(2) equivariance.
+  - Weights are stored as raw parameters (no activation/bias); only the l=0 bias is separate.
 
 ### 6. Deterministic initialization
 
 - All submodules derive seeds via `child_seed(seed, idx)`; repeated structures include loop indices.
 - If `seed=None`, initialization follows the global RNG.
+- SO2Linear weights use truncated normal init with std `1/sqrt(fan_in + fan_out)`, cut at +/-3\*std.
+- For |m|>0 blocks, an extra `1/sqrt(2)` scale is applied to preserve SO(2) coupling energy.
+- SO3Linear weights use truncated normal init with variance `2/fan_in`, cut at +/-3\*std.
 
 ### 7. Gate initialization strategy
 
@@ -139,19 +161,18 @@ All gate projections use a consistent initialization:
 - **Matrix**: `Normal(mean=0, std=0.01)` with reproducible generator
 - **Bias**: zeros
 
-This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5` and `2*sigmoid(0) ≈ 1.0`.
+This ensures gate logits start near 0, making `sigmoid(0) ≈ 0.5`.
 
 **Benefits**:
 
 - Maximum gradient flow: `sigmoid'(0.5) = 0.25` is the maximum derivative value
 - Unbiased feature scaling: the model learns which features to suppress/amplify from the loss signal
-- Near-identity initialization for `2*sigmoid` gates preserves initial magnitude
+- Edge gates start at `~0.5` with small `alpha_msg`, avoiding early saturation
 
 ### 8. Stability defaults
 
 - Residual branches start near-identity: the output projections of both SO(2) convolution and Equivariant FFN are zero-initialized (weights + bias).
-- Attention aggregation runs in promoted dtype (fp32) and clamps logits to `[-6, 6]` before `sigmoid`.
-- Message feedback into edge gates is bounded: `edge_logits = dst + radial + λ * msg` with `λ ∈ (0, λ_max)` and `λ_max = 0.2`.
+- Attention aggregation runs in promoted dtype (fp32) with per-head temperature `tau` and `alpha_msg` for message feedback.
 - Multi-layer SO(2) stacks optionally insert a reduced-layout separable RMSNorm between layers (except the last) when `so2_norm=True`. This keeps truncated m-major activations balanced but is disabled by default.
 
 ### 9. Optional environment matrix initial embedding (EnvironmentInitialEmbedding)
@@ -162,7 +183,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 
 - Uses an **independent** `env_type_embed` (TypeEmbedNet) instead of projecting from the main type embedding
 - This allows `env_seed` to learn type representations independent from the main descriptor backbone
-- RBF projection (`rbf_proj`) aligns G-network input dimension to approximately `channels`
+- RBF projection (`rbf_proj`) aligns G-network input dimension to approximately `embed_dim`
 
 **Computation pipeline**:
 
@@ -172,12 +193,14 @@ An optional module that provides physical inductive bias for l=0 features using 
    - `r_tilde = [s, s * r_hat]` encodes both radial decay and angular information
 
 2. **G network**: Computes per-edge filter features:
-   - RBF projection: Two-layer MLP `rbf_proj_layer1 → rbf_proj_layer2` with dimension `rbf_out_dim = max(32, channels - 2*type_dim)`
-     - First layer: `n_radial → rbf_out_dim` with activation (SiLU)
-     - Second layer: `rbf_out_dim → rbf_out_dim` linear
-   - Type embeddings: `type_src, type_dst = env_type_embed(atype[src]), env_type_embed(atype[dst])`
-   - Input: `concat([rbf_proj, type_src, type_dst])` with dimension `(E, rbf_out_dim + 2*type_dim) ≈ channels`
-   - Two-layer MLP: `hidden_dim` → `embed_dim` with SiLU activation
+   - RBF projection: Two-layer MLP `rbf_proj_layer1 → rbf_proj_layer2` with dimension `rbf_out_dim = max(32, embed_dim - 2*type_dim)`
+
+- RBF/G MLP layers use `TruncatedNormal(mean=0, std=sqrt(2/(fan_in+fan_out)), ±3σ)` for weights; `output_proj` is still zero-initialized for FiLM logits
+  - First layer: `n_radial → rbf_out_dim` with activation (SiLU)
+  - Second layer: `rbf_out_dim → rbf_out_dim` linear
+- Type embeddings: `type_src, type_dst = env_type_embed(atype[src]), env_type_embed(atype[dst])`
+- Input: `concat([rbf_proj, type_src, type_dst])` with dimension `(E, rbf_out_dim + 2*type_dim) ≈ embed_dim`
+- Two-layer MLP: `hidden_dim` → `embed_dim` with SiLU activation
 
 3. **env_agg (environment aggregation)**: Vectorized outer product and scatter:
    - `outer = r_tilde[:, :, None] * g[:, None, :]` produces `(E, 4, embed_dim)`
@@ -189,19 +212,22 @@ An optional module that provides physical inductive bias for l=0 features using 
 4. **D matrix construction**: Captures local geometry via matrix product:
    - `D = env_agg^T @ env_agg[:, :, :axis_dim]` with shape `(N, embed_dim, axis_dim)`
 
-5. **Output projection to FiLM deltas**:
+5. **Output projection to FiLM logits**:
    - Flatten D to `(N, embed_dim * axis_dim)` and project to `(N, 2*channels)`
-   - Split to `(scale_logits, shift)` and apply FiLM on `l=0`:
-     `scale = 1 + env_seed_scale_delta * (2 * sigmoid(scale_logits) - 1)`
-     `x0 = x0 * scale + shift`
-   - Output projection is zero-initialized → `scale_logits=0`, `shift=0` at init
+   - Split to `(scale_logits, shift_logits)` and apply FiLM on `l=0`:
+     - `scale_strength = exp(scale_strength_log)`
+     - `shift_strength = exp(shift_strength_log)`
+     - `scale = 1 + scale_strength * tanh(RMSNorm(scale_logits))`
+     - `shift = shift_strength * tanh(RMSNorm(shift_logits))`
+     - `x0 = x0 * scale + shift`
+   - Output projection is zero-initialized → logits start at 0; strengths initialize to `1e-2` (near-identity, non-dead gradients)
 
 **Key properties**:
 
 - Uses **global frame** direction (not edge-aligned local frame) to preserve angular information
 - Neighbor count normalization uses actual degree, not `inv_sqrt_deg` from edge cache
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
-- **Identity start** is guaranteed for any `env_seed_scale_delta` with zero-initialized logits
+- **Near-identity start** is guaranteed by small strengths with zero-initialized logits
 
 ### 10. Runtime acceleration flags and serialization
 
@@ -269,9 +295,8 @@ Definition:
 
 Implementation detail:
 
-- Extract the m=0 column from `Dt_full[:, s:e, l*(l+1)]`
-
-The global index for m=0 in l-block is `l^2 + l = l*(l+1)`.
+- Vectorized gather: collect all rows with `l>=1` in packed order, and map each row to its `m=0` column using the identity `l^2 + l = l*(l+1)`.
+- Broadcast `radial_feat` to each packed row via its `l-1` mapping, then scatter once into a compact buffer and assign back to `out[:, row_index, :]` to avoid advanced-index writeback.
 
 ### SO(2) Convolution (linearized)
 
@@ -300,12 +325,15 @@ For each edge `(src -> dst)`:
 7. **Aggregate with optional head gates**:
    - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
    - `n_atten_head > 0`:
-     - **Edge gate**: `g = 2 * sigmoid(clamp(dst + radial + λ * msg, [-6, 6]))` where `λ = λ_max * sigmoid(lambda_raw)` with `λ_max = 0.2`.
+     - **Edge gate**:
+       - `dst_logits = proj_dst(RMSNorm(x_l0))`
+       - `radial_logits = proj_rad(radial_l0)` (no normalization on radial path)
+       - `msg_logits = proj_msg(RMSNorm(msg_l0))`
+       - `edge_logits = dst_logits[dst] + radial_logits + alpha_msg * msg_logits`
+       - `g = sigmoid(edge_logits / tau)` with learnable `alpha_msg` (init ~ 1e-3) and `tau` (init 1)
      - Weight: `w = edge_env * g` (all gate math and scatter aggregation in promoted dtype, fp32)
      - Split value into `H = n_atten_head` heads, scale by `w`, `index_add` by `dst`
      - Apply `inv_sqrt_deg`
-     - **Head gate**: `alpha = 2 * sigmoid(clamp(proj_head(RMSNorm(x_l0)), [-6, 6]))` with bounded per-head scale `gamma_head = 2 * sigmoid(gamma_head_raw)` (init ones, bounded in (0,2))
-     - Both gates use `2*sigmoid` (no softmax) and clamp logits before activation
 
 ### Full Equivariant FFN
 
@@ -346,16 +374,28 @@ SeZMInteractionBlock:
   x_res = x
 
   # === Path 1: SO(2) Convolution ===
-  x = pre_so2_norm(x)
+  if so2_pre_norm:
+      x_pre = pre_so2_norm(x)
+  else:
+      x_pre = x
   if edge_cache.src.numel() > 0:
-      x = so2_conv(x, edge_cache)
-  x = x + x_res  # Residual
+      y = so2_conv(x_pre, edge_cache)
+  else:
+      y = x_pre
+  if so2_post_norm:
+      y = post_so2_norm(y)
+  x = x_res + y
   x_res = x
 
   # === Path 2: Equivariant FFN ===
-  x = pre_ffn_norm(x)
-  x = ffn(x)
-  x = x + x_res  # Residual
+  if ffn_pre_norm:
+      x_pre = pre_ffn_norm(x)
+  else:
+      x_pre = x
+  y = ffn(x_pre)
+  if ffn_post_norm:
+      y = post_ffn_norm(y)
+  x = x_res + y
 
   return x
 ```
@@ -428,15 +468,13 @@ Key arguments:
 - `so2_norm: bool` — If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. When False (default), no normalization is applied between layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
-- `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, channels must be divisible by `n_atten_head`. Edge gate uses `2 * sigmoid(proj_b(x_l0)[dst] + proj_s(radial_l0))` without normalization; head gate uses `2 * sigmoid(proj_head(RMSNorm(x_l0)))` with per-head scale `gamma_head` (no softmax).
+- `n_atten_head: int` — Number of gated attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, channels must be divisible by `n_atten_head`, and per-head edge gating is applied with input-side RMSNorm and learnable temperature (radial path stays raw).
+- `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
 - `use_triton: bool` — If True and Triton is available, use fused Triton kernels for outer-product scatter-sum in EnvironmentInitialEmbedding, including custom backward/double-backward. This reduces memory usage by avoiding large intermediate tensors. Only effective on CUDA devices. Falls back to PyTorch if Triton is unavailable (default: False)
-- `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation (default: False)
-- `env_seed_embed_dim: int` — Output dimension of the G network in environment initial embedding. Other dimensions are derived: `axis_dim = min(8, max(4, env_seed_embed_dim//2))`, `type_dim = min(16, max(8, env_seed_embed_dim//2))`, `hidden_dim = min(64, max(32, 2*env_seed_embed_dim))` (default: 64)
-- `env_seed_norm: str` — Normalization mode for env_agg aggregation: "deg" (1/degree) or "sqrt_deg" (1/sqrt(degree)) (default: "sqrt_deg")
-- `env_seed_scale_delta: float` — Symmetric FiLM scale delta around 1 for env_seed. The scale is `1 + env_seed_scale_delta * (2*sigmoid(scale_logits) - 1)` (default: 0.5)
+- `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 
@@ -459,16 +497,18 @@ Output:
 
 - hyperparameters including `l_schedule`, `m_schedule`, `use_env_seed`, and `compute_mode`
 - type embedding parameters
-- **env_seed_embedding** (if `use_env_seed=True`): independent type embedding (`env_type_embed`), two-layer RBF projection (`rbf_proj_layer1`, `rbf_proj_layer2`), G network layers, output projection (2\*C), zero-init for FiLM deltas
-- **radial basis with trainable frequencies**
-- **radial embedding** (RadialMLP: edge_rbf -> (lmax+1)\*C, architecture: Linear → LayerNorm → Activation, first layer bias zero-initialized)
-- geometric initial embedding (GIE, if lmax > 0)
-- block sub-networks:
-  - `EquivariantFFN` (SO3LinearV2 projections + GatedActivation)
-  - `SO2Convolution` (SO2Linear + SO3LinearV2, receives pre-computed radial_feat)
-  - `SeparableRMSNorm` (pre-norms)
-- `so3_linear_output`: final SO3LinearV2 with `lmax=0` for l=0 channel mixing, **uses promoted dtype (float32+) for performance**
+- **env_seed** (if `use_env_seed=True`): packed env-seed payload (embedding + FiLM norms + FiLM strengths), including independent type embedding (`env_type_embed`), two-layer RBF projection (`rbf_proj_layer1`, `rbf_proj_layer2`), G network layers, output projection (2\*C), zero-init for FiLM logits with small strength init
+- **radial basis** and **radial embedding** (store `config` + `@variables` state dict)
+- geometric initial embedding (GIE, store `config` + `@variables` state dict)
+- block sub-networks (each stores `config` + `@variables` state dict):
+  - `EquivariantFFN`
+  - `SO2Convolution`
+  - `SeparableRMSNorm`
+- `so3_linear_output` (store `config` + `@variables` state dict)
 - `davg` / `dstd` statistics buffers
+
+All SeZM modules (descriptor + submodules) use the same layout: `config` for constructor
+arguments and `@variables` for full `state_dict()` payload.
 
 `deserialize()` reconstructs the model and restores all parameters including trainable frequencies.
 
@@ -566,7 +606,8 @@ Why caching matters:
 What is cached / reused:
 
 - All per-edge tensors needed by all blocks (geometry, radial basis, envelope, Wigner-D blocks).
-- `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused (`edge_type_feat = type_ebed[src] + type_ebed[dst]`) and **per-block truncated slices** are prebuilt according to `l_schedule`.
+- `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused via a single `embedding_bag` reduction and **per-block truncated slices** are prebuilt according to `l_schedule`.
+
 - Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `(lmax, mmax)`, shared by all blocks and available in both eager and TorchScript.
 - Dtypes: `compute_dtype = get_promoted_dtype(dtype)` is set once in `__init__` and reused for geometry, radial basis/MLP, Wigner calculators, and the final l=0 mixer; runtime casts happen once on `extended_coord`, `radial_feat`, and the final scalar output.
 
