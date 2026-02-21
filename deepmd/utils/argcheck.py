@@ -375,6 +375,7 @@ def descrpt_se_zm_args() -> list[Argument]:
         "- GatedActivation: gate linear bias\n"
         "- SeparableRMSNorm: centering bias\n"
         "- ReducedSeparableRMSNorm: centering bias\n"
+        "- EnvironmentInitialEmbedding MLPs: rbf_proj_layer1/2 and g_layer1/2\n"
         "Attention projections in SO2Convolution "
         "(attn_radial_bias_proj, attn_output_gate_proj) are always bias-free."
     )
@@ -506,7 +507,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             "mlp_bias",
             bool,
             optional=True,
-            default=True,
+            default=False,
             doc=doc_only_pt_supported + doc_mlp_bias,
         ),
         Argument(

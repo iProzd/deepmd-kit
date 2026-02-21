@@ -241,7 +241,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 
 **Key design: Type embedding decoupling**
 
-- Uses an **independent** `env_type_embed` (TypeEmbedNet) instead of projecting from the main type embedding
+- Uses an **independent** `env_type_embed` (`SeZMTypeEmbedding`) instead of projecting from the main type embedding
 - This allows `env_seed` to learn type representations independent from the main descriptor backbone
 - RBF projection (`rbf_proj`) aligns G-network input dimension to approximately `embed_dim`
 
@@ -408,8 +408,10 @@ For each edge `(src -> dst)`:
 - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
 - `n_atten_head > 0`:
   - **Edge attention logits**:
-    - `q, k` come from normalized node scalar channel `x_l0` and are split by heads
-    - `logits = dot(q_dst, k_src) / sqrt(head_dim) + attn_radial_logit_proj(radial_l0)`
+    - Pre-norm: `qk_input = attn_qk_norm(x_l0_node)` on destination node scalar channel
+    - Independent Q/K projections: `q = attn_q_proj(qk_input)`, `k = attn_k_proj(qk_input)`
+    - Gather per-edge: `q_edge = q[dst]`, `k_edge = k[src]`, reshape to `(E, F, H, Dh)`
+    - `logits = dot(q_edge, k_edge) / sqrt(head_dim) + attn_radial_logit_proj(radial_l0)`
   - **Stable grouped softmax with envelope-weighted competition**:
     - destination-wise max subtraction for numerical stability
     - `unnormalized = exp(logits - grouped_max) * edge_env^p` (default `p=0.5`)
@@ -567,7 +569,7 @@ Key arguments:
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
-- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, SeparableRMSNorm centering bias) (default: True)
+- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, SeparableRMSNorm centering bias) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: False)
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)

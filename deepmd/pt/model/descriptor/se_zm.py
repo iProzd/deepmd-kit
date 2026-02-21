@@ -50,9 +50,6 @@ from deepmd.dpmodel.utils import EnvMat as DPEnvMat
 from deepmd.dpmodel.utils.seed import (
     child_seed,
 )
-from deepmd.pt.model.network.network import (
-    TypeEmbedNet,
-)
 from deepmd.pt.utils import (
     env,
 )
@@ -82,6 +79,7 @@ from .se_zm_helper import (
     GeometricInitialEmbedding,
     RadialBasis,
     RadialMLP,
+    SeZMTypeEmbedding,
     WignerDCalculator,
     build_edge_type_feat,
     edge_cache_to_dtype,
@@ -196,6 +194,8 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         - GatedActivation: gate linear bias
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
+        - EnvironmentInitialEmbedding:
+          rbf_proj_layer1/2 and g_layer1/2
         Attention projections in SO2Convolution
         (attn_radial_logit_proj, attn_output_gate_proj) are always bias-free.
     layer_scale
@@ -262,7 +262,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         activation_function: str = "silu",
         glu_activation: bool = True,
         precision: str = "float32",
-        mlp_bias: bool = True,
+        mlp_bias: bool = False,
         layer_scale: bool = False,
         use_amp: bool = True,
         exclude_types: list[tuple[int, int]] | None = None,
@@ -368,13 +368,11 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         self.reinit_exclude(exclude_types)
 
         # === Step 4. Type embedding ===
-        type_embedding_precision = RESERVED_PRECISION_DICT[self.compute_dtype]
-        self.type_embedding = TypeEmbedNet(
-            type_nums=self.ntypes,
+        self.type_embedding = SeZMTypeEmbedding(
+            ntypes=self.ntypes,
             embed_dim=self.channels,
-            precision=type_embedding_precision,  # force fp32+
+            dtype=self.compute_dtype,  # force fp32+
             seed=seed_type_embedding,
-            type_map=type_map,
             trainable=self.trainable,
         )
 
@@ -389,6 +387,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
                     axis_dim=self.env_seed_axis_dim,
                     type_dim=self.env_seed_type_dim,
                     hidden_dim=self.env_seed_hidden_dim,
+                    mlp_bias=self.mlp_bias,
                     activation_function=self.activation_function,
                     eps=self.eps,
                     dtype=self.compute_dtype,  # force fp32+
@@ -1423,7 +1422,7 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         1. assumes total number of atoms of each atom type aligned across frames;
         2. requires a neighbor list that distinguishes different atomic types.
 
-        SeZM uses TypeEmbedNet for type handling, so it does not require
+        SeZM uses SeZMTypeEmbedding for type handling, so it does not require
         a type-distinguished neighbor list.
         """
         return True

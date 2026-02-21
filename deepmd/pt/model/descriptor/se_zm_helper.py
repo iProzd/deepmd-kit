@@ -44,9 +44,6 @@ from deepmd.dpmodel.utils.seed import (
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
 )
-from deepmd.pt.model.network.network import (
-    TypeEmbedNet,
-)
 from deepmd.pt.utils import (
     env,
 )
@@ -378,6 +375,95 @@ class EdgeFeatureCache(NamedTuple):
         Dt_from_m = Dt_block.index_select(2, coeff_index_m)  # (E, D, D_m_trunc)
         cache_dict[cache_key] = Dt_from_m
         return Dt_from_m
+
+
+class SeZMTypeEmbedding(nn.Module):
+    """
+    Minimal SeZM type embedding with Adam-routed parameter naming.
+
+    Parameters
+    ----------
+    ntypes
+        Number of atom types.
+    embed_dim
+        Embedding dimension.
+    dtype
+        Parameter dtype.
+    seed
+        Random seed for initialization.
+    trainable
+        Whether parameters are trainable.
+    padding
+        Whether to append one all-zero padding row.
+
+    Notes
+    -----
+    The parameter is named with ``adam_`` prefix so HybridMuon routes it to Adam.
+    """
+
+    def __init__(
+        self,
+        *,
+        ntypes: int,
+        embed_dim: int,
+        dtype: torch.dtype,
+        seed: int | list[int] | None = None,
+        trainable: bool,
+        padding: bool = True,
+    ) -> None:
+        super().__init__()
+        self.ntypes = int(ntypes)
+        self.embed_dim = int(embed_dim)
+        self.dtype = dtype
+        self.seed = seed
+        self.device = env.DEVICE
+        self.padding = bool(padding)
+        if self.ntypes <= 0:
+            raise ValueError("`ntypes` must be positive")
+        if self.embed_dim <= 0:
+            raise ValueError("`embed_dim` must be positive")
+
+        # === Step 1. Build embedding table parameter ===
+        n_rows = self.ntypes + int(self.padding)
+        self.adam_type_embedding = nn.Parameter(
+            torch.empty(
+                n_rows,
+                self.embed_dim,
+                device=self.device,
+                dtype=self.dtype,
+            )
+        )
+
+        # === Step 2. Initialize active type rows with default normal scale ===
+        init_std = 1.0 / math.sqrt(float(self.ntypes + self.embed_dim))
+        nn.init.normal_(
+            self.adam_type_embedding[: self.ntypes],
+            mean=0.0,
+            std=init_std,
+            generator=get_generator(child_seed(seed, 0)),
+        )
+        if self.padding:
+            with torch.no_grad():
+                self.adam_type_embedding[self.ntypes].zero_()
+
+        for p in self.parameters():
+            p.requires_grad = trainable
+
+    def forward(self, atype: torch.Tensor) -> torch.Tensor:
+        """
+        Gather type embeddings.
+
+        Parameters
+        ----------
+        atype
+            Atom types with shape (...,). Valid type range is [0, ntypes-1].
+
+        Returns
+        -------
+        torch.Tensor
+            Type embeddings with shape (..., embed_dim).
+        """
+        return torch.embedding(self.adam_type_embedding, atype)
 
 
 class RadialMLP(nn.Module):
@@ -915,6 +1001,9 @@ class EnvironmentInitialEmbedding(nn.Module):
         Dimension for independent type embeddings in env_seed.
     hidden_dim : int
         Hidden layer size for G network.
+    mlp_bias : bool
+        Whether to enable bias terms in env-seed MLP layers
+        (`rbf_proj_layer1/2` and `g_layer1/2`).
     activation_function : str
         Activation function for G network hidden layer.
     eps : float
@@ -937,6 +1026,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         axis_dim: int = 8,
         type_dim: int = 16,
         hidden_dim: int = 64,
+        mlp_bias: bool = False,
         activation_function: str = "silu",
         eps: float = 1e-7,
         dtype: torch.dtype,
@@ -958,6 +1048,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.axis_dim = int(axis_dim)
         self.type_dim = int(type_dim)
         self.hidden_dim = int(hidden_dim)
+        self.mlp_bias = bool(mlp_bias)
         self.activation_function = str(activation_function)
         self.eps = float(eps)
         self.dtype = dtype
@@ -973,7 +1064,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.rbf_proj_layer1 = MLPLayer(
             self.n_radial,
             self.rbf_out_dim,
-            bias=True,
+            bias=self.mlp_bias,
             activation_function=self.activation_function,
             precision=self.precision,
             seed=child_seed(seed_rbf_proj, 0),
@@ -981,7 +1072,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.rbf_proj_layer2 = MLPLayer(
             self.rbf_out_dim,
             self.rbf_out_dim,
-            bias=True,
+            bias=self.mlp_bias,
             activation_function=None,
             precision=self.precision,
             seed=child_seed(seed_rbf_proj, 1),
@@ -990,10 +1081,10 @@ class EnvironmentInitialEmbedding(nn.Module):
         # === Independent type embedding: ntypes -> type_dim ===
         # Individual type embedding
         seed_type_embed = child_seed(seed, 1)
-        self.env_type_embed = TypeEmbedNet(
-            type_nums=self.ntypes,
+        self.env_type_embed = SeZMTypeEmbedding(
+            ntypes=self.ntypes,
             embed_dim=self.type_dim,
-            precision=self.precision,
+            dtype=self.dtype,
             seed=seed_type_embed,
             trainable=trainable,
         )
@@ -1004,7 +1095,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.g_layer1 = MLPLayer(
             g_in_dim,
             self.hidden_dim,
-            bias=True,
+            bias=self.mlp_bias,
             activation_function=self.activation_function,
             precision=self.precision,
             seed=child_seed(seed_g_net, 0),
@@ -1012,7 +1103,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.g_layer2 = MLPLayer(
             self.hidden_dim,
             self.embed_dim,
-            bias=True,
+            bias=self.mlp_bias,
             activation_function=None,
             precision=self.precision,
             seed=child_seed(seed_g_net, 1),
@@ -1132,6 +1223,7 @@ class EnvironmentInitialEmbedding(nn.Module):
                 "axis_dim": self.axis_dim,
                 "type_dim": self.type_dim,
                 "hidden_dim": self.hidden_dim,
+                "mlp_bias": self.mlp_bias,
                 "activation_function": self.activation_function,
                 "eps": self.eps,
                 "precision": self.precision,

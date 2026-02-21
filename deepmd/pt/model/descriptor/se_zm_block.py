@@ -1705,6 +1705,8 @@ class SO2Convolution(nn.Module):
 
         # === Step 7. Optional attention projections (n_atten_head > 0) ===
         self.attn_qk_norm: ScalarRMSNorm | None = None
+        self.attn_q_proj: FocusLinear | None = None
+        self.attn_k_proj: FocusLinear | None = None
         self.attn_radial_logit_proj: FocusLinear | None = None
         self.attn_output_gate_norm: ScalarRMSNorm | None = None
         self.attn_output_gate_proj: FocusLinear | None = None
@@ -1716,13 +1718,31 @@ class SO2Convolution(nn.Module):
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
+            self.attn_q_proj = FocusLinear(
+                in_channels=self.focus_dim,
+                out_channels=self.focus_dim,
+                n_focus=self.n_focus,
+                dtype=self.compute_dtype,
+                bias=False,
+                seed=child_seed(seed_gate, 0),
+                trainable=trainable,
+            )
+            self.attn_k_proj = FocusLinear(
+                in_channels=self.focus_dim,
+                out_channels=self.focus_dim,
+                n_focus=self.n_focus,
+                dtype=self.compute_dtype,
+                bias=False,
+                seed=child_seed(seed_gate, 1),
+                trainable=trainable,
+            )
             self.attn_radial_logit_proj = FocusLinear(
                 in_channels=self.focus_dim,
                 out_channels=self.n_atten_head,
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
                 bias=False,
-                seed=child_seed(seed_gate, 1),
+                seed=child_seed(seed_gate, 2),
                 trainable=trainable,
                 init_std=0.01,
             )
@@ -1739,7 +1759,7 @@ class SO2Convolution(nn.Module):
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
                 bias=False,
-                seed=child_seed(seed_gate, 2),
+                seed=child_seed(seed_gate, 3),
                 trainable=trainable,
                 init_std=0.01,
             )
@@ -1761,7 +1781,7 @@ class SO2Convolution(nn.Module):
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
                 bias=self.mlp_bias,
-                seed=child_seed(seed_gate, 3),
+                seed=child_seed(seed_gate, 4),
                 trainable=trainable,
                 init_std=0.01,
             )
@@ -1931,11 +1951,13 @@ class SO2Convolution(nn.Module):
                 x_l0_node = x[:, 0, :].reshape(
                     n_node, self.n_focus, self.focus_dim
                 )  # (N, F, Cf)
-                qk_scalar = self.attn_qk_norm(x_l0_node.to(dtype=compute_dtype))
-                q_edge = qk_scalar.index_select(0, dst).reshape(
+                qk_input = self.attn_qk_norm(x_l0_node.to(dtype=compute_dtype))
+                q_node = self.attn_q_proj(qk_input)  # (N, F, Cf)
+                k_node = self.attn_k_proj(qk_input)  # (N, F, Cf)
+                q_edge = q_node.index_select(0, dst).reshape(
                     n_edge, self.n_focus, self.n_atten_head, self.head_dim
                 )  # (E, F, H, Dh)
-                k_edge = qk_scalar.index_select(0, src).reshape(
+                k_edge = k_node.index_select(0, src).reshape(
                     n_edge, self.n_focus, self.n_atten_head, self.head_dim
                 )  # (E, F, H, Dh)
                 radial_l0 = radial_feat[:, 0, :].reshape(
