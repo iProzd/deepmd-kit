@@ -42,7 +42,10 @@ _GEN_ENV=""
 if echo "${CXXFLAGS:-}" | grep -q fsanitize=leak; then
 	_LSAN_LIB=$(gcc -print-file-name=liblsan.so 2>/dev/null || true)
 	if [ -n "${_LSAN_LIB}" ] && [ -f "${_LSAN_LIB}" ]; then
-		_GEN_ENV="LD_PRELOAD=${_LSAN_LIB}"
+		# Preload LSAN runtime so Python can dlopen the sanitized .so,
+		# but disable leak detection — PyTorch/Python internals trigger
+		# massive false-positive reports that abort the script.
+		_GEN_ENV="LD_PRELOAD=${_LSAN_LIB} LSAN_OPTIONS=detect_leaks=0"
 	fi
 fi
 env ${_GEN_ENV} python ${INFER_SCRIPT_PATH}/gen_sea.py
