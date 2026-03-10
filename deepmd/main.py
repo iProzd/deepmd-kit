@@ -854,6 +854,30 @@ def main_parser() -> argparse.ArgumentParser:
         choices=["model-branch", "type-map", "descriptor", "fitting-net", "size"],
         nargs="+",
     )
+    # grad-probe: per-task descriptor gradient probe
+    parser_grad_probe = subparsers.add_parser(
+        "grad-probe",
+        parents=[parser_log, parser_mpi_log],
+        help="Compute per-task descriptor gradient vectors from a multitask checkpoint.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser_grad_probe.add_argument("INPUT", help="Training config JSON file.")
+    parser_grad_probe.add_argument(
+        "--ckpt", required=True, help="Checkpoint .pt file path."
+    )
+    parser_grad_probe.add_argument(
+        "-o",
+        "--output",
+        default="descriptor_grads.npz",
+        help="Output NPZ file path.",
+    )
+    parser_grad_probe.add_argument(
+        "-n",
+        "--nbatches",
+        type=int,
+        default=1,
+        help="Number of batches per task to average gradient over.",
+    )
     return parser
 
 
