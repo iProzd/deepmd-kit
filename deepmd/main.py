@@ -943,6 +943,7 @@ def main(args: Optional[list[str]] = None) -> None:
         "convert-from",
         "train-nvnmd",
         "change-bias",
+        "grad-probe",
     ):
         deepmd_main = BACKENDS[args.backend]().entry_point_hook
     elif args.command is None:
