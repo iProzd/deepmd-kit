@@ -17,15 +17,15 @@ if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
 from deepmd.pt.model.model import (
-    get_sezm_net_model,
+    get_sezm_model,
 )
 from deepmd.pt.utils import (
     env,
 )
 
 
-class TestSeZMNetModelCompile(unittest.TestCase):
-    """Test SeZM-Net model compile path consistency."""
+class TestSeZMModelCompile(unittest.TestCase):
+    """Test SeZM model compile path consistency."""
 
     def setUp(self) -> None:
         self.device = env.DEVICE
@@ -33,7 +33,7 @@ class TestSeZMNetModelCompile(unittest.TestCase):
 
     def _build_model_params(self, *, use_compile: bool, n_node: int) -> dict:
         return {
-            "type": "SeZM-Net",
+            "type": "SeZM",
             "type_map": ["A", "B"],
             "descriptor": {
                 "type": "SeZM",
@@ -183,10 +183,10 @@ class TestSeZMNetModelCompile(unittest.TestCase):
         coord, atype, box, energy, force, _virial = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_net_model(
+        model_dyn = get_sezm_model(
             self._build_model_params(use_compile=False, n_node=512)
         )
-        model_cmp = get_sezm_net_model(
+        model_cmp = get_sezm_model(
             self._build_model_params(use_compile=True, n_node=512)
         )
         model_cmp.load_state_dict(model_dyn.state_dict())
@@ -214,10 +214,10 @@ class TestSeZMNetModelCompile(unittest.TestCase):
         coord, atype, box, _, _, _ = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_net_model(
+        model_dyn = get_sezm_model(
             self._build_model_params(use_compile=False, n_node=512)
         )
-        model_cmp = get_sezm_net_model(
+        model_cmp = get_sezm_model(
             self._build_model_params(use_compile=True, n_node=512)
         )
         model_cmp.load_state_dict(model_dyn.state_dict())
@@ -238,10 +238,10 @@ class TestSeZMNetModelCompile(unittest.TestCase):
         n_node = int(coord.shape[0] * coord.shape[1] + 64)
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_net_model(
+        model_dyn = get_sezm_model(
             self._build_model_params(use_compile=False, n_node=n_node)
         )
-        model_cmp = get_sezm_net_model(
+        model_cmp = get_sezm_model(
             self._build_model_params(use_compile=True, n_node=n_node)
         )
         model_cmp.load_state_dict(model_dyn.state_dict())
@@ -263,10 +263,10 @@ class TestSeZMNetModelCompile(unittest.TestCase):
         coord, atype, box, _, _, _ = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_net_model(
+        model_dyn = get_sezm_model(
             self._build_model_params(use_compile=False, n_node=512)
         )
-        model_cmp = get_sezm_net_model(
+        model_cmp = get_sezm_model(
             self._build_model_params(use_compile=True, n_node=512)
         )
         model_cmp.load_state_dict(model_dyn.state_dict())
@@ -297,10 +297,10 @@ class TestSeZMNetModelCompile(unittest.TestCase):
         coord, atype, box, _, _, _ = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_net_model(
+        model_dyn = get_sezm_model(
             self._build_model_params(use_compile=False, n_node=512)
         )
-        model_cmp = get_sezm_net_model(
+        model_cmp = get_sezm_model(
             self._build_model_params(use_compile=True, n_node=512)
         )
         model_cmp.load_state_dict(model_dyn.state_dict())

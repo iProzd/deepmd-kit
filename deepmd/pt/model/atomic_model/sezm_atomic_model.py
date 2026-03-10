@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""SeZM-Net atomic model definitions."""
+"""SeZM atomic model definitions."""
 
 from __future__ import (
     annotations,
@@ -19,8 +19,8 @@ from deepmd.pt.model.task.ener import (
 )
 
 
-class SeZMNetAtomicModel(DPAtomicModel):
-    """Atomic model scaffold for SeZM-Net energy fitting.
+class SeZMAtomicModel(DPAtomicModel):
+    """Atomic model scaffold for SeZM energy fitting.
 
     Parameters
     ----------
@@ -49,6 +49,6 @@ class SeZMNetAtomicModel(DPAtomicModel):
         ):
             raise TypeError(
                 "fitting must be an instance of EnergyFittingNet, EnergyFittingNetDirect "
-                "or InvarFitting for SeZMNetAtomicModel"
+                "or InvarFitting for SeZMAtomicModel"
             )
         super().__init__(descriptor, fitting, type_map, **kwargs)

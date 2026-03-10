@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""SeZM-Net GLU energy fitting networks."""
+"""SeZM GLU energy fitting networks."""
 
 from __future__ import (
     annotations,
@@ -41,7 +41,7 @@ from deepmd.utils.version import (
 
 class GLUFittingNet(torch.nn.Module):
     """
-    GLU-based fitting network for SeZM-Net.
+    GLU-based fitting network for SeZM.
 
     Parameters
     ----------
@@ -189,9 +189,9 @@ class GLUFittingNet(torch.nn.Module):
         return obj
 
 
-class SeZMNetNetworkCollection(torch.nn.Module):
+class SeZMNetworkCollection(torch.nn.Module):
     """
-    Network collection for SeZM-Net fitting networks.
+    Network collection for SeZM fitting networks.
 
     Parameters
     ----------
@@ -230,7 +230,7 @@ class SeZMNetNetworkCollection(torch.nn.Module):
         for idx, network in enumerate(networks):
             self[idx] = network
         if any(net is None for net in self._networks):
-            raise RuntimeError("SeZMNetNetworkCollection is incomplete.")
+            raise RuntimeError("SeZMNetworkCollection is incomplete.")
         self.networks = torch.nn.ModuleList(self._networks)
 
     def _convert_key(self, key: int | tuple | str) -> int:
@@ -279,7 +279,7 @@ class SeZMNetNetworkCollection(torch.nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict) -> SeZMNetNetworkCollection:
+    def deserialize(cls, data: dict) -> SeZMNetworkCollection:
         """Deserialize the networks from a dict."""
         data = data.copy()
         check_version_compatibility(data.pop("@version", 1), 1, 1)
@@ -288,9 +288,9 @@ class SeZMNetNetworkCollection(torch.nn.Module):
 
 
 @Fitting.register("sezm_ener")
-class SeZMNetEnergyFittingNet(InvarFitting):
+class SeZMEnergyFittingNet(InvarFitting):
     """
-    SeZM-Net energy fitting with GLU hidden layers.
+    SeZM energy fitting with GLU hidden layers.
 
     This uses the same configuration keys as the standard energy fitting
     but replaces hidden MLP layers with GLU blocks.
@@ -349,7 +349,7 @@ class SeZMNetEnergyFittingNet(InvarFitting):
         n_networks = self.ntypes if not self.mixed_types else 1
 
         # === Step 2. Build GLU fitting networks ===
-        self.filter_layers = SeZMNetNetworkCollection(
+        self.filter_layers = SeZMNetworkCollection(
             1 if not self.mixed_types else 0,
             self.ntypes,
             network_type="sezm_fitting_network",
@@ -382,7 +382,7 @@ class SeZMNetEnergyFittingNet(InvarFitting):
         obj = cls(**data)
         for kk in variables.keys():
             obj[kk] = to_torch_tensor(variables[kk])
-        obj.filter_layers = SeZMNetNetworkCollection.deserialize(nets)
+        obj.filter_layers = SeZMNetworkCollection.deserialize(nets)
         return obj
 
     def serialize(self) -> dict:

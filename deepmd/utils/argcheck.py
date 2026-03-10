@@ -53,7 +53,7 @@ doc_se_atten = "Used by the smooth edition of Deep Potential. The full relative 
 doc_se_atten_v2 = "Used by the smooth edition of Deep Potential. The full relative coordinates are used to construct the descriptor. Attention mechanism with new modifications will be used by this descriptor."
 doc_se_a_mask = "Used by the smooth edition of Deep Potential. It can accept a variable number of atoms in a frame (Non-PBC system). *aparam* are required as an indicator matrix for the real/virtual sign of input atoms."
 doc_hybrid = "Concatenate of a list of descriptors as a new descriptor."
-doc_se_zm = "SeZM descriptor: Smooth equivariant ZBL Message-passing Network."
+doc_se_zm = "SeZM descriptor: Smooth equivariant Zone-bridging Model."
 # fitting
 doc_ener = "Fit an energy model (potential energy surface)."
 doc_dos = "Fit a density of states model. The total density of states / site-projected density of states labels should be provided by `dos.npy` or `atom_dos.npy` in each data system. The file has a number of frames (rows) and a number of energy-grid columns (multiplied by the number of atoms in `atom_dos.npy`). See `loss` parameter."
@@ -347,7 +347,7 @@ def descrpt_se_a_args() -> list[Argument]:
     doc=doc_only_pt_supported + doc_se_zm,
 )
 def descrpt_se_zm_args() -> list[Argument]:
-    # Follows exact order of docstring in se_zm.py DescrptSeZMNet class
+    # Follows exact order of docstring in se_zm.py DescrptSeZM class
     doc_sel = 'The maximum number of neighbors. It can be:\n\n\
     - `int`: the total maximum number of neighbors within `rcut` (all types combined)\n\n\
     - `list[int]`: sel[i] specifies the maximum number of type-i neighbors within `rcut`\n\n\
@@ -2627,16 +2627,16 @@ def standard_model_args() -> Argument:
 
 
 @model_args_plugin.register(
-    "SeZM-Net",
-    alias=["se_zm_net", "se_zm-net", "sezm-net"],
+    "SeZM",
+    alias=["se_zm", "sezm"],
 )
-def sezm_net_model_args() -> Argument:
+def sezm_model_args() -> Argument:
     doc_descrpt = (
         "The descriptor of atomic environment. User-provided (SeZM is recommended)."
     )
     doc_fitting = (
         "The fitting of physical properties. The `type` field is ignored; "
-        "SeZM-Net always uses sezm_ener (GLU fitting)."
+        "SeZM always uses sezm_ener (GLU fitting)."
     )
     doc_model_branch_alias = (
         "List of aliases for this model branch. "
@@ -2649,7 +2649,7 @@ def sezm_net_model_args() -> Argument:
         "Used only in multitask models."
     )
     doc_use_compile = (
-        "If True, use fixed-shape edges and torch.compile in the SeZM-Net model. "
+        "If True, use fixed-shape edges and torch.compile in the SeZM model. "
         "Only supported in the PyTorch backend."
     )
     doc_use_tf32 = (
@@ -2667,7 +2667,7 @@ def sezm_net_model_args() -> Argument:
     )
 
     ca = Argument(
-        "SeZM-Net",
+        "SeZM",
         dict,
         [
             Argument(
@@ -2723,7 +2723,7 @@ def sezm_net_model_args() -> Argument:
                 doc=doc_only_pt_supported + doc_info,
             ),
         ],
-        doc="SeZM-Net model scaffold with fixed descriptor and fitting types.",
+        doc="SeZM model scaffold with fixed descriptor and fitting types.",
     )
     return ca
 

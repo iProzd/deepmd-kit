@@ -113,7 +113,7 @@ class DeepEval(DeepEvalBackend):
         auto_batch_size: bool | int | AutoBatchSize = True,
         neighbor_list: Optional["ase.neighborlist.NewPrimitiveNeighborList"] = None,
         head: str | int | None = None,
-        # TODO: Temporarily set to True for SeZM-Net development (JIT not yet supported)
+        # TODO: Temporarily set to True for SeZM development (JIT not yet supported)
         no_jit: bool = True,
         **kwargs: Any,
     ) -> None:

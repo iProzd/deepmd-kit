@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """
-SeZM-Net interaction blocks for DeePMD-kit (PyTorch backend).
+SeZM interaction blocks for DeePMD-kit (PyTorch backend).
 
 This module implements per-block message passing, SO(2)/SO(3) transforms, and
-nonlinearities used by `DescrptSeZMNet`. Shared geometry, caches, and projection
+nonlinearities used by `DescrptSeZM`. Shared geometry, caches, and projection
 helpers are provided by `se_zm_helper.py`.
 
 Design notes

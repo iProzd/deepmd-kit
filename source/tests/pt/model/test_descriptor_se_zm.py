@@ -14,7 +14,7 @@ if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
 from deepmd.pt.model.descriptor.se_zm import (
-    DescrptSeZMNet,
+    DescrptSeZM,
     init_edge_rot_mat_frisvad,
 )
 from deepmd.pt.model.descriptor.se_zm_block import (
@@ -61,8 +61,8 @@ def _zyz_euler_to_matrix(
     return R
 
 
-class TestDescrptSeZMNet(unittest.TestCase):
-    """Test the SeZM-Net descriptor."""
+class TestDescrptSeZM(unittest.TestCase):
+    """Test the SeZM descriptor."""
 
     def setUp(self) -> None:
         self.device = env.DEVICE
@@ -87,7 +87,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             coord, atype, nlist = self._tiny_system(dtype=dtype)
             extended_coord = coord.reshape(1, -1)
 
-            model = DescrptSeZMNet(
+            model = DescrptSeZM(
                 rcut=3.0,
                 sel=[1, 1],
                 ntypes=2,
@@ -114,7 +114,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
         """Test focus-stream path (N, D, F, Df) through forward and backward."""
         coord, atype, nlist = self._tiny_system(dtype=torch.float32)
         extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
-        model = DescrptSeZMNet(
+        model = DescrptSeZM(
             rcut=3.0,
             sel=[1, 1],
             ntypes=2,
@@ -143,7 +143,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
     def test_focus_stream_config_validation(self) -> None:
         """Test invalid focus-stream configuration raises ValueError."""
         with self.assertRaisesRegex(ValueError, "divisible"):
-            DescrptSeZMNet(
+            DescrptSeZM(
                 rcut=3.0,
                 sel=[1, 1],
                 ntypes=2,
@@ -170,7 +170,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
         nlist = torch.tensor([[[1, 1], [0, 0]]], dtype=torch.int64, device=self.device)
         extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
 
-        model = DescrptSeZMNet(
+        model = DescrptSeZM(
             rcut=3.0,
             sel=[1, 1],
             ntypes=2,
@@ -241,7 +241,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             dtype = PRECISION_DICT[prec]
             coord, atype, nlist = self._tiny_system(dtype=dtype)
             extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
-            model = DescrptSeZMNet(
+            model = DescrptSeZM(
                 rcut=3.0,
                 sel=[1, 1],
                 ntypes=2,
@@ -269,7 +269,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             extended_coord = coord.reshape(1, -1)
 
             # Create model
-            model = DescrptSeZMNet(
+            model = DescrptSeZM(
                 rcut=3.0,
                 sel=[1, 1],
                 ntypes=2,
@@ -293,7 +293,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             data = model.serialize()
 
             # Deserialize
-            model_restored = DescrptSeZMNet.deserialize(data)
+            model_restored = DescrptSeZM.deserialize(data)
 
             # Forward after deserialization
             desc2, _, _, _, sw2 = model_restored(extended_coord, atype, nlist)
@@ -331,7 +331,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
             seed = 12345
 
             # Create two models with the same seed
-            model1 = DescrptSeZMNet(
+            model1 = DescrptSeZM(
                 rcut=3.0,
                 sel=[1, 1],
                 ntypes=2,
@@ -348,7 +348,7 @@ class TestDescrptSeZMNet(unittest.TestCase):
                 seed=seed,
             )
 
-            model2 = DescrptSeZMNet(
+            model2 = DescrptSeZM(
                 rcut=3.0,
                 sel=[1, 1],
                 ntypes=2,
@@ -1154,8 +1154,8 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
                 "seed": seed,
             }
 
-            model_no_env = DescrptSeZMNet(use_env_seed=False, **base_kwargs)
-            model_env = DescrptSeZMNet(
+            model_no_env = DescrptSeZM(use_env_seed=False, **base_kwargs)
+            model_env = DescrptSeZM(
                 use_env_seed=True,
                 **base_kwargs,
             )

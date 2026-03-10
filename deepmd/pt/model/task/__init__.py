@@ -25,7 +25,7 @@ from .property import (
     PropertyFittingNet,
 )
 from .sezm_ener import (
-    SeZMNetEnergyFittingNet,
+    SeZMEnergyFittingNet,
 )
 from .type_predict import (
     TypePredictNet,
@@ -41,6 +41,6 @@ __all__ = [
     "Fitting",
     "PolarFittingNet",
     "PropertyFittingNet",
-    "SeZMNetEnergyFittingNet",
+    "SeZMEnergyFittingNet",
     "TypePredictNet",
 ]

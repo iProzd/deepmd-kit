@@ -30,7 +30,7 @@ from deepmd.pt.model.task import (
     BaseFitting,
 )
 from deepmd.pt.model.task.sezm_ener import (
-    SeZMNetEnergyFittingNet,
+    SeZMEnergyFittingNet,
 )
 from deepmd.utils.spin import (
     Spin,
@@ -72,8 +72,8 @@ from .polar_model import (
 from .property_model import (
     PropertyModel,
 )
-from .sezm_net_model import (
-    SeZMNetModel,
+from .sezm_model import (
+    SeZMModel,
 )
 from .spin_model import (
     SpinEnergyModel,
@@ -294,7 +294,7 @@ def get_standard_model(model_params: dict) -> BaseModel:
     return model
 
 
-def get_sezm_net_model(model_params: dict) -> BaseModel:
+def get_sezm_model(model_params: dict) -> BaseModel:
     model_params_old = model_params
     model_params = copy.deepcopy(model_params)
     model_params.setdefault("descriptor", {})
@@ -311,7 +311,7 @@ def get_sezm_net_model(model_params: dict) -> BaseModel:
     fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
     fitting_net["mixed_types"] = descriptor.mixed_types()
     fitting_net["dim_descrpt"] = descriptor.get_dim_out()
-    fitting = SeZMNetEnergyFittingNet(**fitting_net)
+    fitting = SeZMEnergyFittingNet(**fitting_net)
     atom_exclude_types = model_params.get("atom_exclude_types", [])
     pair_exclude_types = model_params.get("pair_exclude_types", [])
     preset_out_bias = model_params.get("preset_out_bias")
@@ -324,7 +324,7 @@ def get_sezm_net_model(model_params: dict) -> BaseModel:
     n_node = model_params.get("n_node")
     n_edge = model_params.get("n_edge", 0)
 
-    model = SeZMNetModel(
+    model = SeZMModel(
         descriptor=descriptor,
         fitting=fitting,
         type_map=model_params["type_map"],
@@ -352,8 +352,8 @@ def get_model(model_params: dict) -> Any:
             return get_standard_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
-    elif model_type == "SeZM-Net":
-        return get_sezm_net_model(model_params)
+    elif model_type in ("SeZM", "SeZM-Net"):
+        return get_sezm_model(model_params)
     else:
         return BaseModel.get_class_by_type(model_type).get_model(model_params)
 
@@ -368,7 +368,7 @@ __all__ = [
     "FrozenModel",
     "LinearEnergyModel",
     "PolarModel",
-    "SeZMNetModel",
+    "SeZMModel",
     "SpinEnergyModel",
     "SpinModel",
     "get_model",

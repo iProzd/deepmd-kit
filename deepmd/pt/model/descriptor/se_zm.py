@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """
-SeZM: The descriptor of smooth equivariant ZBL Message-passing Network.
+SeZM: The descriptor of smooth equivariant Zone-bridging Model.
 
 PyTorch backend
 
@@ -108,9 +108,9 @@ if TYPE_CHECKING:
 
 @BaseDescriptor.register("SeZM")
 @BaseDescriptor.register("se_zm")
-class DescrptSeZMNet(BaseDescriptor, nn.Module):
+class DescrptSeZM(BaseDescriptor, nn.Module):
     """
-    SeZM: Smooth equivariant ZBL Message-passing Network descriptor for DeePMD-kit.
+    SeZM: The descriptor of smooth equivariant Zone-bridging Model for DeePMD-kit.
 
     Execution outline
     -----------------
@@ -1581,14 +1581,14 @@ class DescrptSeZMNet(BaseDescriptor, nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> DescrptSeZMNet:
+    def deserialize(cls, data: dict[str, Any]) -> DescrptSeZM:
         data = data.copy()
         data_cls = data.pop("@class")
         if data_cls != "Descriptor":
-            raise ValueError(f"Invalid class for DescrptSeZMNet: {data_cls}")
+            raise ValueError(f"Invalid class for DescrptSeZM: {data_cls}")
         type_val = data.pop("type")
         if type_val != "SeZM":
-            raise ValueError(f"Invalid type for DescrptSeZMNet: {type_val}")
+            raise ValueError(f"Invalid type for DescrptSeZM: {type_val}")
         version = int(data.pop("@version"))
         if version != 1:
             raise ValueError(f"Unsupported SeZM version: {version}")

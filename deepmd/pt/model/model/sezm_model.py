@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""SeZM-Net: Smooth equivariant ZBL Message-passing Network."""
+"""SeZM: Smooth equivariant Zone-bridging Model."""
 
 from __future__ import (
     annotations,
@@ -28,8 +28,8 @@ if TYPE_CHECKING:
     from jaxtyping import Float, Int
     from torch import Tensor
 
-from deepmd.pt.model.atomic_model.sezm_net_atomic_model import (
-    SeZMNetAtomicModel,
+from deepmd.pt.model.atomic_model.sezm_atomic_model import (
+    SeZMAtomicModel,
 )
 from deepmd.pt.model.descriptor.se_zm_helper import (
     nvtx_range,
@@ -53,16 +53,16 @@ from deepmd.pt.utils.nlist import (
     extend_input_and_build_neighbor_list,
 )
 
-SeZMNetModel_ = make_model(SeZMNetAtomicModel)
+SeZMModel_ = make_model(SeZMAtomicModel)
 
 
-@BaseModel.register("SeZM-Net")
-@BaseModel.register("se_zm_net")
-@BaseModel.register("se_zm-net")
-@BaseModel.register("sezm-net")
-class SeZMNetModel(DPModelCommon, SeZMNetModel_):
+@BaseModel.register("SeZM")
+@BaseModel.register("se_zm")
+@BaseModel.register("sezm")
+@BaseModel.register("SeZM-Net")  # Backward compatibility alias
+class SeZMModel(DPModelCommon, SeZMModel_):
     """
-    SeZM-Net energy model with optional fixed-shape compile path.
+    SeZM energy model with optional fixed-shape compile path.
 
     By default it uses the traditional DeePMD neighbor list path with ghost atoms
     and padded neighbor matrix, compatible with LAMMPS and other MD engines.
@@ -71,7 +71,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
     torch.compile.
     """
 
-    model_type = "SeZM-Net"
+    model_type = "SeZM"
 
     def __init__(
         self,
@@ -83,7 +83,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         **kwargs: Any,
     ) -> None:
         DPModelCommon.__init__(self)
-        SeZMNetModel_.__init__(self, *args, **kwargs)
+        SeZMModel_.__init__(self, *args, **kwargs)
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         self.use_compile = bool(use_compile)
         self.use_tf32 = bool(use_tf32)
@@ -216,7 +216,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         dict[str, torch.Tensor]
             Model predictions including energy, forces, etc.
         """
-        with nvtx_range("SeZMNet/forward_common"):
+        with nvtx_range("SeZM/forward_common"):
             if self.use_compile:
                 return self.forward_common_compile(
                     coord,
@@ -228,14 +228,14 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                 )
 
             # === Step 1. Cast inputs to correct dtype ===
-            with nvtx_range("SeZMNet/input_type_cast"):
+            with nvtx_range("SeZM/input_type_cast"):
                 cc, bb, fp, ap, input_prec = self._input_type_cast(
                     coord, box=box, fparam=fparam, aparam=aparam
                 )
                 del coord, box, fparam, aparam
 
             # === Step 2. Build neighbor list ===
-            with nvtx_range("SeZMNet/build_neighbor_list"):
+            with nvtx_range("SeZM/build_neighbor_list"):
                 # extended_coord: (nf, nall, 3), extended_atype: (nf, nall)
                 # mapping: (nf, nall), nlist: (nf, nloc, nsel)
                 extended_coord, extended_atype, mapping, nlist = (
@@ -243,7 +243,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                 )
 
             # === Step 3. Lower Forward + Communication ===
-            with nvtx_range("SeZMNet/forward_lower"):
+            with nvtx_range("SeZM/forward_lower"):
                 model_predict_lower = self.forward_common_lower(
                     extended_coord,
                     extended_atype,
@@ -254,7 +254,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                     aparam=ap,
                 )
 
-            with nvtx_range("SeZMNet/communicate_output"):
+            with nvtx_range("SeZM/communicate_output"):
                 model_predict = communicate_extended_output(
                     model_predict_lower,
                     self.model_output_def(),
@@ -262,7 +262,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                     do_atomic_virial=do_atomic_virial,
                 )
 
-            with nvtx_range("SeZMNet/output_type_cast"):
+            with nvtx_range("SeZM/output_type_cast"):
                 model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
 
@@ -281,9 +281,9 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         This path uses DeePMD neighbor list to build fixed-shape edges,
         then traces/compiles the compute graph.
         """
-        with nvtx_range("SeZMNet/forward_common_compile"):
+        with nvtx_range("SeZM/forward_common_compile"):
             # === Step 1. Cast inputs to correct dtype ===
-            with nvtx_range("SeZMNet/input_type_cast"):
+            with nvtx_range("SeZM/input_type_cast"):
                 cc, bb, fp, ap, input_prec = self._input_type_cast(
                     coord, box=box, fparam=fparam, aparam=aparam
                 )
@@ -311,7 +311,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                 cc.requires_grad_(True)
 
             # === Step 4. Build neighbor list (standard DeePMD path) ===
-            with nvtx_range("SeZMNet/build_neighbor_list"):
+            with nvtx_range("SeZM/build_neighbor_list"):
                 extended_coord, extended_atype, mapping, nlist = (
                     self.build_neighbor_list(cc, atype, bb)
                 )
@@ -375,7 +375,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                     )
 
                 # === Step 8. Forward through compiled compute path ===
-                with nvtx_range("SeZMNet/forward_compute"):
+                with nvtx_range("SeZM/forward_compute"):
                     compute_ret = self.compiled_compute(
                         cc_flat,
                         atype_valid,
@@ -388,13 +388,13 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                     )
 
             # === Step 9. Post-process outputs ===
-            with nvtx_range("SeZMNet/post_process"):
+            with nvtx_range("SeZM/post_process"):
                 model_predict = self.post_process_output(
                     compute_ret, atype, nf, nloc, do_atomic_virial
                 )
 
             # === Step 10. Output type cast ===
-            with nvtx_range("SeZMNet/output_type_cast"):
+            with nvtx_range("SeZM/output_type_cast"):
                 model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
 
@@ -511,7 +511,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         edge_vec = self.attach_edge_vec_grad(cc_flat, edge_index, edge_vec)
 
         # === Step 2. Descriptor (edge path only) ===
-        with nvtx_range("SeZMNet/descriptor"):
+        with nvtx_range("SeZM/descriptor"):
             descriptor_model = self.atomic_model.descriptor
             descriptor, rot_mat, g2, h2, _ = descriptor_model.forward_with_edges(
                 extended_coord=cc_flat.view(1, n_node, 3),
@@ -529,7 +529,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
         atype_for_fit = atype_valid.unsqueeze(0)
 
         # === Step 3. Fitting net ===
-        with nvtx_range("SeZMNet/fitting_net"):
+        with nvtx_range("SeZM/fitting_net"):
             fit_ret = self.atomic_model.fitting_net(
                 descriptor_for_fit,
                 atype_for_fit,
@@ -540,7 +540,7 @@ class SeZMNetModel(DPModelCommon, SeZMNetModel_):
                 aparam=ap,
             )
 
-        with nvtx_range("SeZMNet/apply_out_stat"):
+        with nvtx_range("SeZM/apply_out_stat"):
             fit_ret = self.atomic_model.apply_out_stat(fit_ret, atype_for_fit)
 
         atom_energy = fit_ret["energy"]  # (1, n_node, 1)

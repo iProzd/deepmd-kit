@@ -1,29 +1,33 @@
-# SeZM-Net: Smooth equivariant ZBL Message-passing Network
+# SeZM: Smooth equivariant Zone-bridging Model
 
 SeZM is a small-`l` equivariant message passing descriptor designed for molecular dynamics (MD) workloads where **inference speed** and **physical correctness** (conservative forces + smooth PES) dominate.
-SeZM-Net is the model branch built on top of the SeZM descriptor.
+SeZM is the model branch built on top of the SeZM descriptor.
 
 This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_zm`) implemented in:
 
 - `deepmd/pt/model/descriptor/se_zm.py`
 - `deepmd/pt/model/descriptor/se_zm_block.py`
 
----
+______________________________________________________________________
 
 ## Goals (Non-Negotiable)
 
 1. **Conservative forces**
+
    - SeZM outputs features meant for an energy model; forces must come from `autograd` of energy w.r.t. coordinates.
    - Geometry / rotations are fully differentiable; **no `.detach()`** in edge rotations.
 
-2. **Smooth cutoff**
+1. **Smooth cutoff**
+
    - Every edge message is multiplied by a **C² polynomial envelope** that goes to **exactly 0 at `rcut`**, so message and its derivatives vanish at `rcut`.
 
-3. **Strict padded neighbor masking**
+1. **Strict padded neighbor masking**
+
    - DeePMD neighbor lists are padded (typically with `-1` indices).
    - Padding and excluded type-pairs must contribute **exactly zero** and must not introduce NaNs.
 
-4. **Speed mandate: single geometry/Wigner pass**
+1. **Speed mandate: single geometry/Wigner pass**
+
    - Edge geometry and Wigner-D rotation blocks are computed **once per `forward()`** and reused by all blocks.
    - No interaction block is allowed to recompute:
      - `edge_vec`
@@ -37,18 +41,18 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
 - Top-K neighbor selection: **not allowed**. Use `rcut` and masks only.
 - External equivariant libraries (e.g. e3nn): **not allowed**.
 
----
+______________________________________________________________________
 
 ## Model Integration (PyTorch)
 
-- Set `model.type = "SeZM-Net"` (aliases: `"se_zm_net"`, `"se_zm-net"`, `"sezm-net"`) to select the SeZM-Net model scaffold. Aliases are resolved during configuration validation.
+- Set `model.type = "SeZM"` (aliases: `"se_zm"`, `"sezm"`) to select the SeZM model scaffold. Aliases are resolved during configuration validation.
 - `loss.type` still follows the fitting target (e.g., `"ener"`).
-- `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is ignored; SeZM-Net always uses `sezm_ener`.
-- Internally it is built as `make_model(SeZMNetAtomicModel)`.
+- `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is ignored; SeZM always uses `sezm_ener`.
+- Internally it is built as `make_model(SeZMAtomicModel)`.
 
 ### Optional compile path (fixed-shape sparse edges)
 
-SeZM-Net supports an optional **fixed-shape edge** path that enables `torch.compile` while preserving
+SeZM supports an optional **fixed-shape edge** path that enables `torch.compile` while preserving
 the standard DeePMD neighbor list behavior:
 
 - Enable with `model.use_compile = true`.
@@ -66,7 +70,7 @@ the standard DeePMD neighbor list behavior:
 This path is designed for second-order derivatives during training; all geometry (edge vectors,
 Wigner-D, radial basis) remains differentiable, and padded edges are fully masked.
 
----
+______________________________________________________________________
 
 ## High-Level Architecture
 
@@ -111,9 +115,9 @@ Standard DeePMD nlist path:
        └─ (nf, nloc, channels)
 ```
 
----
+______________________________________________________________________
 
-## SeZM-Net Fitting (GLU)
+## SeZM Fitting (GLU)
 
 - The fitting net uses the same configuration keys as the standard energy fitting
   (`neuron`, `activation_function`, `precision`, `seed`, ...).
@@ -124,7 +128,7 @@ Standard DeePMD nlist path:
   This makes the internal hidden width double the user-specified value
   (e.g., `hidden=256` becomes `512` before split).
 
----
+______________________________________________________________________
 
 ## Key Design Decisions
 
@@ -248,11 +252,13 @@ An optional module that provides physical inductive bias for l=0 features using 
 **Computation pipeline**:
 
 1. **r_tilde construction**: For each edge, build a 4D vector `[s, s*rx, s*ry, s*rz]` where:
+
    - `s = edge_env / r` (smooth weight divided by distance)
    - `r_hat = edge_vec / r` (unit direction vector)
    - `r_tilde = [s, s * r_hat]` encodes both radial decay and angular information
 
-2. **G network**: Computes per-edge filter features:
+1. **G network**: Computes per-edge filter features:
+
    - RBF projection: Two-layer MLP `rbf_proj_layer1 → rbf_proj_layer2` with dimension `rbf_out_dim = max(32, embed_dim - 2*type_dim)`
 
 - RBF/G MLP layers use `TruncatedNormal(mean=0, std=sqrt(2/(fan_in+fan_out)), ±3σ)` for weights; `output_proj` is still zero-initialized for FiLM logits
@@ -263,14 +269,17 @@ An optional module that provides physical inductive bias for l=0 features using 
 - Two-layer MLP: `hidden_dim` → `embed_dim` with SiLU activation
 
 3. **env_agg (environment aggregation)**: Vectorized outer product and scatter:
+
    - `outer = r_tilde[:, :, None] * g[:, None, :]` produces `(E, 4, embed_dim)`
    - Scatter-sum by destination node: `env_agg.index_add_(0, dst, outer_flat)`
    - Normalize by neighbor count (degree normalization)
 
-4. **D matrix construction**: Captures local geometry via matrix product:
+1. **D matrix construction**: Captures local geometry via matrix product:
+
    - `D = env_agg^T @ env_agg[:, :, :axis_dim]` with shape `(N, embed_dim, axis_dim)`
 
-5. **Output projection to FiLM logits**:
+1. **Output projection to FiLM logits**:
+
    - Flatten D to `(N, embed_dim * axis_dim)` and project to `(N, 2*channels)`
    - Split to `(scale_logits, shift_logits)` and apply FiLM on `l=0`:
      - `scale_strength = exp(scale_strength_log)`
@@ -287,7 +296,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
 - **Near-identity start** is guaranteed by small strengths with zero-initialized logits
 
----
+______________________________________________________________________
 
 ## Tensor Layouts and Invariants
 
@@ -339,7 +348,7 @@ Let `E` be the number of valid edges:
 - `Dt_full`: transpose of `D_full`
 - `inv_sqrt_deg`: `(N, 1, 1)` inverse sqrt degree for graph-style normalization
 
----
+______________________________________________________________________
 
 ## Core Operations
 
@@ -365,21 +374,21 @@ For each edge `(src -> dst)`:
 1. **Pre-focus mixing (full C width, node-side)**:
    - `x = pre_focus_mix(x.unsqueeze(2)).squeeze(2)` with `n_focus=1`
    - this is channel-only mixing per `(l,m)` and keeps SO(3) equivariance
-2. **Rotate to local frame (full C width first)**:
+1. **Rotate to local frame (full C width first)**:
    - project once per `(lmax, mmax)` via cached `project_D_to_m(D_full, coeff_index_m)`
    - `x_src = x.index_select(0, src)` gives `(E, D, C)`
    - `x_local = bmm(D_to_m, x_src)` gives `(E, D_m, C)` (high-efficiency GEMM)
-3. **Type feature fusion (once, outside blocks)**:
+1. **Type feature fusion (once, outside blocks)**:
    - `edge_type_feat = type_ebed[src] + type_ebed[dst]` with shape `(E, C)`
    - `radial_feat = radial_feat + edge_type_feat.unsqueeze(1)` with shape `(E, lmax+1, C)`
    - Per-block truncated `radial_feat[:, : l_i+1, :]` is prebuilt according to `l_schedule`
-4. **Modulate local features**:
+1. **Modulate local features**:
    - `rad_feat = radial_feat[:, degree_index_m, :]` with shape `(E, D_m, C)`
    - `x_local *= rad_feat`
-5. **Convert to SO(2) internal layout**:
+1. **Convert to SO(2) internal layout**:
    - `x_local.view(E, D_m, F, Cf).transpose(1, 2)` gives strided `(E, F, D_m, Cf)`
    - no explicit contiguous call here
-6. **Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)**: for each layer in `so2_linears`:
+1. **Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)**: for each layer in `so2_linears`:
    - Save residual: `residual = x_local`
    - Pre-norm: apply `inter_norm(x_local)` (ReducedSeparableRMSNorm when `so2_norm=True`, Identity otherwise; last layer always Identity)
    - Apply `SO2Linear` (group by `|m|`):
@@ -389,7 +398,7 @@ For each edge `(src -> dst)`:
      - l=0: SiLU activation
      - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
    - LayerScale + Residual: `x_local = residual + scale * x_local` (scalar scale, init 1e-3 when `layer_scale=True`; bare residual otherwise)
-7. **Cross-focus competition (optional)**:
+1. **Cross-focus competition (optional)**:
    - Enabled only when `focus_compete=True and n_focus>1`
    - Use scalar-invariant source captured before SO(2) stack: `focus_gate_src = x_local_pre[:, :, 0, :]`
    - Compute logits with per-focus scalar projection and temperature:
@@ -398,12 +407,12 @@ For each edge `(src -> dst)`:
    - Apply label smoothing to avoid dead focuses:
      - `alpha = (1 - eps) * alpha + eps / n_focus` (internal default `eps=0.02`)
    - Apply invariant weights to full irreps: `x_local *= alpha[:, :, None, None]`
-8. **Rotate back preparation**:
+1. **Rotate back preparation**:
    - `x_local.transpose(1, 2).contiguous().view(E, D_m, C)`
-9. **Rotate back (reduced)**:
+1. **Rotate back (reduced)**:
    - reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
    - `x_message = bmm(Dt_from_m, x_local)` gives `(E, D, C)`
-10. **Aggregate with optional head gates**:
+1. **Aggregate with optional head gates**:
 
 - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
 - `n_atten_head > 0`:
@@ -454,7 +463,7 @@ Key properties:
 - Residual connection: `x = x + ffn(x)`
 - Output projection is zero-initialized so the residual path starts near-identity
 
----
+______________________________________________________________________
 
 ## Interaction Block Structure
 
@@ -501,14 +510,14 @@ Components:
 - `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and gated activation
 - `adam_ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
 
----
+______________________________________________________________________
 
 ## Pyramid `l_schedule`
 
 SeZM supports:
 
 1. constant `lmax` (default): `l_schedule = [lmax] * n_blocks`
-2. explicit pyramid: `l_schedule = [2, 2, 1, 0]` (example)
+1. explicit pyramid: `l_schedule = [2, 2, 1, 0]` (example)
 
 Rules:
 
@@ -517,14 +526,14 @@ Rules:
 - when schedule decreases, higher-`l` channels are **physically discarded**
 - later blocks operate on smaller `ebed_dim`, reducing compute
 
----
+______________________________________________________________________
 
 ## Pyramid `m_schedule`
 
 SeZM supports:
 
 1. constant `mmax` (default None): if `mmax is None`, `m_schedule[i] = l_schedule[i]`, otherwise `m_schedule[i] = min(mmax, l_schedule[i])`
-2. explicit pyramid: `m_schedule = [2, 2, 1, 0]` (example)
+1. explicit pyramid: `m_schedule = [2, 2, 1, 0]` (example)
 
 Rules:
 
@@ -541,16 +550,16 @@ Note: unlike `l_schedule`, `m_schedule` does NOT change the **global node tensor
 (`D = (lmax+1)^2`). It only changes the **edge-local** coefficient set used inside the SO(2)
 operator and its rotate-to/rotate-back.
 
----
+______________________________________________________________________
 
 ## Public API and Hyperparameters
 
-Constructor: `DescrptSeZMNet(...)`
+Constructor: `DescrptSeZM(...)`
 
 Key arguments:
 
 - `rcut: float` — Cutoff radius in Å
-- `sel: list[int] | int` — Maximum neighbors (int: total count, list[int]: per-type counts)
+- `sel: list[int] | int` — Maximum neighbors (int: total count, list\[int\]: per-type counts)
 - `lmax: int` — Maximum degree (only if `l_schedule` is None)
 - `n_blocks: int` — Number of blocks (only if `l_schedule` is None, default: 2)
 - `l_schedule: list[int] | None` — Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored
@@ -583,10 +592,80 @@ Optimizer routing note:
   - trailing numeric `ParameterList` indices are ignored when deriving the effective segment
   - all other parameters follow shape-based routing (2D → Muon, otherwise → AdamW)
 - SeZM norm/layer-scale/frequency parameters use `adam_` prefixes (`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adam_freqs`) so HybridMuon routes them to Adam (no weight decay).
-- For HybridMuon with SeZM-Net, recommended routing mode is `muon_mode = "slice"`:
+- For HybridMuon with SeZM, recommended routing mode is `muon_mode = "slice"`:
   - 2D weights (SO2Linear, FocusLinear): Muon (same as mode=2d)
   - 3D SO3Linear `(F*(lmax+1), C_out, C_in)`: per-(focus, l) independent Muon with correct rectangular scale
   - `adam_`/`bias` parameters: Adam (name-based routing takes priority)
+- HybridMuon supports optional Muon-path Magma-lite damping via `magma_muon` (default: `false`):
+  - computes block-wise cosine alignment between Muon momentum and current gradients
+  - applies EMA smoothing on alignment score (`decay=0.9`)
+  - rescales Muon updates to `[0.1, 1.0]` for stability under noisy gradients
+  - does not change Adam/AdamW paths and does not use Bernoulli update dropping
+
+Detailed Magma-lite behavior (`training.magma_muon`):
+
+- Scope and insertion point
+
+  - active only on the Muon route after momentum update (`m_t`) is computed
+  - damping is applied to Muon update right before parameter update
+  - no change to Adam or AdamW branches
+
+- Block definition
+
+  - `muon_mode = "slice"`: one score per matrix slice `(..., m, n)` in Muon view
+  - `muon_mode = "2d"` or `"flat"`: one score per parameter
+  - state is stored as `optimizer.state[param]["magma_score"]`
+    - shape `(batch_size,)` in slice mode
+    - shape `(1,)` in 2d/flat mode
+  - if block shape changes unexpectedly (e.g., mismatch after load), score is reinitialized to `0.5`
+
+- Alignment and scaling formula (implementation)
+
+  - cosine alignment (FP32):
+    - `cos = clamp( <m_t, g_t> / (||m_t|| * ||g_t|| + eps), -1, 1 )`
+    - `eps = 1e-12`
+  - temperature sigmoid:
+    - `raw_sig = sigmoid(cos / tau)`, `tau = 2.0`
+  - range stretching to `[0, 1]`:
+    - `smin = sigmoid(-1/tau)`, `smax = sigmoid(1/tau)`
+    - `raw = clamp((raw_sig - smin) / (smax - smin), 0, 1)`
+  - EMA score:
+    - `score_t = 0.9 * score_{t-1} + 0.1 * raw`
+  - final damping scale:
+    - `scale = 0.1 + 0.9 * score_t` (always in `[0.1, 1.0]`)
+  - Muon update:
+    - `delta_muon = delta_muon * scale`
+
+- Practical interpretation
+
+  - strong momentum-gradient agreement (`cos` near `1`) gives larger scale
+  - poor or opposite alignment (`cos` near `0` or `-1`) damps the update
+  - `min_scale = 0.1` avoids complete update starvation on hard blocks
+
+- Usage guidance
+
+  - keep `magma_muon = false` when baseline is already stable
+  - enable `magma_muon = true` when multi-focus runs show frequent gradient spikes / unstable loss
+  - this is a stability-first variant; unlike the paper's full Magma, it intentionally avoids stochastic Bernoulli masking
+
+- Differences from the original Magma paper and rationale
+
+  - No Bernoulli skip masking:
+    - paper: `delta <- Q * S * delta`, with `S ~ Bernoulli(0.5)`
+    - here: `delta <- scale * delta` (dense every step)
+    - rationale: force-field training is more sensitive to intermittent block freezing; dense damping is more stable for noisy second-order/coupled objectives
+  - Muon-route-only application:
+    - paper: generic wrapper for multiple adaptive optimizers
+    - here: only HybridMuon's Muon branch is modulated
+    - rationale: observed instability is concentrated on large matrix Muon updates; keeping Adam/AdamW unchanged avoids side effects on bias/norm/layer-scale paths
+  - Sigmoid output stretching + minimum scale floor:
+    - paper: directly uses `sigmoid(cos/tau)` as alignment score
+    - here: score is stretched to `[0, 1]` and mapped to `[0.1, 1.0]`
+    - rationale: direct sigmoid with `tau=2` has narrow dynamic range; stretching improves control sensitivity, and the `0.1` floor prevents full starvation of hard blocks
+  - Block definition tied to Muon routing:
+    - paper: abstract block partition
+    - here: block granularity follows Muon view (`slice`: per `(..., m, n)` slice; `2d/flat`: per parameter)
+    - rationale: preserves structural independence of SeZM focus/l slices and aligns damping with the actual update operator
 
 Note: Neighbor normalization (graph-style degree normalization) is always enabled.
 Note: `focus_softmax_tau` (default `1.0`) and `focus_label_smoothing` (default `0.02`) are internal `SO2Convolution` parameters and are not exposed in descriptor top-level config.
@@ -602,7 +681,7 @@ Output:
 
 - returns only `l=0` features as descriptor: `(nf, nloc, channels)`
 
----
+______________________________________________________________________
 
 ## Serialization
 
@@ -627,7 +706,7 @@ arguments and `@variables` for full `state_dict()` payload.
 
 Version: `@version: 1`
 
----
+______________________________________________________________________
 
 ## Physics & Numerics
 
@@ -645,7 +724,7 @@ The coefficients satisfy `E(0)=1, E(1)=0, E'(1)=0, E''(1)=0`, ensuring C² conti
 The C² envelope is applied in two places:
 
 1. In `RadialBasis.forward()`: multiplied into the radial basis functions
-2. As `edge_env`: applied to all edge messages
+1. As `edge_env`: applied to all edge messages
 
 This double-guarantee ensures:
 
@@ -694,7 +773,7 @@ and the edge-aligned local frame. The block-diagonal matrices are computed by
 - Each submodule stores `self.precision = RESERVED_PRECISION_DICT[dtype]` for serialization compatibility.
 - The `env_protection` parameter (stored as `self.eps`) is used for numerical stability in division and normalization. If 0.0 is passed, it defaults to `1e-7`.
 
----
+______________________________________________________________________
 
 ## Caching Strategy (Critical)
 
@@ -709,14 +788,17 @@ Why caching matters:
 What is cached / reused:
 
 - All per-edge tensors needed by all blocks (geometry, radial basis, envelope, Wigner-D blocks).
+
 - Focus streams do not duplicate geometric caches. `n_focus` only adds a feature axis;
   `edge_vec`, `edge_rbf`, `D_full`, and `Dt_full` remain on the original edge axis.
+
 - `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused via a single `embedding_bag` reduction and **per-block truncated slices** are prebuilt according to `l_schedule`.
 
 - Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `(lmax, mmax)`, shared by all blocks and available in both eager and TorchScript.
+
 - Dtypes: `compute_dtype = get_promoted_dtype(dtype)` is set once in `__init__` and reused for geometry, radial basis/MLP, Wigner calculators, and the final l=0 mixer; runtime casts happen once on `extended_coord`, `radial_feat`, and the final scalar output.
 
----
+______________________________________________________________________
 
 ## DeePMD Interface Compatibility
 
@@ -726,7 +808,7 @@ SeZM follows the **new-style descriptor interface** (same as `dpa3`), using `ext
 - `_ENV_DIM = 1` for `EnvMatStatSe` compatibility; statistics are stored but not used in forward.
 - Not implemented: `share_params()`, `change_type_map()`.
 
----
+______________________________________________________________________
 
 ## Quick VRAM Estimation Formulas
 

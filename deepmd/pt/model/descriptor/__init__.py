@@ -43,7 +43,7 @@ from .se_t_tebd import (
     DescrptSeTTebd,
 )
 from .se_zm import (
-    DescrptSeZMNet,
+    DescrptSeZM,
 )
 
 __all__ = [
@@ -62,7 +62,7 @@ __all__ = [
     "DescrptSeR",
     "DescrptSeT",
     "DescrptSeTTebd",
-    "DescrptSeZMNet",
+    "DescrptSeZM",
     "make_default_type_embedding",
     "prod_env_mat",
 ]

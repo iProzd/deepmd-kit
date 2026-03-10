@@ -42,8 +42,8 @@ from .polar_atomic_model import (
 from .property_atomic_model import (
     DPPropertyAtomicModel,
 )
-from .sezm_net_atomic_model import (
-    SeZMNetAtomicModel,
+from .sezm_atomic_model import (
+    SeZMAtomicModel,
 )
 
 __all__ = [
@@ -57,5 +57,5 @@ __all__ = [
     "DPZBLLinearEnergyAtomicModel",
     "LinearEnergyAtomicModel",
     "PairTabAtomicModel",
-    "SeZMNetAtomicModel",
+    "SeZMAtomicModel",
 ]

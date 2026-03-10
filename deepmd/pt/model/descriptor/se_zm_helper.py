@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """
-Helper utilities for SeZM-Net PyTorch descriptor.
+Helper utilities for SeZM PyTorch descriptor.
 
 This module collects shared building blocks and math utilities, including:
 - edge caches, radial bases/envelopes, and initial embeddings
