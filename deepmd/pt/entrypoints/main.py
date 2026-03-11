@@ -516,6 +516,10 @@ def change_bias(
 def grad_probe(FLAGS) -> None:
     """Compute per-task descriptor gradient vectors for multitask conflict analysis."""
     import numpy as np
+    from deepmd.common import j_loader
+    from deepmd.utils.compat import update_deepmd_input
+    from deepmd.pt.utils.multi_task import preprocess_shared_params
+    from deepmd.utils.argcheck import normalize
 
     config = j_loader(FLAGS.INPUT)
     config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
@@ -549,7 +553,7 @@ def grad_probe(FLAGS) -> None:
             input_dict, label_dict, _ = trainer.get_data(
                 is_train=True, task_key=task_key
             )
-            cur_lr = trainer.lr_schedule.value(0)
+            cur_lr = config["learning_rate"]["start_lr"]
             _, loss, _ = trainer.wrapper(
                 **input_dict, cur_lr=cur_lr, label=label_dict, task_key=task_key
             )
