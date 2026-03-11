@@ -35,31 +35,16 @@ cmake --build . -j${NPROC}
 cmake --install .
 # Generate PT/PT2 model files for C++ tests.
 # Must run after cmake --build so that libdeepmd_op_pt.so (custom ops) is available.
-# When the build uses -fsanitize=leak, the resulting .so requires the LSAN runtime;
-# Python's dlopen would fail unless we preload it.
+# Note: gen scripts use the pip-installed (non-sanitized) deepmd libraries via
+# "import deepmd", so they do NOT need the LSAN runtime preloaded even when the
+# C++ build uses -fsanitize=leak.  The _load_custom_ops() fallback in each script
+# gracefully handles the case where the sanitized build_tests .so cannot be loaded.
 INFER_SCRIPT_PATH=${SCRIPT_PATH}/../tests/infer
-_GEN_ENV=""
-if echo "${CXXFLAGS:-}" | grep -q fsanitize=leak; then
-	_LSAN_LIB=$(gcc -print-file-name=liblsan.so 2>/dev/null || true)
-	if [ -n "${_LSAN_LIB}" ] && [ -f "${_LSAN_LIB}" ]; then
-		# Preload LSAN runtime so Python can dlopen the sanitized .so.
-		_GEN_ENV="LD_PRELOAD=${_LSAN_LIB}"
-		# Point to the suppressions file when LSAN_OPTIONS is not already
-		# set (i.e. running outside CI).  In CI the workflow already sets
-		# LSAN_OPTIONS with the same suppressions file.
-		if [ -z "${LSAN_OPTIONS:-}" ]; then
-			_SUPPR=${SCRIPT_PATH}/../../.github/workflows/suppr.txt
-			if [ -f "${_SUPPR}" ]; then
-				_GEN_ENV="${_GEN_ENV} LSAN_OPTIONS=suppressions=${_SUPPR}"
-			fi
-		fi
-	fi
-fi
-env ${_GEN_ENV} python ${INFER_SCRIPT_PATH}/gen_sea.py
-env ${_GEN_ENV} python ${INFER_SCRIPT_PATH}/gen_dpa1.py
-env ${_GEN_ENV} python ${INFER_SCRIPT_PATH}/gen_dpa2.py
-env ${_GEN_ENV} python ${INFER_SCRIPT_PATH}/gen_dpa3.py
-env ${_GEN_ENV} python ${INFER_SCRIPT_PATH}/gen_fparam_aparam.py
+python ${INFER_SCRIPT_PATH}/gen_sea.py
+python ${INFER_SCRIPT_PATH}/gen_dpa1.py
+python ${INFER_SCRIPT_PATH}/gen_dpa2.py
+python ${INFER_SCRIPT_PATH}/gen_dpa3.py
+python ${INFER_SCRIPT_PATH}/gen_fparam_aparam.py
 if [ "${ENABLE_PADDLE:-TRUE}" == "TRUE" ]; then
 	PADDLE_INFERENCE_DIR=${BUILD_TMP_DIR}/paddle_inference_install_dir
 	export LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${PADDLE_INFERENCE_DIR}/third_party/install/onednn/lib:${PADDLE_INFERENCE_DIR}/third_party/install/mklml/lib
