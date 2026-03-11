@@ -3,3 +3,19 @@ leak:libpaddle_inference
 leak:xla::
 leak:mlir::
 leak:llvm::
+# PyTorch runtime — pybind11 bindings, op registration, tensor allocation, etc.
+leak:pybind11::
+leak:torch::
+leak:at::detail::
+# Python runtime — arena allocator, type system, module loader, string interning
+leak:_PyObject_Malloc
+leak:_PyMem_RawMalloc
+leak:PyMem_Malloc
+leak:PyMem_RawMalloc
+leak:_PyRuntime
+leak:_PyEval
+leak:_PyImport_LoadDynamicModuleWithSpec
+leak:find_name_in_mro
+leak:strdup
+# System libraries
+leak:libcrypto
