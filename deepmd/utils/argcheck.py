@@ -4034,6 +4034,18 @@ If MPI is used, the value should be considered as the batch size per task.'
 - "prob_sys_size" : the probability of a system is proportional to the number of batches in the system\n\n\
 - "prob_sys_size;stt_idx:end_idx:weight;stt_idx:end_idx:weight;..." : the list of systems is divided into blocks. A block is specified by `stt_idx:end_idx:weight`, where `stt_idx` is the starting index of the system, `end_idx` is then ending (not including) index of the system, the probabilities of the systems in this block sums up to `weight`, and the relatively probabilities within this block is proportional to the number of batches in the system.'
     doc_sys_probs = "A list of float if specified. Should be of the same length as `systems`, specifying the probability of each system."
+    doc_min_pair_dist = (
+        "Minimum pairwise atomic distance threshold in Å. "
+        "Frames containing any atom pair closer than this distance are excluded "
+        "from loss computation, as DFT labels for near-collision configurations "
+        "are often unreliable. Set to 0 to disable (default). "
+        "Under distributed training (DDP/FSDP), if ALL frames in a batch are "
+        "filtered out on a given rank, one frame is retained to ensure every "
+        "rank participates in collective communication (backward all-reduce). "
+        "Note: enabling this adds an O(N²) distance check per frame in the "
+        "DataLoader workers (CPU-side), which may slow down training for large "
+        "systems. To avoid the overhead, consider pre-cleaning the dataset instead."
+    )
 
     args = [
         Argument(
@@ -4070,6 +4082,13 @@ If MPI is used, the value should be considered as the batch size per task.'
             default=None,
             doc=doc_sys_probs,
             alias=["sys_weights"],
+        ),
+        Argument(
+            "min_pair_dist",
+            float,
+            optional=True,
+            default=0.0,
+            doc=doc_only_pt_supported + doc_min_pair_dist,
         ),
     ]
 

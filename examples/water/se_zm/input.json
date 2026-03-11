@@ -89,6 +89,7 @@
         "../data/data_2"
       ],
       "batch_size": 1,
+      "min_pair_dist": 1.0,
       "_comment": "that's all"
     },
     "validation_data": {

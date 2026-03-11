@@ -452,9 +452,22 @@ class Trainer:
             # add data requirement for labels
             data_requirement = self.loss.label_requirement
             data_requirement += get_additional_data_requirement(self.model)
+            if training_params.get("training_data", {}).get("min_pair_dist", 0.0) > 0.0:
+                data_requirement.append(
+                    DataRequirementItem(
+                        "min_pair_dist",
+                        ndof=1,
+                        atomic=False,
+                        must=False,
+                        high_prec=False,
+                    )
+                )
             training_data.add_data_requirement(data_requirement)
             if validation_data is not None:
-                validation_data.add_data_requirement(data_requirement)
+                validation_data.add_data_requirement(
+                    self.loss.label_requirement
+                    + get_additional_data_requirement(self.model)
+                )
             # Preload and apply modifiers to all data before computing statistics
             training_data.preload_and_modify_all_data_torch()
             if validation_data is not None:
@@ -510,9 +523,25 @@ class Trainer:
                 data_requirement += get_additional_data_requirement(
                     self.model[model_key]
                 )
+                if (
+                    training_params.get("training_data", {}).get("min_pair_dist", 0.0)
+                    > 0.0
+                ):
+                    data_requirement.append(
+                        DataRequirementItem(
+                            "min_pair_dist",
+                            ndof=1,
+                            atomic=False,
+                            must=False,
+                            high_prec=False,
+                        )
+                    )
                 training_data[model_key].add_data_requirement(data_requirement)
                 if validation_data[model_key] is not None:
-                    validation_data[model_key].add_data_requirement(data_requirement)
+                    validation_data[model_key].add_data_requirement(
+                        self.loss[model_key].label_requirement
+                        + get_additional_data_requirement(self.model[model_key])
+                    )
                 # Preload and apply modifiers to all data before computing statistics
                 training_data[model_key].preload_and_modify_all_data_torch()
                 if validation_data[model_key] is not None:
@@ -660,6 +689,11 @@ class Trainer:
         # Learning rate
         self.gradient_max_norm = training_params.get("gradient_max_norm", 0.0)
         self.lr_schedule = get_lr(config["learning_rate"])
+
+        # Minimum pairwise distance for filtering unphysical frames during training
+        self.min_pair_dist = training_params.get("training_data", {}).get(
+            "min_pair_dist", 0.0
+        )
 
         # JIT
         if JIT:
@@ -1284,6 +1318,12 @@ class Trainer:
             input_dict, label_dict, log_dict = self.get_data(
                 is_train=True, task_key=task_key
             )
+            # All frames filtered by min_pair_dist (single-GPU only;
+            # DDP path in get_data() always keeps at least one frame)
+            if not input_dict:
+                if self.opt_type in ["Adam", "AdamW", "AdaMuon", "HybridMuon"]:
+                    self.scheduler.step()
+                return
             if SAMPLER_RECORD:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
                 fout1.write(print_str)
@@ -2017,6 +2057,27 @@ class Trainer:
         if iterator is None:
             return {}, {}, {}
         batch_data = next(iterator)
+        # === Filter frames with atoms too close (training only) ===
+        if is_train and self.min_pair_dist > 0.0 and "min_pair_dist" in batch_data:
+            min_dists = batch_data["min_pair_dist"]
+            if isinstance(min_dists, torch.Tensor):
+                valid_mask = min_dists.squeeze(-1) >= self.min_pair_dist
+                n_total = valid_mask.shape[0]
+                n_valid = int(valid_mask.sum().item())
+                if n_valid == 0:
+                    # Under distributed training (DDP/FSDP), every rank must
+                    # participate in backward() to avoid collective communication
+                    # deadlock.  Keep one frame as a fallback instead of
+                    # skipping the entire batch.
+                    if dist.is_available() and dist.is_initialized():
+                        valid_mask[0] = True
+                        n_valid = 1
+                    else:
+                        return {}, {}, {}
+                if n_valid < n_total:
+                    for key, val in batch_data.items():
+                        if isinstance(val, torch.Tensor) and val.shape[0] == n_total:
+                            batch_data[key] = val[valid_mask]
         for key in batch_data.keys():
             if key == "sid" or key == "fid" or key == "box" or "find_" in key:
                 continue
