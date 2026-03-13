@@ -23,6 +23,7 @@ from deepmd.pt.model.descriptor.se_zm_block import (
 )
 from deepmd.pt.model.descriptor.se_zm_helper import (
     EdgeFeatureCache,
+    InnerClamp,
     WignerDCalculator,
     build_m_major_index,
     edge_cache_to_dtype,
@@ -1181,6 +1182,204 @@ class TestEnvironmentInitialEmbedding(unittest.TestCase):
             )
             self.assertTrue(torch.isfinite(desc_no).all().item())
             self.assertTrue(torch.isfinite(desc_env).all().item())
+
+
+class TestInnerClamp(unittest.TestCase):
+    """Test InnerClamp C2-continuous quintic Hermite clamping."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+        self.r_inner = 1.0
+        self.r_outer = 1.5
+        self.clamp = InnerClamp(self.r_inner, self.r_outer)
+
+    def test_boundary_values(self) -> None:
+        """Test that r̃(r_inner) = r_inner, r̃(r_outer) = r_outer, and identity above."""
+        r = torch.tensor(
+            [0.5, self.r_inner, self.r_outer, 3.0],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        out = self.clamp(r)
+        expected = torch.tensor(
+            [self.r_inner, self.r_inner, self.r_outer, 3.0],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        torch.testing.assert_close(out, expected, atol=1e-12, rtol=0)
+
+    def test_monotonicity(self) -> None:
+        """Test that r̃ is monotonically non-decreasing."""
+        r = torch.linspace(0.0, 3.0, 1000, dtype=torch.float64, device=self.device)
+        out = self.clamp(r)
+        diff = out[1:] - out[:-1]
+        self.assertTrue((diff >= -1e-14).all(), "InnerClamp is not monotonic")
+
+    def test_frozen_zone_zero_gradient(self) -> None:
+        """Test that dr̃/dr = 0 for r < r_inner (frozen zone)."""
+        r = torch.tensor(
+            [0.3, 0.5, 0.8, 0.99],
+            dtype=torch.float64,
+            device=self.device,
+            requires_grad=True,
+        )
+        out = self.clamp(r)
+        grads = torch.autograd.grad(out.sum(), r)[0]
+        torch.testing.assert_close(
+            grads,
+            torch.zeros_like(grads),
+            atol=1e-12,
+            rtol=0,
+            msg="Gradient should be zero in the frozen zone",
+        )
+
+    def test_identity_zone_unit_gradient(self) -> None:
+        """Test that dr̃/dr = 1 for r > r_outer (identity zone)."""
+        r = torch.tensor(
+            [1.6, 2.0, 3.0, 5.0],
+            dtype=torch.float64,
+            device=self.device,
+            requires_grad=True,
+        )
+        out = self.clamp(r)
+        grads = torch.autograd.grad(out.sum(), r)[0]
+        torch.testing.assert_close(
+            grads,
+            torch.ones_like(grads),
+            atol=1e-12,
+            rtol=0,
+            msg="Gradient should be 1 in the identity zone",
+        )
+
+    def test_c2_continuity_at_boundaries(self) -> None:
+        """Test C2 continuity at r_inner and r_outer via numerical finite differences."""
+        eps = 1e-6
+        for boundary in [self.r_inner, self.r_outer]:
+            r = torch.tensor(
+                [boundary - eps, boundary, boundary + eps],
+                dtype=torch.float64,
+                device=self.device,
+                requires_grad=True,
+            )
+            out = self.clamp(r)
+
+            # First derivative via autograd
+            grads = torch.autograd.grad(out.sum(), r, create_graph=True)[0]
+            # dr̃/dr should be continuous (left ≈ center ≈ right)
+            self.assertAlmostEqual(
+                grads[0].item(),
+                grads[1].item(),
+                places=4,
+                msg=f"First derivative discontinuous at {boundary}",
+            )
+            self.assertAlmostEqual(
+                grads[1].item(),
+                grads[2].item(),
+                places=4,
+                msg=f"First derivative discontinuous at {boundary}",
+            )
+
+            # Second derivative via autograd
+            grads2 = torch.autograd.grad(grads.sum(), r)[0]
+            self.assertAlmostEqual(
+                grads2[0].item(),
+                grads2[1].item(),
+                places=3,
+                msg=f"Second derivative discontinuous at {boundary}",
+            )
+            self.assertAlmostEqual(
+                grads2[1].item(),
+                grads2[2].item(),
+                places=3,
+                msg=f"Second derivative discontinuous at {boundary}",
+            )
+
+    def test_invalid_params(self) -> None:
+        """Test that invalid parameters raise ValueError."""
+        with self.assertRaises(ValueError):
+            InnerClamp(1.5, 1.0)
+        with self.assertRaises(ValueError):
+            InnerClamp(-1.0, 1.0)
+        with self.assertRaises(ValueError):
+            InnerClamp(1.0, 1.0)
+
+
+class TestDescriptorInnerClamp(unittest.TestCase):
+    """Test DescrptSeZM with inner clamping enabled vs disabled."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+    def test_clamp_no_effect_beyond_r_outer(self) -> None:
+        """Test that inner clamp has no effect when all distances > r_outer."""
+        dtype = torch.float32
+        coord = torch.tensor(
+            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
+            dtype=dtype,
+            device=self.device,
+        ).view(1, -1, 3)
+        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
+        nlist = torch.tensor([[[1, 1], [0, 0]]], dtype=torch.int64, device=self.device)
+        extended_coord = coord.reshape(1, -1)
+
+        base_kwargs = {
+            "rcut": 3.0,
+            "sel": [1, 1],
+            "ntypes": 2,
+            "l_schedule": [1, 0],
+            "channels": 4,
+            "n_radial": 3,
+            "radial_mlp": [6],
+            "ffn_neurons": 8,
+            "ffn_blocks": 1,
+            "precision": "float32",
+            "trainable": True,
+            "seed": 42,
+        }
+
+        model_no_clamp = DescrptSeZM(**base_kwargs)
+        model_clamp = DescrptSeZM(
+            inner_clamp_r_inner=1.0,
+            inner_clamp_r_outer=1.5,
+            **base_kwargs,
+        )
+        model_clamp.load_state_dict(model_no_clamp.state_dict())
+
+        desc_no, *_ = model_no_clamp(extended_coord, atype, nlist)
+        desc_yes, *_ = model_clamp(extended_coord, atype, nlist)
+
+        # At r=2.0 > r_outer=1.5, outputs should be identical
+        torch.testing.assert_close(
+            desc_no,
+            desc_yes,
+            atol=1e-6,
+            rtol=1e-6,
+            msg="Descriptor should be identical when all distances > r_outer",
+        )
+
+    def test_serialization_with_inner_clamp(self) -> None:
+        """Test that inner_clamp params survive serialization round-trip."""
+        model = DescrptSeZM(
+            rcut=3.0,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 0],
+            channels=4,
+            n_radial=3,
+            radial_mlp=[6],
+            ffn_neurons=8,
+            ffn_blocks=1,
+            precision="float32",
+            trainable=True,
+            seed=42,
+            inner_clamp_r_inner=1.0,
+            inner_clamp_r_outer=1.5,
+        )
+        data = model.serialize()
+        restored = DescrptSeZM.deserialize(data)
+        self.assertEqual(restored.inner_clamp_r_inner, 1.0)
+        self.assertEqual(restored.inner_clamp_r_outer, 1.5)
+        self.assertIsNotNone(restored.inner_clamp)
 
 
 if __name__ == "__main__":

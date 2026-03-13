@@ -61,6 +61,9 @@
     "use_compile": false,
     "n_node": 256,
     "n_edge": 0,
+    "bridging_method": "None",
+    "bridging_r_inner": 1.0,
+    "bridging_r_outer": 1.5,
     "_comment": "that's all"
   },
   "learning_rate": {

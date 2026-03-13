@@ -19,6 +19,9 @@ if torch_set_num_threads is not None:
 from deepmd.pt.model.model import (
     get_sezm_model,
 )
+from deepmd.pt.model.model.sezm_model import (
+    InterPotential,
+)
 from deepmd.pt.utils import (
     env,
 )
@@ -372,3 +375,224 @@ class TestSeZMModelCompile(unittest.TestCase):
             torch.testing.assert_close(
                 grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
+
+
+class TestInterPotential(unittest.TestCase):
+    """Test InterPotential ZBL analytical pair potential."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+    def test_zbl_known_value_OO(self) -> None:
+        """Test ZBL energy for O-O pair at known distance against reference."""
+        pot = InterPotential(type_map=["O", "H"], mode="ZBL").to(self.device)
+
+        import math
+
+        z_o = 8.0
+        a_bohr = 0.5291772109
+        ke = 14.3996
+        a_screen = 0.88534 * a_bohr / (z_o**0.23 + z_o**0.23)
+        r = 1.0
+        x = r / a_screen
+        phi = (
+            0.18175 * math.exp(-3.1998 * x)
+            + 0.50986 * math.exp(-0.94229 * x)
+            + 0.28022 * math.exp(-0.4029 * x)
+            + 0.028171 * math.exp(-0.20162 * x)
+        )
+        expected = ke * z_o * z_o / r * phi
+
+        extended_coord = torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        extended_atype = torch.tensor([[0, 0]], dtype=torch.int64, device=self.device)
+        nlist = torch.tensor([[[1], [0]]], dtype=torch.int64, device=self.device)
+
+        pair_e = pot(extended_coord, extended_atype, nlist, nloc=2)
+        total_e = pair_e.sum().item()
+        self.assertAlmostEqual(total_e, expected, places=5)
+
+    def test_zbl_known_value_OH(self) -> None:
+        """Test ZBL energy for O-H pair at known distance."""
+        pot = InterPotential(type_map=["O", "H"], mode="ZBL").to(self.device)
+        import math
+
+        z_o, z_h = 8.0, 1.0
+        a_bohr = 0.5291772109
+        ke = 14.3996
+        a_screen = 0.88534 * a_bohr / (z_o**0.23 + z_h**0.23)
+        r = 0.8
+        x = r / a_screen
+        phi = (
+            0.18175 * math.exp(-3.1998 * x)
+            + 0.50986 * math.exp(-0.94229 * x)
+            + 0.28022 * math.exp(-0.4029 * x)
+            + 0.028171 * math.exp(-0.20162 * x)
+        )
+        expected = ke * z_o * z_h / r * phi
+
+        extended_coord = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0]]],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        extended_atype = torch.tensor([[0, 1]], dtype=torch.int64, device=self.device)
+        nlist = torch.tensor([[[1], [0]]], dtype=torch.int64, device=self.device)
+
+        pair_e = pot(extended_coord, extended_atype, nlist, nloc=2)
+        total_e = pair_e.sum().item()
+        self.assertAlmostEqual(total_e, expected, places=5)
+
+    def test_zbl_gradient_exists(self) -> None:
+        """Test that ZBL potential produces valid gradients for force computation."""
+        pot = InterPotential(type_map=["O", "H"], mode="ZBL").to(self.device)
+
+        extended_coord = torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+            dtype=torch.float64,
+            device=self.device,
+            requires_grad=True,
+        )
+        extended_atype = torch.tensor([[0, 1]], dtype=torch.int64, device=self.device)
+        nlist = torch.tensor([[[1], [0]]], dtype=torch.int64, device=self.device)
+
+        pair_e = pot(extended_coord, extended_atype, nlist, nloc=2)
+        pair_e.sum().backward()
+        self.assertIsNotNone(extended_coord.grad)
+        self.assertTrue(torch.isfinite(extended_coord.grad).all())
+
+    def test_unknown_element_raises(self) -> None:
+        """Test that unknown element raises ValueError."""
+        with self.assertRaises(ValueError):
+            InterPotential(type_map=["O", "Xx"])
+
+    def test_forward_from_edges(self) -> None:
+        """Test the compile-path edge-based ZBL computation."""
+        pot = InterPotential(type_map=["O", "H"], mode="ZBL").to(self.device)
+
+        edge_vec = torch.tensor(
+            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        edge_index = torch.tensor(
+            [[1, 0], [0, 1]], dtype=torch.long, device=self.device
+        )
+        atype_flat = torch.tensor([0, 1], dtype=torch.long, device=self.device)
+        edge_mask = torch.tensor([True, True], device=self.device)
+
+        result = pot.forward_from_edges(edge_vec, edge_index, atype_flat, edge_mask, 2)
+        self.assertEqual(result.shape, (1, 2, 1))
+        self.assertTrue(torch.isfinite(result).all())
+
+        extended_coord = torch.tensor(
+            [[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        extended_atype = torch.tensor([[0, 1]], dtype=torch.int64, device=self.device)
+        nlist = torch.tensor([[[1], [0]]], dtype=torch.int64, device=self.device)
+        pair_e_nlist = pot(extended_coord, extended_atype, nlist, nloc=2)
+        torch.testing.assert_close(
+            result.sum(), pair_e_nlist.sum().to(result.dtype), atol=1e-8, rtol=1e-8
+        )
+
+
+class TestSeZMModelBridging(unittest.TestCase):
+    """Test SeZM model with ZBL bridging enabled."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+        torch.manual_seed(2024)
+
+    def _build_model_params(self, *, bridging_method: str = "none") -> dict:
+        return {
+            "type": "SeZM",
+            "type_map": ["O", "H"],
+            "descriptor": {
+                "type": "SeZM",
+                "sel": [2, 2],
+                "rcut": 3.0,
+                "channels": 4,
+                "n_focus": 1,
+                "focus_compete": False,
+                "n_radial": 3,
+                "radial_mlp": [6],
+                "use_env_seed": False,
+                "l_schedule": [1, 0],
+                "mmax": 1,
+                "so2_norm": False,
+                "so2_layers": 1,
+                "n_atten_head": 0,
+                "sandwich_norm": [True, False, True, False],
+                "ffn_neurons": 8,
+                "ffn_blocks": 1,
+                "mlp_bias": True,
+                "layer_scale": True,
+                "use_amp": False,
+                "activation_function": "silu",
+                "glu_activation": True,
+                "precision": "float32",
+                "seed": 7,
+            },
+            "fitting_net": {
+                "neuron": [8],
+                "activation_function": "silu",
+                "precision": "float32",
+                "seed": 7,
+            },
+            "use_compile": False,
+            "n_node": 256,
+            "bridging_method": bridging_method,
+            "bridging_r_inner": 1.0,
+            "bridging_r_outer": 1.5,
+        }
+
+    def test_bridging_none_unchanged(self) -> None:
+        """Test that bridging_method='none' produces no inter_potential."""
+        model = get_sezm_model(self._build_model_params(bridging_method="none"))
+        self.assertIsNone(model.inter_potential)
+        self.assertEqual(model.bridging_method, "NONE")
+
+    def test_bridging_zbl_creates_potential(self) -> None:
+        """Test that bridging_method='ZBL' creates InterPotential and InnerClamp."""
+        model = get_sezm_model(self._build_model_params(bridging_method="ZBL"))
+        self.assertIsNotNone(model.inter_potential)
+        self.assertEqual(model.bridging_method, "ZBL")
+        self.assertIsNotNone(model.atomic_model.descriptor.inner_clamp)
+
+    def test_zbl_adds_energy(self) -> None:
+        """Test that ZBL bridging adds energy to the model output."""
+        model_plain = get_sezm_model(self._build_model_params(bridging_method="none"))
+        model_zbl = get_sezm_model(self._build_model_params(bridging_method="ZBL"))
+
+        sd = model_plain.state_dict()
+        model_zbl.load_state_dict(sd, strict=False)
+
+        coord = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.8, 0.0, 0.0], [0.0, 2.0, 0.0]]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        atype = torch.tensor([[0, 1, 0]], dtype=torch.int32, device=self.device)
+        box = torch.tensor(
+            [[10.0, 0, 0, 0, 10.0, 0, 0, 0, 10.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        model_plain.eval()
+        model_zbl.eval()
+
+        out_plain = model_plain(coord, atype, box=box)
+        out_zbl = model_zbl(coord, atype, box=box)
+
+        energy_diff = (out_zbl["energy"] - out_plain["energy"]).item()
+        self.assertGreater(
+            energy_diff,
+            0.0,
+            "ZBL bridging should add positive (repulsive) energy",
+        )

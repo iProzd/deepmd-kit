@@ -45,6 +45,7 @@ from deepmd.pt.model.model.model import (
 )
 from deepmd.pt.model.model.transform_output import (
     communicate_extended_output,
+    fit_output_to_model_output,
 )
 from deepmd.pt.utils import (
     env,
@@ -59,7 +60,7 @@ SeZMModel_ = make_model(SeZMAtomicModel)
 @BaseModel.register("SeZM")
 @BaseModel.register("se_zm")
 @BaseModel.register("sezm")
-@BaseModel.register("SeZM-Net")  # Backward compatibility alias
+@BaseModel.register("SeZM-Net")
 class SeZMModel(DPModelCommon, SeZMModel_):
     """
     SeZM energy model with optional fixed-shape compile path.
@@ -80,6 +81,9 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         use_tf32: bool = False,
         n_node: int | None = None,
         n_edge: int = 0,
+        bridging_method: str = "none",
+        bridging_r_inner: float = 1.0,
+        bridging_r_outer: float = 1.5,
         **kwargs: Any,
     ) -> None:
         DPModelCommon.__init__(self)
@@ -101,9 +105,106 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             if self.n_edge > 0 and self.n_edge > self.n_node * self.get_nsel():
                 raise ValueError("n_edge must be <= n_node * nsel when set")
 
+        # === Bridging (optional short-range zone bridging) ===
+        self.bridging_method: str = str(bridging_method).upper()
+        self.bridging_r_inner = float(bridging_r_inner)
+        self.bridging_r_outer = float(bridging_r_outer)
+        self.inter_potential: InterPotential | None = (
+            InterPotential(type_map=self.get_type_map(), mode=self.bridging_method)
+            if self.bridging_method != "NONE"
+            else None
+        )
+
     # =========================================================================
     # Forward Methods
     # =========================================================================
+
+    def forward_common_lower(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+        extra_nlist_sort: bool = False,
+        extended_coord_corr: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Override to inject analytical pair potential before autograd.
+
+        When ``bridging_method`` is active, the pair energy is added to the
+        atomic energy between ``forward_common_atomic`` and
+        ``fit_output_to_model_output``, so that autograd naturally produces
+        forces and virial that include the analytical potential contribution.
+
+        Parameters
+        ----------
+        extended_coord
+            Coordinates in extended region with shape (nf, nall*3) or (nf, nall, 3) in Å.
+        extended_atype
+            Atom types in extended region with shape (nf, nall).
+        nlist
+            Neighbor list with shape (nf, nloc, nsel).
+        mapping
+            Maps extended indices to local indices with shape (nf, nall).
+        fparam
+            Frame parameters with shape (nf, ndf) or None.
+        aparam
+            Atomic parameters with shape (nf, nloc, nda) or None.
+        do_atomic_virial
+            Whether to compute atomic virial.
+        comm_dict
+            Communication data for parallel inference.
+        extra_nlist_sort
+            Whether to forcibly sort the nlist.
+        extended_coord_corr
+            Coordinates correction for virial with shape (nf, nall*3) or None.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Model predictions on the extended region.
+        """
+        nframes, nall = extended_atype.shape[:2]
+        extended_coord = extended_coord.view(nframes, -1, 3)
+        nlist = self.format_nlist(
+            extended_coord, extended_atype, nlist, extra_nlist_sort=extra_nlist_sort
+        )
+        cc_ext, _, fp, ap, input_prec = self._input_type_cast(
+            extended_coord, fparam=fparam, aparam=aparam
+        )
+        del extended_coord, fparam, aparam
+        atomic_ret = self.atomic_model.forward_common_atomic(
+            cc_ext,
+            extended_atype,
+            nlist,
+            mapping=mapping,
+            fparam=fp,
+            aparam=ap,
+            comm_dict=comm_dict,
+        )
+
+        # === Inject analytical pair potential ===
+        if self.inter_potential is not None:
+            nloc = nlist.shape[1]
+            atomic_ret["energy"] = atomic_ret["energy"] + self.inter_potential(
+                cc_ext, extended_atype, nlist, nloc
+            )  # (nf, nloc, 1)
+
+        model_predict = fit_output_to_model_output(
+            atomic_ret,
+            self.atomic_output_def(),
+            cc_ext,
+            do_atomic_virial=do_atomic_virial,
+            create_graph=self.training,
+            mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
+            extended_coord_corr=extended_coord_corr,
+        )
+        model_predict = self._output_type_cast(model_predict, input_prec)
+        return model_predict
 
     def forward(
         self,
@@ -544,6 +645,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             fit_ret = self.atomic_model.apply_out_stat(fit_ret, atype_for_fit)
 
         atom_energy = fit_ret["energy"]  # (1, n_node, 1)
+
+        # === Step 3b. Inject zone bridging potential (compile path) ===
+        if self.inter_potential is not None:
+            pair_energy = self.inter_potential.forward_from_edges(
+                edge_vec, edge_index, atype_valid, edge_mask, n_node
+            )  # (1, n_node, 1)
+            atom_energy = atom_energy + pair_energy
+
         redu_prec = self.redu_prec
         atom_mask_view = atom_mask.to(dtype=redu_prec).view(1, n_node, 1)
         atom_energy_masked = atom_energy * atom_mask_view
@@ -1035,6 +1144,53 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
         return output_def
 
+    def serialize(self) -> dict[str, Any]:
+        """
+        Serialize the SeZM model including model-level bridging state.
+
+        Returns
+        -------
+        dict[str, Any]
+            Serialized SeZM model data.
+        """
+        return {
+            "@class": "Model",
+            "@version": 1,
+            "type": self.model_type,
+            "atomic_model": self.atomic_model.serialize(),
+            "use_compile": self.use_compile,
+            "use_tf32": self.use_tf32,
+            "n_node": self.n_node,
+            "n_edge": self.n_edge,
+            "bridging_method": self.bridging_method,
+            "bridging_r_inner": self.bridging_r_inner,
+            "bridging_r_outer": self.bridging_r_outer,
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> SeZMModel:
+        """
+        Deserialize the SeZM model including model-level bridging state.
+
+        Parameters
+        ----------
+        data
+            Serialized SeZM model data.
+
+        Returns
+        -------
+        SeZMModel
+            Deserialized SeZM model.
+        """
+        data = data.copy()
+        version = int(data.pop("@version", 1))
+        if version != 1:
+            raise ValueError(f"Unsupported SeZM version: {version}")
+        data.pop("@class", None)
+        data.pop("type", None)
+        atomic_model = SeZMAtomicModel.deserialize(data.pop("atomic_model"))
+        return cls(atomic_model_=atomic_model, **data)
+
     # =========================================================================
     # Context Managers
     # =========================================================================
@@ -1104,3 +1260,213 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             )
 
         return fp, ap
+
+
+# =============================================================================
+# InterPotential: analytical pair potentials for bridging
+# =============================================================================
+
+# fmt: off
+ELEMENT_TO_Z: dict[str, int] = {
+    "H": 1, "He": 2, "Li": 3, "Be": 4, "B": 5, "C": 6, "N": 7, "O": 8,
+    "F": 9, "Ne": 10, "Na": 11, "Mg": 12, "Al": 13, "Si": 14, "P": 15,
+    "S": 16, "Cl": 17, "Ar": 18, "K": 19, "Ca": 20, "Sc": 21, "Ti": 22,
+    "V": 23, "Cr": 24, "Mn": 25, "Fe": 26, "Co": 27, "Ni": 28, "Cu": 29,
+    "Zn": 30, "Ga": 31, "Ge": 32, "As": 33, "Se": 34, "Br": 35, "Kr": 36,
+    "Rb": 37, "Sr": 38, "Y": 39, "Zr": 40, "Nb": 41, "Mo": 42, "Tc": 43,
+    "Ru": 44, "Rh": 45, "Pd": 46, "Ag": 47, "Cd": 48, "In": 49, "Sn": 50,
+    "Sb": 51, "Te": 52, "I": 53, "Xe": 54, "Cs": 55, "Ba": 56, "La": 57,
+    "Ce": 58, "Pr": 59, "Nd": 60, "Pm": 61, "Sm": 62, "Eu": 63, "Gd": 64,
+    "Tb": 65, "Dy": 66, "Ho": 67, "Er": 68, "Tm": 69, "Yb": 70, "Lu": 71,
+    "Hf": 72, "Ta": 73, "W": 74, "Re": 75, "Os": 76, "Ir": 77, "Pt": 78,
+    "Au": 79, "Hg": 80, "Tl": 81, "Pb": 82, "Bi": 83, "Po": 84, "At": 85,
+    "Rn": 86, "Fr": 87, "Ra": 88, "Ac": 89, "Th": 90, "Pa": 91, "U": 92,
+    "Np": 93, "Pu": 94, "Am": 95, "Cm": 96, "Bk": 97, "Cf": 98, "Es": 99,
+    "Fm": 100, "Md": 101, "No": 102, "Lr": 103, "Rf": 104, "Db": 105,
+    "Sg": 106, "Bh": 107, "Hs": 108, "Mt": 109, "Ds": 110, "Rg": 111,
+    "Cn": 112, "Nh": 113, "Fl": 114, "Mc": 115, "Lv": 116, "Ts": 117,
+    "Og": 118,
+}
+# fmt: on
+
+# ZBL screening function coefficients
+_ZBL_A_COEFF = (0.18175, 0.50986, 0.28022, 0.028171)
+_ZBL_B_COEFF = (3.1998, 0.94229, 0.4029, 0.20162)
+
+# Physical constants
+_KE_EV_A = 14.3996  # Coulomb constant in eV·Å
+_A_BOHR = 0.5291772109  # Bohr radius in Å
+
+
+class InterPotential(torch.nn.Module):
+    """
+    Analytical pair potential module for Zone bridging.
+
+    Supports the Ziegler-Biersack-Littmark (ZBL) screened nuclear repulsion
+    potential. Designed to be extensible to other analytical forms (LJ, Morse,
+    etc.) through the ``mode`` parameter.
+
+    Each pair (i, j) contributes ``V_ZBL(r_ij) / 2`` to both atom i and atom j,
+    avoiding double-counting from the symmetric neighbor list.
+
+    Parameters
+    ----------
+    type_map : list[str]
+        Element symbols (e.g. ``["O", "H"]``). Index in this list corresponds
+        to the ``atype`` integer values.
+    mode : str
+        Potential formula. Currently only ``"zbl"`` is supported.
+
+    Raises
+    ------
+    ValueError
+        If ``mode`` is not recognized, or if any element in ``type_map`` is
+        not found in the periodic table.
+    """
+
+    def __init__(self, type_map: list[str], mode: str = "zbl") -> None:
+        super().__init__()
+        mode = mode.upper()
+        if mode != "ZBL":
+            raise ValueError(f"Unknown InterPotential mode: {mode}")
+        self.mode = mode
+
+        atomic_numbers = []
+        for elem in type_map:
+            z = ELEMENT_TO_Z.get(elem)
+            if z is None:
+                raise ValueError(f"Unknown element symbol: {elem}")
+            atomic_numbers.append(z)
+        self.register_buffer(
+            "atomic_numbers",
+            torch.tensor(atomic_numbers, dtype=torch.float64, device=env.DEVICE),
+        )
+
+    def _zbl_pair_energy(
+        self,
+        r: torch.Tensor,
+        zi: torch.Tensor,
+        zj: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute ZBL pair energy for given distances and nuclear charges.
+
+        Parameters
+        ----------
+        r : torch.Tensor
+            Pair distances with shape (...) in Å.
+        zi : torch.Tensor
+            Nuclear charge of atom i with shape (...).
+        zj : torch.Tensor
+            Nuclear charge of atom j with shape (...).
+
+        Returns
+        -------
+        torch.Tensor
+            Pair energies with shape (...) in eV.
+        """
+        a_screen = 0.88534 * _A_BOHR / (zi.pow(0.23) + zj.pow(0.23))
+        x = r / a_screen
+        phi = sum(a * torch.exp(-b * x) for a, b in zip(_ZBL_A_COEFF, _ZBL_B_COEFF))
+        return _KE_EV_A * zi * zj / r * phi
+
+    def forward(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        nloc: int,
+    ) -> torch.Tensor:
+        """
+        Compute per-atom pair energy from the standard neighbor list path.
+
+        Parameters
+        ----------
+        extended_coord
+            Coordinates in extended region with shape (nf, nall, 3) in Å.
+        extended_atype
+            Atom types in extended region with shape (nf, nall).
+        nlist
+            Neighbor list with shape (nf, nloc, nsel).
+        nloc : int
+            Number of local atoms.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-atom pair energy with shape (nf, nloc, 1) in eV.
+        """
+        nf = extended_coord.shape[0]
+        coord64 = extended_coord.to(dtype=torch.float64)
+        z_all = self.atomic_numbers[extended_atype.clamp(min=0)]  # (nf, nall)
+
+        # === Step 1. Gather neighbor coordinates and types ===
+        nsel = nlist.shape[2]
+        nlist_clamp = nlist.clamp(min=0)  # (nf, nloc, nsel)
+        nei_coord = torch.gather(
+            coord64, 1, nlist_clamp.unsqueeze(-1).expand(-1, -1, -1, 3).view(nf, -1, 3)
+        ).view(nf, nloc, nsel, 3)
+        atom_coord = coord64[:, :nloc].unsqueeze(2)  # (nf, nloc, 1, 3)
+        diff = nei_coord - atom_coord  # (nf, nloc, nsel, 3)
+        r = diff.norm(dim=-1).clamp(min=1e-10)  # (nf, nloc, nsel)
+
+        zi = z_all[:, :nloc].unsqueeze(2).expand_as(r)  # (nf, nloc, nsel)
+        zj_idx = nlist_clamp
+        zj = torch.gather(z_all, 1, zj_idx.view(nf, -1)).view(nf, nloc, nsel)
+
+        # === Step 2. Compute pair energies ===
+        pair_e = self._zbl_pair_energy(r, zi, zj)  # (nf, nloc, nsel)
+
+        # Mask padding entries (nlist == -1)
+        valid = (nlist >= 0).to(dtype=pair_e.dtype)
+        pair_e = pair_e * valid
+
+        # Half contribution to avoid double-counting
+        atom_pair_energy = (pair_e * 0.5).sum(dim=-1, keepdim=True)  # (nf, nloc, 1)
+        return atom_pair_energy.to(dtype=extended_coord.dtype)
+
+    def forward_from_edges(
+        self,
+        edge_vec: torch.Tensor,
+        edge_index: torch.Tensor,
+        atype_flat: torch.Tensor,
+        edge_mask: torch.Tensor,
+        n_node: int,
+    ) -> torch.Tensor:
+        """
+        Compute per-atom pair energy from the compile-path edge list.
+
+        Parameters
+        ----------
+        edge_vec
+            Edge vectors with shape (E, 3) in Å.
+        edge_index
+            Edge source/destination indices with shape (2, E).
+        atype_flat
+            Flat atom types with shape (N,).
+        edge_mask
+            Boolean mask with shape (E,). True means valid edge.
+        n_node : int
+            Padded number of nodes.
+
+        Returns
+        -------
+        torch.Tensor
+            Per-atom pair energy with shape (1, N, 1) in eV.
+        """
+        src = edge_index[0].to(dtype=torch.long)
+        dst = edge_index[1].to(dtype=torch.long)
+
+        r = edge_vec.to(dtype=torch.float64).norm(dim=-1).clamp(min=1e-10)  # (E,)
+        z_all = self.atomic_numbers[atype_flat.clamp(min=0)]  # (N,)
+        zi = z_all[src]  # (E,)
+        zj = z_all[dst]  # (E,)
+
+        pair_e = self._zbl_pair_energy(r, zi, zj)  # (E,)
+        pair_e = pair_e * edge_mask.to(dtype=pair_e.dtype)
+
+        # Half contribution to each destination atom
+        atom_energy = torch.zeros(n_node, dtype=pair_e.dtype, device=pair_e.device)
+        atom_energy.index_add_(0, dst, pair_e * 0.5)
+
+        return atom_energy.to(dtype=edge_vec.dtype).view(1, n_node, 1)

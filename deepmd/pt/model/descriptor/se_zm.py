@@ -77,6 +77,7 @@ from .se_zm_helper import (
     EdgeFeatureCache,
     EnvironmentInitialEmbedding,
     GeometricInitialEmbedding,
+    InnerClamp,
     RadialBasis,
     RadialMLP,
     SeZMTypeEmbedding,
@@ -276,6 +277,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         trainable: bool = True,
         seed: int | list[int] | None = None,
         type_map: list[str] | None = None,
+        inner_clamp_r_inner: float | None = None,
+        inner_clamp_r_outer: float | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -345,6 +348,23 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.use_amp = bool(use_amp)  # and self.training
         self.trainable = bool(trainable)
         self.seed = seed
+
+        # === Inner clamping for zone bridging ===
+        self.inner_clamp_r_inner = (
+            float(inner_clamp_r_inner) if inner_clamp_r_inner is not None else None
+        )
+        self.inner_clamp_r_outer = (
+            float(inner_clamp_r_outer) if inner_clamp_r_outer is not None else None
+        )
+        if (
+            self.inner_clamp_r_inner is not None
+            and self.inner_clamp_r_outer is not None
+        ):
+            self.inner_clamp: InnerClamp | None = InnerClamp(
+                self.inner_clamp_r_inner, self.inner_clamp_r_outer
+            )
+        else:
+            self.inner_clamp = None
 
         # === Env seed parameters ===
         self.use_env_seed = bool(use_env_seed)
@@ -1012,12 +1032,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         nf, nloc, nnei = nlist.shape
         n_nodes = int(nf * nloc)
 
-        # === Step 0. Force fp32+ for geometry ===
+        # === Step 1. Force fp32+ for geometry ===
         geom_dtype = get_promoted_dtype(extended_coord.dtype)
         coord = extended_coord.to(dtype=geom_dtype)  # (nf, nall, 3)
         nall = coord.shape[1]
 
-        # === Step 1. Build per-pair geometry with padding-safe gather ===
+        # === Step 2. Build per-pair geometry with padding-safe gather ===
         # DeePMD uses -1 for padding in nlist. torch.gather cannot index -1, so we
         # replace padding indices with 0 (any valid index works since padding positions
         # are masked out by `keep`). This avoids the extra cat operation for sentinel.
@@ -1045,7 +1065,17 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             diff = nei_pos - atom_pos  # (nf, nloc, nnei, 3)
             length = safe_norm(diff, self.eps)  # (nf, nloc, nnei, 1)
 
-        # === Step 2. C^2 envelope weight `sw` ===
+        # === Step 3. Inner clamping for zone bridging ===
+        # Freeze the descriptor below r_inner: both scalar distance and
+        # displacement vector are clamped so the descriptor sees no
+        # information about the true distance when r < r_inner.
+        if self.inner_clamp is not None:
+            clamped = self.inner_clamp(length)  # (nf, nloc, nnei, 1)
+            scale = clamped / length.clamp(min=self.eps)
+            diff = diff * scale  # direction preserved, length → clamped
+            length = clamped
+
+        # === Step 4. C^2 envelope weight `sw` ===
         # sw is the C^2-continuous cutoff envelope weight in [0, 1], applied per neighbor pair.
         with nvtx_range("envelope"):
             sw = self.c2_envelope(length)  # (nf, nloc, nnei, 1)
@@ -1053,7 +1083,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 dtype=sw.dtype
             )
 
-        # === Step 3. Filter valid edges for message passing ===
+        # === Step 5. Filter valid edges for message passing ===
         # An edge is valid if:
         #   - it is not padding (nlist >= 0)
         #   - the type pair is allowed (pair_keep_mask)
@@ -1104,7 +1134,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             )
             return cache
 
-        # === Step 4. Build flat edge indices and map to (src, dst) nodes ===
+        # === Step 6. Build flat edge indices and map to (src, dst) nodes ===
         # edge_idx indexes the flattened (nf, nloc, nnei) axis in row-major order.
         # Convert it back to:
         #   f_idx   in [0, nf)
@@ -1143,19 +1173,20 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             src = valid_f_idx * nloc + src_local  # (E,)
             num_edges = int(src.numel())
 
-        # === Step 5. Gather per-edge geometry ===
+        # === Step 7. Gather per-edge geometry ===
         # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
+        # edge_len is the (possibly clamped) scalar distance.
         with nvtx_range("edge_geom"):
             diff_flat = diff.reshape(-1, 3)  # (nf*nloc*nnei, 3)
             length_flat = length.reshape(-1, 1)  # (nf*nloc*nnei, 1)
             edge_vec = diff_flat[edge_idx]  # (E, 3)
             edge_len = length_flat[edge_idx]  # (E, 1)
 
-        # === Step 6. Radial basis (envelope already baked in) ===
+        # === Step 8. Radial basis (envelope already baked in) ===
         with nvtx_range("radial_basis"):
             edge_rbf = self.radial_basis(edge_len)  # (E, n_radial)
 
-        # === Step 7. Wigner-D blocks ===
+        # === Step 9. Wigner-D blocks ===
         with nvtx_range("rot_mat"):
             rot_mat = init_edge_rot_mat_frisvad(  # (E, 3, 3)
                 edge_vec, edge_len=edge_len, eps=self.eps
@@ -1167,7 +1198,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             type_ebed, src, dst, num_edges=num_edges
         )
 
-        # === Step 8. Neighbor normalization (destination degree) ===
+        # === Step 10. Neighbor normalization (destination degree) ===
         # Compute inverse sqrt degree for graph-style message normalization.
         with nvtx_range("degree"):
             deg = torch.zeros(
@@ -1244,6 +1275,11 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         # === Step 3. Edge length, envelope, and radial basis ===
         with nvtx_range("envelope"):
             edge_len = safe_norm(edge_vec, self.eps)
+            if self.inner_clamp is not None:
+                clamped = self.inner_clamp(edge_len)
+                scale = clamped / edge_len.clamp(min=self.eps)
+                edge_vec = edge_vec * scale
+                edge_len = clamped
             edge_env = self.c2_envelope(edge_len) * edge_keep_f  # (E, 1)
             edge_rbf = self.radial_basis(edge_len) * edge_keep_f  # (E, n_radial)
 
@@ -1575,6 +1611,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "eps": self.eps,
                 "trainable": self.trainable,
                 "seed": self.seed,
+                "inner_clamp_r_inner": self.inner_clamp_r_inner,
+                "inner_clamp_r_outer": self.inner_clamp_r_outer,
             },
             "@variables": {key: np_safe(value) for key, value in state.items()},
             "env_mat": DPEnvMat(self.rcut, self.rcut, self.eps).serialize(),

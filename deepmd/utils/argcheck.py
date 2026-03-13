@@ -2722,6 +2722,32 @@ def sezm_model_args() -> Argument:
                 default={},
                 doc=doc_only_pt_supported + doc_info,
             ),
+            Argument(
+                "bridging_method",
+                str,
+                optional=True,
+                default="None",
+                doc="Bridging method for short-range repulsion. Currently supports 'ZBL'. "
+                "Case-insensitive. Set to 'None' to disable.",
+            ),
+            Argument(
+                "bridging_r_inner",
+                float,
+                optional=True,
+                default=1.0,
+                doc="Inner clamping radius in Å. Distances below this are frozen for the ML model. "
+                "Only used when bridging_method is set. "
+                "When using ZBL bridging, set training_data.min_pair_dist to the same value "
+                "so that frames with atoms closer than r_inner are skipped during training.",
+            ),
+            Argument(
+                "bridging_r_outer",
+                float,
+                optional=True,
+                default=1.5,
+                doc="Outer clamping radius in Å. The transition zone [bridging_r_inner, bridging_r_outer] "
+                "uses a C2-continuous quintic Hermite polynomial. Only used when bridging_method is set.",
+            ),
         ],
         doc="SeZM model scaffold with fixed descriptor and fitting types.",
     )

@@ -303,6 +303,16 @@ def get_sezm_model(model_params: dict) -> BaseModel:
     ntypes = len(model_params["type_map"])
     model_params["descriptor"]["ntypes"] = ntypes
     model_params["descriptor"]["type_map"] = copy.deepcopy(model_params["type_map"])
+
+    # === Bridging parameters ===
+    bridging_method = str(model_params.get("bridging_method", "none")).upper()
+    bridging_r_inner = float(model_params.get("bridging_r_inner", 1.0))
+    bridging_r_outer = float(model_params.get("bridging_r_outer", 1.5))
+    # Only inject bridging parameters when bridging is enabled.
+    if bridging_method != "NONE":
+        model_params["descriptor"]["inner_clamp_r_inner"] = bridging_r_inner
+        model_params["descriptor"]["inner_clamp_r_outer"] = bridging_r_outer
+
     descriptor = BaseDescriptor(**model_params["descriptor"])
 
     fitting_net = copy.deepcopy(model_params["fitting_net"])
@@ -336,6 +346,9 @@ def get_sezm_model(model_params: dict) -> BaseModel:
         use_tf32=use_tf32,
         n_node=n_node,
         n_edge=n_edge,
+        bridging_method=bridging_method,
+        bridging_r_inner=bridging_r_inner,
+        bridging_r_outer=bridging_r_outer,
     )
     model.model_def_script = json.dumps(model_params_old)
     return model

@@ -37,7 +37,6 @@ ______________________________________________________________________
 
 ## Non-Goals (Explicitly Out of Scope)
 
-- ZBL gating / short-range repulsion: only a **clean placeholder hook** is provided.
 - Top-K neighbor selection: **not allowed**. Use `rcut` and masks only.
 - External equivariant libraries (e.g. e3nn): **not allowed**.
 
@@ -69,6 +68,91 @@ the standard DeePMD neighbor list behavior:
 
 This path is designed for second-order derivatives during training; all geometry (edge vectors,
 Wigner-D, radial basis) remains differentiable, and padded edges are fully masked.
+
+______________________________________________________________________
+
+## ZBL Bridging (Optional Short-Range Repulsion)
+
+SeZM supports an optional analytical short-range repulsion potential that supplements the
+ML-predicted energy via pure additive energy decomposition:
+
+```
+E_total = E_ZBL(r) + E_model(r̃)
+```
+
+where `r` is the true interatomic distance and `r̃` is the clamped distance seen by the descriptor.
+
+### Design Principles
+
+1. **Pure additive**: ZBL energy is added to the atomic energy *before* autograd, so forces and
+   virials naturally include ZBL contributions with no extra code.
+1. **Descriptor-level inner clamping**: When bridging is active, the descriptor sees clamped
+   distances — both scalar and vectorial — so its output is completely frozen below `r_inner`.
+   This prevents the ML model from learning (or unlearning) the repulsive wall.
+1. **Optional**: Controlled by `model.bridging_method` (default `"none"`). Setting it to `"ZBL"`
+   enables both the ZBL potential and inner clamping simultaneously.
+
+### Configuration Parameters (model-level)
+
+| Parameter          | Type  | Default  | Description                                              |
+| ------------------ | ----- | -------- | -------------------------------------------------------- |
+| `bridging_method`  | str   | `"none"` | Bridging formula. `"none"` to disable, `"ZBL"` to enable |
+| `bridging_r_inner` | float | 1.0      | Inner clamping radius in Å. Descriptor frozen below this |
+| `bridging_r_outer` | float | 1.5      | Outer clamping radius in Å. Transition zone upper bound  |
+
+These are model-level parameters. When `bridging_method != "none"`, the model factory injects
+`inner_clamp_r_inner` and `inner_clamp_r_outer` into the descriptor parameters automatically;
+they are not user-facing descriptor config keys.
+
+### Inner Clamping
+
+The `InnerClamp` module (in `se_zm_helper.py`) implements a C2-continuous quintic Hermite
+polynomial that maps true distances to effective distances:
+
+```
+r̃(r) = r_inner                                           if r <= r_inner   (frozen zone)
+      = r_inner + (r_outer - r_inner) * h(t)              if r_inner < r < r_outer  (transition)
+      = r                                                  if r >= r_outer  (identity zone)
+
+where t = (r - r_inner) / (r_outer - r_inner)
+      h(t) = 3t^5 - 8t^4 + 6t^3
+```
+
+Boundary conditions: `h(0)=0, h(1)=1, h'(0)=0, h'(1)=1, h''(0)=0, h''(1)=0`.
+
+**Vector-level clamping**: Both the scalar distance and the displacement vector are clamped.
+The vector is rescaled to preserve direction while matching the clamped distance:
+
+```python
+clamped = inner_clamp(length)
+scale = clamped / length.clamp(min=eps)
+diff = diff * scale  # direction preserved, ||diff|| = clamped
+length = clamped
+```
+
+This ensures the descriptor receives *no information* about the true distance when `r < r_inner`.
+All downstream modules — radial basis, envelope, rotation matrix, `EnvironmentInitialEmbedding` —
+see clamped values uniformly. No raw distance is preserved anywhere.
+
+### InterPotential (ZBL)
+
+The `InterPotential` module (in `sezm_model.py`) computes the analytical Ziegler-Biersack-Littmark
+screened nuclear repulsion potential:
+
+```
+V_ZBL(r) = (ke * Zi * Zj / r) * phi(r / a)
+a = 0.88534 * a_bohr / (Zi^0.23 + Zj^0.23)
+phi(x) = 0.18175*exp(-3.1998*x) + 0.50986*exp(-0.94229*x) + 0.28022*exp(-0.4029*x) + 0.02817*exp(-0.20162*x)
+```
+
+Each pair `(i, j)` contributes `V_ZBL / 2` to atom `i` (symmetric neighbor list, avoid double-counting).
+
+Energy injection points:
+
+- **Standard path** (`forward_common_lower`): injected into `atomic_ret["energy"]` before
+  `fit_output_to_model_output`.
+- **Compile path** (`compile_compute_func`): injected into `atom_energy` before autograd
+  computes forces/virials.
 
 ______________________________________________________________________
 

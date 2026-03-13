@@ -664,6 +664,71 @@ class C2CutoffEnvelope(torch.nn.Module):
         return env_val * ((d_scaled < 1.0).to(dst.dtype))
 
 
+class InnerClamp(nn.Module):
+    """
+    C2-continuous inner distance clamping for zone bridging.
+
+    Applies a quintic Hermite polynomial transition that freezes distances
+    below ``r_inner`` to the constant ``r_inner``, then smoothly transitions
+    back to identity at ``r_outer``::
+
+        r̃(r) = r_inner                                    if r <= r_inner
+        r̃(r) = r_inner + (r_outer - r_inner) * h(t)       if r_inner < r < r_outer
+        r̃(r) = r                                          if r >= r_outer
+
+        h(t) = 6t^3 - 8t^4 + 3t^5,  t = (r - r_inner) / (r_outer - r_inner)
+
+    Boundary conditions: h(0)=0, h(1)=1, h'(0)=0, h'(1)=1, h''(0)=0, h''(1)=0.
+    This ensures C2 continuity: ``dr̃/dr = 0`` at r_inner (frozen zone) and
+    ``dr̃/dr = 1`` at r_outer (identity zone).
+
+    Parameters
+    ----------
+    r_inner : float
+        Freeze radius in Å. Distances below this are clamped to ``r_inner``.
+    r_outer : float
+        Outer boundary of the transition zone in Å. Above this, ``r̃ = r``.
+
+    Raises
+    ------
+    ValueError
+        If ``r_inner >= r_outer`` or either is non-positive.
+    """
+
+    def __init__(self, r_inner: float, r_outer: float) -> None:
+        super().__init__()
+        if r_inner <= 0 or r_outer <= 0:
+            raise ValueError("r_inner and r_outer must be positive")
+        if r_inner >= r_outer:
+            raise ValueError(f"r_inner ({r_inner}) must be < r_outer ({r_outer})")
+        self.r_inner = float(r_inner)
+        self.r_outer = float(r_outer)
+
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Apply inner distance clamping.
+
+        Parameters
+        ----------
+        r : torch.Tensor
+            Pair distances with shape (...) or (..., 1) in Å.
+
+        Returns
+        -------
+        torch.Tensor
+            Clamped distances r̃ with the same shape as input.
+        """
+        t = ((r - self.r_inner) / (self.r_outer - self.r_inner)).clamp(0.0, 1.0)
+        t3 = t * t * t
+        # h(t) = 6t^3 - 8t^4 + 3t^5 = t^3 * (3t^2 - 8t + 6)
+        # Satisfies: h(0)=0, h(1)=1, h'(0)=0, h'(1)=1, h''(0)=0, h''(1)=0
+        h = t3 * (3.0 * t * t - 8.0 * t + 6.0)
+        interpolated = self.r_inner + (self.r_outer - self.r_inner) * h
+        # Identity zone: r >= r_outer returns r directly.
+        # Both branches have gradient 1 at r_outer so torch.where is C2 here.
+        return torch.where(r >= self.r_outer, r, interpolated)
+
+
 class RadialBasis(nn.Module):
     """
     Spherical Bessel radial basis with C^2 cutoff envelope.
