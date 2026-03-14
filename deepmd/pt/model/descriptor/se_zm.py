@@ -376,30 +376,22 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         g_in_dim = rbf_out_dim + 2 * self.env_seed_type_dim
         self.env_seed_hidden_dim = min(256, max(2 * self.env_seed_embed_dim, g_in_dim))
 
-        # === Step 0. Split deterministic seeds at the descriptor top-level ===
+        # === Split deterministic seeds at the descriptor top-level ===
         seed_type_embedding = child_seed(self.seed, 0)
         seed_blocks = child_seed(self.seed, 1)
         seed_out = child_seed(self.seed, 2)
         seed_radial_embedding = child_seed(self.seed, 3)
         seed_env_seed = child_seed(self.seed, 4)
 
-        # === Step 1. L/M schedules ===
+        # === L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
         self.ebed_dims = [get_so3_dim_of_lmax(l) for l in self.l_schedule]
         self.rad_sizes_per_block = [l + 1 for l in self.l_schedule]
 
-        # === Step 2. Statistics buffers (interface compatibility) ===
-        _shape = (self.ntypes, self.nnei, self._ENV_DIM)
-        mean = torch.zeros(_shape, dtype=self.dtype, device=self.device)
-        stddev = torch.ones(_shape, dtype=self.dtype, device=self.device)
-        self.register_buffer("mean", mean)
-        self.register_buffer("stddev", stddev)
-        self.stats: dict[str, Any] | None = None
-
-        # === Step 3. Excluded type pairs ===
+        # === Excluded type pairs ===
         self.reinit_exclude(exclude_types)
 
-        # === Step 4. Type embedding ===
+        # === Type embedding ===
         self.type_embedding = SeZMTypeEmbedding(
             ntypes=self.ntypes,
             embed_dim=self.channels,
@@ -408,7 +400,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             trainable=self.trainable,
         )
 
-        # === Step 5. Env FiLM embedding (optional) ===
+        # === Env FiLM embedding (optional) ===
         if self.use_env_seed:
             self.env_seed_embedding: EnvironmentInitialEmbedding | None = (
                 EnvironmentInitialEmbedding(
@@ -560,6 +552,15 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.register_buffer(
             "_empty_tensor",
             torch.empty(0, device=env.DEVICE, dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+        )
+
+        # === Statistics buffers (interface compatibility) ===
+        self.stats: dict[str, Any] | None = None
+        self.register_buffer(
+            "mean", torch.zeros(0, dtype=self.dtype, device=self.device)
+        )
+        self.register_buffer(
+            "stddev", torch.ones(0, dtype=self.dtype, device=self.device)
         )
 
     def forward(
@@ -1680,3 +1681,28 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         )
         local_jdata_cpy["sel"] = sel[0]
         return local_jdata_cpy, min_nbor_dist
+
+    def _load_from_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: dict[str, Any],
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_msgs: list[str],
+    ) -> None:
+        """Ignore mean/stddev from checkpoint."""
+        for key in ["mean", "stddev"]:
+            full_key = prefix + key
+            state_dict.pop(full_key, None)
+            state_dict[full_key] = getattr(self, key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )

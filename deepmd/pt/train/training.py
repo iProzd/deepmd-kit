@@ -843,6 +843,9 @@ class Trainer:
                         "_extra_state"
                     ]
 
+                # Always use current model_params so newly added fields
+                # (e.g. bridging_method) are persisted in checkpoints.
+                state_dict["_extra_state"] = self.wrapper.state_dict()["_extra_state"]
                 self.wrapper.load_state_dict(state_dict)
 
                 # change bias for fine-tuning
