@@ -180,17 +180,22 @@ Standard DeePMD nlist path:
     └─ l>0: Zonal (m=0) initial embedding via cached Wigner-D + radial_feat[:, 1:, :]
 
   Interaction blocks (pyramid schedule):
+    depth_sources = [x0]
     for block i:
+      ├─ optional block AttnRes over truncated `depth_sources` when `block_attn_res != "none"`
       ├─ slice D to ebed_dim(l_schedule[i]) (discard higher-l if needed)
       ├─ main tensor layout is fixed as (N, D, F, Cf), contiguous
       ├─ SeparableRMSNorm (pre-SO2, per-focus on (N, D, F, Cf))
       ├─ Multi-Focus SO(2) Convolution (enabled for ALL lmax, including lmax=0)
       │  ├─ `pre_focus_mix`: full-channel mixing on (N, D, C)
       │  ├─ rotate/bmm in full width (E, D, C), then SO2 stack on strided (E, F, Dm, Cf)
+      │  ├─ optional SO(2) internal AttnRes over local layer history when `so2_attn_res != "none"`
       │  └─ `post_focus_mix` on (N, 1, D, C)
-      └─ FFN subblock sequence (ffn_blocks iterations, global C via view, no permute)
+      ├─ FFN subblock sequence (ffn_blocks iterations, global C via view, no permute)
+      └─ append block delta to `depth_sources`
 
   Output (forward, promoted dtype):
+    └─ optional final AttnRes over all completed block representations when `block_attn_res != "none"`
     └─ Extract x(l=0) from global block output
     └─ reshape to (N, 1, 1, C)
     └─ Convert to promoted dtype (float32+)
@@ -268,6 +273,11 @@ ______________________________________________________________________
   - This reduces kernel launches while preserving SO(2) equivariance.
   - All learnable weights use `(in, out)` layout; focus dimension `F` is folded on the output (cols) side.
   - Weights are stored as raw parameters (no activation/bias); only the l=0 bias is separate.
+- Optional depth-wise attention residuals:
+  - `so2_attn_res="none"` disables SO(2)-internal AttnRes, `"independent"` uses a learned pseudo-query, and `"dependent"` derives the query from the current reduced-layout `l=0` slice before each SO(2) layer.
+  - `block_attn_res="none"` disables descriptor-level AttnRes, `"independent"` uses a learned pseudo-query, and `"dependent"` derives the query from the current descriptor `l=0` slice before each block and before the final aggregation.
+  - When enabled, the descriptor keeps `depth_sources = [x0, delta1, delta2, ...]`, applies selective aggregation in the common truncated `D_i` space before each block, and runs one final aggregation before `output_ffn`.
+  - All depth-attention query paths are zero-initialized, so the initial behavior is a uniform average over the available sources.
 
 ### 6. Deterministic initialization
 
@@ -646,26 +656,28 @@ Key arguments:
 - `sel: list[int] | int` — Maximum neighbors (int: total count, list\[int\]: per-type counts)
 - `lmax: int` — Maximum degree (only if `l_schedule` is None)
 - `n_blocks: int` — Number of blocks (only if `l_schedule` is None, default: 2)
+- `block_attn_res: str` — Descriptor-level depth-wise attention residual mode across block history, including the final aggregation over all completed block representations before the scalar output FFN. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `l_schedule: list[int] | None` — Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored
 - `mmax: int | None` — Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax
 - `m_schedule: list[int] | None` — Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored
 - `channels: int` — Total channels per (l,m) coefficient (default: 64)
 - `n_focus: int` — Number of parallel focus streams. Internal width is `focus_dim = channels // n_focus`; channels must be divisible by `n_focus` (default: 1)
-- `focus_compete: bool` — If True, enable cross-focus softmax competition in SO(2) convolution. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus (default: False)
+- `focus_compete: bool` — If True, enable cross-focus softmax competition in SO(2) convolution. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus (default: True)
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
 - `so2_norm: bool` — If True, apply ReducedSeparableRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
-- `so2_layers: int` — Number of SO2Linear layers per convolution (default: 2)
-- `ffn_neurons: int` — Hidden size for equivariant FFN (default: 128)
+- `so2_layers: int` — Number of SO2Linear layers per convolution (default: 4)
+- `so2_attn_res: str` — SO(2)-internal depth-wise attention residual mode inside each interaction block. Allowed values: `none`, `independent`, `dependent` (default: `none`)
+- `ffn_neurons: int` — Hidden size for equivariant FFN (default: 96)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
 - `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and envelope-aware grouped softmax attention with output-side head gate is applied. Competition uses `edge_env^0.5`; value amplitude uses `edge_env`.
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
-- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, SeparableRMSNorm centering bias) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: False)
+- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, DepthAttnRes input-dependent query projection, SeparableRMSNorm centering bias) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: True)
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
-- `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: False)
-- `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: False)
+- `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: True)
+- `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: True)
 
 Optimizer routing note:
 
@@ -771,22 +783,18 @@ ______________________________________________________________________
 
 `serialize()` captures:
 
-- hyperparameters including `l_schedule`, `m_schedule`, `use_env_seed`, and `compute_mode`
-- type embedding parameters
-- **env_seed** (if `use_env_seed=True`): packed env-seed payload (embedding + FiLM norms + FiLM strengths), including independent type embedding (`env_type_embed`), two-layer RBF projection (`rbf_proj_layer1`, `rbf_proj_layer2`), G network layers, output projection (2\*C), zero-init for FiLM logits with small strength init
-- **radial basis** and **radial embedding** (store `config` + `@variables` state dict)
-- geometric initial embedding (GIE, store `config` + `@variables` state dict)
-- block sub-networks (each stores `config` + `@variables` state dict):
-  - `EquivariantFFN`
-  - `SO2Convolution`
-  - `SeparableRMSNorm`
-- `so3_linear_output` (store `config` + `@variables` state dict)
-- `davg` / `dstd` statistics buffers
+- top-level descriptor config, including `l_schedule`, `m_schedule`, `use_env_seed`,
+  `block_attn_res`, `so2_attn_res`, `sandwich_norm`, and inner-clamp settings
+- the full descriptor `state_dict()` payload under `@variables`
+- an `env_mat` compatibility payload
 
-All SeZM modules (descriptor + submodules) use the same layout: `config` for constructor
-arguments and `@variables` for full `state_dict()` payload.
+At the descriptor top level, serialization is flat: `DescrptSeZM.serialize()` does
+not recursively pack per-submodule payloads. Instead, `DescrptSeZM.deserialize()`
+reconstructs `DescrptSeZM(**config)` and restores the full `state_dict()`.
 
-`deserialize()` reconstructs the model and restores all parameters including trainable frequencies.
+Individual SeZM submodules such as `DepthAttnRes`, `SO2Convolution`, and
+`SeZMInteractionBlock` still expose standalone `serialize()` / `deserialize()`
+helpers using the same `config` + `@variables` convention when tested in isolation.
 
 Version: `@version: 1`
 

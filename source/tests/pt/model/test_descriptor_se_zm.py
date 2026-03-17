@@ -18,6 +18,7 @@ from deepmd.pt.model.descriptor.se_zm import (
     init_edge_rot_mat_frisvad,
 )
 from deepmd.pt.model.descriptor.se_zm_block import (
+    DepthAttnRes,
     SO2Convolution,
     SO2Linear,
 )
@@ -159,6 +160,39 @@ class TestDescrptSeZM(unittest.TestCase):
                 trainable=True,
             )
 
+    def test_forward_with_attention_residuals(self) -> None:
+        """Test forward/backward with descriptor and SO(2) attention residuals."""
+        coord, atype, nlist = self._tiny_system(dtype=torch.float32)
+        extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
+        model = DescrptSeZM(
+            rcut=3.0,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 1, 0],
+            channels=8,
+            n_focus=2,
+            n_radial=4,
+            radial_mlp=[8],
+            so2_layers=2,
+            block_attn_res="dependent",
+            so2_attn_res="dependent",
+            ffn_neurons=16,
+            ffn_blocks=2,
+            layer_scale=True,
+            precision="float32",
+            trainable=True,
+            seed=123,
+        )
+
+        desc, *_ = model(extended_coord, atype, nlist, mapping=None, comm_dict=None)
+        self.assertEqual(desc.shape, (1, 2, 8))
+        self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
+
+        loss = desc.sum()
+        loss.backward()
+        self.assertIsNotNone(extended_coord.grad)
+        self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
+
     def test_forward_backward_second_order_fixed_edges(self) -> None:
         """Test fixed-shape edge path matches nlist for fwd/bwd/2nd order."""
         dtype = torch.float32
@@ -175,10 +209,13 @@ class TestDescrptSeZM(unittest.TestCase):
             rcut=3.0,
             sel=[1, 1],
             ntypes=2,
-            l_schedule=[1, 0],
+            l_schedule=[1, 1, 0],
             channels=4,
             n_radial=3,
             radial_mlp=[6],
+            so2_layers=2,
+            block_attn_res="dependent",
+            so2_attn_res="dependent",
             ffn_neurons=8,
             ffn_blocks=2,
             layer_scale=True,
@@ -280,6 +317,8 @@ class TestDescrptSeZM(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 so2_layers=2,
+                block_attn_res="dependent",
+                so2_attn_res="dependent",
                 ffn_neurons=16,
                 ffn_blocks=2,
                 layer_scale=True,
@@ -341,6 +380,8 @@ class TestDescrptSeZM(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 so2_layers=2,
+                block_attn_res="dependent",
+                so2_attn_res="dependent",
                 ffn_neurons=16,
                 ffn_blocks=2,
                 layer_scale=True,
@@ -358,6 +399,8 @@ class TestDescrptSeZM(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 so2_layers=2,
+                block_attn_res="dependent",
+                so2_attn_res="dependent",
                 ffn_neurons=16,
                 ffn_blocks=2,
                 layer_scale=True,
@@ -419,6 +462,44 @@ class TestDescrptSeZM(unittest.TestCase):
                 rtol=rtol,
                 msg="Smooth weight differs for models with same seed",
             )
+
+
+class TestDepthAttnRes(unittest.TestCase):
+    """Test the DepthAttnRes helper."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+    def test_pseudo_query_zero_init_uniform_average(self) -> None:
+        """Test zero-init pseudo-query gives a uniform source average."""
+        module = DepthAttnRes(
+            channels=4,
+            input_dependent=False,
+            eps=1e-7,
+            dtype=torch.float32,
+            trainable=True,
+        )
+        source_a = torch.tensor(
+            [[[[1.0, 2.0]], [[3.0, 4.0]]], [[[0.5, 1.5]], [[2.5, 3.5]]]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        source_b = torch.tensor(
+            [[[[5.0, 6.0]], [[7.0, 8.0]]], [[[1.5, 2.5]], [[3.5, 4.5]]]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        def scalar_extractor(v: torch.Tensor) -> torch.Tensor:
+            return v[:, :, 0, :].reshape(v.shape[0], 4)
+
+        out = module(
+            sources=[source_a, source_b],
+            scalar_extractor=scalar_extractor,
+        )
+        expected = 0.5 * (source_a + source_b)
+        torch.testing.assert_close(out, expected, atol=1e-6, rtol=1e-6)
+        self.assertEqual(out.dtype, source_a.dtype)
 
 
 class TestInitEdgeRotMatFrisvad(unittest.TestCase):

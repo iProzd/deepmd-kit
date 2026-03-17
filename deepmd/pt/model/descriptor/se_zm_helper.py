@@ -62,6 +62,35 @@ if TYPE_CHECKING:
     )
 
 
+ATTN_RES_MODES = ("none", "independent", "dependent")
+
+
+def normalize_attn_res_mode(mode: str, *, has_history: bool) -> str:
+    """
+    Normalize the string mode for depth-wise attention residuals.
+
+    Parameters
+    ----------
+    mode
+        String mode. Must be one of ``"none"``, ``"independent"``, or
+        ``"dependent"``.
+    has_history
+        Whether this call site has more than one depth source to aggregate.
+        When False, the mode is normalized to ``"none"``.
+
+    Returns
+    -------
+    str
+        Normalized mode string.
+    """
+    mode = str(mode).lower()
+    if mode not in ATTN_RES_MODES:
+        raise ValueError("`mode` must be one of 'none', 'independent', or 'dependent'")
+    if not has_history:
+        return "none"
+    return mode
+
+
 def init_trunc_normal_fan_in_out(
     weight: torch.Tensor,
     seed: int | list[int] | None,

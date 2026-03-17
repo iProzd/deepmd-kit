@@ -24,6 +24,7 @@ from __future__ import (
 
 import math
 from typing import (
+    TYPE_CHECKING,
     Any,
 )
 
@@ -53,6 +54,7 @@ from .se_zm_helper import (
     get_so3_dim_of_lmax,
     init_trunc_normal_fan_in_out,
     map_degree_idx,
+    normalize_attn_res_mode,
     np_safe,
     nvtx_range,
     project_D_to_m,
@@ -60,6 +62,11 @@ from .se_zm_helper import (
     safe_numpy_to_tensor,
     segment_softmax_with_env_weight,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import (
+        Callable,
+    )
 
 
 class FocusLinear(nn.Module):
@@ -919,6 +926,200 @@ class ScalarRMSNorm(nn.Module):
         return obj
 
 
+class DepthAttnRes(nn.Module):
+    """
+    Depth-wise attention residual aggregation for equivariant tensors.
+
+    Attention logits are computed only from scalar ``l=0`` channels, while the
+    resulting scalar weights are broadcast to the full equivariant value tensors.
+    This keeps the aggregation equivariant as long as all sources share the same
+    representation space.
+
+    Query modes
+    -----------
+    - ``input_dependent=True``: query comes from the current scalar state.
+    - ``input_dependent=False``: use a learned pseudo-query shared across inputs.
+
+    Both query paths are zero-initialized so the initial aggregation is a uniform
+    average over all provided sources.
+
+    Parameters
+    ----------
+    channels
+        Scalar feature dimension used by query and key.
+    input_dependent
+        Whether to project the current scalar state into a query vector.
+    eps
+        Small epsilon for key RMS normalization.
+    bias
+        Whether to use bias in the input-dependent query projection. Only
+        effective when ``input_dependent=True``.
+    dtype
+        Parameter and compute dtype. Caller should pass compute_dtype (fp32+).
+    trainable
+        Whether parameters are trainable.
+    seed
+        Random seed reserved for consistency with other modules.
+    """
+
+    if TYPE_CHECKING:
+        query_proj: FocusLinear
+        adamw_pseudo_query: torch.Tensor
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        input_dependent: bool = True,
+        eps: float = 1e-7,
+        bias: bool = True,
+        dtype: torch.dtype,
+        trainable: bool,
+        seed: int | list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.input_dependent = bool(input_dependent)
+        self.eps = float(eps)
+        self.query_bias = bool(bias)
+        self.dtype = dtype
+        self.device = env.DEVICE
+        self.precision = RESERVED_PRECISION_DICT[dtype]
+
+        self.key_norm = ScalarRMSNorm(
+            channels=self.channels,
+            n_focus=1,
+            eps=self.eps,
+            dtype=self.dtype,
+            trainable=trainable,
+        )
+        if self.input_dependent:
+            self.query_proj = FocusLinear(
+                in_channels=self.channels,
+                out_channels=self.channels,
+                n_focus=1,
+                dtype=self.dtype,
+                bias=self.query_bias,
+                trainable=trainable,
+                seed=seed,
+                init_std=0.0,
+            )
+        else:
+            self.adamw_pseudo_query = nn.Parameter(
+                torch.zeros(self.channels, dtype=self.dtype, device=self.device),
+                requires_grad=trainable,
+            )
+
+        for p in self.parameters():
+            p.requires_grad = trainable
+
+    def forward(
+        self,
+        *,
+        sources: list[torch.Tensor],
+        scalar_extractor: Callable[[torch.Tensor], torch.Tensor],
+        current_x: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Aggregate same-shape sources with depth attention.
+
+        Parameters
+        ----------
+        sources
+            Source tensors with identical shape ``(B, ...)``.
+        scalar_extractor
+            Function that extracts scalar features from each source with shape
+            ``(B, C)`` where ``C=channels``.
+        current_x
+            Current tensor state. Required when ``input_dependent=True`` and
+            converted to scalar query features via ``scalar_extractor``.
+
+        Returns
+        -------
+        torch.Tensor
+            Aggregated tensor with the same shape as each source.
+        """
+        source0 = sources[0]
+        if len(sources) == 1:
+            return source0
+        batch_size = int(source0.shape[0])
+        value_dtype = source0.dtype
+
+        # === Step 1. Build the query vector ===
+        if self.input_dependent:
+            current_x_scalar = scalar_extractor(current_x)
+            query = self.query_proj(
+                current_x_scalar.to(dtype=self.dtype).unsqueeze(1)
+            ).squeeze(1)
+        else:
+            query = self.adamw_pseudo_query.unsqueeze(0).expand(batch_size, -1)
+
+        # === Step 2. Extract and normalize scalar keys ===
+        source_count = len(sources)
+        raw_keys = torch.stack(
+            [scalar_extractor(source).to(dtype=self.dtype) for source in sources],
+            dim=1,
+        )  # (B, S, C)
+        keys = self.key_norm(raw_keys)
+        logits = torch.einsum("bc,bsc->bs", query, keys)
+        alpha = torch.softmax(logits, dim=1)  # (B, S)
+
+        # === Step 3. Broadcast scalar weights to equivariant values ===
+        value_stack = torch.stack(
+            [source.to(dtype=self.dtype) for source in sources],
+            dim=1,
+        )
+        alpha = alpha.reshape(
+            batch_size,
+            source_count,
+            *([1] * (value_stack.ndim - 2)),
+        )
+        aggregated = (alpha * value_stack).sum(dim=1)
+        return aggregated.to(dtype=value_dtype)
+
+    def serialize(self) -> dict[str, Any]:
+        trainable = all(p.requires_grad for p in self.parameters())
+        state = self.state_dict()
+        return {
+            "@class": "DepthAttnRes",
+            "@version": 1,
+            "config": {
+                "channels": self.channels,
+                "input_dependent": self.input_dependent,
+                "eps": self.eps,
+                "bias": self.query_bias,
+                "precision": RESERVED_PRECISION_DICT[self.dtype],
+                "trainable": trainable,
+                "seed": None,
+            },
+            "@variables": {key: np_safe(value) for key, value in state.items()},
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> DepthAttnRes:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "DepthAttnRes":
+            raise ValueError(f"Invalid class for DepthAttnRes: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported DepthAttnRes version: {version}")
+        config = data.pop("config")
+        variables = data.pop("@variables")
+        precision = config.pop("precision")
+        config["dtype"] = PRECISION_DICT[precision]
+        obj = cls(**config)
+        template = obj.state_dict()
+        state = {
+            key: safe_numpy_to_tensor(
+                value, device=template[key].device, dtype=template[key].dtype
+            )
+            for key, value in variables.items()
+        }
+        obj.load_state_dict(state)
+        return obj
+
+
 class SO3Linear(nn.Module):
     """
     Focus-aware degree-wise linear self-interaction.
@@ -1531,6 +1732,11 @@ class SO2Convolution(nn.Module):
         each SO(2) mixing layer. The last SO(2) layer always uses Identity.
     so2_layers
         Number of SO2Linear layers per convolution (default: 1).
+    so2_attn_res
+        Depth-wise attention residual mode across the internal SO(2) layer
+        history. Must be one of ``"none"``, ``"independent"``, or
+        ``"dependent"``. The same scalar weights are broadcast to the full
+        reduced equivariant tensor.
     layer_scale
         If True, apply per-layer learnable LayerScale (per-focus-channel,
         init 1e-3) on each SO(2) residual branch.
@@ -1563,6 +1769,7 @@ class SO2Convolution(nn.Module):
         focus_compete: bool = True,
         so2_norm: bool = False,
         so2_layers: int = 4,
+        so2_attn_res: str = "none",
         layer_scale: bool = False,
         n_atten_head: int = 0,
         mlp_bias: bool = True,
@@ -1591,6 +1798,11 @@ class SO2Convolution(nn.Module):
         self.so2_layers = int(so2_layers)
         if self.so2_layers < 1:
             raise ValueError("`so2_layers` must be >= 1")
+        self.so2_attn_res_mode = normalize_attn_res_mode(
+            so2_attn_res,
+            has_history=self.so2_layers > 1,
+        )
+        self.use_so2_attn_res = self.so2_attn_res_mode != "none"
         self.layer_scale = bool(layer_scale)
         self.n_atten_head = int(n_atten_head)
         if self.n_atten_head < 0:
@@ -1623,6 +1835,7 @@ class SO2Convolution(nn.Module):
         seed_so3_pre = child_seed(seed, 2)
         seed_so3_post = child_seed(seed, 3)
         seed_gate = child_seed(seed, 4)
+        seed_depth_attn = child_seed(seed, 5)
 
         # === Step 3. Multiple SO2Linear layers ===
         self.so2_linears = nn.ModuleList(
@@ -1683,6 +1896,25 @@ class SO2Convolution(nn.Module):
             )
         non_linearities.append(nn.Identity())
         self.non_linearities = nn.ModuleList(non_linearities)
+
+        # === Step 5.5. Optional depth-wise attention residuals across SO(2) layers ===
+        if self.use_so2_attn_res:
+            self.so2_layer_attn_res: nn.ModuleList | None = nn.ModuleList(
+                [
+                    DepthAttnRes(
+                        channels=self.channels,
+                        input_dependent=self.so2_attn_res_mode == "dependent",
+                        eps=self.eps,
+                        bias=self.mlp_bias,
+                        dtype=self.compute_dtype,
+                        trainable=trainable,
+                        seed=child_seed(seed_depth_attn, i),
+                    )
+                    for i in range(self.so2_layers)
+                ]
+            )
+        else:
+            self.so2_layer_attn_res = None
 
         # === Step 6. Optional per-layer LayerScale for SO(2) residual branches ===
         if self.layer_scale:
@@ -1903,32 +2135,74 @@ class SO2Convolution(nn.Module):
 
         # === Step 5. Multi-layer SO(2) mixing (pre-norm + residual + LayerScale) ===
         with nvtx_range("SO2Conv/so2_layers"):
-            for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
-                zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
-            ):
-                residual = x_local
-                x_local = inter_norm(x_local)
-                x_local = so2_linear(x_local)
 
-                if layer_idx == 0 and so2_linear.bias0 is not None:
-                    # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
-                    bias0 = so2_linear.bias0.view(
-                        self.n_focus, self.focus_dim
-                    ).unsqueeze(0)
-                    bias_correction = bias0 * (
-                        rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1) - 1.0
-                    )  # (E, F, Cf)
-                    x_local[:, :, 0, :].add_(bias_correction)
+            def so2_l0_extractor(v: torch.Tensor) -> torch.Tensor:
+                """Extract scalar features from SO(2) reduced layout."""
+                return v[:, :, 0, :].reshape(v.shape[0], self.channels)
 
-                x_local = non_linear(x_local)
-
-                if self.layer_scale:
-                    scale = self.adam_so2_layer_scales[layer_idx].reshape(
-                        1, self.n_focus, 1, self.focus_dim
+            if self.use_so2_attn_res:
+                so2_depth_sources = [x_local]
+                for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
+                    zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
+                ):
+                    x_local = self.so2_layer_attn_res[layer_idx](
+                        sources=so2_depth_sources,
+                        scalar_extractor=so2_l0_extractor,
+                        current_x=x_local,
                     )
-                    x_local = residual + scale * x_local
-                else:
-                    x_local = residual + x_local
+                    residual = x_local
+                    x_local = inter_norm(x_local)
+                    x_local = so2_linear(x_local)
+
+                    if layer_idx == 0 and so2_linear.bias0 is not None:
+                        # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
+                        bias0 = so2_linear.bias0.view(
+                            self.n_focus, self.focus_dim
+                        ).unsqueeze(0)
+                        bias_correction = bias0 * (
+                            rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1)
+                            - 1.0
+                        )  # (E, F, Cf)
+                        x_local[:, :, 0, :].add_(bias_correction)
+
+                    x_local = non_linear(x_local)
+
+                    if self.layer_scale:
+                        scale = self.adam_so2_layer_scales[layer_idx].reshape(
+                            1, self.n_focus, 1, self.focus_dim
+                        )
+                        x_local = residual + scale * x_local
+                    else:
+                        x_local = residual + x_local
+                    so2_depth_sources.append(x_local - residual)
+            else:
+                for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
+                    zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
+                ):
+                    residual = x_local
+                    x_local = inter_norm(x_local)
+                    x_local = so2_linear(x_local)
+
+                    if layer_idx == 0 and so2_linear.bias0 is not None:
+                        # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
+                        bias0 = so2_linear.bias0.view(
+                            self.n_focus, self.focus_dim
+                        ).unsqueeze(0)
+                        bias_correction = bias0 * (
+                            rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1)
+                            - 1.0
+                        )  # (E, F, Cf)
+                        x_local[:, :, 0, :].add_(bias_correction)
+
+                    x_local = non_linear(x_local)
+
+                    if self.layer_scale:
+                        scale = self.adam_so2_layer_scales[layer_idx].reshape(
+                            1, self.n_focus, 1, self.focus_dim
+                        )
+                        x_local = residual + scale * x_local
+                    else:
+                        x_local = residual + x_local
 
         # === Step 5.5. Cross-focus softmax competition ===
         if self.focus_compete and self.n_focus > 1:
@@ -2077,6 +2351,7 @@ class SO2Convolution(nn.Module):
                 "focus_compete": self.focus_compete,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,
+                "so2_attn_res": self.so2_attn_res_mode,
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "mlp_bias": self.mlp_bias,
@@ -2333,6 +2608,10 @@ class SeZMInteractionBlock(nn.Module):
         When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers.
+    so2_attn_res
+        Depth-wise attention residual mode across the internal SO(2) layer
+        history. Must be one of ``"none"``, ``"independent"``, or
+        ``"dependent"``.
     n_atten_head
         Number of attention heads when aggregating messages in SO(2) convolution.
         0 means no attention is used; >0 enables envelope-aware grouped softmax
@@ -2385,6 +2664,7 @@ class SeZMInteractionBlock(nn.Module):
         focus_compete: bool = True,
         so2_norm: bool = False,
         so2_layers: int = 4,
+        so2_attn_res: str = "none",
         n_atten_head: int = 0,
         so2_pre_norm: bool = True,
         so2_post_norm: bool = False,
@@ -2416,6 +2696,10 @@ class SeZMInteractionBlock(nn.Module):
         self.focus_compete = bool(focus_compete)
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
+        self.so2_attn_res_mode = normalize_attn_res_mode(
+            so2_attn_res,
+            has_history=self.so2_layers > 1,
+        )
         self.n_atten_head = int(n_atten_head)
         self.so2_pre_norm = bool(so2_pre_norm)
         self.so2_post_norm = bool(so2_post_norm)
@@ -2474,6 +2758,7 @@ class SeZMInteractionBlock(nn.Module):
             focus_compete=self.focus_compete,
             so2_norm=self.so2_norm,
             so2_layers=self.so2_layers,
+            so2_attn_res=self.so2_attn_res_mode,
             layer_scale=self.layer_scale,
             n_atten_head=n_atten_head,
             mlp_bias=self.mlp_bias,
@@ -2623,6 +2908,7 @@ class SeZMInteractionBlock(nn.Module):
                 "focus_compete": self.focus_compete,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,
+                "so2_attn_res": self.so2_attn_res_mode,
                 "n_atten_head": self.n_atten_head,
                 "so2_pre_norm": self.so2_pre_norm,
                 "so2_post_norm": self.so2_post_norm,

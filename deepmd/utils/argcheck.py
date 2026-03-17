@@ -376,11 +376,23 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
     doc_m_schedule = "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored."
     doc_n_blocks = "Number of blocks (only used when `l_schedule` is None)."
+    doc_block_attn_res = (
+        "Descriptor-level depth-wise attention residual mode across block "
+        "history, including the final aggregation over all completed block "
+        "representations before the scalar output FFN. Must be one of "
+        "`none`, `independent`, or `dependent`."
+    )
     doc_so2_norm = (
         "If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. "
         "When False (default), no normalization is applied between layers."
     )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
+    doc_so2_attn_res = (
+        "Depth-wise attention residual mode across the internal SO(2) layer "
+        "history inside each interaction block. Must be one of `none`, "
+        "`independent`, or `dependent`."
+    )
+    attn_res_modes = {"none", "independent", "dependent"}
     doc_n_focus = (
         "Number of parallel focus streams. Per-stream width is "
         "`focus_dim = channels // n_focus`; `channels` must be divisible by `n_focus`."
@@ -408,6 +420,7 @@ def descrpt_se_zm_args() -> list[Argument]:
         "- SO3Linear: l=0 bias\n"
         "- SO2Linear: l=0 bias\n"
         "- GatedActivation: gate linear bias\n"
+        "- DepthAttnRes: input-dependent query projection\n"
         "- SeparableRMSNorm: centering bias\n"
         "- ReducedSeparableRMSNorm: centering bias\n"
         "- EnvironmentInitialEmbedding MLPs: rbf_proj_layer1/2 and g_layer1/2\n"
@@ -479,8 +492,26 @@ def descrpt_se_zm_args() -> list[Argument]:
             "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
         ),
         Argument("n_blocks", int, optional=True, default=2, doc=doc_n_blocks),
+        Argument(
+            "block_attn_res",
+            str,
+            optional=True,
+            default="none",
+            extra_check=lambda x: x in attn_res_modes,
+            extra_check_errmsg="must be one of 'none', 'independent', or 'dependent'",
+            doc=doc_only_pt_supported + doc_block_attn_res,
+        ),
         Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
         Argument("so2_layers", int, optional=True, default=4, doc=doc_so2_layers),
+        Argument(
+            "so2_attn_res",
+            str,
+            optional=True,
+            default="none",
+            extra_check=lambda x: x in attn_res_modes,
+            extra_check_errmsg="must be one of 'none', 'independent', or 'dependent'",
+            doc=doc_only_pt_supported + doc_so2_attn_res,
+        ),
         Argument("n_focus", int, optional=True, default=1, doc=doc_n_focus),
         Argument(
             "focus_compete", bool, optional=True, default=True, doc=doc_focus_compete

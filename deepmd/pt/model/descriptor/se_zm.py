@@ -68,6 +68,7 @@ from .base_descriptor import (
     BaseDescriptor,
 )
 from .se_zm_block import (
+    DepthAttnRes,
     EquivariantFFN,
     ScalarRMSNorm,
     SeZMInteractionBlock,
@@ -87,6 +88,7 @@ from .se_zm_helper import (
     get_promoted_dtype,
     get_so3_dim_of_lmax,
     init_edge_rot_mat_frisvad,
+    normalize_attn_res_mode,
     np_safe,
     nvtx_range,
     safe_norm,
@@ -166,11 +168,19 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         recommended but not required. If set, `mmax` will be ignored.
     n_blocks
         Number of blocks (only used when `l_schedule` is None).
+    block_attn_res
+        Descriptor-level depth-wise attention residual mode across block history,
+        including the final aggregation over all completed block representations
+        before the scalar output FFN. Must be one of
+        ``"none"``, ``"independent"``, or ``"dependent"``.
     so2_norm
         If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers per block.
+    so2_attn_res
+        SO(2)-internal depth-wise attention residual mode inside each interaction
+        block. Must be one of ``"none"``, ``"independent"``, or ``"dependent"``.
     n_focus
         Number of parallel focus streams. The per-stream channel width is
         ``focus_dim = channels // n_focus``. Must divide ``channels`` exactly.
@@ -198,6 +208,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         - SO3Linear: l=0 bias
         - SO2Linear: l=0 bias
         - GatedActivation: gate linear bias
+        - DepthAttnRes: input-dependent query projection
         - SeparableRMSNorm: centering bias
         - ReducedSeparableRMSNorm: centering bias
         - EnvironmentInitialEmbedding:
@@ -258,8 +269,10 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         mmax: int | None = None,
         m_schedule: list[int] | None = None,
         n_blocks: int = 2,
+        block_attn_res: str = "none",
         so2_norm: bool = False,
         so2_layers: int = 4,
+        so2_attn_res: str = "none",
         n_focus: int = 1,
         focus_compete: bool = True,
         n_atten_head: int = 0,
@@ -315,17 +328,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         if radial_mlp is None:
             radial_mlp = [64]
         self.radial_mlp = list(radial_mlp)
-        self.so2_norm = bool(so2_norm)
-        self.so2_layers = int(so2_layers)
-        self.ffn_neurons = int(ffn_neurons)
-        self.ffn_blocks = int(ffn_blocks)
-        if self.ffn_blocks < 1:
-            raise ValueError("`ffn_blocks` must be >= 1")
-        self.n_atten_head = int(n_atten_head)
-        if self.n_atten_head > 0 and self.focus_dim % self.n_atten_head != 0:
-            raise ValueError(
-                "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
-            )
         if sandwich_norm is None:
             sandwich_norm = [True, False, True, False]
         if not isinstance(sandwich_norm, (list, tuple)) or len(sandwich_norm) != 4:
@@ -385,8 +387,29 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
+        self.block_attn_res_mode = normalize_attn_res_mode(
+            block_attn_res,
+            has_history=self.n_blocks > 1,
+        )
+        self.use_block_attn_res = self.block_attn_res_mode != "none"
         self.ebed_dims = [get_so3_dim_of_lmax(l) for l in self.l_schedule]
         self.rad_sizes_per_block = [l + 1 for l in self.l_schedule]
+
+        self.so2_norm = bool(so2_norm)
+        self.so2_layers = int(so2_layers)
+        self.so2_attn_res_mode = normalize_attn_res_mode(
+            so2_attn_res,
+            has_history=self.so2_layers > 1,
+        )
+        self.ffn_neurons = int(ffn_neurons)
+        self.ffn_blocks = int(ffn_blocks)
+        if self.ffn_blocks < 1:
+            raise ValueError("`ffn_blocks` must be >= 1")
+        self.n_atten_head = int(n_atten_head)
+        if self.n_atten_head > 0 and self.focus_dim % self.n_atten_head != 0:
+            raise ValueError(
+                "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
+            )
 
         # === Excluded type pairs ===
         self.reinit_exclude(exclude_types)
@@ -513,6 +536,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     focus_compete=self.focus_compete,
                     so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
+                    so2_attn_res=self.so2_attn_res_mode,
                     ffn_neurons=self.ffn_neurons,
                     ffn_blocks=self.ffn_blocks,
                     layer_scale=self.layer_scale,
@@ -531,6 +555,35 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 )
             )
         self.blocks = nn.ModuleList(blocks)
+
+        # === Optional descriptor-level depth attention residuals ===
+        if self.use_block_attn_res:
+            self.block_attn_res: nn.ModuleList | None = nn.ModuleList(
+                [
+                    DepthAttnRes(
+                        channels=self.channels,
+                        input_dependent=self.block_attn_res_mode == "dependent",
+                        eps=self.eps,
+                        bias=self.mlp_bias,
+                        dtype=self.compute_dtype,
+                        trainable=self.trainable,
+                        seed=child_seed(seed_blocks, 1000 + i),
+                    )
+                    for i in range(self.n_blocks)
+                ]
+            )
+            self.final_attn_res: DepthAttnRes | None = DepthAttnRes(
+                channels=self.channels,
+                input_dependent=self.block_attn_res_mode == "dependent",
+                eps=self.eps,
+                bias=self.mlp_bias,
+                dtype=self.compute_dtype,
+                trainable=self.trainable,
+                seed=child_seed(seed_blocks, 2000),
+            )
+        else:
+            self.block_attn_res = None
+            self.final_attn_res = None
 
         # === Final FFN for l=0 output mixing ===
         self.output_ffn = EquivariantFFN(
@@ -573,6 +626,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         edge_vec: torch.Tensor | None = None,
         edge_mask: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        fparam: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -604,6 +658,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             is provided.
         comm_dict
             Communication dictionary for parallel inference (unused).
+        fparam
+            Frame parameters with shape (nf, nfp). Not used by SeZM, kept for
+            interface compatibility.
 
         Returns
         -------
@@ -945,7 +1002,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         radial_feat_per_block: list[torch.Tensor],
     ) -> torch.Tensor:
         """
-        Run the interaction blocks.
+        Run the interaction blocks with optional depth attention.
 
         Parameters
         ----------
@@ -961,12 +1018,49 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         torch.Tensor
             Output features with shape (N, D, F, Cf).
         """
-        # Blocks with pyramid l-schedule slicing
+        if not self.use_block_attn_res:
+            # === Fast path without descriptor-level attention residuals ===
+            for i, block in enumerate(self.blocks):
+                x = x[:, : self.ebed_dims[i], :, :]
+                blk_radial = radial_feat_per_block[i]
+                with nvtx_range(f"block_{i}"):
+                    x = block(x, edge_cache, blk_radial)
+            return x
+
+        n_node = x.shape[0]
+
+        def node_l0_extractor(v: torch.Tensor) -> torch.Tensor:
+            """Extract scalar features from global SO(3) layout."""
+            return v[:, 0, :, :].reshape(n_node, self.channels)
+
+        # === Step 1. Maintain descriptor-level depth history ===
+        depth_sources = [x]
+
+        # === Step 2. Run each block with selective depth aggregation ===
         for i, block in enumerate(self.blocks):
-            x = x[:, : self.ebed_dims[i], :, :]
+            current_dim = self.ebed_dims[i]
+            truncated_sources = [
+                source[:, :current_dim, :, :] for source in depth_sources
+            ]
+            x = self.block_attn_res[i](
+                sources=truncated_sources,
+                scalar_extractor=node_l0_extractor,
+                current_x=x,
+            ).to(dtype=self.dtype)
+            x_before = x
             blk_radial = radial_feat_per_block[i]
             with nvtx_range(f"block_{i}"):
                 x = block(x, edge_cache, blk_radial)
+            depth_sources.append(x - x_before)
+
+        # === Step 3. Final aggregation over all completed block representations ===
+        final_dim = self.ebed_dims[-1]
+        final_sources = [source[:, :final_dim, :, :] for source in depth_sources]
+        x = self.final_attn_res(
+            sources=final_sources,
+            scalar_extractor=node_l0_extractor,
+            current_x=x,
+        ).to(dtype=self.dtype)
         return x
 
     def build_edge_cache(
@@ -1590,14 +1684,16 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "l_schedule": self.l_schedule,
                 "mmax": self.mmax,
                 "m_schedule": self.m_schedule,
+                "block_attn_res": self.block_attn_res_mode,
                 "channels": self.channels,
-                "n_focus": self.n_focus,
-                "focus_compete": self.focus_compete,
                 "n_radial": self.n_radial,
                 "radial_mlp": self.radial_mlp,
                 "use_env_seed": self.use_env_seed,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,
+                "so2_attn_res": self.so2_attn_res_mode,
+                "n_focus": self.n_focus,
+                "focus_compete": self.focus_compete,
                 "ffn_neurons": self.ffn_neurons,
                 "ffn_blocks": self.ffn_blocks,
                 "layer_scale": self.layer_scale,
