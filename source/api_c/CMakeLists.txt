@@ -12,14 +12,14 @@ target_include_directories(
   ${libname} PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
                     $<INSTALL_INTERFACE:include>)
 
-set_target_properties(
-  ${libname} PROPERTIES INSTALL_RPATH "$ORIGIN;${TensorFlow_LIBRARY_PATH}")
+set_target_properties(${libname} PROPERTIES INSTALL_RPATH
+                                            "$ORIGIN;${BACKEND_LIBRARY_PATH}")
 if(CMAKE_TESTING_ENABLED)
   target_link_libraries(${libname} PRIVATE coverage_config)
 endif()
 
 if(BUILD_PY_IF)
-  install(TARGETS ${libname} DESTINATION deepmd/op/)
+  install(TARGETS ${libname} DESTINATION deepmd/lib/)
 else(BUILD_PY_IF)
   install(
     TARGETS ${libname}

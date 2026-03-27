@@ -1,7 +1,10 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <string>
 
 #include "DataModifier.h"
+#include "DeepBaseModel.h"
 #include "DeepPot.h"
+#include "DeepSpin.h"
 #include "DeepTensor.h"
 #include "neighbor_list.h"
 
@@ -32,20 +35,58 @@ struct DP_Nlist {
   std::string exception;
 };
 
-struct DP_DeepPot {
+struct DP_DeepBaseModel {
+  DP_DeepBaseModel();
+  DP_DeepBaseModel(deepmd::DeepBaseModel& dpbase);
+  virtual ~DP_DeepBaseModel() {};
+
+  deepmd::DeepBaseModel dpbase;
+  std::string exception;
+  int dfparam;
+  int daparam;
+  bool aparam_nall;
+  bool has_default_fparam;
+};
+
+struct DP_DeepBaseModelDevi {
+  DP_DeepBaseModelDevi();
+  DP_DeepBaseModelDevi(deepmd::DeepBaseModelDevi& dpbase);
+  virtual ~DP_DeepBaseModelDevi() {};
+
+  deepmd::DeepBaseModelDevi dpbase;
+  std::string exception;
+  int dfparam;
+  int daparam;
+  bool aparam_nall;
+  bool has_default_fparam;
+};
+
+struct DP_DeepPot : DP_DeepBaseModel {
   DP_DeepPot();
   DP_DeepPot(deepmd::DeepPot& dp);
 
   deepmd::DeepPot dp;
-  std::string exception;
 };
 
-struct DP_DeepPotModelDevi {
+struct DP_DeepPotModelDevi : DP_DeepBaseModelDevi {
   DP_DeepPotModelDevi();
   DP_DeepPotModelDevi(deepmd::DeepPotModelDevi& dp);
 
   deepmd::DeepPotModelDevi dp;
-  std::string exception;
+};
+
+struct DP_DeepSpin : DP_DeepBaseModel {
+  DP_DeepSpin();
+  DP_DeepSpin(deepmd::DeepSpin& dp);
+
+  deepmd::DeepSpin dp;
+};
+
+struct DP_DeepSpinModelDevi : DP_DeepBaseModelDevi {
+  DP_DeepSpinModelDevi();
+  DP_DeepSpinModelDevi(deepmd::DeepSpinModelDevi& dp);
+
+  deepmd::DeepSpinModelDevi dp;
 };
 
 struct DP_DeepTensor {

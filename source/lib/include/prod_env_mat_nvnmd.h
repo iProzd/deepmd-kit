@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 /*
 //==================================================
  _   _  __     __  _   _   __  __   ____
@@ -41,14 +42,11 @@ void prod_env_mat_a_nvnmd_quantize_cpu(FPTYPE* em,
                                        const int nall,
                                        const float rcut,
                                        const float rcut_smth,
-                                       const std::vector<int> sec);
+                                       const std::vector<int> sec,
+                                       const int* f_type = NULL);
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 // UNDEFINE
-#endif  // GOOGLE_CUDA
-
-#if TENSORFLOW_USE_ROCM
-// UNDEFINE
-#endif  // TENSORFLOW_USE_ROCM
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 }  // namespace deepmd

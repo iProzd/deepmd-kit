@@ -1,67 +1,163 @@
 # See https://pre-commit.com for more information
 # See https://pre-commit.com/hooks.html for more hooks
+exclude: ^source/3rdparty/.+/
 repos:
--   repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
     hooks:
-    -   id: trailing-whitespace
+      - id: trailing-whitespace
         exclude: "^.+\\.pbtxt$"
-    -   id: end-of-file-fixer
-        exclude: "^.+\\.pbtxt$"
-    -   id: check-yaml
-    #-   id: check-json
-    -   id: check-added-large-files
-    -   id: check-merge-conflict
-    -   id: check-symlinks
-    -   id: check-toml
-# Python
--   repo: https://github.com/psf/black
-    rev: 22.12.0
+      - id: end-of-file-fixer
+        exclude: "^.+\\.pbtxt$|deeppot_sea.*\\.json$"
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=1024", "--enforce-all"]
+        exclude: |
+          (?x)^(
+              source/tests/infer/dipolecharge_e.pbtxt|
+              source/tests/infer/deeppolar_new.pbtxt
+          )$
+      - id: check-merge-conflict
+      - id: check-symlinks
+      - id: check-toml
+  # Python
+  - repo: https://github.com/PyCQA/isort
+    rev: 8.0.1
     hooks:
-    -   id: black-jupyter
--   repo: https://github.com/PyCQA/isort
-    rev: 5.12.0
-    hooks:
-    - id: isort
-      files: \.py$
--   repo: https://github.com/charliermarsh/ruff-pre-commit
+      - id: isort
+        files: \.py$
+        exclude: ^source/3rdparty
+  - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.0.243
+    rev: v0.15.6
     hooks:
-    - id: ruff
-      args: ["--fix"]
-# numpydoc
--   repo: https://github.com/Carreau/velin
+      - id: ruff
+        args: ["--fix"]
+        exclude: ^source/3rdparty
+        types_or: [python, pyi, jupyter]
+      - id: ruff-format
+        exclude: ^source/3rdparty
+        types_or: [python, pyi, jupyter]
+  # numpydoc
+  - repo: https://github.com/Carreau/velin
     rev: 0.0.12
     hooks:
-    - id: velin
-      args: ["--write"]
-# Python inside docs
--   repo: https://github.com/asottile/blacken-docs
-    rev: 1.13.0
+      - id: velin
+        args: ["--write"]
+        exclude: ^source/3rdparty
+  # markdown
+  - repo: https://github.com/hukkin/mdformat
+    rev: 1.0.0
     hooks:
-    -   id: blacken-docs
-# C++
--   repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v15.0.7
+      - id: mdformat
+        additional_dependencies:
+          # - mdformat-myst==0.3.0
+          # See https://github.com/executablebooks/mdformat-myst/issues/13
+          - "git+https://github.com/njzjz-bothub/mdformat-myst@d9c414e#egg=mdformat-myst"
+          - mdformat-ruff==0.1.3
+          - mdformat-web==0.2.0
+          - mdformat-config==0.2.1
+          - mdformat-beautysh==1.0.0
+          - mdformat-gfm-alerts==2.0.0
+  # C++
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v22.1.1
     hooks:
-    -   id: clang-format
-        exclude: ^source/3rdparty|source/lib/src/cuda/cudart/.+\.inc
-# CSS
--   repo: https://github.com/pre-commit/mirrors-csslint
-    rev: v1.0.5
+      - id: clang-format
+        exclude: ^(source/3rdparty|source/lib/src/gpu/cudart/.+\.inc|.+\.ipynb$|source/tests/infer/.+\.json$)
+  # yaml, CSS, javascript
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
     hooks:
-    -   id: csslint
-# Shell
-- repo: https://github.com/scop/pre-commit-shfmt
-  rev: v3.6.0-1
-  hooks:
-    - id: shfmt
-# CMake
-- repo: https://github.com/cheshirekow/cmake-format-precommit
-  rev: v0.6.13
-  hooks:
-    - id: cmake-format
-    #- id: cmake-lint
-ci:
-  autoupdate_branch: devel
+      - id: prettier
+        types_or: [yaml, css]
+        # workflow files cannot be modified by pre-commit.ci
+        exclude: ^(source/3rdparty|\.clang-format)
+  # Shell
+  - repo: https://github.com/scop/pre-commit-shfmt
+    rev: v3.12.0-2
+    hooks:
+      - id: shfmt
+  # CMake
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+      - id: cmake-format
+      #- id: cmake-lint
+  - repo: https://github.com/njzjz/mirrors-bibtex-tidy
+    rev: v1.14.0
+    hooks:
+      - id: bibtex-tidy
+        args:
+          - --curly
+          - --numeric
+          - --align=13
+          - --blank-lines
+          # disable sort: the order of keys and fields has explict meanings
+          #- --sort=key
+          - --duplicates=key,doi,citation,abstract
+          - --merge=combine
+          #- --sort-fields
+          #- --strip-comments
+          - --trailing-commas
+          - --encode-urls
+          - --remove-empty-fields
+          - --wrap=80
+  # license header
+  - repo: https://github.com/Lucas-C/pre-commit-hooks
+    rev: v1.5.6
+    hooks:
+      # C++, js
+      - id: insert-license
+        files: \.(c|cc|cpp|js|ts|h|hpp)$
+        args:
+          - --license-filepath
+          - .license-header.txt
+          - --comment-style
+          - //
+          - --no-extra-eol
+        exclude: ^source/3rdparty|source/lib/src/gpu/cudart/.+\.inc
+      # CSS
+      - id: insert-license
+        files: \.(css|scss)$
+        args:
+          - --license-filepath
+          - .license-header.txt
+          - --comment-style
+          - /*| *| */
+          - --no-extra-eol
+      # Python
+      - id: insert-license
+        files: \.(py|pyx)$
+        args:
+          - --license-filepath
+          - .license-header.txt
+          - --comment-style
+          - "#"
+          - --no-extra-eol
+        exclude: ^source/3rdparty
+      # HTML
+      - id: insert-license
+        files: \.(html|vue|xml)$
+        args:
+          - --license-filepath
+          - .license-header.txt
+          - --comment-style
+          - <!--|  ~|  -->
+          - --no-extra-eol
+  - repo: local
+    hooks:
+      - id: disallow-caps
+        name: Disallow improper capitalization
+        language: pygrep
+        entry: DeepMD|DeepMd|Pytorch|Tensorflow|Numpy|Github|Lammps|I-Pi|I-PI|i-Pi
+        # unclear why PairDeepMD is used instead of PairDeePMD
+        exclude: .pre-commit-config.yaml|source/lmp
+  # customized pylint rules
+  - repo: https://github.com/pylint-dev/pylint/
+    rev: v4.0.5
+    hooks:
+      - id: pylint
+        entry: env PYTHONPATH=source/checker pylint
+        files: ^deepmd/

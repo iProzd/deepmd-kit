@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -65,6 +66,9 @@ class TestInferDeepPotAHPP : public ::testing::Test {
   deepmd::hpp::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/deeppot.pbtxt";
     deepmd::hpp::convert_pbtxt_to_pb("../../tests/infer/deeppot.pbtxt",
                                      "deeppot.pb");
@@ -139,7 +143,7 @@ TYPED_TEST(TestInferDeepPotAHPP, cpu_build_nlist_numfv) {
 
    public:
     MyModel(deepmd::hpp::DeepPot& dp_, const std::vector<int>& atype_)
-        : mydp(dp_), atype(atype_){};
+        : mydp(dp_), atype(atype_) {};
     virtual void compute(double& ener,
                          std::vector<VALUETYPE>& force,
                          std::vector<VALUETYPE>& virial,
@@ -477,6 +481,23 @@ TYPED_TEST(TestInferDeepPotAHPP, cpu_lmp_nlist_type_sel) {
   }
 }
 
+TYPED_TEST(TestInferDeepPotAHPP, cpu_build_nlist_empty_input) {
+  using VALUETYPE = TypeParam;
+  std::vector<VALUETYPE> coord;
+  std::vector<int> atype;
+  std::vector<VALUETYPE>& box = this->box;
+  unsigned int natoms = 0;
+  deepmd::hpp::DeepPot& dp = this->dp;
+  double ener;
+  std::vector<VALUETYPE> force, virial;
+
+  dp.compute(ener, force, virial, coord, atype, box);
+  // no errors will be fine
+  EXPECT_EQ(force.size(), natoms * 3);
+  EXPECT_EQ(virial.size(), 9);
+  EXPECT_LT(fabs(ener), EPSILON);
+}
+
 TYPED_TEST(TestInferDeepPotAHPP, print_summary) {
   deepmd::hpp::DeepPot& dp = this->dp;
   dp.print_summary("");
@@ -539,6 +560,9 @@ class TestInferDeepPotANoPbcHPP : public ::testing::Test {
   deepmd::hpp::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/deeppot.pbtxt";
     deepmd::hpp::convert_pbtxt_to_pb(file_name, "deeppot.pb");
 

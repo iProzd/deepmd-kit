@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "compute_deeptensor_atom.h"
 
 #include <algorithm>
@@ -19,25 +20,34 @@
 
 using namespace LAMMPS_NS;
 
-#ifdef HIGH_PREC
 #define VALUETYPE double
-#else
-#define VALUETYPE float
-#endif
 
 /* ---------------------------------------------------------------------- */
 
-ComputeDeeptensorAtom::ComputeDeeptensorAtom(LAMMPS *lmp, int narg, char **arg)
+ComputeDeeptensorAtom::ComputeDeeptensorAtom(LAMMPS* lmp, int narg, char** arg)
     : Compute(lmp, narg, arg), dp(lmp), tensor(nullptr) {
-  if (narg < 4) error->all(FLERR, "Illegal compute deeptensor/atom command");
+  if (strcmp(update->unit_style, "lj") == 0) {
+    error->all(FLERR,
+               "Compute deeptensor/atom does not support unit style lj. Please "
+               "use other "
+               "unit styles like metal or real unit instead. You may set it by "
+               "\"units metal\" or \"units real\"");
+  }
+
+  if (narg < 4) {
+    error->all(FLERR, "Illegal compute deeptensor/atom command");
+  }
 
   // parse args
   std::string model_file = std::string(arg[3]);
 
   // initialize deeptensor
   int gpu_rank = dp.get_node_rank();
-  std::string model_file_content = dp.get_file_content(model_file);
-  dt.init(model_file, gpu_rank);
+  try {
+    dt.init(model_file, gpu_rank);
+  } catch (deepmd_compat::deepmd_exception& e) {
+    error->one(FLERR, e.what());
+  }
   sel_types = dt.sel_types();
   std::sort(sel_types.begin(), sel_types.end());
 
@@ -47,6 +57,8 @@ ComputeDeeptensorAtom::ComputeDeeptensorAtom(LAMMPS *lmp, int narg, char **arg)
   timeflag = 1;
 
   nmax = 0;
+
+  dist_unit_cvt_factor = force->angstrom;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -71,7 +83,7 @@ void ComputeDeeptensorAtom::init() {
 #endif
 }
 
-void ComputeDeeptensorAtom::init_list(int /*id*/, NeighList *ptr) {
+void ComputeDeeptensorAtom::init_list(int /*id*/, NeighList* ptr) {
   list = ptr;
 }
 
@@ -89,10 +101,10 @@ void ComputeDeeptensorAtom::compute_peratom() {
     array_atom = tensor;
   }
 
-  double **x = atom->x;
-  double **f = atom->f;
-  int *type = atom->type;
-  int *mask = atom->mask;
+  double** x = atom->x;
+  double** f = atom->f;
+  int* type = atom->type;
+  int* mask = atom->mask;
   int nlocal = atom->nlocal;
   int nghost = atom->nghost;
   int nall = nlocal + nghost;
@@ -106,30 +118,36 @@ void ComputeDeeptensorAtom::compute_peratom() {
     dtype[ii] = type[ii] - 1;
   }
   // get box
-  dbox[0] = domain->h[0];  // xx
-  dbox[4] = domain->h[1];  // yy
-  dbox[8] = domain->h[2];  // zz
-  dbox[7] = domain->h[3];  // zy
-  dbox[6] = domain->h[4];  // zx
-  dbox[3] = domain->h[5];  // yx
+  dbox[0] = domain->h[0] / dist_unit_cvt_factor;  // xx
+  dbox[4] = domain->h[1] / dist_unit_cvt_factor;  // yy
+  dbox[8] = domain->h[2] / dist_unit_cvt_factor;  // zz
+  dbox[7] = domain->h[3] / dist_unit_cvt_factor;  // zy
+  dbox[6] = domain->h[4] / dist_unit_cvt_factor;  // zx
+  dbox[3] = domain->h[5] / dist_unit_cvt_factor;  // yx
   // get coord
   for (int ii = 0; ii < nall; ++ii) {
     for (int dd = 0; dd < 3; ++dd) {
-      dcoord[ii * 3 + dd] = x[ii][dd] - domain->boxlo[dd];
+      dcoord[ii * 3 + dd] =
+          (x[ii][dd] - domain->boxlo[dd]) / dist_unit_cvt_factor;
     }
   }
 
   // invoke full neighbor list (will copy or build if necessary)
   neighbor->build_one(list);
-  deepmd::InputNlist lmp_list(list->inum, list->ilist, list->numneigh,
-                              list->firstneigh);
+  deepmd_compat::InputNlist lmp_list(list->inum, list->ilist, list->numneigh,
+                                     list->firstneigh);
+  lmp_list.set_mask(NEIGHMASK);
 
   // declare outputs
   std::vector<VALUETYPE> gtensor, force, virial, atensor, avirial;
 
   // compute tensors
-  dt.compute(gtensor, force, virial, atensor, avirial, dcoord, dtype, dbox,
-             nghost, lmp_list);
+  try {
+    dt.compute(gtensor, force, virial, atensor, avirial, dcoord, dtype, dbox,
+               nghost, lmp_list);
+  } catch (deepmd_compat::deepmd_exception& e) {
+    error->one(FLERR, e.what());
+  }
 
   // store the result in tensor
   int iter_tensor = 0;
@@ -141,7 +159,7 @@ void ComputeDeeptensorAtom::compute_peratom() {
     // record when selected and in group
     if (selected && ingroup) {
       for (int jj = 0; jj < size_peratom_cols; ++jj) {
-        tensor[ii][jj] = atensor[iter_tensor + jj];
+        tensor[ii][jj] = atensor[iter_tensor + jj] * dist_unit_cvt_factor;
       }
     }
     // if not selected or not in group set to 0.
@@ -161,6 +179,6 @@ void ComputeDeeptensorAtom::compute_peratom() {
 ------------------------------------------------------------------------- */
 
 double ComputeDeeptensorAtom::memory_usage() {
-  double bytes = nmax * size_peratom_cols * sizeof(double);
+  double bytes = static_cast<size_t>(nmax) * size_peratom_cols * sizeof(double);
   return bytes;
 }

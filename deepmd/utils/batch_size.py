@@ -1,15 +1,20 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 import logging
 import os
-from typing import (
+from abc import (
+    ABC,
+    abstractmethod,
+)
+from collections.abc import (
     Callable,
-    Tuple,
+)
+from typing import (
+    Any,
 )
 
+import array_api_compat
 import numpy as np
 
-from deepmd.env import (
-    tf,
-)
 from deepmd.utils.errors import (
     OutOfMemoryError,
 )
@@ -17,7 +22,7 @@ from deepmd.utils.errors import (
 log = logging.getLogger(__name__)
 
 
-class AutoBatchSize:
+class AutoBatchSize(ABC):
     """This class allows DeePMD-kit to automatically decide the maximum
     batch size that will not cause an OOM error.
 
@@ -49,7 +54,6 @@ class AutoBatchSize:
 
     def __init__(self, initial_batch_size: int = 1024, factor: float = 2.0) -> None:
         # See also PyTorchLightning/pytorch-lightning#1638
-        # TODO: discuss a proper initial batch size
         self.current_batch_size = initial_batch_size
         DP_INFER_BATCH_SIZE = int(os.environ.get("DP_INFER_BATCH_SIZE", 0))
         if DP_INFER_BATCH_SIZE > 0:
@@ -58,7 +62,7 @@ class AutoBatchSize:
             self.minimal_not_working_batch_size = self.maximum_working_batch_size + 1
         else:
             self.maximum_working_batch_size = initial_batch_size
-            if tf.test.is_gpu_available():
+            if self.is_gpu_available():
                 self.minimal_not_working_batch_size = 2**31
             else:
                 self.minimal_not_working_batch_size = (
@@ -67,14 +71,14 @@ class AutoBatchSize:
                 log.warning(
                     "You can use the environment variable DP_INFER_BATCH_SIZE to"
                     "control the inference batch size (nframes * natoms). "
-                    "The default value is %d." % initial_batch_size
+                    f"The default value is {initial_batch_size}."
                 )
 
         self.factor = factor
 
     def execute(
         self, callable: Callable, start_index: int, natoms: int
-    ) -> Tuple[int, tuple]:
+    ) -> tuple[int, tuple]:
         """Excuate a method with given batch size.
 
         Parameters
@@ -99,13 +103,15 @@ class AutoBatchSize:
         OutOfMemoryError
             OOM when batch size is 1
         """
+        if natoms > 0:
+            batch_nframes = self.current_batch_size // natoms
+        else:
+            batch_nframes = self.current_batch_size
         try:
-            n_batch, result = callable(
-                max(self.current_batch_size // natoms, 1), start_index
-            )
-        except OutOfMemoryError as e:
-            # TODO: it's very slow to catch OOM error; I don't know what TF is doing here
-            # but luckily we only need to catch once
+            n_batch, result = callable(max(batch_nframes, 1), start_index)
+        except Exception as e:
+            if not self.is_oom_error(e):
+                raise e
             self.minimal_not_working_batch_size = min(
                 self.minimal_not_working_batch_size, self.current_batch_size
             )
@@ -134,23 +140,29 @@ class AutoBatchSize:
                 self._adjust_batch_size(self.factor)
             return n_batch, result
 
-    def _adjust_batch_size(self, factor: float):
+    def _adjust_batch_size(self, factor: float) -> None:
         old_batch_size = self.current_batch_size
         self.current_batch_size = int(self.current_batch_size * factor)
         log.info(
-            "Adjust batch size from %d to %d"
-            % (old_batch_size, self.current_batch_size)
+            f"Adjust batch size from {old_batch_size} to {self.current_batch_size}"
         )
 
     def execute_all(
-        self, callable: Callable, total_size: int, natoms: int, *args, **kwargs
-    ) -> Tuple[np.ndarray]:
+        self,
+        callable: Callable,
+        total_size: int,
+        natoms: int,
+        *args: Any,
+        **kwargs: Any,
+    ) -> tuple[np.ndarray]:
         """Excuate a method with all given data.
+
+        This method is compatible with Array API.
 
         Parameters
         ----------
         callable : Callable
-            The method should accept *args and **kwargs as input and return the similiar array.
+            The method should accept *args and **kwargs as input and return the similar array.
         total_size : int
             Total size
         natoms : int
@@ -163,22 +175,28 @@ class AutoBatchSize:
 
         def execute_with_batch_size(
             batch_size: int, start_index: int
-        ) -> Tuple[int, Tuple[np.ndarray]]:
+        ) -> tuple[int, tuple[np.ndarray]]:
             end_index = start_index + batch_size
             end_index = min(end_index, total_size)
             return (end_index - start_index), callable(
                 *[
                     (
-                        vv[start_index:end_index]
-                        if isinstance(vv, np.ndarray) and vv.ndim > 1
+                        vv[start_index:end_index, ...]
+                        if (
+                            (array_api_compat.is_array_api_obj(vv) and vv.ndim > 1)
+                            or str(vv.__class__) == "<class 'paddle.Tensor'>"
+                        )
                         else vv
                     )
                     for vv in args
                 ],
                 **{
                     kk: (
-                        vv[start_index:end_index]
-                        if isinstance(vv, np.ndarray) and vv.ndim > 1
+                        vv[start_index:end_index, ...]
+                        if (
+                            (array_api_compat.is_array_api_obj(vv) and vv.ndim > 1)
+                            or str(vv.__class__) == "<class 'paddle.Tensor'>"
+                        )
                         else vv
                     )
                     for kk, vv in kwargs.items()
@@ -186,19 +204,80 @@ class AutoBatchSize:
             )
 
         index = 0
-        results = []
+        results = None
+        returned_dict = None
         while index < total_size:
             n_batch, result = self.execute(execute_with_batch_size, index, natoms)
-            if not isinstance(result, tuple):
-                result = (result,)
+            if n_batch == 0:
+                continue
+            returned_dict = (
+                isinstance(result, dict) if returned_dict is None else returned_dict
+            )
+            if not returned_dict:
+                result = (result,) if not isinstance(result, tuple) else result
             index += n_batch
-            if n_batch:
-                for rr in result:
-                    rr.reshape((n_batch, -1))
-                results.append(result)
 
-        r = tuple([np.concatenate(r, axis=0) for r in zip(*results)])
-        if len(r) == 1:
-            # avoid returning tuple if callable doesn't return tuple
-            r = r[0]
+            def append_to_list(res_list: list[Any], res: Any) -> list[Any]:
+                if n_batch:
+                    res_list.append(res)
+                return res_list
+
+            if not returned_dict:
+                results = [] if results is None else results
+                results = append_to_list(results, result)
+            else:
+                results = {kk: [] for kk in result} if results is None else results
+                results = {kk: append_to_list(results[kk], result[kk]) for kk in result}
+        assert results is not None
+        assert returned_dict is not None
+
+        def concate_result(r: list[Any]) -> Any:
+            if array_api_compat.is_array_api_obj(r[0]):
+                xp = array_api_compat.array_namespace(r[0])
+                ret = xp.concat(r, axis=0)
+            elif str(r[0].__class__) == "<class 'paddle.Tensor'>":
+                try:
+                    import paddle
+                except ModuleNotFoundError as e:
+                    raise ModuleNotFoundError(
+                        "The 'paddlepaddle' is required but not installed."
+                    ) from e
+                ret = paddle.concat(r, axis=0)
+            else:
+                raise RuntimeError(f"Unexpected result type {type(r[0])}")
+            return ret
+
+        if not returned_dict:
+            r_list = [concate_result(r) for r in zip(*results, strict=True)]
+            r = tuple(r_list)
+            if len(r) == 1:
+                # avoid returning tuple if callable doesn't return tuple
+                r = r[0]
+        else:
+            r = {kk: concate_result(vv) for kk, vv in results.items()}
         return r
+
+    @abstractmethod
+    def is_gpu_available(self) -> bool:
+        """Check if GPU is available.
+
+        Returns
+        -------
+        bool
+            True if GPU is available
+        """
+
+    @abstractmethod
+    def is_oom_error(self, e: Exception) -> bool:
+        """Check if the exception is an OOM error.
+
+        Parameters
+        ----------
+        e : Exception
+            Exception
+
+        Returns
+        -------
+        bool
+            True if the exception is an OOM error
+        """

@@ -1,11 +1,16 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Base of plugin systems."""
 # copied from https://github.com/deepmodeling/dpdata/blob/a3e76d75de53f6076254de82d18605a010dc3b00/dpdata/plugin.py
 
+import difflib
 from abc import (
     ABCMeta,
 )
-from typing import (
+from collections.abc import (
     Callable,
+)
+from typing import (
+    Any,
 )
 
 
@@ -14,7 +19,7 @@ class Plugin:
 
     Attributes
     ----------
-    plugins : Dict[str, object]
+    plugins : dict[str, object]
         plugins
 
     Examples
@@ -23,13 +28,13 @@ class Plugin:
     >>> @plugin.register("xx")
         def xxx():
             pass
-    >>> print(plugin.plugins['xx'])
+    >>> print(plugin.plugins["xx"])
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.plugins = {}
 
-    def __add__(self, other) -> "Plugin":
+    def __add__(self, other: "Plugin") -> "Plugin":
         self.plugins.update(other.plugins)
         return self
 
@@ -53,7 +58,7 @@ class Plugin:
 
         return decorator
 
-    def get_plugin(self, key) -> object:
+    def get_plugin(self, key: str) -> object:
         """Visit a plugin by key.
 
         Parameters
@@ -70,9 +75,9 @@ class Plugin:
 
 
 class VariantMeta:
-    def __call__(cls, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Remove `type` and keys that starts with underline."""
-        obj = cls.__new__(cls, *args, **kwargs)
+        obj = self.__new__(self, *args, **kwargs)
         kwargs.pop("type", None)
         to_pop = []
         for kk in kwargs:
@@ -92,3 +97,65 @@ class PluginVariant(metaclass=VariantABCMeta):
     """A class to remove `type` from input arguments."""
 
     pass
+
+
+def make_plugin_registry(name: str | None = None) -> type[object]:
+    """Make a plugin registry.
+
+    Parameters
+    ----------
+    name : Optional[str]
+        the name of the registry for the error message, e.g. descriptor, backend, etc.
+
+    Examples
+    --------
+    >>> class BaseClass(make_plugin_registry()):
+            pass
+    """
+    if name is None:
+        name = "class"
+
+    class PR:
+        __plugins = Plugin()
+
+        @staticmethod
+        def register(key: str) -> Callable[[object], object]:
+            """Register a descriptor plugin.
+
+            Parameters
+            ----------
+            key : str
+                the key of a descriptor
+
+            Returns
+            -------
+            callable[[object], object]
+                the registered descriptor
+
+            Examples
+            --------
+            >>> @BaseClass.register("some_class")
+                class SomeClass(BaseClass):
+                    pass
+            """
+            return PR.__plugins.register(key)
+
+        @classmethod
+        def get_class_by_type(cls, class_type: str) -> type[object]:
+            """Get the class by the plugin type."""
+            if class_type in PR.__plugins.plugins:
+                return PR.__plugins.plugins[class_type]
+            else:
+                # did you mean
+                matches = difflib.get_close_matches(
+                    class_type, PR.__plugins.plugins.keys()
+                )
+                dym_message = f"Did you mean: {matches[0]}?" if matches else ""
+                raise RuntimeError(f"Unknown {name} type: {class_type}. {dym_message}")
+
+        @classmethod
+        def get_plugins(cls) -> dict[str, type[object]]:
+            """Get all the registered plugins."""
+            return PR.__plugins.plugins
+
+    return PR

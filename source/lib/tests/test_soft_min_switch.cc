@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <gtest/gtest.h>
 
 #include <iostream>
@@ -54,8 +55,8 @@ class TestSoftMinSwitch : public ::testing::Test {
     }
     build_nlist(nlist_a_cpy, nlist_r_cpy, posi_cpy, nloc, rc, rc, nat_stt,
                 ncell, ext_stt, ext_end, region, ncell);
-    nlist.resize(nloc * nnei);
-    rij.resize(nloc * nnei * 3);
+    nlist.resize(static_cast<size_t>(nloc) * nnei);
+    rij.resize(static_cast<size_t>(nloc) * nnei * 3);
     for (int ii = 0; ii < nloc; ++ii) {
       // format nlist and record
       format_nlist_i_cpu<double>(fmt_nlist_a, posi_cpy, atype_cpy, ii,
@@ -119,7 +120,9 @@ TEST_F(TestSoftMinSwitch, cpu_num_deriv) {
     int i_idx = ii;
     for (int jj = 0; jj < nnei; ++jj) {
       int j_idx = nlist[ii * nnei + jj];
-      if (j_idx < 0) continue;
+      if (j_idx < 0) {
+        continue;
+      }
       for (int dd = 0; dd < 3; ++dd) {
         std::vector<double> posi_0 = posi_cpy;
         std::vector<double> posi_1 = posi_cpy;

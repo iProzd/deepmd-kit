@@ -1,12 +1,18 @@
 {
   "nvnmd": {
+    "version": 0,
+    "max_nnei": 128,
     "net_size": 128,
     "sel": [
       60,
       60
     ],
     "rcut": 6.0,
-    "rcut_smth": 0.5
+    "rcut_smth": 0.5,
+    "type_map": [
+      "Ge",
+      "Te"
+    ]
   },
   "learning_rate": {
     "type": "exp",
@@ -34,7 +40,6 @@
       "systems": [
         "../data"
       ],
-      "set_prefix": "set",
       "batch_size": [
         1
       ]

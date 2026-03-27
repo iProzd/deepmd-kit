@@ -1,4 +1,6 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Register entry points for lammps-wheel."""
+
 import os
 import platform
 from importlib import (
@@ -7,16 +9,16 @@ from importlib import (
 from pathlib import (
     Path,
 )
-from typing import (
-    List,
-    Optional,
-)
 
+import torch  # noqa: TID253
 from packaging.version import (
     Version,
 )
 
 from deepmd.env import (
+    SHARED_LIB_DIR,
+)
+from deepmd.tf.env import (  # noqa: TID253
     TF_VERSION,
     tf,
 )
@@ -29,18 +31,20 @@ else:
     find_libpython = None
 
 
-def get_env(paths: List[Optional[str]]) -> str:
+def get_env(paths: list[str | None]) -> str:
     """Get the environment variable from given paths."""
     return ":".join(p for p in paths if p is not None)
 
 
-def get_library_path(module: str) -> List[str]:
+def get_library_path(module: str, filename: str) -> list[str]:
     """Get library path from a module.
 
     Parameters
     ----------
     module : str
         The module name.
+    filename : str
+        The library filename pattern.
 
     Returns
     -------
@@ -52,7 +56,8 @@ def get_library_path(module: str) -> List[str]:
     except ModuleNotFoundError:
         return []
     else:
-        return [str(Path(m.__file__).parent)]
+        libs = sorted(Path(m.__path__[0]).glob(filename))
+        return [str(lib) for lib in libs]
 
 
 if platform.system() == "Linux":
@@ -62,24 +67,38 @@ elif platform.system() == "Darwin":
 else:
     raise RuntimeError("Unsupported platform")
 
-tf_dir = tf.sysconfig.get_lib()
-op_dir = str((Path(__file__).parent / "op").absolute())
+if platform.system() == "Linux":
+    preload_env = "LD_PRELOAD"
+elif platform.system() == "Darwin":
+    preload_env = "DYLD_INSERT_LIBRARIES"
+else:
+    raise RuntimeError("Unsupported platform")
 
+tf_dir = tf.sysconfig.get_lib()
+pt_dir = os.path.join(torch.__path__[0], "lib")
+op_dir = str(SHARED_LIB_DIR)
 
 cuda_library_paths = []
 if platform.system() == "Linux":
     cuda_library_paths.extend(
         [
-            *get_library_path("nvidia.cuda_runtime.lib"),
-            *get_library_path("nvidia.cublas.lib"),
-            *get_library_path("nvidia.cublas.lib"),
-            *get_library_path("nvidia.cufft.lib"),
-            *get_library_path("nvidia.curand.lib"),
-            *get_library_path("nvidia.cusolver.lib"),
-            *get_library_path("nvidia.cusparse.lib"),
-            *get_library_path("nvidia.cudnn.lib"),
+            *get_library_path("nvidia.cuda_runtime.lib", "libcudart.so*"),
+            *get_library_path("nvidia.cublas.lib", "libcublasLt.so*"),
+            *get_library_path("nvidia.cublas.lib", "libcublas.so*"),
+            *get_library_path("nvidia.cufft.lib", "libcufft.so*"),
+            *get_library_path("nvidia.curand.lib", "libcurand.so*"),
+            *get_library_path("nvidia.cusolver.lib", "libcusolver.so*"),
+            *get_library_path("nvidia.cusparse.lib", "libcusparse.so*"),
+            *get_library_path("nvidia.cudnn.lib", "libcudnn.so*"),
         ]
     )
+
+os.environ[preload_env] = get_env(
+    [
+        os.environ.get(preload_env),
+        *cuda_library_paths,
+    ]
+)
 
 # set LD_LIBRARY_PATH
 os.environ[lib_env] = get_env(
@@ -87,20 +106,14 @@ os.environ[lib_env] = get_env(
         os.environ.get(lib_env),
         tf_dir,
         os.path.join(tf_dir, "python"),
+        pt_dir,
         op_dir,
-        *cuda_library_paths,
     ]
 )
 
 # preload python library, only for TF<2.12
 if find_libpython is not None:
     libpython = find_libpython()
-    if platform.system() == "Linux":
-        preload_env = "LD_PRELOAD"
-    elif platform.system() == "Darwin":
-        preload_env = "DYLD_INSERT_LIBRARIES"
-    else:
-        raise RuntimeError("Unsupported platform")
     os.environ[preload_env] = get_env(
         [
             os.environ.get(preload_env),

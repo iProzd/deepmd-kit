@@ -3,30 +3,47 @@
 # Output: TensorFlow_FOUND TensorFlow_INCLUDE_DIRS TensorFlow_LIBRARY
 # TensorFlow_LIBRARY_PATH TensorFlowFramework_LIBRARY
 # TensorFlowFramework_LIBRARY_PATH TENSORFLOW_LINK_LIBPYTHON : whether
-# Tensorflow::tensorflow_cc links libpython
+# TensorFlow::tensorflow_cc links libpython
 #
 # Target: TensorFlow::tensorflow_framework TensorFlow::tensorflow_cc
 
+if(SKBUILD)
+  # clean cmake caches for skbuild, as TF directories may be changed due to
+  # PEP-517
+  set(TensorFlowFramework_LIBRARY_tensorflow_framework
+      "TensorFlowFramework_LIBRARY_tensorflow_framework-NOTFOUND")
+  set(TensorFlow_LIBRARY_tensorflow_cc
+      "TensorFlow_LIBRARY_tensorflow_cc-NOTFOUND")
+  set(TensorFlow_INCLUDE_DIRS "TensorFlow_INCLUDE_DIRS-NOTFOUND")
+  set(TensorFlow_INCLUDE_DIRS_GOOGLE "TensorFlow_INCLUDE_DIRS_GOOGLE-NOTFOUND")
+endif(SKBUILD)
+
 if(BUILD_CPP_IF AND INSTALL_TENSORFLOW)
-  # Here we try to install libtensorflow_cc using conda install.
+  # Here we try to install libtensorflow_cc using pip install.
 
   if(USE_CUDA_TOOLKIT)
-    set(VARIANT cuda)
+    set(VARIANT "")
   else()
-    set(VARIANT cpu)
+    set(VARIANT "-cpu")
   endif()
 
   if(NOT DEFINED TENSORFLOW_ROOT)
     set(TENSORFLOW_ROOT ${CMAKE_INSTALL_PREFIX})
   endif()
-  # execute conda install
-  execute_process(COMMAND conda create libtensorflow_cc=*=${VARIANT}* -c
-                          deepmodeling -y -p ${TENSORFLOW_ROOT})
+  # execute pip install
+  execute_process(
+    COMMAND ${Python_EXECUTABLE} -m pip install tensorflow${VARIANT} --no-deps
+            --target=${TENSORFLOW_ROOT})
+  set(TENSORFLOW_ROOT
+      ${TENSORFLOW_ROOT}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages/tensorflow
+  )
 endif()
 
 if(BUILD_CPP_IF
    AND USE_TF_PYTHON_LIBS
-   AND NOT SKBUILD)
+   AND NOT CMAKE_CROSSCOMPILING
+   AND NOT SKBUILD
+   AND NOT INSTALL_TENSORFLOW)
   # Here we try to install libtensorflow_cc.so as well as
   # libtensorflow_framework.so using libs within the python site-package
   # tensorflow folder.
@@ -269,20 +286,41 @@ else(BUILD_CPP_IF)
 endif(BUILD_CPP_IF)
 
 # detect TensorFlow version
-try_run(
-  TENSORFLOW_VERSION_RUN_RESULT_VAR TENSORFLOW_VERSION_COMPILE_RESULT_VAR
-  ${CMAKE_CURRENT_BINARY_DIR}/tf_version
-  "${CMAKE_CURRENT_LIST_DIR}/tf_version.cpp"
-  CMAKE_FLAGS "-DINCLUDE_DIRECTORIES:STRING=${TensorFlow_INCLUDE_DIRS}"
-  RUN_OUTPUT_VARIABLE TENSORFLOW_VERSION
-  COMPILE_OUTPUT_VARIABLE TENSORFLOW_VERSION_COMPILE_OUTPUT_VAR)
-if(NOT ${TENSORFLOW_VERSION_COMPILE_RESULT_VAR})
-  message(
-    FATAL_ERROR "Failed to compile: \n ${TENSORFLOW_VERSION_COMPILE_OUTPUT_VAR}"
-  )
+if(NOT DEFINED TENSORFLOW_VERSION)
+  try_run(
+    TENSORFLOW_VERSION_RUN_RESULT_VAR TENSORFLOW_VERSION_COMPILE_RESULT_VAR
+    ${CMAKE_CURRENT_BINARY_DIR}/tf_version
+    "${CMAKE_CURRENT_LIST_DIR}/tf_version.cpp"
+    CMAKE_FLAGS
+      "-DINCLUDE_DIRECTORIES:STRING=${TensorFlow_INCLUDE_DIRS}" LINK_LIBRARIES
+      ${TensorFlowFramework_LIBRARY} ${TensorFlow_LIBRARY}
+      RUN_OUTPUT_STDOUT_VARIABLE TENSORFLOW_VERSION
+    COMPILE_OUTPUT_VARIABLE TENSORFLOW_VERSION_COMPILE_OUTPUT_VAR)
+  if(NOT ${TENSORFLOW_VERSION_COMPILE_RESULT_VAR})
+    message(
+      FATAL_ERROR
+        "Failed to compile: \n ${TENSORFLOW_VERSION_COMPILE_OUTPUT_VAR}")
+  endif()
+  if(NOT ${TENSORFLOW_VERSION_RUN_RESULT_VAR} EQUAL "0")
+    message(FATAL_ERROR "Failed to run, return code: ${TENSORFLOW_VERSION}")
+  endif()
 endif()
-if(NOT ${TENSORFLOW_VERSION_RUN_RESULT_VAR} EQUAL "0")
-  message(FATAL_ERROR "Failed to run, return code: ${TENSORFLOW_VERSION}")
+
+if(TENSORFLOW_VERSION VERSION_GREATER_EQUAL 2.20)
+  # since TF 2.20, macros like TF_MAJOR_VERSION, TF_MINOR_VERSION, and
+  # TF_PATCH_VERSION are not defined We manuanlly define them in our CMake files
+  # first, split TENSORFLOW_VERSION (e.g. 2.20.0rc0) to 2 20 0 rc0
+  string(REGEX MATCH "^([0-9]+)\\.([0-9]+)\\.([0-9]+)(.*)$" _match
+               ${TENSORFLOW_VERSION})
+  if(_match)
+    set(TF_MAJOR_VERSION ${CMAKE_MATCH_1})
+    set(TF_MINOR_VERSION ${CMAKE_MATCH_2})
+    set(TF_PATCH_VERSION ${CMAKE_MATCH_3})
+    # add defines
+    add_definitions(-DTF_MAJOR_VERSION=${TF_MAJOR_VERSION})
+    add_definitions(-DTF_MINOR_VERSION=${TF_MINOR_VERSION})
+    add_definitions(-DTF_PATCH_VERSION=${TF_PATCH_VERSION})
+  endif()
 endif()
 
 # print message
@@ -326,12 +364,14 @@ elseif(NOT DEFINED OP_CXX_ABI)
     try_compile(
       CPP_CXX_ABI_COMPILE_RESULT_VAR0 ${CMAKE_CURRENT_BINARY_DIR}/tf_cxx_abi0
       "${CMAKE_CURRENT_LIST_DIR}/test_cxx_abi.cpp"
+      OUTPUT_VARIABLE CPP_CXX_ABI_COMPILE_OUTPUT_VAR0
       LINK_LIBRARIES ${TensorFlowFramework_LIBRARY}
       CMAKE_FLAGS "-DINCLUDE_DIRECTORIES:STRING=${TensorFlow_INCLUDE_DIRS}"
       COMPILE_DEFINITIONS -D_GLIBCXX_USE_CXX11_ABI=0)
     try_compile(
       CPP_CXX_ABI_COMPILE_RESULT_VAR1 ${CMAKE_CURRENT_BINARY_DIR}/tf_cxx_abi1
       "${CMAKE_CURRENT_LIST_DIR}/test_cxx_abi.cpp"
+      OUTPUT_VARIABLE CPP_CXX_ABI_COMPILE_OUTPUT_VAR1
       LINK_LIBRARIES ${TensorFlowFramework_LIBRARY}
       CMAKE_FLAGS "-DINCLUDE_DIRECTORIES:STRING=${TensorFlow_INCLUDE_DIRS}"
       COMPILE_DEFINITIONS -D_GLIBCXX_USE_CXX11_ABI=1)
@@ -345,13 +385,18 @@ elseif(NOT DEFINED OP_CXX_ABI)
            AND ${CPP_CXX_ABI_COMPILE_RESULT_VAR1})
       message(
         WARNING
-          "Both _GLIBCXX_USE_CXX11_ABI=0 and 1 work. The reason may be that your C++ compiler (e.g. Red Hat Developer Toolset) does not support the custom cxx11 abi flag. For convience, we set _GLIBCXX_USE_CXX11_ABI=1."
+          "Both _GLIBCXX_USE_CXX11_ABI=0 and 1 work. The reason may be that your C++ compiler (e.g. Red Hat Developer Toolset) does not support the custom cxx11 abi flag. For convenience, we set _GLIBCXX_USE_CXX11_ABI=1."
       )
       set(OP_CXX_ABI 1)
     else()
+      # print results of try_compile
+      message(WARNING "Output with _GLIBCXX_USE_CXX11_ABI=0:"
+                      ${CPP_CXX_ABI_COMPILE_OUTPUT_VAR0})
+      message(WARNING "Output with _GLIBCXX_USE_CXX11_ABI=1:"
+                      ${CPP_CXX_ABI_COMPILE_OUTPUT_VAR1})
       message(
         FATAL_ERROR
-          "Both _GLIBCXX_USE_CXX11_ABI=0 and 1 do not work. The reason may be that your C++ compiler (e.g. Red Hat Developer Toolset) does not support the custom cxx11 abi flag."
+          "Both _GLIBCXX_USE_CXX11_ABI=0 and 1 do not work. The reason may be that your C++ compiler (e.g. Red Hat Developer Toolset) does not support the custom cxx11 abi flag. Please check the above outputs."
       )
     endif()
   else()

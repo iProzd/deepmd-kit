@@ -1,10 +1,9 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
 #include <map>
 #include <string>
 #include <vector>
-
-// using namespace std;
 
 template <typename VALUETYPE>
 class Convert {

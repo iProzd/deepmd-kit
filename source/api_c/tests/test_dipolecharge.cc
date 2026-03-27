@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -5,7 +6,6 @@
 #include <fstream>
 #include <vector>
 
-#include "common.h"
 #include "deepmd.hpp"
 #include "ewald.h"
 #include "region.h"
@@ -54,6 +54,9 @@ class TestDipoleCharge : public ::testing::Test {
   deepmd::hpp::DipoleChargeModifier dm;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/dipolecharge_e.pbtxt";
     std::string model = "dipolecharge_e.pb";
     deepmd::hpp::convert_pbtxt_to_pb(file_name, model);
@@ -76,7 +79,9 @@ class TestDipoleCharge : public ::testing::Test {
 static bool _in_vec(const int& value, const std::vector<int>& vec) {
   // naive impl.
   for (int ii = 0; ii < vec.size(); ++ii) {
-    if (value == vec[ii]) return true;
+    if (value == vec[ii]) {
+      return true;
+    }
   }
   return false;
 }
@@ -124,12 +129,12 @@ TYPED_TEST(TestDipoleCharge, cpu_lmp_nlist) {
   std::vector<int> sel_types = dp.sel_types();
   std::vector<int> sel_fwd, sel_bwd;
   int sel_nghost;
-  deepmd::select_by_type(sel_fwd, sel_bwd, sel_nghost, coord_cpy, atype_cpy,
-                         nghost, sel_types);
+  deepmd::hpp::select_by_type(sel_fwd, sel_bwd, sel_nghost, coord_cpy,
+                              atype_cpy, nghost, sel_types);
   int sel_nall = sel_bwd.size();
   int sel_nloc = sel_nall - sel_nghost;
   std::vector<int> sel_atype(sel_bwd.size());
-  deepmd::select_map<int>(sel_atype, atype, sel_fwd, 1);
+  deepmd::hpp::select_map<int>(sel_atype, atype, sel_fwd, 1);
   // Yixiao: because the deeptensor already return the correct order, the
   // following map is no longer needed deepmd::AtomMap<double>
   // nnp_map(sel_atype.begin(), sel_atype.begin() + sel_nloc); const

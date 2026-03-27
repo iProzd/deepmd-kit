@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 # The initial version of this file comes from
 # https://github.com/mithro/sphinx-contrib-mithro/tree/master/sphinx-contrib-exhale-multiproject
 # under the following license:
@@ -77,14 +78,22 @@ import os.path
 from pprint import (
     pprint,
 )
+from typing import (
+    TYPE_CHECKING,
+)
 
 import exhale
 import exhale.configs
 import exhale.deploy
 import exhale.utils
 
+if TYPE_CHECKING:
+    from sphinx.application import (
+        Sphinx,
+    )
 
-def exhale_environment_ready(app):
+
+def exhale_environment_ready(app: "Sphinx") -> None:
     default_project = app.config.breathe_default_project
     default_exhale_args = dict(app.config.exhale_args)
 
@@ -102,11 +111,11 @@ def exhale_environment_ready(app):
         app.config.exhale_args["containmentFolder"] = os.path.realpath(
             app.config.exhale_args["containmentFolder"]
         )
-        print("=" * 75)
-        print(project)
-        print("-" * 50)
-        pprint(app.config.exhale_args)
-        print("=" * 75)
+        print("=" * 75)  # noqa: T201
+        print(project)  # noqa: T201
+        print("-" * 50)  # noqa: T201
+        pprint(app.config.exhale_args)  # noqa: T203
+        print("=" * 75)  # noqa: T201
 
         # First, setup the extension and verify all of the configurations.
         exhale.configs.apply_sphinx_configurations(app)

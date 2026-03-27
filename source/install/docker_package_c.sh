@@ -3,7 +3,10 @@ set -e
 SCRIPT_PATH=$(dirname $(realpath -s $0))
 
 docker run --rm -v ${SCRIPT_PATH}/../..:/root/deepmd-kit -w /root/deepmd-kit \
-	ghcr.io/deepmodeling/libtensorflow_cc:2.9.2_cuda11.6_centos7_cmake \
-	/bin/sh -c "source /opt/rh/devtoolset-10/enable \
+	tensorflow/build:${TENSORFLOW_BUILD_VERSION:-2.15}-python3.11 \
+	/bin/sh -c "pip install \"tensorflow${TENSORFLOW_VERSION}\" cmake \
+            && git config --global --add safe.directory /root/deepmd-kit \
             && cd /root/deepmd-kit/source/install \
-            && /bin/sh package_c.sh"
+            && CC=/dt9/usr/bin/gcc \
+               CXX=/dt9/usr/bin/g++ \
+               /bin/sh package_c.sh"

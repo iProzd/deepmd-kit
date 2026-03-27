@@ -1,6 +1,6 @@
 #!/bin/bash
 
-source env.sh
+source ./env.sh
 
 # Install/unInstall package files in LAMMPS
 # mode = 0/1/2 for uninstall/install/update
@@ -29,6 +29,17 @@ action() {
 		fi
 	fi
 }
+
+if (test $1 = 1); then
+	if (test ! -e ../pppm.cpp); then
+		echo "Must install KSPACE package with USER-DEEPMD package"
+		exit 1
+	fi
+	if (test ! -e ../fix_ttm.cpp); then
+		echo "Must install EXTRA-FIX package with USER-DEEPMD package"
+		exit 1
+	fi
+fi
 
 # all package files with no dependencies
 

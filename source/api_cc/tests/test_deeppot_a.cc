@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
@@ -69,6 +70,9 @@ class TestInferDeepPotA : public ::testing::Test {
   deepmd::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/deeppot.pbtxt";
     deepmd::convert_pbtxt_to_pb("../../tests/infer/deeppot.pbtxt",
                                 "deeppot.pb");
@@ -142,7 +146,7 @@ TYPED_TEST(TestInferDeepPotA, cpu_build_nlist_numfv) {
 
    public:
     MyModel(deepmd::DeepPot& dp_, const std::vector<int>& atype_)
-        : mydp(dp_), atype(atype_){};
+        : mydp(dp_), atype(atype_) {};
     virtual void compute(double& ener,
                          std::vector<VALUETYPE>& force,
                          std::vector<VALUETYPE>& virial,
@@ -606,6 +610,9 @@ class TestInferDeepPotANoPbc : public ::testing::Test {
   deepmd::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/deeppot.pbtxt";
     deepmd::convert_pbtxt_to_pb(file_name, "deeppot.pb");
 

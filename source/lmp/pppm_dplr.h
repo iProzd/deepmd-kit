@@ -1,17 +1,14 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #ifdef KSPACE_CLASS
-
-KSpaceStyle(pppm / dplr, PPPMDPLR)
-
+// clang-format off
+KSpaceStyle(pppm/dplr, PPPMDPLR)
+// clang-format on
 #else
 
 #ifndef LMP_PPPM_DPLR_H
 #define LMP_PPPM_DPLR_H
 
-#ifdef HIGH_PREC
 #define FLOAT_PREC double
-#else
-#define FLOAT_PREC float
-#endif
 
 #include <iostream>
 #include <vector>
@@ -24,13 +21,14 @@ class PPPMDPLR : public PPPM {
  public:
 #if LAMMPS_VERSION_NUMBER < 20181109
   // See lammps/lammps#1165
-  PPPMDPLR(class LAMMPS *, int, char **);
+  PPPMDPLR(class LAMMPS*, int, char**);
 #else
-  PPPMDPLR(class LAMMPS *);
+  PPPMDPLR(class LAMMPS*);
 #endif
-  ~PPPMDPLR() override{};
+  ~PPPMDPLR() override {};
   void init() override;
-  const std::vector<double> &get_fele() const { return fele; };
+  const std::vector<double>& get_fele() const { return fele; };
+  std::vector<double>& get_fele() { return fele; }
 
  protected:
   void compute(int, int) override;

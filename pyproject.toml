@@ -1,19 +1,18 @@
 [build-system]
 requires = [
-    "setuptools>=61",
-    "setuptools_scm[toml]>=6.2",
-    "wheel",
-    "scikit-build",
-    "cmake",
-    # see https://github.com/scikit-build/scikit-build/releases/tag/0.13.1
-    "ninja; platform_system!='Windows'",
+    # TODO: unpin the upper bound when scikit-build dynamic metadata API is stable
+    # dynamic metadata API is still unstable
+    "scikit-build-core>=0.5,!=0.6.0,<0.13",
+    "packaging",
+    'tomli >= 1.1.0 ; python_version < "3.11"',
+    "dependency_groups",
 ]
-build-backend = "dp_backend"
-backend-path = ["backend"]
+build-backend = "backend.dp_backend"
+backend-path = ["."]
 
 [project]
 name = "deepmd-kit"
-dynamic = ["version", "optional-dependencies", "entry-points"]
+dynamic = ["version", "optional-dependencies", "scripts", "readme"]
 description = "A deep learning package for many-body potential energy representation and molecular dynamics"
 authors = [
   {name = "DeepModeling"},
@@ -21,80 +20,329 @@ authors = [
 ]
 license = {file = "LICENSE"}
 classifiers = [
-    "Programming Language :: Python :: 3.7",
+    "Natural Language :: English",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Development Status :: 5 - Production/Stable",
+    "Programming Language :: C",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3 :: Only",
+    "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.2",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "License :: OSI Approved :: GNU Lesser General Public License v3 (LGPLv3)",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+    "Environment :: Console",
 ]
 dependencies = [
-    'numpy',
+    # array-api-compat requires numpy>=1.21
+    'numpy>=1.21',
     'scipy',
     'pyyaml',
-    'dargs >= 0.2.9',
-    'python-hostlist >= 1.21',
-    'typing_extensions; python_version < "3.7"',
+    'dargs >= 0.4.7',
+    'typing_extensions>=4.0.0',
     'importlib_metadata>=1.4; python_version < "3.8"',
     'h5py',
+    "h5py>=3.6.0,!=3.11.0; platform_system=='Linux' and platform_machine=='aarch64'",
     'wcmatch',
     'packaging',
+    'ml_dtypes',
+    'mendeleev',
+    'array-api-compat',
 ]
-requires-python = ">=3.7"
-readme = "README.md"
+requires-python = ">=3.10"
 keywords = ["deepmd"]
+
+[project.entry-points."lammps.plugins"]
+deepmd = "deepmd.lmp_check_build:get_op_dir"
+
+[project.entry-points."dpgui"]
+"DeePMD-kit" = "deepmd.utils.argcheck:gen_args"
+"DeePMD-kit Multi-task" = "deepmd.utils.argcheck:gen_args_multi_task"
+
+[project.entry-points."dpdata.plugins"]
+deepmd_driver = "deepmd.driver:DPDriver"
 
 [project.urls]
 Homepage = "https://github.com/deepmodeling/deepmd-kit"
-documentation = "https://docs.deepmodeling.com/projects/deepmd-kit"
+documentation = "https://docs.deepmodeling.com/projects/deepmd"
 repository = "https://github.com/deepmodeling/deepmd-kit"
 
+# Metadata below is dynamic. However, it still has static parts,
+# which can be read by the build backend.
+[tool.deepmd_build_backend.optional-dependencies]
+test = [
+    "dpdata>=0.2.7",
+    # ASE issue: https://gitlab.com/ase/ase/-/merge_requests/2843
+    # fixed in 3.23.0
+    "ase>=3.23.0",
+    "pytest",
+    "pytest-cov",
+    "pytest-sugar",
+    "pytest-split",
+    "dpgui",
+    # to support Array API 2024.12
+    'array-api-strict>=2.2;python_version>="3.9"',
+]
+docs = [
+    "sphinx>=3.1.1",
+    "sphinx-book-theme",
+    "myst-nb>=1.0.0",
+    "myst-parser>=0.19.2",
+    "sphinx-design",
+    "breathe",
+    "exhale>=0.3.7",
+    "numpydoc",
+    "ase",
+    "deepmodeling-sphinx>=0.3.0",
+    "dargs>=0.3.4",
+    "sphinx-argparse<0.5.0",
+    "pygments-lammps",
+    "sphinxcontrib-bibtex",
+    "sphinx-autoapi>=3.0.0",
+    "sphinxcontrib-programoutput",
+    "sphinxcontrib-moderncmakedomain",
+    "sphinx-remove-toctrees",
+]
+lmp = [
+    "lammps[mpi]~=2025.7.22.2.0",
+]
+ipi = [
+    "ipi",
+]
+gui = [
+    "dpgui",
+]
+cu12 = [
+    "nvidia-cuda-runtime-cu12",
+    "nvidia-cublas-cu12",
+    "nvidia-cufft-cu12",
+    "nvidia-curand-cu12",
+    "nvidia-cusolver-cu12",
+    "nvidia-cusparse-cu12",
+    "nvidia-cudnn-cu12",
+    "nvidia-cuda-nvcc-cu12",
+]
+jax = [
+    # below is a funny workaround for
+    # https://github.com/astral-sh/uv/issues/8601
+    'jax>=0.4.33;python_version>="3.10"',
+    'jax>=0.4.33;python_version>="3.10"',
+    'flax>=0.10.0;python_version>="3.10"',
+    'flax>=0.10.0;python_version>="3.10"',
+    'orbax-checkpoint;python_version>="3.10"',
+    'orbax-checkpoint;python_version>="3.10"',
+    # The pinning of ml_dtypes may conflict with TF
+    # 'jax-ai-stack;python_version>="3.10"',
+]
+
+[tool.deepmd_build_backend.scripts]
+dp = "deepmd.main:main"
+
+[dependency-groups]
+dev = [
+  "prek",
+  "cmake",
+  "mpich",
+]
+pin_tensorflow_cpu = [
+  # https://github.com/tensorflow/tensorflow/issues/75279
+  # macos x86 has been deprecated
+  "tensorflow-cpu==2.21.0; platform_machine=='x86_64' and platform_system == 'Linux'",
+  "tensorflow~=2.18.0; (platform_machine!='x86_64' or platform_system != 'Linux') and (platform_machine!='x86_64' or platform_system != 'Darwin')",
+  "tensorflow; platform_machine=='x86_64' and platform_system == 'Darwin'",
+]
+pin_tensorflow_gpu = [
+  "tensorflow==2.18.0",
+  # TODO: unpin protobuf after TF is upgraded to 2.21
+  # See: https://github.com/tensorflow/tensorflow/pull/103382
+  "protobuf<7.34.0",
+]
+pin_pytorch_cpu = [
+  # https://github.com/pytorch/pytorch/issues/114602
+  # macos x86 has been deprecated
+  "torch==2.10.0; platform_machine!='x86_64' or platform_system != 'Darwin'",
+  "torch; platform_machine=='x86_64' and platform_system == 'Darwin'",
+]
+pin_pytorch_gpu = [
+  "torch==2.10.0",
+]
+pin_jax = [
+  "jax==0.5.0;python_version>='3.10'",
+]
+
 [tool.setuptools_scm]
-write_to = "deepmd/_version.py"
+
+[tool.scikit-build]
+experimental = true
+minimum-version = "0.5"
+cmake.source-dir = "source"
+sdist.include = [
+    "/deepmd/_version.py",
+]
+sdist.exclude = [
+    "/source/tests",
+    "/source/api_c/tests",
+    "/source/api_cc/tests",
+    "/source/lib/tests",
+    "/source/lmp/tests",
+    "/doc",
+    "/examples",
+    "/data",
+    "/.github",
+]
+wheel.packages = [
+    "deepmd",
+]
+wheel.py-api = "py37"
+build-dir = "build/{wheel_tag}"
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.setuptools_scm"
+
+[tool.scikit-build.metadata.optional-dependencies]
+provider = "backend.dynamic_metadata"
+provider-path = "backend"
+
+[tool.scikit-build.metadata.scripts]
+provider = "backend.dynamic_metadata"
+provider-path = "backend"
+
+[tool.scikit-build.metadata.readme]
+provider = "scikit_build_core.metadata.fancy_pypi_readme"
+
+[[tool.scikit-build.generate]]
+path = "deepmd/_version.py"
+template = '''
+version = "${version}"
+'''
+
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+# links
+pattern = '\[(.+?)\]\(((?!https?://)\S+?)\)'
+replacement = '[\1](https://github.com/deepmodeling/deepmd-kit/tree/master/\g<2>)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+# image
+pattern = '(srcset|src)="((?!https?://)\S+?)"'
+replacement = '\1="https://github.com/deepmodeling/deepmd-kit/raw/master/\g<2>"'
 
 [tool.cibuildwheel]
 test-command = [
-    "dp -h",
-]
-test-extras = ["cpu"]
-build = ["cp310-*"]
-skip = ["*-win32", "*-manylinux_i686", "*-musllinux*"]
-# TODO: bump to "latest" tag when CUDA supports GCC 12
-manylinux-x86_64-image = "quay.io/pypa/manylinux_2_28_x86_64:2022-11-19-1b19e81"
-manylinux-aarch64-image = "quay.io/pypa/manylinux_2_28_aarch64:2022-11-19-1b19e81"
-
-[tool.cibuildwheel.macos]
-environment = { PIP_PREFER_BINARY="1", DP_LAMMPS_VERSION="stable_23Jun2022_update3", DP_ENABLE_IPI="1" }
-before-all = ["brew install mpich"]
-repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} --ignore-missing-dependencies"
-test-extras = ["cpu", "test", "lmp", "ipi"]
-test-command = [
+    "python -m deepmd -h",
+    """python -c "import deepmd.tf;import deepmd.pt;import deepmd.pd" """,
     "dp -h",
     "dp_ipi",
-    "pytest {project}/source/tests/test_lammps.py"
+    "pytest {project}/source/tests/common/test_lammps.py"
 ]
+test-extras = ["cpu", "test", "lmp", "ipi", "torch", "paddle"]
+build = ["cp311-*"]
+skip = ["*-win32", "*-manylinux_i686", "*-musllinux*"]
+manylinux-x86_64-image = "manylinux_2_28"
+manylinux-aarch64-image = "manylinux_2_28"
+
+[tool.cibuildwheel.macos]
+repair-wheel-command = """delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel} --ignore-missing-dependencies"""
+
+[tool.cibuildwheel.macos.environment]
+PIP_PREFER_BINARY = "1"
+DP_LAMMPS_VERSION = "stable_22Jul2025_update2"
+DP_ENABLE_IPI = "1"
+DP_ENABLE_PYTORCH = "1"
+DP_ENABLE_PADDLE = "1"
+# for unclear reason, when enabling PyTorch, OpenMP is found accidentally
+CMAKE_ARGS = "-DCMAKE_DISABLE_FIND_PACKAGE_OpenMP=1"
+
+[[tool.cibuildwheel.overrides]]
+# error: 'value' is unavailable: introduced in macOS 10.13
+select = "*-macosx_x86_64"
+inherit.environment = "append"
+environment.MACOSX_DEPLOYMENT_TARGET = "11.0"
 
 [tool.cibuildwheel.linux]
-repair-wheel-command = "auditwheel repair --exclude libtensorflow_framework.so.2 --exclude libtensorflow_framework.so.1 --exclude libtensorflow_framework.so --exclude _pywrap_tensorflow_internal.so --exclude libtensorflow_cc.so.2 -w {dest_dir} {wheel}"
-environment-pass = ["CIBW_BUILD", "DP_VARIANT"]
-environment = { PIP_PREFER_BINARY="1", DP_VARIANT="cuda", DP_LAMMPS_VERSION="stable_23Jun2022_update3", DP_ENABLE_IPI="1", MPI_HOME="/usr/lib64/mpich", PATH="/usr/lib64/mpich/bin:$PATH" }
-before-all = [
-    """{ if [ "$(uname -m)" = "x86_64" ] ; then curl https://developer.download.nvidia.com/compute/cuda/11.8.0/local_installers/cuda_11.8.0_520.61.05_linux.run -O && bash cuda_11.8.0_520.61.05_linux.run --silent --toolkit; fi }""",
-    "yum install -y mpich-devel",
+repair-wheel-command = "auditwheel repair --exclude libtensorflow_framework.so.2 --exclude libtensorflow_framework.so.1 --exclude libtensorflow_framework.so --exclude _pywrap_tensorflow_internal.so --exclude libtensorflow_cc.so.2 --exclude libc10.so --exclude libtorch.so --exclude libtorch_cpu.so --exclude libmpi.so.12 -w {dest_dir} {wheel}"
+environment-pass = [
+    "CIBW_BUILD",
+    "DP_VARIANT",
+    "CUDA_VERSION",
+    "DP_PKG_NAME",
+    "SETUPTOOLS_SCM_PRETEND_VERSION",
 ]
+before-all = [
+    """if [ ! -z "${DP_PKG_NAME}" ]; then sed -i "s/name = \\"deepmd-kit\\"/name = \\"${DP_PKG_NAME}\\"/g" pyproject.toml; fi""",
+    """{ if [ "$(uname -m)" = "x86_64" ] ; then yum config-manager --add-repo http://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo && yum install -y cuda-nvcc-${CUDA_VERSION/./-} cuda-cudart-devel-${CUDA_VERSION/./-}; fi }""",
+]
+before-build = [
+]
+[tool.cibuildwheel.linux.environment]
+PIP_PREFER_BINARY = "1"
+DP_LAMMPS_VERSION = "stable_22Jul2025_update2"
+DP_ENABLE_IPI = "1"
+DP_ENABLE_PYTORCH = "1"
+DP_ENABLE_PADDLE = "1"
+# use CPU version of torch for building, which should also work for GPU
+# https://docs.astral.sh/uv/guides/integration/pytorch/#automatic-backend-selection
+UV_TORCH_BACKEND = "cpu"
 
 [tool.cibuildwheel.windows]
-environment = { PIP_PREFER_BINARY="1" }
+test-extras = ["cpu", "torch", "paddle"]
+test-command = [
+    "python -m deepmd -h",
+    "dp -h",
+]
+[tool.cibuildwheel.windows.environment]
+PIP_PREFER_BINARY = "1"
+DP_ENABLE_PYTORCH = "1"
+DP_ENABLE_PADDLE = "1"
 
+# One can run `tox` or `tox -e gpu`
+# to run pytest in an isolated environment
+# Use with pipx:
+# $ pip install -U pipx
+# $ pipx tox
+[tool.tox]
+legacy_tox_ini = """
+    [tox]
+    min_version = 4.0
+
+    [testenv]
+    extras =
+        test
+        cpu
+    commands = pytest source/tests
+
+    [testenv:gpu]
+    extras =
+        test
+        gpu
+    commands = pytest source/tests
+    setenv =
+        DP_VARIANT = cuda
+"""
 
 # selectively turn of lintner warnings, always include reasoning why any warning should
 # be silenced
 
 # W504 - line break after binary operator - there is conflict between W503 and W504 in
-# some lintners. One recomends line bread after and one before binary operator so we
-# swith W504 off and recomend this coding style:
+# some lintners. One recommends line bread after and one before binary operator so we
+# switch W504 off and recommend this coding style:
 # a = (b +     -> instead of -> a = (b
 #      c)                            + c)
 [tool.autopep8]
 ignore = "W504"
 
-# D413 - Missing blank line after last section - makes no sense only adds empy lines in
+# D413 - Missing blank line after last section - makes no sense only adds empty lines in
 # docstrings
 # D416 - Section name should end with a colon - only applicable to RST type docstrings,
 # we are using numpy style
@@ -111,23 +359,43 @@ profile = "black"
 force_grid_wrap = 1
 
 [tool.ruff]
-target-version = "py37"
+extend-exclude = [
+    "source/3rdparty/**",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+[tool.ruff.lint]
 select = [
     "E", # errors
+    "W", # warning
     "F", # pyflakes
     "D", # pydocstyle
     "UP", # pyupgrade
+    "C4", # flake8-comprehensions
+    "RUF", # ruff
+    "NPY", # numpy
+    "TID251", # banned-api
+    "TID253", # banned-module-level-imports
+    "T20", # ban print
+    "B904", # raise-without-from-inside-except
+    "N804", # invalid-first-argument-name-for-class-method
+    "N805", # invalid-first-argument-name-for-method
+    "DTZ", # datetime
+    "TCH", # flake8-type-checking
+    "PYI", # flake8-pyi
+    "ANN", # type annotations
+    "B905", # zip-without-explicit-strict
 ]
+
 ignore = [
+    "ANN401", # Allow Any due to too many violations
     "E501", # line too long
     "F841", # local variable is assigned to but never used
+    "RUF059", # unused-unpacked-variable
     "E741", # ambiguous variable name
     "E402", # module level import not at top of file
-    "D413", # missing blank line after last section
-    "D416", # section name should end with a colon
-    "D203", # 1 blank line required before class docstring
-    "D107", # missing docstring in __init__
-    "D213", # multi-line docstring summary should start at the second line
     "D100", # TODO: missing docstring in public module
     "D101", # TODO: missing docstring in public class
     "D102", # TODO: missing docstring in public method
@@ -138,4 +406,152 @@ ignore = [
     "D401", # TODO: first line should be in imperative mood
     "D404", # TODO: first word of the docstring should not be This
 ]
-ignore-init-module-imports = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.flake8-tidy-imports]
+banned-module-level-imports = [
+    "deepmd.tf",
+    "deepmd.pt",
+    "deepmd.pt_expt",
+    "deepmd.pd",
+    "deepmd.jax",
+    "tensorflow",
+    "torch",
+    "jax",
+    "paddle",
+]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"torch.testing.assert_allclose".msg = "Use `torch.testing.assert_close()` instead, see https://github.com/pytorch/pytorch/issues/61844."
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["torch.nn.Module"]
+
+[tool.ruff.lint.extend-per-file-ignores]
+# Also ignore `E402` in all `__init__.py` files.
+"source/3rdparty/**" = ["ALL"]
+"backend/**" = ["ANN"]
+"data/**" = ["ANN"]
+"deepmd/tf/**" = ["TID253"]
+"deepmd/pt/**" = ["TID253", "B905"]
+"deepmd/pt_expt/**" = ["TID253", "B905"]
+"deepmd/jax/**" = ["TID253"]
+"deepmd/pd/**" = ["TID253", "B905"]
+"source/**" = ["ANN"]
+"source/tests/tf/**" = ["TID253", "ANN"]
+"source/tests/pt/**" = ["TID253", "ANN"]
+"source/tests/pt_expt/**" = ["TID253", "ANN"]
+"source/tests/jax/**" = ["TID253", "ANN"]
+"source/tests/pd/**" = ["TID253", "ANN"]
+"source/tests/universal/pt/**" = ["TID253", "ANN"]
+"source/tests/universal/pd/**" = ["TID253", "ANN"]
+"source/tests/**" = ["ANN"]
+"source/jax2tf_tests/**" = ["TID253", "ANN"]
+"source/ipi/tests/**" = ["TID253", "ANN"]
+"source/lmp/tests/**" = ["TID253", "ANN"]
+"**/tests/**/test_*.py" = ["ANN"]
+"**/tests/**/*_test.py" = ["ANN"]
+"**/*.ipynb" = ["T20"]  # printing in a nb file is expected
+
+[tool.pytest.ini_options]
+markers = "run"
+
+[tool.coverage.run]
+plugins = ["source.3rdparty.coverage_plugins.jit_plugin"]
+
+[tool.pylint.'MESSAGES CONTROL']
+load-plugins = "deepmd_checker"
+disable = "all"
+enable = "E8001,E8002"
+
+[tool.flake8]
+select = [
+    "TOR0",
+    "TOR1",
+    "TOR2",
+]
+
+[[tool.uv.dependency-metadata]]
+# Fix https://github.com/deepmodeling/deepmd-kit/issues/4679
+name = "tensorflow"
+version = "2.19.0"
+requires-dist = [
+    'absl-py >=1.0.0',
+    'astunparse >=1.6.0',
+    'flatbuffers >=24.3.25',
+    'gast !=0.5.0,!=0.5.1,!=0.5.2,>=0.2.1',
+    'google-pasta >=0.1.1',
+    'libclang >=13.0.0',
+    'opt-einsum >=2.3.2',
+    'packaging',
+    'protobuf !=4.21.0,!=4.21.1,!=4.21.2,!=4.21.3,!=4.21.4,!=4.21.5,<6.0.0dev,>=3.20.3',
+    'requests <3,>=2.21.0',
+    'setuptools',
+    'six >=1.12.0',
+    'termcolor >=1.1.0',
+    'typing-extensions >=3.6.6',
+    'wrapt >=1.11.0',
+    'grpcio <2.0,>=1.24.3',
+    'tensorboard ~=2.19.0',
+    'keras >=3.5.0',
+    'numpy <2.2.0,>=1.26.0',
+    'h5py >=3.11.0',
+    'ml-dtypes <1.0.0,>=0.5.1',
+    # 'tensorflow-intel ==2.19.0 ; platform_system == "Windows"',
+    'tensorflow-io-gcs-filesystem >=0.23.1 ; python_version < "3.12"',
+    'nvidia-cublas-cu12 ==12.5.3.2 ; extra == "and-cuda"',
+    'nvidia-cuda-cupti-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cuda-nvcc-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cuda-nvrtc-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cuda-runtime-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cudnn-cu12 ==9.3.0.75 ; extra == "and-cuda"',
+    'nvidia-cufft-cu12 ==11.2.3.61 ; extra == "and-cuda"',
+    'nvidia-curand-cu12 ==10.3.6.82 ; extra == "and-cuda"',
+    'nvidia-cusolver-cu12 ==11.6.3.83 ; extra == "and-cuda"',
+    'nvidia-cusparse-cu12 ==12.5.1.3 ; extra == "and-cuda"',
+    'nvidia-nccl-cu12 ==2.23.4 ; extra == "and-cuda"',
+    'nvidia-nvjitlink-cu12 ==12.5.82 ; extra == "and-cuda"',
+]
+
+[[tool.uv.dependency-metadata]]
+name = "tensorflow-cpu"
+version = "2.19.0"
+requires-dist = [
+    'absl-py >=1.0.0',
+    'astunparse >=1.6.0',
+    'flatbuffers >=24.3.25',
+    'gast !=0.5.0,!=0.5.1,!=0.5.2,>=0.2.1',
+    'google-pasta >=0.1.1',
+    'libclang >=13.0.0',
+    'opt-einsum >=2.3.2',
+    'packaging',
+    'protobuf !=4.21.0,!=4.21.1,!=4.21.2,!=4.21.3,!=4.21.4,!=4.21.5,<6.0.0dev,>=3.20.3',
+    'requests <3,>=2.21.0',
+    'setuptools',
+    'six >=1.12.0',
+    'termcolor >=1.1.0',
+    'typing-extensions >=3.6.6',
+    'wrapt >=1.11.0',
+    'grpcio <2.0,>=1.24.3',
+    'tensorboard ~=2.19.0',
+    'keras >=3.5.0',
+    'numpy <2.2.0,>=1.26.0',
+    'h5py >=3.11.0',
+    'ml-dtypes <1.0.0,>=0.5.1',
+    # 'tensorflow-intel ==2.19.0 ; platform_system == "Windows"',
+    'tensorflow-io-gcs-filesystem >=0.23.1 ; python_version < "3.12"',
+    'nvidia-cublas-cu12 ==12.5.3.2 ; extra == "and-cuda"',
+    'nvidia-cuda-cupti-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cuda-nvcc-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cuda-nvrtc-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cuda-runtime-cu12 ==12.5.82 ; extra == "and-cuda"',
+    'nvidia-cudnn-cu12 ==9.3.0.75 ; extra == "and-cuda"',
+    'nvidia-cufft-cu12 ==11.2.3.61 ; extra == "and-cuda"',
+    'nvidia-curand-cu12 ==10.3.6.82 ; extra == "and-cuda"',
+    'nvidia-cusolver-cu12 ==11.6.3.83 ; extra == "and-cuda"',
+    'nvidia-cusparse-cu12 ==12.5.1.3 ; extra == "and-cuda"',
+    'nvidia-nccl-cu12 ==2.23.4 ; extra == "and-cuda"',
+    'nvidia-nvjitlink-cu12 ==12.5.82 ; extra == "and-cuda"',
+]

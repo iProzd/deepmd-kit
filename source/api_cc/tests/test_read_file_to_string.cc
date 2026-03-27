@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
@@ -12,6 +13,9 @@
 
 #include "common.h"
 TEST(TestReadFileToString, readfiletostring) {
+#ifndef BUILD_TENSORFLOW
+  GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
   std::string file_content;
   deepmd::read_file_to_string("../../tests/infer/deeppot.txt", file_content);
 

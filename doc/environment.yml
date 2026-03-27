@@ -4,7 +4,10 @@ channels:
   - defaults
 dependencies:
   - doxygen>=1.9.1
-  - python=3.9
+  - python=3.10
   - pip>=20.1
   - pip:
-    - ..[docs,cpu]
+      - ..[docs,cpu,torch]
+      - "exhale @ https://github.com/svenevs/exhale/archive/2759a394268307b88f5440487ae0920ee4ebf81e.zip"
+      # https://github.com/mcmtroffaes/sphinxcontrib-bibtex/issues/309
+      - docutils!=0.18.*,!=0.19.*

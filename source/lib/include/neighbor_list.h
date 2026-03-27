@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
 #include <algorithm>
@@ -25,13 +26,85 @@ struct InputNlist {
   int* numneigh;
   /// Array stores the core region atom's neighbor index
   int** firstneigh;
-  InputNlist() : inum(0), ilist(NULL), numneigh(NULL), firstneigh(NULL){};
+  ///  # of swaps to perform = sum of maxneed
+  int nswap;
+  /// # of atoms to send in each swap
+  int* sendnum;
+  /// # of atoms to recv in each swap
+  int* recvnum;
+  /// where to put 1st recv atom in each swap
+  int* firstrecv;
+  /// list of atoms to send in each swap
+  int** sendlist;
+  /// proc to send to at each swap
+  int* sendproc;
+  /// proc to recv from at each swap
+  int* recvproc;
+  /// MPI_comm data in lmp
+  void* world;
+  /// mask to the neighbor index
+  int mask = 0xFFFFFFFF;
+  /// mapping from all atoms to real atoms, in the size of nall
+  int* mapping = nullptr;
+  InputNlist()
+      : inum(0),
+        ilist(NULL),
+        numneigh(NULL),
+        firstneigh(NULL),
+        nswap(0),
+        sendnum(nullptr),
+        recvnum(nullptr),
+        firstrecv(nullptr),
+        sendlist(nullptr),
+        sendproc(nullptr),
+        recvproc(nullptr),
+        world(0) {};
   InputNlist(int inum_, int* ilist_, int* numneigh_, int** firstneigh_)
       : inum(inum_),
         ilist(ilist_),
         numneigh(numneigh_),
-        firstneigh(firstneigh_){};
-  ~InputNlist(){};
+        firstneigh(firstneigh_),
+        nswap(0),
+        sendnum(nullptr),
+        recvnum(nullptr),
+        firstrecv(nullptr),
+        sendlist(nullptr),
+        sendproc(nullptr),
+        recvproc(nullptr),
+        world(0) {};
+  InputNlist(int inum_,
+             int* ilist_,
+             int* numneigh_,
+             int** firstneigh_,
+             int nswap,
+             int* sendnum,
+             int* recvnum,
+             int* firstrecv,
+             int** sendlist,
+             int* sendproc,
+             int* recvproc,
+             void* world)
+      : inum(inum_),
+        ilist(ilist_),
+        numneigh(numneigh_),
+        firstneigh(firstneigh_),
+        nswap(nswap),
+        sendnum(sendnum),
+        recvnum(recvnum),
+        firstrecv(firstrecv),
+        sendlist(sendlist),
+        sendproc(sendproc),
+        recvproc(recvproc),
+        world(world) {};
+  ~InputNlist() {};
+  /**
+   * @brief Set mask for this neighbor list.
+   */
+  void set_mask(int mask_) { mask = mask_; };
+  /**
+   * @brief Set mapping for this neighbor list.
+   */
+  void set_mapping(int* mapping_) { mapping = mapping_; };
 };
 
 /**
@@ -65,7 +138,7 @@ int max_numneigh(const InputNlist& to_nlist);
 //	c_cpy, nloc, nall, mem_size, rcut, region
 //	mem_size is the size of allocated memory for jlist.
 // returns
-//	0: succssful
+//	0: successful
 //	1: the memory is not large enough to hold all neighbors.
 //	   i.e. max_list_size > mem_nall
 template <typename FPTYPE>
@@ -120,7 +193,7 @@ void use_nlist_map(int* nlist,
 
 #endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 // build neighbor list.
 // outputs
 //	nlist, max_list_size
@@ -129,7 +202,7 @@ void use_nlist_map(int* nlist,
 //	c_cpy, nloc, nall, mem_size, rcut, region
 //	mem_size is the size of allocated memory for jlist.
 // returns
-//	0: succssful
+//	0: successful
 //	1: the memory is not large enough to hold all neighbors.
 //	   i.e. max_list_size > mem_nall
 template <typename FPTYPE>
@@ -149,7 +222,7 @@ int build_nlist_gpu(InputNlist& nlist,
  * @param ftype_in The input atom type.
  * @param nloc The number of atoms.
  */
-void filter_ftype_gpu_cuda(int* ftype_out, const int* ftype_in, const int nloc);
+void filter_ftype_gpu(int* ftype_out, const int* ftype_in, const int nloc);
 
 void use_nei_info_gpu(int* nlist,
                       int* ntype,
@@ -161,49 +234,7 @@ void use_nei_info_gpu(int* nlist,
                       const int ntypes,
                       const bool b_nlist_map);
 
-#endif  // GOOGLE_CUDA
-
-#if TENSORFLOW_USE_ROCM
-// build neighbor list.
-// outputs
-//	nlist, max_list_size
-//	max_list_size is the maximal size of jlist.
-// inputs
-//	c_cpy, nloc, nall, mem_size, rcut, region
-//	mem_size is the size of allocated memory for jlist.
-// returns
-//	0: succssful
-//	1: the memory is not large enough to hold all neighbors.
-//	   i.e. max_list_size > mem_nall
-template <typename FPTYPE>
-int build_nlist_gpu_rocm(InputNlist& nlist,
-                         int* max_list_size,
-                         int* nlist_data,
-                         const FPTYPE* c_cpy,
-                         const int& nloc,
-                         const int& nall,
-                         const int& mem_size,
-                         const float& rcut);
-/**
- * @brief Filter the fake atom type.
- * @details If >=0, set to 0; if <0, set to -1.
- * @param ftype_out The output filtered atom type.
- * @param ftype_in The input atom type.
- * @param nloc The number of atoms.
- */
-void filter_ftype_gpu_rocm(int* ftype_out, const int* ftype_in, const int nloc);
-
-void use_nei_info_gpu_rocm(int* nlist,
-                           int* ntype,
-                           bool* nmask,
-                           const int* type,
-                           const int* nlist_map,
-                           const int nloc,
-                           const int nnei,
-                           const int ntypes,
-                           const bool b_nlist_map);
-
-#endif  // TENSORFLOW_USE_ROCM
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 }  // namespace deepmd
 

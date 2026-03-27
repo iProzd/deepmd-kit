@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <gtest/gtest.h>
 
 #include <algorithm>
@@ -108,6 +109,9 @@ class TestInferDeepPotANFrames : public ::testing::Test {
   deepmd::hpp::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/deeppot.pbtxt";
     deepmd::hpp::convert_pbtxt_to_pb("../../tests/infer/deeppot.pbtxt",
                                      "deeppot.pb");
@@ -118,7 +122,7 @@ class TestInferDeepPotANFrames : public ::testing::Test {
     EXPECT_EQ(nframes * natoms * 3, expected_f.size());
     EXPECT_EQ(nframes * natoms * 9, expected_v.size());
     expected_tot_e.resize(nframes);
-    expected_tot_v.resize(nframes * 9);
+    expected_tot_v.resize(static_cast<size_t>(nframes) * 9);
     std::fill(expected_tot_e.begin(), expected_tot_e.end(), 0.);
     std::fill(expected_tot_v.begin(), expected_tot_v.end(), 0.);
     for (int kk = 0; kk < nframes; ++kk) {
@@ -718,6 +722,9 @@ class TestInferDeepPotANFramesNoPbc : public ::testing::Test {
   deepmd::hpp::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/deeppot.pbtxt";
     deepmd::hpp::convert_pbtxt_to_pb(file_name, "deeppot.pb");
 
@@ -727,7 +734,7 @@ class TestInferDeepPotANFramesNoPbc : public ::testing::Test {
     EXPECT_EQ(nframes * natoms * 3, expected_f.size());
     EXPECT_EQ(nframes * natoms * 9, expected_v.size());
     expected_tot_e.resize(nframes);
-    expected_tot_v.resize(nframes * 9);
+    expected_tot_v.resize(static_cast<size_t>(nframes) * 9);
     std::fill(expected_tot_e.begin(), expected_tot_e.end(), 0.);
     std::fill(expected_tot_v.begin(), expected_tot_v.end(), 0.);
     for (int kk = 0; kk < nframes; ++kk) {

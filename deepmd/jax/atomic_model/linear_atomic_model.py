@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
+from typing import (
+    Any,
+)
+
+from packaging.version import (
+    Version,
+)
+
+from deepmd.dpmodel.atomic_model.linear_atomic_model import (
+    DPZBLLinearEnergyAtomicModel as DPZBLLinearEnergyAtomicModelDP,
+)
+from deepmd.jax.atomic_model.base_atomic_model import (
+    base_atomic_model_set_attr,
+)
+from deepmd.jax.atomic_model.dp_atomic_model import (
+    DPAtomicModel,
+)
+from deepmd.jax.atomic_model.pairtab_atomic_model import (
+    PairTabAtomicModel,
+)
+from deepmd.jax.common import (
+    ArrayAPIVariable,
+    flax_module,
+    to_jax_array,
+)
+from deepmd.jax.env import (
+    flax_version,
+    jax,
+    jnp,
+    nnx,
+)
+
+
+@flax_module
+class DPZBLLinearEnergyAtomicModel(DPZBLLinearEnergyAtomicModelDP):
+    def __setattr__(self, name: str, value: Any) -> None:
+        value = base_atomic_model_set_attr(name, value)
+        if name == "mapping_list":
+            value = [ArrayAPIVariable(to_jax_array(vv)) for vv in value]
+            if Version(flax_version) >= Version("0.12.0"):
+                value = nnx.List([nnx.data(item) for item in value])
+        elif name == "zbl_weight":
+            # discard since it's only used in tests
+            # to fix flax.errors.TraceContextError: Cannot mutate 'FlaxModule' from different trace level
+            return
+        elif name == "models":
+            value = [
+                DPAtomicModel.deserialize(value[0].serialize()),
+                PairTabAtomicModel.deserialize(value[1].serialize()),
+            ]
+            if Version(flax_version) >= Version("0.12.0"):
+                value = nnx.List([nnx.data(item) for item in value])
+        return super().__setattr__(name, value)
+
+    def forward_common_atomic(
+        self,
+        extended_coord: jnp.ndarray,
+        extended_atype: jnp.ndarray,
+        nlist: jnp.ndarray,
+        mapping: jnp.ndarray | None = None,
+        fparam: jnp.ndarray | None = None,
+        aparam: jnp.ndarray | None = None,
+    ) -> dict[str, jnp.ndarray]:
+        return super().forward_common_atomic(
+            extended_coord,
+            extended_atype,
+            jax.lax.stop_gradient(nlist),
+            mapping=mapping,
+            fparam=fparam,
+            aparam=aparam,
+        )

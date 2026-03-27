@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
 #include <algorithm>
@@ -5,8 +6,8 @@
 #if defined(_OPENMP)
 #include <omp.h>
 #else
-int omp_get_num_threads() { return 1; }
-int omp_get_thread_num() { return 0; }
+inline int omp_get_num_threads() { return 1; }
+inline int omp_get_thread_num() { return 0; }
 #endif
 
 #include "region.h"

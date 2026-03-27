@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
@@ -58,6 +59,9 @@ class TestDipoleCharge : public ::testing::Test {
   deepmd::DipoleChargeModifier dm;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/dipolecharge_e.pbtxt";
     std::string model = "dipolecharge_e.pb";
     deepmd::convert_pbtxt_to_pb(file_name, model);
@@ -80,7 +84,9 @@ class TestDipoleCharge : public ::testing::Test {
 static bool _in_vec(const int& value, const std::vector<int>& vec) {
   // naive impl.
   for (int ii = 0; ii < vec.size(); ++ii) {
-    if (value == vec[ii]) return true;
+    if (value == vec[ii]) {
+      return true;
+    }
   }
   return false;
 }

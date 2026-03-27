@@ -6,107 +6,203 @@ After your easy installation, DeePMD-kit (`dp`) and LAMMPS (`lmp`) will be avail
 
 :::{note}
 Note: The off-line packages and conda packages require the [GNU C Library](https://www.gnu.org/software/libc/) 2.17 or above. The GPU version requires [compatible NVIDIA driver](https://docs.nvidia.com/deploy/cuda-compatibility/index.html#minor-version-compatibility) to be installed in advance. It is possible to force conda to [override detection](https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-virtual.html#overriding-detected-packages) when installation, but these requirements are still necessary during runtime.
+You can refer to [DeepModeling conda FAQ](https://docs.deepmodeling.com/faq/conda.html) for more information.
 :::
 
-- [Install off-line packages](#install-off-line-packages)
-- [Install with conda](#install-with-conda)
-- [Install with docker](#install-with-docker)
-- [Install Python interface with pip](#install-python-interface-with-pip)
+:::{note}
+Python 3.10 or above is required for Python interface.
+:::
 
+## Install DeePMD-kit in 1s
+
+Just copy and paste in 1s, and let it run.
+
+```sh
+curl -fsSL https://dp1s.deepmodeling.com | bash
+```
+
+More options are provided, as documented in the [dp1s repository](https://github.com/deepmodeling-activity/dp1s).
 
 ## Install off-line packages
-Both CPU and GPU version offline packages are available in [the Releases page](https://github.com/deepmodeling/deepmd-kit/releases).
 
-Some packages are splited into two files due to size limit of GitHub. One may merge them into one after downloading:
+Both CPU and GPU version offline packages are available on [the Releases page](https://github.com/deepmodeling/deepmd-kit/releases).
+
+Some packages are split into two files due to the size limit of GitHub. One may merge them into one after downloading:
+
 ```bash
-cat deepmd-kit-2.1.1-cuda11.6_gpu-Linux-x86_64.sh.0 deepmd-kit-2.1.1-cuda11.6_gpu-Linux-x86_64.sh.1 > deepmd-kit-2.1.1-cuda11.6_gpu-Linux-x86_64.sh
+cat deepmd-kit-2.2.9-cuda118-Linux-x86_64.sh.0 deepmd-kit-2.2.9-cuda118-Linux-x86_64.sh.1 > deepmd-kit-2.2.9-cuda118-Linux-x86_64.sh
 ```
 
 One may enable the environment using
+
 ```bash
 conda activate /path/to/deepmd-kit
 ```
 
 ## Install with conda
-DeePMD-kit is available with [conda](https://github.com/conda/conda). Install [Anaconda](https://www.anaconda.com/distribution/#download-section) or [Miniconda](https://docs.conda.io/en/latest/miniconda.html) first.
 
-### Official channel
-
-One may create an environment that contains the CPU version of DeePMD-kit and LAMMPS:
-```bash
-conda create -n deepmd deepmd-kit=*=*cpu libdeepmd=*=*cpu lammps -c https://conda.deepmodeling.com -c defaults
-```
-
-Or one may want to create a GPU environment containing [CUDA Toolkit](https://docs.nvidia.com/deploy/cuda-compatibility/index.html#binary-compatibility__table-toolkit-driver):
-```bash
-conda create -n deepmd deepmd-kit=*=*gpu libdeepmd=*=*gpu lammps cudatoolkit=11.6 horovod -c https://conda.deepmodeling.com -c defaults
-```
-One could change the CUDA Toolkit version from `10.2` or `11.6`.
-
-One may specify the DeePMD-kit version such as `2.1.1` using
-```bash
-conda create -n deepmd deepmd-kit=2.1.1=*cpu libdeepmd=2.1.1=*cpu lammps horovod -c https://conda.deepmodeling.com -c defaults
-```
-
-One may enable the environment using
-```bash
-conda activate deepmd
-```
+DeePMD-kit is available with [conda](https://github.com/conda/conda). Install [Anaconda](https://www.anaconda.com/distribution/#download-section), [Miniconda](https://docs.conda.io/en/latest/miniconda.html), or [miniforge](https://conda-forge.org/download/) first.
+You can refer to [DeepModeling conda FAQ](https://docs.deepmodeling.com/faq/conda.html) for how to setup a conda environment.
 
 ### conda-forge channel
 
-DeePMD-kit is also available on the [conda-forge](https://conda-forge.org/) channel:
+DeePMD-kit is available on the [conda-forge](https://conda-forge.org/) channel:
 
 ```bash
-conda create -n deepmd deepmd-kit lammps -c conda-forge
+conda create -n deepmd deepmd-kit lammps horovod -c conda-forge
 ```
 
-The supported platform includes Linux x86-64, macOS x86-64, and macOS arm64.
+The supported platforms include Linux x86-64, macOS x86-64, and macOS arm64.
 Read [conda-forge FAQ](https://conda-forge.org/docs/user/tipsandtricks.html#installing-cuda-enabled-packages-like-tensorflow-and-pytorch) to learn how to install CUDA-enabled packages.
 
+### Official channel (deprecated)
+
+::::{danger}
+
+:::{deprecated} 3.0.0
+The official channel has been deprecated since 3.0.0, due to the challenging work of building dependencies for [multiple backends](../backend.md).
+Old packages will still be available at https://conda.deepmodeling.com.
+Maintainers will build packages in the conda-forge organization together with other conda-forge members.
+:::
+
+::::
+
 ## Install with docker
-A docker for installing the DeePMD-kit is available [here](https://github.com/orgs/deepmodeling/packages/container/package/deepmd-kit).
+
+A docker for installing the DeePMD-kit is available [here](https://github.com/deepmodeling/deepmd-kit/pkgs/container/deepmd-kit).
 
 To pull the CPU version:
+
 ```bash
-docker pull ghcr.io/deepmodeling/deepmd-kit:2.1.1_cpu
+docker pull ghcr.io/deepmodeling/deepmd-kit:2.2.8_cpu
 ```
 
 To pull the GPU version:
-```bash
-docker pull ghcr.io/deepmodeling/deepmd-kit:2.1.1_cuda11.6_gpu
-```
 
-To pull the ROCm version:
 ```bash
-docker pull deepmodeling/dpmdkit-rocm:dp2.0.3-rocm4.5.2-tf2.6-lmp29Sep2021
+docker pull ghcr.io/deepmodeling/deepmd-kit:2.2.8_cuda12.0_gpu
 ```
 
 ## Install Python interface with pip
 
-If you have no existing TensorFlow installed, you can use `pip` to install the pre-built package of the Python interface with CUDA 11 supported:
+[Create a new environment](https://docs.deepmodeling.com/faq/conda.html#how-to-create-a-new-conda-pip-environment), and then execute the following command:
+
+::::::{tab-set}
+
+:::::{tab-item} TensorFlow {{ tensorflow_icon }}
+
+::::{tab-set}
+
+:::{tab-item} CUDA 12
 
 ```bash
-pip install deepmd-kit[gpu,cu11]
+pip install deepmd-kit[gpu,cu12]
 ```
 
-`cu11` is required only when CUDA Toolkit and cuDNN were not installed.
+`cu12` is required only when CUDA Toolkit and cuDNN were not installed.
+:::
 
-Or install the CPU version without CUDA supported:
+:::{tab-item} CPU
+
 ```bash
 pip install deepmd-kit[cpu]
 ```
+:::
 
-[The LAMMPS module](../third-party/lammps-command.md) and [the i-Pi driver](../third-party/ipi.md) are only provided on Linux and macOS. To install LAMMPS and/or i-Pi, add `lmp` and/or `ipi` to extras:
+::::
+
+:::::
+
+:::::{tab-item} PyTorch {{ pytorch_icon }}
+
+::::{tab-set}
+
+:::{tab-item} CUDA 12
+
 ```bash
-pip install deepmd-kit[gpu,cu11,lmp,ipi]
+pip install deepmd-kit[torch]
 ```
-MPICH is required for parallel running.
+:::
 
-It is suggested to install the package into an isolated environment.
-The supported platform includes Linux x86-64 and aarch64 with GNU C Library 2.28 or above, macOS x86-64, and Windows x86-64.
-A specific version of TensorFlow which is compatible with DeePMD-kit will be also installed.
+:::{tab-item} CPU
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install deepmd-kit
+```
+:::
+
+::::
+
+:::::
+
+:::::{tab-item} JAX {{ jax_icon }}
+
+::::{tab-set}
+
+:::{tab-item} CUDA 12
+
+```bash
+pip install deepmd-kit[jax] jax[cuda12]
+```
+:::
+
+:::{tab-item} CPU
+
+```bash
+pip install deepmd-kit[jax]
+```
+:::
+
+::::
+
+To generate a SavedModel and use [the LAMMPS module](../third-party/lammps-command.md) and [the i-PI driver](../third-party/ipi.md),
+you need to install the TensorFlow.
+Switch to the TensorFlow {{ tensorflow_icon }} tab for more information.
+:::::
+
+:::::{tab-item} Paddle {{ paddle_icon }}
+
+::::{tab-set}
+
+:::{tab-item} CUDA 12.6
+
+```bash
+# release version
+pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+# nightly-build version
+# pip install --pre -U paddlepaddle-gpu -i https://www.paddlepaddle.org.cn/packages/nightly/cu126/
+pip install deepmd-kit
+```
+:::
+
+:::{tab-item} CPU
+
+```bash
+# release version
+pip install paddlepaddle==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+# nightly-build version
+# pip install --pre -U paddlepaddle -i https://www.paddlepaddle.org.cn/packages/nightly/cpu/
+pip install deepmd-kit
+```
+:::
+
+::::
+
+:::::
+
+::::::
+
+The supported platform includes Linux x86-64 and aarch64 with GNU C Library 2.28 or above, macOS x86-64 and arm64, and Windows x86-64.
 
 :::{Warning}
-If your platform is not supported, or want to build against the installed TensorFlow, or want to enable ROCM support, please [build from source](install-from-source.md).
+If your platform is not supported, or you want to build against the installed backends, or you want to enable ROCM support, please [build from source](install-from-source.md).
 :::
+
+[The LAMMPS module](../third-party/lammps-command.md) and [the i-PI driver](../third-party/ipi.md) are provided on Linux and macOS for the TensorFlow, PyTorch, and JAX backend. It requires both TensorFlow and PyTorch. To install LAMMPS and/or i-PI, add `lmp` and/or `ipi` to extras:
+
+```bash
+pip install deepmd-kit[gpu,cu12,lmp,ipi]
+```
+
+MPICH will be installed automatically - you do not need to install a MPI library by yourself.

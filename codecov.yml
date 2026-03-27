@@ -1,5 +1,6 @@
 ignore:
   - "source/**/tests"
+  - "source/3rdparty"
 coverage:
   status:
     project:
@@ -39,3 +40,11 @@ component_management:
       name: LAMMPS
       paths:
         - source/lmp/**
+    - component_id: module_ipi
+      name: i-PI
+      paths:
+        - source/ipi/**
+codecov:
+  notify:
+    # 12 Python + 2 C++
+    after_n_builds: 14

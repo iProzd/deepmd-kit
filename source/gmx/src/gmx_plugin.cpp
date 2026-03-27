@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include "gmx_plugin.h"
 
 #include <fstream>
@@ -6,12 +7,12 @@
 
 #include "json.hpp"
 
-using namespace deepmd;
+using deepmd::DeepmdPlugin;
 
-DeepmdPlugin::DeepmdPlugin() { nnp = new deepmd::DeepPot; }
+DeepmdPlugin::DeepmdPlugin() { nnp = new deepmd_compat::DeepPot; }
 
 DeepmdPlugin::DeepmdPlugin(char* json_file) {
-  nnp = new deepmd::DeepPot;
+  nnp = new deepmd_compat::DeepPot;
   DeepmdPlugin::init_from_json(json_file);
 }
 
@@ -102,7 +103,7 @@ void DeepmdPlugin::init_from_json(char* json_file) {
 
     std::cout << "Successfully init plugin!" << std::endl;
   } else {
-    std::cerr << "Invaild json file: " << json_file << std::endl;
+    std::cerr << "Invalid json file: " << json_file << std::endl;
     exit(1);
   }
 }

@@ -13,6 +13,7 @@
 *.bz2
 *.pyc
 *.pb
+*.DS_Store
 tmp*
 CMakeCache.txt
 CMakeFiles
@@ -22,12 +23,12 @@ _skbuild
 deepmd_kit.egg-info/
 dist
 .eggs
-_version.py
+/deepmd/_version.py
 venv*
 .vscode/**
 _build
 _templates
-API_CC
+doc/API_CC/
 doc/api_py/
 doc/api_core/
 doc/api_c/
@@ -43,3 +44,30 @@ build_cc_tests
 build_c_tests
 build_c/
 libdeepmd_c/
+.uv/
+libtorch/
+uv.lock
+buildcxx/
+node_modules/
+*.bib.original
+
+# Coverage files
+.coverage
+.coverage.*
+
+# Test output files (temporary)
+test_dp_test/
+test_dp_test_*.out
+*_detail.out
+
+# Training and model output files
+*.pth
+*.ckpt*
+checkpoint
+lcurve.out
+out.json
+input_v2_compat.json
+frozen_model.*
+
+# Test system directories
+system/

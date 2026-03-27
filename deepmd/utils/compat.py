@@ -1,33 +1,33 @@
+# SPDX-License-Identifier: LGPL-3.0-or-later
 """Module providing compatibility between `0.x.x` and `1.x.x` input versions."""
 
 import json
 import warnings
+from collections.abc import (
+    Sequence,
+)
 from pathlib import (
     Path,
 )
 from typing import (
     Any,
-    Dict,
-    Optional,
-    Sequence,
-    Union,
 )
 
 import numpy as np
 
 from deepmd.common import (
-    j_must_have,
+    j_deprecated,
 )
 
 
 def convert_input_v0_v1(
-    jdata: Dict[str, Any], warning: bool = True, dump: Optional[Union[str, Path]] = None
-) -> Dict[str, Any]:
+    jdata: dict[str, Any], warning: bool = True, dump: str | Path | None = None
+) -> dict[str, Any]:
     """Convert input from v0 format to v1.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         loaded json/yaml file
     warning : bool, optional
         whether to show deprecation warning, by default True
@@ -36,7 +36,7 @@ def convert_input_v0_v1(
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         converted output
     """
     output = {}
@@ -52,7 +52,7 @@ def convert_input_v0_v1(
     return output
 
 
-def _warning_input_v0_v1(fname: Optional[Union[str, Path]]):
+def _warning_input_v0_v1(fname: str | Path | None) -> None:
     msg = (
         "It seems that you are using a deepmd-kit input of version 0.x.x, "
         "which is deprecated. we have converted the input to >2.0.0 compatible"
@@ -62,19 +62,19 @@ def _warning_input_v0_v1(fname: Optional[Union[str, Path]]):
     warnings.warn(msg)
 
 
-def _model(jdata: Dict[str, Any], smooth: bool) -> Dict[str, Dict[str, Any]]:
+def _model(jdata: dict[str, Any], smooth: bool) -> dict[str, dict[str, Any]]:
     """Convert data to v1 input for non-smooth model.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
     smooth : bool
         whether to use smooth or non-smooth descriptor version
 
     Returns
     -------
-    Dict[str, Dict[str, Any]]
+    dict[str, dict[str, Any]]
         dictionary with model input parameters and sub-dictionaries for descriptor and
         fitting net
     """
@@ -86,17 +86,17 @@ def _model(jdata: Dict[str, Any], smooth: bool) -> Dict[str, Dict[str, Any]]:
     return model
 
 
-def _nonsmth_descriptor(jdata: Dict[str, Any]) -> Dict[str, Any]:
+def _nonsmth_descriptor(jdata: dict[str, Any]) -> dict[str, Any]:
     """Convert data to v1 input for non-smooth descriptor.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         dict with descriptor parameters
     """
     descriptor = {}
@@ -105,17 +105,17 @@ def _nonsmth_descriptor(jdata: Dict[str, Any]) -> Dict[str, Any]:
     return descriptor
 
 
-def _smth_descriptor(jdata: Dict[str, Any]) -> Dict[str, Any]:
+def _smth_descriptor(jdata: dict[str, Any]) -> dict[str, Any]:
     """Convert data to v1 input for smooth descriptor.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         dict with descriptor parameters
     """
     descriptor = {}
@@ -126,8 +126,8 @@ def _smth_descriptor(jdata: Dict[str, Any]) -> Dict[str, Any]:
     descriptor["sel"] = jdata["sel_a"]
     _jcopy(jdata, descriptor, ("rcut",))
     descriptor["rcut_smth"] = jdata.get("rcut_smth", descriptor["rcut"])
-    descriptor["neuron"] = j_must_have(jdata, "filter_neuron")
-    descriptor["axis_neuron"] = j_must_have(jdata, "axis_neuron", ["n_axis_neuron"])
+    descriptor["neuron"] = jdata["filter_neuron"]
+    descriptor["axis_neuron"] = j_deprecated(jdata, "axis_neuron", ["n_axis_neuron"])
     descriptor["resnet_dt"] = False
     if "resnet_dt" in jdata:
         descriptor["resnet_dt"] = jdata["filter_resnet_dt"]
@@ -135,17 +135,17 @@ def _smth_descriptor(jdata: Dict[str, Any]) -> Dict[str, Any]:
     return descriptor
 
 
-def _fitting_net(jdata: Dict[str, Any]) -> Dict[str, Any]:
+def _fitting_net(jdata: dict[str, Any]) -> dict[str, Any]:
     """Convert data to v1 input for fitting net.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         dict with fitting net parameters
     """
     fitting_net = {}
@@ -153,7 +153,7 @@ def _fitting_net(jdata: Dict[str, Any]) -> Dict[str, Any]:
     seed = jdata.get("seed", None)
     if seed is not None:
         fitting_net["seed"] = seed
-    fitting_net["neuron"] = j_must_have(jdata, "fitting_neuron", ["n_neuron"])
+    fitting_net["neuron"] = j_deprecated(jdata, "fitting_neuron", ["n_neuron"])
     fitting_net["resnet_dt"] = True
     if "resnet_dt" in jdata:
         fitting_net["resnet_dt"] = jdata["resnet_dt"]
@@ -162,17 +162,17 @@ def _fitting_net(jdata: Dict[str, Any]) -> Dict[str, Any]:
     return fitting_net
 
 
-def _learning_rate(jdata: Dict[str, Any]) -> Dict[str, Any]:
+def _learning_rate(jdata: dict[str, Any]) -> dict[str, Any]:
     """Convert data to v1 input for learning rate section.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         dict with learning rate parameters
     """
     learning_rate = {}
@@ -181,20 +181,20 @@ def _learning_rate(jdata: Dict[str, Any]) -> Dict[str, Any]:
     return learning_rate
 
 
-def _loss(jdata: Dict[str, Any]) -> Dict[str, Any]:
+def _loss(jdata: dict[str, Any]) -> dict[str, Any]:
     """Convert data to v1 input for loss function.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         dict with loss function parameters
     """
-    loss: Dict[str, Any] = {}
+    loss: dict[str, Any] = {}
     _jcopy(
         jdata,
         loss,
@@ -214,17 +214,17 @@ def _loss(jdata: Dict[str, Any]) -> Dict[str, Any]:
     return loss
 
 
-def _training(jdata: Dict[str, Any]) -> Dict[str, Any]:
+def _training(jdata: dict[str, Any]) -> dict[str, Any]:
     """Convert data to v1 input for training.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         parsed input json/yaml data
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         dict with training parameters
     """
     training = {}
@@ -236,41 +236,42 @@ def _training(jdata: Dict[str, Any]) -> Dict[str, Any]:
     training["disp_file"] = "lcurve.out"
     if "disp_file" in jdata:
         training["disp_file"] = jdata["disp_file"]
-    training["disp_freq"] = j_must_have(jdata, "disp_freq")
-    training["numb_test"] = j_must_have(jdata, "numb_test")
-    training["save_freq"] = j_must_have(jdata, "save_freq")
-    training["save_ckpt"] = j_must_have(jdata, "save_ckpt")
-    training["disp_training"] = j_must_have(jdata, "disp_training")
-    training["time_training"] = j_must_have(jdata, "time_training")
+    training["disp_freq"] = jdata["disp_freq"]
+    training["numb_test"] = jdata["numb_test"]
+    training["save_freq"] = jdata["save_freq"]
+    training["save_ckpt"] = jdata["save_ckpt"]
+    training["disp_training"] = jdata["disp_training"]
+    training["time_training"] = jdata["time_training"]
     if "profiling" in jdata:
         training["profiling"] = jdata["profiling"]
         if training["profiling"]:
-            training["profiling_file"] = j_must_have(jdata, "profiling_file")
+            training["profiling_file"] = jdata["profiling_file"]
     return training
 
 
-def _jcopy(src: Dict[str, Any], dst: Dict[str, Any], keys: Sequence[str]):
+def _jcopy(src: dict[str, Any], dst: dict[str, Any], keys: Sequence[str]) -> None:
     """Copy specified keys from one dict to another.
 
     Parameters
     ----------
-    src : Dict[str, Any]
+    src : dict[str, Any]
         source dictionary
-    dst : Dict[str, Any]
+    dst : dict[str, Any]
         destination dictionary, will be modified in place
     keys : Sequence[str]
         list of keys to copy
     """
     for k in keys:
-        dst[k] = src[k]
+        if k in src:
+            dst[k] = src[k]
 
 
-def remove_decay_rate(jdata: Dict[str, Any]):
+def remove_decay_rate(jdata: dict[str, Any]) -> None:
     """Convert decay_rate to stop_lr.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         input data
     """
     lr = jdata["learning_rate"]
@@ -285,9 +286,8 @@ def remove_decay_rate(jdata: Dict[str, Any]):
 
 
 def convert_input_v1_v2(
-    jdata: Dict[str, Any], warning: bool = True, dump: Optional[Union[str, Path]] = None
-) -> Dict[str, Any]:
-
+    jdata: dict[str, Any], warning: bool = True, dump: str | Path | None = None
+) -> dict[str, Any]:
     tr_cfg = jdata["training"]
     tr_data_keys = {
         "systems",
@@ -303,6 +303,10 @@ def convert_input_v1_v2(
     tr_data_cfg = {k: v for k, v in tr_cfg.items() if k in tr_data_keys}
     new_tr_cfg = {k: v for k, v in tr_cfg.items() if k not in tr_data_keys}
     new_tr_cfg["training_data"] = tr_data_cfg
+    if "training_data" in tr_cfg:
+        raise RuntimeError(
+            "Both v1 (training/systems) and v2 (training/training_data) parameters are given."
+        )
 
     jdata["training"] = new_tr_cfg
 
@@ -318,7 +322,7 @@ def convert_input_v1_v2(
     return jdata
 
 
-def _warning_input_v1_v2(fname: Optional[Union[str, Path]]):
+def _warning_input_v1_v2(fname: str | Path | None) -> None:
     msg = (
         "It seems that you are using a deepmd-kit input of version 1.x.x, "
         "which is deprecated. we have converted the input to >2.0.0 compatible"
@@ -329,15 +333,15 @@ def _warning_input_v1_v2(fname: Optional[Union[str, Path]]):
 
 
 def deprecate_numb_test(
-    jdata: Dict[str, Any], warning: bool = True, dump: Optional[Union[str, Path]] = None
-) -> Dict[str, Any]:
+    jdata: dict[str, Any], warning: bool = True, dump: str | Path | None = None
+) -> dict[str, Any]:
     """Deprecate `numb_test` since v2.1. It has taken no effect since v2.0.
 
     See `#1243 <https://github.com/deepmodeling/deepmd-kit/discussions/1243>`_.
 
     Parameters
     ----------
-    jdata : Dict[str, Any]
+    jdata : dict[str, Any]
         loaded json/yaml file
     warning : bool, optional
         whether to show deprecation warning, by default True
@@ -346,7 +350,7 @@ def deprecate_numb_test(
 
     Returns
     -------
-    Dict[str, Any]
+    dict[str, Any]
         converted output
     """
     try:
@@ -366,14 +370,81 @@ def deprecate_numb_test(
     return jdata
 
 
+def migrate_training_warmup(
+    jdata: dict[str, Any], warning: bool = True
+) -> dict[str, Any]:
+    """
+    Migrate legacy warmup settings from training to learning_rate.
+
+    Parameters
+    ----------
+    jdata : dict[str, Any]
+        Input configuration dictionary.
+    warning : bool, optional
+        Whether to show a deprecation warning, by default True.
+
+    Returns
+    -------
+    dict[str, Any]
+        Updated configuration dictionary.
+    """
+    training = jdata.get("training")
+    if not isinstance(training, dict):
+        return jdata
+
+    warmup_keys = ("warmup_steps", "warmup_ratio", "warmup_start_factor")
+    legacy_keys = [key for key in warmup_keys if key in training]
+    if not legacy_keys:
+        return jdata
+
+    lr = jdata.get("learning_rate")
+    if not isinstance(lr, dict):
+        for key in legacy_keys:
+            training.pop(key)
+        if warning:
+            warnings.warn(
+                "Found legacy warmup settings under training, but learning_rate "
+                "is missing or invalid. The warmup keys were removed from training."
+            )
+        return jdata
+
+    moved_keys = []
+    conflict_keys = []
+    # === Step 1. Check for conflicts first (read-only pass) ===
+    for key in legacy_keys:
+        if key in lr:
+            conflict_keys.append(key)
+
+    # Raise error if there are conflicting definitions before mutating
+    if conflict_keys:
+        raise ValueError(
+            "Conflicting warmup settings found in both 'training' and "
+            f"'learning_rate': {', '.join(conflict_keys)}. "
+            "Please define warmup settings only in 'learning_rate'."
+        )
+
+    # === Step 2. Move legacy warmup keys ===
+    for key in legacy_keys:
+        value = training.pop(key)
+        lr[key] = value
+        moved_keys.append(key)
+
+    if warning and moved_keys:
+        warnings.warn(
+            "Legacy warmup settings under training were moved to learning_rate: "
+            f"{', '.join(moved_keys)}."
+        )
+    return jdata
+
+
 def update_deepmd_input(
-    jdata: Dict[str, Any], warning: bool = True, dump: Optional[Union[str, Path]] = None
-) -> Dict[str, Any]:
-    def is_deepmd_v0_input(jdata):
+    jdata: dict[str, Any], warning: bool = True, dump: str | Path | None = None
+) -> dict[str, Any]:
+    def is_deepmd_v0_input(jdata: dict[str, Any]) -> bool:
         return "model" not in jdata.keys()
 
-    def is_deepmd_v1_input(jdata):
-        return "systems" in j_must_have(jdata, "training").keys()
+    def is_deepmd_v1_input(jdata: dict[str, Any]) -> bool:
+        return "systems" in jdata["training"].keys()
 
     if is_deepmd_v0_input(jdata):
         jdata = convert_input_v0_v1(jdata, warning, None)
@@ -384,5 +455,94 @@ def update_deepmd_input(
         jdata = deprecate_numb_test(jdata, False, dump)
     else:
         jdata = deprecate_numb_test(jdata, warning, dump)
+
+    jdata = migrate_training_warmup(jdata, warning=warning)
+    jdata = convert_optimizer_v31_to_v32(jdata, warning=warning)
+    return jdata
+
+
+def convert_optimizer_v31_to_v32(
+    jdata: dict[str, Any], warning: bool = True
+) -> dict[str, Any]:
+    """Convert optimizer format from v3.1 to v3.2.
+
+    v3.1 format: optimizer parameters (opt_type, kf_blocksize, etc.) in training section.
+    v3.2 format: separate optimizer section with type field.
+
+    Parameters
+    ----------
+    jdata : dict[str, Any]
+        loaded json/yaml file
+    warning : bool, optional
+        whether to show deprecation warning, by default True
+
+    Returns
+    -------
+    dict[str, Any]
+        converted output with optimizer section
+    """
+    # Default optimizer values (must match argcheck.py defaults)
+    default_optimizer = {
+        "type": "Adam",
+        "adam_beta1": 0.9,
+        "adam_beta2": 0.999,
+        "weight_decay": 0.0,
+    }
+
+    training_cfg = jdata.get("training", {})
+    optimizer_cfg = jdata.get("optimizer", {})
+
+    # === Step 1. Extract legacy optimizer parameters from training ===
+    optimizer_keys = [
+        "opt_type",
+        "kf_blocksize",
+        "kf_start_pref_e",
+        "kf_limit_pref_e",
+        "kf_start_pref_f",
+        "kf_limit_pref_f",
+        "weight_decay",
+        "momentum",
+        "muon_momentum",
+        "adam_beta1",
+        "adam_beta2",
+        "lr_adjust",
+        "lr_adjust_coeff",
+        "muon_2d_only",
+        "min_2d_dim",
+    ]
+    has_legacy_optimizer = any(key in training_cfg for key in optimizer_keys)
+    if has_legacy_optimizer:
+        extracted_cfg = {}
+        for key in optimizer_keys:
+            if key in training_cfg:
+                extracted_cfg[key] = training_cfg.pop(key)
+
+        # Convert opt_type to type for new format
+        if "opt_type" in extracted_cfg:
+            extracted_cfg["type"] = extracted_cfg.pop("opt_type")
+
+        # Merge with existing optimizer config (conversion takes precedence)
+        optimizer_cfg = {**optimizer_cfg, **extracted_cfg}
+
+        if warning:
+            warnings.warn(
+                "Placing optimizer parameters (opt_type, kf_blocksize, etc.) in the training section "
+                "is deprecated. Use a separate 'optimizer' section with 'type' field instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+
+    # === Step 2. Fill in missing defaults ===
+    if "type" not in optimizer_cfg:
+        optimizer_cfg["type"] = default_optimizer["type"]
+
+    # Fill in defaults for Adam optimizer type
+    if optimizer_cfg["type"] in ("Adam", "AdamW"):
+        for key, value in default_optimizer.items():
+            if key not in optimizer_cfg:
+                optimizer_cfg[key] = value
+
+    # Set/update the optimizer section
+    jdata["optimizer"] = optimizer_cfg
 
     return jdata

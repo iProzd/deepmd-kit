@@ -1,8 +1,7 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #pragma once
 
 #include <vector>
-
-// using namespace std;
 
 namespace deepmd {
 class AtomMap {

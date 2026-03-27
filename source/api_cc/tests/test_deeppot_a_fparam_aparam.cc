@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
 #include <fcntl.h>
 #include <gtest/gtest.h>
 #include <sys/stat.h>
@@ -72,6 +73,9 @@ class TestInferDeepPotAFParamAParam : public ::testing::Test {
   deepmd::DeepPot dp;
 
   void SetUp() override {
+#ifndef BUILD_TENSORFLOW
+    GTEST_SKIP() << "Skip because TensorFlow support is not enabled.";
+#endif
     std::string file_name = "../../tests/infer/fparam_aparam.pbtxt";
     deepmd::convert_pbtxt_to_pb(file_name, "fparam_aparam.pb");
 

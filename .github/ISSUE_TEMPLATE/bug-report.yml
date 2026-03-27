@@ -21,10 +21,10 @@ body:
     validations:
       required: true
   - type: input
-    id: tf-version
+    id: backend-version
     attributes:
-      label: TensorFlow Version
-      description: "The version will be printed when running DeePMD-kit."
+      label: Backend and its version
+      description: "The backend and its version will be printed when running DeePMD-kit, e.g. TensorFlow v2.15.0."
     validations:
       required: true
   - type: dropdown
@@ -37,6 +37,7 @@ body:
         - docker
         - pip
         - Built from source
+        - dp1s
         - Others (write below)
     validations:
       required: true
