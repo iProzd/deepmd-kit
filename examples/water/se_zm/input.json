@@ -25,7 +25,6 @@
         2
       ],
       "mmax": 1,
-      "block_attn_res": "none",
       "so2_norm": false,
       "so2_layers": 4,
       "so2_attn_res": "none",
@@ -42,6 +41,8 @@
       ],
       "mlp_bias": true,
       "layer_scale": false,
+      "full_attn_res": "none",
+      "block_attn_res": "none",
       "activation_function": "silu",
       "glu_activation": true,
       "use_amp": true,

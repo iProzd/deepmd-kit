@@ -377,10 +377,14 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_m_schedule = "Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored."
     doc_n_blocks = "Number of blocks (only used when `l_schedule` is None)."
     doc_block_attn_res = (
-        "Descriptor-level depth-wise attention residual mode across block "
-        "history, including the final aggregation over all completed block "
-        "representations before the scalar output FFN. Must be one of "
-        "`none`, `independent`, or `dependent`."
+        "Descriptor-level block attention residual mode over block history "
+        "`[x0, b1, b2, ...]`, where each block summary is the sum of the SO(2) "
+        "unit output and all FFN unit outputs inside one interaction block. "
+        "`independent` uses learned query vectors, while `dependent` derives "
+        "queries from the current SeZM state before the SO(2) unit, before "
+        "each FFN unit, and before the final block aggregation. Must be one of "
+        "`none`, `independent`, or `dependent`. Cannot be enabled together "
+        "with `full_attn_res`."
     )
     doc_so2_norm = (
         "If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. "
@@ -433,6 +437,15 @@ def descrpt_se_zm_args() -> list[Argument]:
         "(shape `(n_focus, channels//n_focus)`) on each SO(2) mixing layer, "
         "and FFN branch uses per-channel scales (shape `(channels,)`) on each "
         "FFN residual branch."
+    )
+    doc_full_attn_res = (
+        "Descriptor-level full attention residual mode over the unit history "
+        "`[x0, so2_0, ffn_0_0, ffn_0_1, ..., so2_1, ffn_1_0, ffn_1_1, ...]`. "
+        "`independent` uses learned query vectors, while `dependent` derives "
+        "the query from the current SeZM state before the SO(2) unit, before "
+        "each FFN unit, and before the final aggregation. Must be one of "
+        "`none`, `independent`, or `dependent`. Cannot be enabled together "
+        "with `block_attn_res`."
     )
     doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
     doc_glu_activation = (
@@ -492,15 +505,6 @@ def descrpt_se_zm_args() -> list[Argument]:
             "m_schedule", list[int], optional=True, default=None, doc=doc_m_schedule
         ),
         Argument("n_blocks", int, optional=True, default=2, doc=doc_n_blocks),
-        Argument(
-            "block_attn_res",
-            str,
-            optional=True,
-            default="none",
-            extra_check=lambda x: x in attn_res_modes,
-            extra_check_errmsg="must be one of 'none', 'independent', or 'dependent'",
-            doc=doc_only_pt_supported + doc_block_attn_res,
-        ),
         Argument("so2_norm", bool, optional=True, default=False, doc=doc_so2_norm),
         Argument("so2_layers", int, optional=True, default=4, doc=doc_so2_layers),
         Argument(
@@ -545,6 +549,24 @@ def descrpt_se_zm_args() -> list[Argument]:
             optional=True,
             default=False,
             doc=doc_only_pt_supported + doc_layer_scale,
+        ),
+        Argument(
+            "full_attn_res",
+            str,
+            optional=True,
+            default="none",
+            extra_check=lambda x: x in attn_res_modes,
+            extra_check_errmsg="must be one of 'none', 'independent', or 'dependent'",
+            doc=doc_only_pt_supported + doc_full_attn_res,
+        ),
+        Argument(
+            "block_attn_res",
+            str,
+            optional=True,
+            default="none",
+            extra_check=lambda x: x in attn_res_modes,
+            extra_check_errmsg="must be one of 'none', 'independent', or 'dependent'",
+            doc=doc_only_pt_supported + doc_block_attn_res,
         ),
         Argument(
             "activation_function",

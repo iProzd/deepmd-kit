@@ -180,10 +180,15 @@ Standard DeePMD nlist path:
     └─ l>0: Zonal (m=0) initial embedding via cached Wigner-D + radial_feat[:, 1:, :]
 
   Interaction blocks (pyramid schedule):
-    depth_sources = [x0]
+    if `full_attn_res != "none"`:
+      unit_history = [x0]
+    if `block_attn_res != "none"`:
+      block_history = [x0]
     for block i:
-      ├─ optional block AttnRes over truncated `depth_sources` when `block_attn_res != "none"`
       ├─ slice D to ebed_dim(l_schedule[i]) (discard higher-l if needed)
+      ├─ truncate every source in the active history to the current `D_i`
+      ├─ optional full AttnRes for SO(2) input from `unit_history`
+      ├─ optional block AttnRes for SO(2) input from `block_history`
       ├─ main tensor layout is fixed as (N, D, F, Cf), contiguous
       ├─ SeparableRMSNorm (pre-SO2, per-focus on (N, D, F, Cf))
       ├─ Multi-Focus SO(2) Convolution (enabled for ALL lmax, including lmax=0)
@@ -192,10 +197,15 @@ Standard DeePMD nlist path:
       │  ├─ optional SO(2) internal AttnRes over local layer history when `so2_attn_res != "none"`
       │  └─ `post_focus_mix` on (N, 1, D, C)
       ├─ FFN subblock sequence (ffn_blocks iterations, global C via view, no permute)
-      └─ append block delta to `depth_sources`
+      │  ├─ optional full AttnRes before each FFN unit from `unit_history`
+      │  ├─ optional block AttnRes before each FFN unit from `block_history + [partial_block]`
+      │  └─ update either `unit_history` or `partial_block`
+      ├─ if full mode: append SO(2) output and every FFN unit output to `unit_history`
+      └─ if block mode: wrapper returns `block_summary` directly and descriptor appends it once to `block_history`
 
   Output (forward, promoted dtype):
-    └─ optional final AttnRes over all completed block representations when `block_attn_res != "none"`
+    └─ optional final full AttnRes over all completed unit representations when `full_attn_res != "none"`
+    └─ optional final block AttnRes over all completed block summaries when `block_attn_res != "none"`
     └─ Extract x(l=0) from global block output
     └─ reshape to (N, 1, 1, C)
     └─ Convert to promoted dtype (float32+)
@@ -275,8 +285,12 @@ ______________________________________________________________________
   - Weights are stored as raw parameters (no activation/bias); only the l=0 bias is separate.
 - Optional depth-wise attention residuals:
   - `so2_attn_res="none"` disables SO(2)-internal AttnRes, `"independent"` uses a learned pseudo-query, and `"dependent"` derives the query from the current reduced-layout `l=0` slice before each SO(2) layer.
-  - `block_attn_res="none"` disables descriptor-level AttnRes, `"independent"` uses a learned pseudo-query, and `"dependent"` derives the query from the current descriptor `l=0` slice before each block and before the final aggregation.
-  - When enabled, the descriptor keeps `depth_sources = [x0, delta1, delta2, ...]`, applies selective aggregation in the common truncated `D_i` space before each block, and runs one final aggregation before `output_ffn`.
+  - `full_attn_res="none"` and `block_attn_res="none"` keep the original residual-connected block wrapper.
+  - `full_attn_res` keeps `unit_history = [x0, so2_0, ffn_0_0, ffn_0_1, ..., so2_1, ffn_1_0, ffn_1_1, ...]`, truncates every source to the current `D_i`, applies one selective aggregation before the SO(2) unit, applies another selective aggregation before each FFN unit, and runs one final aggregation before `output_ffn`.
+  - In SeZM, `full_attn_res="independent"` uses learned query vectors. `full_attn_res="dependent"` derives the query from the current block input before SO(2), from the latest unit output before each FFN unit, and from the final block output before the last aggregation.
+  - `block_attn_res` keeps `block_history = [x0, b1, b2, ...]`, where each `b_i` is the sum of the SO(2) unit output and all FFN unit outputs inside one `SeZMInteractionBlock`. The SO(2) unit attends only `block_history`; each FFN unit attends `block_history + [partial_block]`, where `partial_block` is the running sum of unit outputs inside the current block.
+  - In SeZM, `block_attn_res="independent"` uses learned query vectors. `block_attn_res="dependent"` derives the query from the current block input before SO(2), from the latest unit output before each FFN unit, and from the final block output before the last aggregation.
+  - `full_attn_res` and `block_attn_res` are mutually exclusive.
   - All depth-attention query paths are zero-initialized, so the initial behavior is a uniform average over the available sources.
 
 ### 6. Deterministic initialization
@@ -656,7 +670,6 @@ Key arguments:
 - `sel: list[int] | int` — Maximum neighbors (int: total count, list\[int\]: per-type counts)
 - `lmax: int` — Maximum degree (only if `l_schedule` is None)
 - `n_blocks: int` — Number of blocks (only if `l_schedule` is None, default: 2)
-- `block_attn_res: str` — Descriptor-level depth-wise attention residual mode across block history, including the final aggregation over all completed block representations before the scalar output FFN. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `l_schedule: list[int] | None` — Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored
 - `mmax: int | None` — Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax
 - `m_schedule: list[int] | None` — Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored
@@ -676,6 +689,8 @@ Key arguments:
 - `precision: str` — `float64` / `float32`
 - `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, DepthAttnRes input-dependent query projection, SeparableRMSNorm centering bias) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: True)
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
+- `full_attn_res: str` — Descriptor-level full AttnRes mode over unit history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`)
+- `block_attn_res: str` — Descriptor-level block AttnRes mode over block history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final block aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`). Cannot be enabled together with `full_attn_res`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: True)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: True)
 
@@ -784,7 +799,7 @@ ______________________________________________________________________
 `serialize()` captures:
 
 - top-level descriptor config, including `l_schedule`, `m_schedule`, `use_env_seed`,
-  `block_attn_res`, `so2_attn_res`, `sandwich_norm`, and inner-clamp settings
+  `full_attn_res`, `block_attn_res`, `so2_attn_res`, `sandwich_norm`, and inner-clamp settings
 - the full descriptor `state_dict()` payload under `@variables`
 - an `env_mat` compatibility payload
 

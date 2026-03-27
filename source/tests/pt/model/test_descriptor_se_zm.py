@@ -161,7 +161,7 @@ class TestDescrptSeZM(unittest.TestCase):
             )
 
     def test_forward_with_attention_residuals(self) -> None:
-        """Test forward/backward with descriptor and SO(2) attention residuals."""
+        """Test forward/backward with full and SO(2) attention residuals."""
         coord, atype, nlist = self._tiny_system(dtype=torch.float32)
         extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
         model = DescrptSeZM(
@@ -174,11 +174,45 @@ class TestDescrptSeZM(unittest.TestCase):
             n_radial=4,
             radial_mlp=[8],
             so2_layers=2,
-            block_attn_res="dependent",
+            full_attn_res="dependent",
             so2_attn_res="dependent",
             ffn_neurons=16,
             ffn_blocks=2,
             layer_scale=True,
+            precision="float32",
+            trainable=True,
+            seed=123,
+        )
+
+        desc, *_ = model(extended_coord, atype, nlist, mapping=None, comm_dict=None)
+        self.assertEqual(desc.shape, (1, 2, 8))
+        self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
+
+        loss = desc.sum()
+        loss.backward()
+        self.assertIsNotNone(extended_coord.grad)
+        self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
+
+    def test_forward_with_block_attention_residuals(self) -> None:
+        """Test forward/backward with block attention residuals."""
+        coord, atype, nlist = self._tiny_system(dtype=torch.float32)
+        extended_coord = coord.reshape(1, -1).detach().requires_grad_(True)
+        model = DescrptSeZM(
+            rcut=3.0,
+            sel=[1, 1],
+            ntypes=2,
+            l_schedule=[1, 1, 0],
+            channels=8,
+            n_focus=2,
+            n_radial=4,
+            radial_mlp=[8],
+            so2_layers=2,
+            so2_attn_res="dependent",
+            ffn_neurons=16,
+            ffn_blocks=2,
+            layer_scale=True,
+            full_attn_res="none",
+            block_attn_res="dependent",
             precision="float32",
             trainable=True,
             seed=123,
@@ -214,7 +248,7 @@ class TestDescrptSeZM(unittest.TestCase):
             n_radial=3,
             radial_mlp=[6],
             so2_layers=2,
-            block_attn_res="dependent",
+            full_attn_res="dependent",
             so2_attn_res="dependent",
             ffn_neurons=8,
             ffn_blocks=2,
@@ -317,7 +351,7 @@ class TestDescrptSeZM(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 so2_layers=2,
-                block_attn_res="dependent",
+                full_attn_res="dependent",
                 so2_attn_res="dependent",
                 ffn_neurons=16,
                 ffn_blocks=2,
@@ -380,7 +414,7 @@ class TestDescrptSeZM(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 so2_layers=2,
-                block_attn_res="dependent",
+                full_attn_res="dependent",
                 so2_attn_res="dependent",
                 ffn_neurons=16,
                 ffn_blocks=2,
@@ -399,7 +433,7 @@ class TestDescrptSeZM(unittest.TestCase):
                 n_radial=4,
                 radial_mlp=[8],
                 so2_layers=2,
-                block_attn_res="dependent",
+                full_attn_res="dependent",
                 so2_attn_res="dependent",
                 ffn_neurons=16,
                 ffn_blocks=2,

@@ -74,6 +74,7 @@ from .se_zm_block import (
     SeZMInteractionBlock,
 )
 from .se_zm_helper import (
+    ATTN_RES_MODES,
     C2CutoffEnvelope,
     EdgeFeatureCache,
     EnvironmentInitialEmbedding,
@@ -88,7 +89,6 @@ from .se_zm_helper import (
     get_promoted_dtype,
     get_so3_dim_of_lmax,
     init_edge_rot_mat_frisvad,
-    normalize_attn_res_mode,
     np_safe,
     nvtx_range,
     safe_norm,
@@ -168,11 +168,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         recommended but not required. If set, `mmax` will be ignored.
     n_blocks
         Number of blocks (only used when `l_schedule` is None).
-    block_attn_res
-        Descriptor-level depth-wise attention residual mode across block history,
-        including the final aggregation over all completed block representations
-        before the scalar output FFN. Must be one of
-        ``"none"``, ``"independent"``, or ``"dependent"``.
     so2_norm
         If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
@@ -220,6 +215,22 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         - SO(2) branch: per-focus-channel scales `(n_focus, focus_dim)`
           on each SO(2) mixing layer.
         - FFN branch: per-channel scales `(channels,)` on each FFN subblock.
+    full_attn_res
+        Descriptor-level full attention residual mode over the unit history
+        `[x0, so2_0, ffn_0_0, ffn_0_1, ..., so2_1, ffn_1_0, ffn_1_1, ...]`,
+        where each FFN subblock contributes its own completed unit
+        representation. `independent` uses learned query vectors, while
+        `dependent` derives queries from the current SeZM state before the
+        SO(2) unit, before each FFN unit, and before the final aggregation.
+        Must be one of ``"none"``, ``"independent"``, or ``"dependent"``.
+    block_attn_res
+        Descriptor-level block attention residual mode over the block history
+        `[x0, b1, b2, ...]`, where each `b_i` is the sum of all unit outputs
+        inside one `SeZMInteractionBlock`. `independent` uses learned query
+        vectors, while `dependent` derives queries from the current SeZM state
+        before the SO(2) unit, before each FFN unit, and before the final block
+        aggregation. Must be one of ``"none"``, ``"independent"``, or
+        ``"dependent"``. Cannot be enabled together with `full_attn_res`.
     activation_function
         Activation function used by deepmd EmbeddingNet.
     glu_activation
@@ -269,7 +280,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         mmax: int | None = None,
         m_schedule: list[int] | None = None,
         n_blocks: int = 2,
-        block_attn_res: str = "none",
         so2_norm: bool = False,
         so2_layers: int = 4,
         so2_attn_res: str = "none",
@@ -281,6 +291,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         sandwich_norm: list[bool] | None = None,
         mlp_bias: bool = True,
         layer_scale: bool = False,
+        full_attn_res: str = "none",
+        block_attn_res: str = "none",
         activation_function: str = "silu",
         glu_activation: bool = True,
         use_amp: bool = True,
@@ -384,27 +396,41 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         seed_out = child_seed(self.seed, 2)
         seed_radial_embedding = child_seed(self.seed, 3)
         seed_env_seed = child_seed(self.seed, 4)
+        seed_full_attn = child_seed(self.seed, 5)
+        seed_block_attn = child_seed(self.seed, 6)
 
         # === L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
-        self.block_attn_res_mode = normalize_attn_res_mode(
-            block_attn_res,
-            has_history=self.n_blocks > 1,
-        )
-        self.use_block_attn_res = self.block_attn_res_mode != "none"
         self.ebed_dims = [get_so3_dim_of_lmax(l) for l in self.l_schedule]
         self.rad_sizes_per_block = [l + 1 for l in self.l_schedule]
 
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
-        self.so2_attn_res_mode = normalize_attn_res_mode(
-            so2_attn_res,
-            has_history=self.so2_layers > 1,
-        )
+        self.so2_attn_res_mode = str(so2_attn_res).lower()
+        if self.so2_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
         self.ffn_neurons = int(ffn_neurons)
         self.ffn_blocks = int(ffn_blocks)
         if self.ffn_blocks < 1:
             raise ValueError("`ffn_blocks` must be >= 1")
+        self.full_attn_res_mode = str(full_attn_res).lower()
+        if self.full_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`full_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
+        self.block_attn_res_mode = str(block_attn_res).lower()
+        if self.block_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`block_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
+        self.use_full_attn_res = self.full_attn_res_mode != "none"
+        self.use_block_attn_res = self.block_attn_res_mode != "none"
+        if self.use_full_attn_res and self.use_block_attn_res:
+            raise ValueError(
+                "`full_attn_res` and `block_attn_res` cannot both be enabled"
+            )
         self.n_atten_head = int(n_atten_head)
         if self.n_atten_head > 0 and self.focus_dim % self.n_atten_head != 0:
             raise ValueError(
@@ -540,6 +566,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     ffn_neurons=self.ffn_neurons,
                     ffn_blocks=self.ffn_blocks,
                     layer_scale=self.layer_scale,
+                    full_attn_res=self.full_attn_res_mode,
+                    block_attn_res=self.block_attn_res_mode,
                     n_atten_head=self.n_atten_head,
                     so2_pre_norm=self.so2_pre_norm,
                     so2_post_norm=self.so2_post_norm,
@@ -556,34 +584,30 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             )
         self.blocks = nn.ModuleList(blocks)
 
-        # === Optional descriptor-level depth attention residuals ===
-        if self.use_block_attn_res:
-            self.block_attn_res: nn.ModuleList | None = nn.ModuleList(
-                [
-                    DepthAttnRes(
-                        channels=self.channels,
-                        input_dependent=self.block_attn_res_mode == "dependent",
-                        eps=self.eps,
-                        bias=self.mlp_bias,
-                        dtype=self.compute_dtype,
-                        trainable=self.trainable,
-                        seed=child_seed(seed_blocks, 1000 + i),
-                    )
-                    for i in range(self.n_blocks)
-                ]
+        # === Optional descriptor-level attention residuals ===
+        self.final_block_attn_res = None
+        if self.use_full_attn_res:
+            self.final_full_attn_res: DepthAttnRes | None = DepthAttnRes(
+                channels=self.channels,
+                input_dependent=self.full_attn_res_mode == "dependent",
+                eps=self.eps,
+                bias=self.mlp_bias,
+                dtype=self.compute_dtype,
+                trainable=self.trainable,
+                seed=child_seed(seed_full_attn, 2000),
             )
-            self.final_attn_res: DepthAttnRes | None = DepthAttnRes(
+        else:
+            self.final_full_attn_res = None
+        if self.use_block_attn_res:
+            self.final_block_attn_res: DepthAttnRes | None = DepthAttnRes(
                 channels=self.channels,
                 input_dependent=self.block_attn_res_mode == "dependent",
                 eps=self.eps,
                 bias=self.mlp_bias,
                 dtype=self.compute_dtype,
                 trainable=self.trainable,
-                seed=child_seed(seed_blocks, 2000),
+                seed=child_seed(seed_block_attn, 2000),
             )
-        else:
-            self.block_attn_res = None
-            self.final_attn_res = None
 
         # === Final FFN for l=0 output mixing ===
         self.output_ffn = EquivariantFFN(
@@ -1018,13 +1042,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         torch.Tensor
             Output features with shape (N, D, F, Cf).
         """
-        if not self.use_block_attn_res:
+        if not self.use_full_attn_res and not self.use_block_attn_res:
             # === Fast path without descriptor-level attention residuals ===
             for i, block in enumerate(self.blocks):
                 x = x[:, : self.ebed_dims[i], :, :]
                 blk_radial = radial_feat_per_block[i]
                 with nvtx_range(f"block_{i}"):
-                    x = block(x, edge_cache, blk_radial)
+                    x, _, _, _ = block(x, edge_cache, blk_radial)
             return x
 
         n_node = x.shape[0]
@@ -1033,30 +1057,64 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             """Extract scalar features from global SO(3) layout."""
             return v[:, 0, :, :].reshape(n_node, self.channels)
 
-        # === Step 1. Maintain descriptor-level depth history ===
-        depth_sources = [x]
+        if self.use_full_attn_res:
+            # === Step 1. Maintain descriptor-level unit history ===
+            unit_history = [x]
 
-        # === Step 2. Run each block with selective depth aggregation ===
-        for i, block in enumerate(self.blocks):
-            current_dim = self.ebed_dims[i]
-            truncated_sources = [
-                source[:, :current_dim, :, :] for source in depth_sources
-            ]
-            x = self.block_attn_res[i](
-                sources=truncated_sources,
+            # === Step 2. Run each block with selective unit-history aggregation ===
+            for i, block in enumerate(self.blocks):
+                current_dim = self.ebed_dims[i]
+                current_x = x[:, :current_dim, :, :]
+                truncated_unit_history = [
+                    source[:, :current_dim, :, :] for source in unit_history
+                ]
+                blk_radial = radial_feat_per_block[i]
+                with nvtx_range(f"block_{i}"):
+                    block_output, _, so2_unit_output, ffn_unit_outputs = block(
+                        current_x,
+                        edge_cache,
+                        blk_radial,
+                        unit_history=truncated_unit_history,
+                    )
+                unit_history.append(so2_unit_output)
+                unit_history.extend(ffn_unit_outputs)
+                x = block_output
+
+            # === Step 3. Final aggregation over all completed unit representations ===
+            final_dim = self.ebed_dims[-1]
+            final_sources = [source[:, :final_dim, :, :] for source in unit_history]
+            x = self.final_full_attn_res(
+                sources=final_sources,
                 scalar_extractor=node_l0_extractor,
                 current_x=x,
             ).to(dtype=self.dtype)
-            x_before = x
+            return x
+
+        # === Step 1. Maintain descriptor-level block history ===
+        block_history = [x]
+
+        # === Step 2. Run each block with selective block-history aggregation ===
+        for i, block in enumerate(self.blocks):
+            current_dim = self.ebed_dims[i]
+            current_x = x[:, :current_dim, :, :]
+            truncated_block_history = [
+                source[:, :current_dim, :, :] for source in block_history
+            ]
             blk_radial = radial_feat_per_block[i]
             with nvtx_range(f"block_{i}"):
-                x = block(x, edge_cache, blk_radial)
-            depth_sources.append(x - x_before)
+                block_output, block_summary, _, _ = block(
+                    current_x,
+                    edge_cache,
+                    blk_radial,
+                    unit_history=truncated_block_history,
+                )
+            block_history.append(block_summary)
+            x = block_output
 
-        # === Step 3. Final aggregation over all completed block representations ===
+        # === Step 3. Final aggregation over all completed block summaries ===
         final_dim = self.ebed_dims[-1]
-        final_sources = [source[:, :final_dim, :, :] for source in depth_sources]
-        x = self.final_attn_res(
+        final_sources = [source[:, :final_dim, :, :] for source in block_history]
+        x = self.final_block_attn_res(
             sources=final_sources,
             scalar_extractor=node_l0_extractor,
             current_x=x,
@@ -1684,7 +1742,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "l_schedule": self.l_schedule,
                 "mmax": self.mmax,
                 "m_schedule": self.m_schedule,
-                "block_attn_res": self.block_attn_res_mode,
                 "channels": self.channels,
                 "n_radial": self.n_radial,
                 "radial_mlp": self.radial_mlp,
@@ -1699,6 +1756,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "sandwich_norm": self.sandwich_norm,
+                "full_attn_res": self.full_attn_res_mode,
+                "block_attn_res": self.block_attn_res_mode,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],

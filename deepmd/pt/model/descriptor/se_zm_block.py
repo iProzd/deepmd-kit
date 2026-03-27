@@ -47,6 +47,7 @@ from deepmd.pt.utils.utils import (
 )
 
 from .se_zm_helper import (
+    ATTN_RES_MODES,
     EdgeFeatureCache,
     build_m_major_index,
     build_m_major_l_index,
@@ -54,7 +55,6 @@ from .se_zm_helper import (
     get_so3_dim_of_lmax,
     init_trunc_normal_fan_in_out,
     map_degree_idx,
-    normalize_attn_res_mode,
     np_safe,
     nvtx_range,
     project_D_to_m,
@@ -1798,10 +1798,11 @@ class SO2Convolution(nn.Module):
         self.so2_layers = int(so2_layers)
         if self.so2_layers < 1:
             raise ValueError("`so2_layers` must be >= 1")
-        self.so2_attn_res_mode = normalize_attn_res_mode(
-            so2_attn_res,
-            has_history=self.so2_layers > 1,
-        )
+        self.so2_attn_res_mode = str(so2_attn_res).lower()
+        if self.so2_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
         self.use_so2_attn_res = self.so2_attn_res_mode != "none"
         self.layer_scale = bool(layer_scale)
         self.n_atten_head = int(n_atten_head)
@@ -2582,10 +2583,13 @@ class SeZMInteractionBlock(nn.Module):
     SeZM interaction block with SO(2) message passing and equivariant FFN stack.
 
     Branch order:
-    1. SO(2) branch: optional pre-norm -> `SO2Convolution` -> optional post-norm
-       -> residual add.
+    1. SO(2) branch: optional pre-norm -> `SO2Convolution` -> optional post-norm.
     2. FFN branch: repeated subblocks of
-       optional pre-norm -> `EquivariantFFN` -> optional post-norm -> residual add.
+       optional pre-norm -> `EquivariantFFN` -> optional post-norm.
+
+    In the baseline path, outer residual shortcuts are applied around the SO(2)
+    unit and each FFN subblock. In AttnRes paths, these shortcuts are replaced by
+    selective depth-wise aggregation before each unit.
 
     `SO2Convolution` internally handles `pre_focus_mix`/`post_focus_mix`, so this
     block operates on the canonical node layout `(N, D, F, Cf)` at boundaries.
@@ -2633,6 +2637,14 @@ class SeZMInteractionBlock(nn.Module):
         - SO(2) branch: per-focus-channel scales `(n_focus, focus_dim)`
           on each SO(2) mixing layer.
         - FFN branch: per-channel scales `(channels,)` on each FFN subblock.
+    full_attn_res
+        Descriptor-level full attention residual mode for this block wrapper.
+        When enabled, the block uses external unit history to build the SO(2)
+        input and the input of each FFN unit.
+    block_attn_res
+        Descriptor-level block attention residual mode for this block wrapper.
+        When enabled, the block uses external block history plus an intra-block
+        partial sum to build the SO(2) input and the input of each FFN unit.
     activation_function
         Activation function for l=0 components.
     glu_activation
@@ -2673,6 +2685,8 @@ class SeZMInteractionBlock(nn.Module):
         ffn_neurons: int = 96,
         ffn_blocks: int = 1,
         layer_scale: bool = False,
+        full_attn_res: str = "none",
+        block_attn_res: str = "none",
         activation_function: str,
         glu_activation: bool = True,
         mlp_bias: bool = True,
@@ -2696,10 +2710,11 @@ class SeZMInteractionBlock(nn.Module):
         self.focus_compete = bool(focus_compete)
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
-        self.so2_attn_res_mode = normalize_attn_res_mode(
-            so2_attn_res,
-            has_history=self.so2_layers > 1,
-        )
+        self.so2_attn_res_mode = str(so2_attn_res).lower()
+        if self.so2_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
         self.n_atten_head = int(n_atten_head)
         self.so2_pre_norm = bool(so2_pre_norm)
         self.so2_post_norm = bool(so2_post_norm)
@@ -2710,6 +2725,22 @@ class SeZMInteractionBlock(nn.Module):
         if self.ffn_blocks < 1:
             raise ValueError("`ffn_blocks` must be >= 1")
         self.layer_scale = bool(layer_scale)
+        self.full_attn_res_mode = str(full_attn_res).lower()
+        if self.full_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`full_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
+        self.block_attn_res_mode = str(block_attn_res).lower()
+        if self.block_attn_res_mode not in ATTN_RES_MODES:
+            raise ValueError(
+                "`block_attn_res` must be one of 'none', 'independent', or 'dependent'"
+            )
+        self.use_full_attn_res = self.full_attn_res_mode != "none"
+        self.use_block_attn_res = self.block_attn_res_mode != "none"
+        if self.use_full_attn_res and self.use_block_attn_res:
+            raise ValueError(
+                "`full_attn_res` and `block_attn_res` cannot both be enabled"
+            )
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
@@ -2722,6 +2753,8 @@ class SeZMInteractionBlock(nn.Module):
         # === Step 0. Split deterministic seeds at the block top-level ===
         seed_so2_conv = child_seed(seed, 0)
         seed_ffn = child_seed(seed, 1)
+        seed_full_attn = child_seed(seed, 2)
+        seed_block_attn = child_seed(seed, 3)
 
         # === Step 1. SO(2) convolution branch norms ===
         if self.so2_pre_norm:
@@ -2839,12 +2872,80 @@ class SeZMInteractionBlock(nn.Module):
         else:
             self.adam_ffn_layer_scales = None
 
+        # === Step 3. Optional full attention residuals for block inputs ===
+        if self.use_full_attn_res:
+            self.full_attn_res_so2: DepthAttnRes | None = DepthAttnRes(
+                channels=self.channels,
+                input_dependent=self.full_attn_res_mode == "dependent",
+                eps=self.eps,
+                bias=self.mlp_bias,
+                dtype=self.compute_dtype,
+                trainable=trainable,
+                seed=child_seed(seed_full_attn, 0),
+            )
+            self.full_attn_res_ffns: nn.ModuleList | None = nn.ModuleList(
+                [
+                    DepthAttnRes(
+                        channels=self.channels,
+                        input_dependent=self.full_attn_res_mode == "dependent",
+                        eps=self.eps,
+                        bias=self.mlp_bias,
+                        dtype=self.compute_dtype,
+                        trainable=trainable,
+                        seed=child_seed(seed_full_attn, i + 1),
+                    )
+                    for i in range(self.ffn_blocks)
+                ]
+            )
+            self.block_attn_res_so2 = None
+            self.block_attn_res_ffns = None
+            self._forward_impl = self._forward_with_full_attn_res
+        elif self.use_block_attn_res:
+            self.full_attn_res_so2 = None
+            self.full_attn_res_ffns = None
+            self.block_attn_res_so2: DepthAttnRes | None = DepthAttnRes(
+                channels=self.channels,
+                input_dependent=self.block_attn_res_mode == "dependent",
+                eps=self.eps,
+                bias=self.mlp_bias,
+                dtype=self.compute_dtype,
+                trainable=trainable,
+                seed=child_seed(seed_block_attn, 0),
+            )
+            self.block_attn_res_ffns: nn.ModuleList | None = nn.ModuleList(
+                [
+                    DepthAttnRes(
+                        channels=self.channels,
+                        input_dependent=self.block_attn_res_mode == "dependent",
+                        eps=self.eps,
+                        bias=self.mlp_bias,
+                        dtype=self.compute_dtype,
+                        trainable=trainable,
+                        seed=child_seed(seed_block_attn, i + 1),
+                    )
+                    for i in range(self.ffn_blocks)
+                ]
+            )
+            self._forward_impl = self._forward_with_block_attn_res
+        else:
+            self.full_attn_res_so2 = None
+            self.full_attn_res_ffns = None
+            self.block_attn_res_so2 = None
+            self.block_attn_res_ffns = None
+            self._forward_impl = self._forward_with_residual_shortcuts
+
     def forward(
         self,
         x: torch.Tensor,
         edge_cache: EdgeFeatureCache,
         radial_feat: torch.Tensor,
-    ) -> torch.Tensor:
+        unit_history: list[torch.Tensor] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        list[torch.Tensor] | None,
+    ]:
         """
         Parameters
         ----------
@@ -2854,45 +2955,265 @@ class SeZMInteractionBlock(nn.Module):
             Edge cache.
         radial_feat
             Per-edge radial features with shape (E, lmax+1, C).
+        unit_history
+            Optional truncated depth history in canonical node layout. When
+            `full_attn_res != "none"`, it is interpreted as completed unit
+            history. When `block_attn_res != "none"`, it is interpreted as
+            completed block history.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, list[torch.Tensor] | None]
+            Tuple `(block_output, block_summary, so2_unit_output, ffn_unit_outputs)`
+            in canonical node layout. `block_output` is always returned.
+            Auxiliary outputs are mode-dependent and may be `None` when the
+            current caller does not need them:
+
+            - baseline path returns `(block_output, None, None, None)`
+            - full AttnRes path returns `(block_output, None, so2_unit_output, ffn_unit_outputs)`
+            - block AttnRes path returns `(block_output, block_summary, None, None)`
+        """
+        return self._forward_impl(x, edge_cache, radial_feat, unit_history)
+
+    def _extract_l0_from_canonical(self, value: torch.Tensor) -> torch.Tensor:
+        """
+        Extract scalar channels from canonical node layout.
+
+        Parameters
+        ----------
+        value
+            Canonical node features with shape (N, D, F, Cf).
 
         Returns
         -------
         torch.Tensor
-            Updated features with shape (N, D, F, Cf).
+            Scalar channels with shape (N, channels).
+        """
+        return value[:, 0, :, :].reshape(value.shape[0], self.channels)
+
+    def _run_so2_unit(
+        self,
+        x: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Run the SO(2) unit without an outer block-level residual shortcut.
+
+        Parameters
+        ----------
+        x
+            Canonical node features with shape (N, D, F, Cf).
+        edge_cache
+            Edge cache.
+        radial_feat
+            Per-edge radial features with shape (E, lmax+1, C).
+
+        Returns
+        -------
+        torch.Tensor
+            SO(2) unit output with shape (N, D, F, Cf).
         """
         n_node = x.shape[0]
         ebed_dim = x.shape[1]
         channels = self.channels
+        x_pre = self.pre_so2_norm(x)
+        so2_unit_output = self.so2_conv(
+            x_pre.reshape(n_node, ebed_dim, channels), edge_cache, radial_feat
+        )
+        return self.post_so2_norm(
+            so2_unit_output.reshape(n_node, ebed_dim, self.n_focus, self.focus_dim)
+        )
 
-        # === Step 1. SO(2) convolution branch ===
-        with nvtx_range("so2_conv"):
-            x_pre = self.pre_so2_norm(x)
-            y = self.so2_conv(
-                x_pre.reshape(n_node, ebed_dim, channels), edge_cache, radial_feat
-            )
-            y = self.post_so2_norm(
-                y.reshape(n_node, ebed_dim, self.n_focus, self.focus_dim)
-            )
-            x = x + y
+    def _run_ffn_unit(self, x: torch.Tensor, unit_idx: int) -> torch.Tensor:
+        """
+        Run one FFN subblock without the outer unit-level residual shortcut.
 
-        # === Step 2. FFN sublayer sequence ===
+        Parameters
+        ----------
+        x
+            Canonical node features with shape (N, D, F, Cf).
+        unit_idx
+            FFN subblock index.
+
+        Returns
+        -------
+        torch.Tensor
+            FFN unit output with shape (N, D, F, Cf).
+        """
+        n_node = x.shape[0]
+        ebed_dim = x.shape[1]
+        channels = self.channels
         x_ffn = x.reshape(n_node, ebed_dim, 1, channels)  # (N, D, 1, C)
-        for i in range(self.ffn_blocks):
-            with nvtx_range(f"ffn_{i}/pre_norm"):
-                x_pre = self.pre_ffn_norms[i](x_ffn)
+        x_pre = self.pre_ffn_norms[unit_idx](x_ffn)
+        y: torch.Tensor = self.ffns[unit_idx](x_pre)
+        y = self.post_ffn_norms[unit_idx](y)
+        if self.layer_scale:
+            y = y * self.adam_ffn_layer_scales[unit_idx]
+        return y.squeeze(2).reshape(n_node, ebed_dim, self.n_focus, self.focus_dim)
 
-            with nvtx_range(f"ffn_{i}/ffn"):
-                y = self.ffns[i](x_pre)
+    def _forward_with_residual_shortcuts(
+        self,
+        x: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+        unit_history: list[torch.Tensor] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        list[torch.Tensor] | None,
+    ]:
+        """
+        Run the original residual-connected block path.
 
-            with nvtx_range(f"ffn_{i}/post_norm"):
-                y = self.post_ffn_norms[i](y)
+        Parameters
+        ----------
+        x
+            Canonical node features with shape (N, D, F, Cf).
+        edge_cache
+            Edge cache.
+        radial_feat
+            Per-edge radial features with shape (E, lmax+1, C).
+        unit_history
+            Unused in the residual-connected path.
 
-            if self.layer_scale:
-                y = y * self.adam_ffn_layer_scales[i]
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, list[torch.Tensor] | None]
+            Tuple `(block_output, None, None, None)`.
+        """
+        with nvtx_range("so2_conv"):
+            so2_unit_output = self._run_so2_unit(x, edge_cache, radial_feat)
+            so2_state = x + so2_unit_output
 
-            x_ffn = x_ffn + y
+        with nvtx_range("ffn"):
+            ffn_state = so2_state
+            for i in range(self.ffn_blocks):
+                ffn_unit_output = self._run_ffn_unit(ffn_state, i)
+                ffn_state = ffn_state + ffn_unit_output
 
-        return x_ffn.squeeze(2).reshape(n_node, ebed_dim, self.n_focus, self.focus_dim)
+        block_output = ffn_state
+        return block_output, None, None, None
+
+    def _forward_with_full_attn_res(
+        self,
+        x: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+        unit_history: list[torch.Tensor] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        list[torch.Tensor] | None,
+    ]:
+        """
+        Run the block with full attention residuals over unit history.
+
+        Parameters
+        ----------
+        x
+            Current block input with shape (N, D, F, Cf).
+        edge_cache
+            Edge cache.
+        radial_feat
+            Per-edge radial features with shape (E, lmax+1, C).
+        unit_history
+            Truncated history in canonical node layout. Each source has shape
+            (N, D, F, Cf).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, list[torch.Tensor] | None]
+            Tuple `(block_output, None, so2_unit_output, ffn_unit_outputs)`.
+        """
+        with nvtx_range("so2_conv"):
+            with nvtx_range("full_attn_res"):
+                so2_input = self.full_attn_res_so2(
+                    sources=unit_history,
+                    scalar_extractor=self._extract_l0_from_canonical,
+                    current_x=x,
+                )
+            so2_unit_output = self._run_so2_unit(so2_input, edge_cache, radial_feat)
+
+        with nvtx_range("ffn"):
+            completed_units = [*unit_history, so2_unit_output]
+            current_x = so2_unit_output
+            ffn_unit_outputs: list[torch.Tensor] = []
+            for i in range(self.ffn_blocks):
+                with nvtx_range("full_attn_res"):
+                    ffn_input: torch.Tensor = self.full_attn_res_ffns[i](
+                        sources=completed_units,
+                        scalar_extractor=self._extract_l0_from_canonical,
+                        current_x=current_x,
+                    )
+                ffn_unit_output = self._run_ffn_unit(ffn_input, i)
+                ffn_unit_outputs.append(ffn_unit_output)
+                completed_units.append(ffn_unit_output)
+                current_x = ffn_unit_output
+
+        block_output = current_x
+        return block_output, None, so2_unit_output, ffn_unit_outputs
+
+    def _forward_with_block_attn_res(
+        self,
+        x: torch.Tensor,
+        edge_cache: EdgeFeatureCache,
+        radial_feat: torch.Tensor,
+        unit_history: list[torch.Tensor] | None = None,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        list[torch.Tensor] | None,
+    ]:
+        """
+        Run the block with block attention residuals over block history.
+
+        Parameters
+        ----------
+        x
+            Current block input with shape (N, D, F, Cf).
+        edge_cache
+            Edge cache.
+        radial_feat
+            Per-edge radial features with shape (E, lmax+1, C).
+        unit_history
+            Truncated block history in canonical node layout. Each source has shape
+            (N, D, F, Cf).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, list[torch.Tensor] | None]
+            Tuple `(block_output, block_summary, None, None)`.
+        """
+        with nvtx_range("so2_conv"):
+            with nvtx_range("block_attn_res"):
+                so2_input = self.block_attn_res_so2(
+                    sources=unit_history,
+                    scalar_extractor=self._extract_l0_from_canonical,
+                    current_x=x,
+                )
+            so2_unit_output = self._run_so2_unit(so2_input, edge_cache, radial_feat)
+
+        with nvtx_range("ffn"):
+            partial_block = so2_unit_output
+            current_x = so2_unit_output
+            for i in range(self.ffn_blocks):
+                with nvtx_range("block_attn_res"):
+                    ffn_input: torch.Tensor = self.block_attn_res_ffns[i](
+                        sources=[*unit_history, partial_block],
+                        scalar_extractor=self._extract_l0_from_canonical,
+                        current_x=current_x,
+                    )
+                ffn_unit_output = self._run_ffn_unit(ffn_input, i)
+                partial_block = partial_block + ffn_unit_output
+                current_x = ffn_unit_output
+
+        block_output = current_x
+        block_summary = partial_block
+        return block_output, block_summary, None, None
 
     def serialize(self) -> dict[str, Any]:
         trainable = all(p.requires_grad for p in self.parameters())
@@ -2916,6 +3237,8 @@ class SeZMInteractionBlock(nn.Module):
                 "ffn_post_norm": self.ffn_post_norm,
                 "ffn_neurons": self.ffn_neurons,
                 "ffn_blocks": self.ffn_blocks,
+                "full_attn_res": self.full_attn_res_mode,
+                "block_attn_res": self.block_attn_res_mode,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,
