@@ -513,6 +513,88 @@ def change_bias(
     log.info(f"Saved model to {output_path}")
 
 
+def grad_probe(FLAGS) -> None:
+    """Compute per-task descriptor gradient vectors for multitask conflict analysis."""
+    import numpy as np
+    from deepmd.common import j_loader
+    from deepmd.utils.compat import update_deepmd_input
+    from deepmd.pt.utils.multi_task import preprocess_shared_params
+    from deepmd.utils.argcheck import normalize
+
+    config = j_loader(FLAGS.INPUT)
+    config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
+    multi_task = "model_dict" in config.get("model", {})
+    shared_links = None
+    if multi_task:
+        config["model"], shared_links = preprocess_shared_params(config["model"])
+    config = normalize(config, multi_task=multi_task)
+
+    trainer = get_trainer(
+        config,
+        restart_model=FLAGS.ckpt,
+        shared_links=shared_links,
+    )
+    trainer.wrapper.eval()
+
+    module = (
+        trainer.wrapper.module
+        if hasattr(trainer.wrapper, "module")
+        else trainer.wrapper
+    )
+
+    grads_per_task: dict = {}
+    param_names: list | None = None
+    param_shapes: list | None = None
+
+    for task_key in trainer.model_keys:
+        trainer.optimizer.zero_grad(set_to_none=True)
+
+        for _ in range(FLAGS.nbatches):
+            input_dict, label_dict, _ = trainer.get_data(
+                is_train=True, task_key=task_key
+            )
+            cur_lr = config["learning_rate"]["start_lr"]
+            _, loss, _ = trainer.wrapper(
+                **input_dict, cur_lr=cur_lr, label=label_dict, task_key=task_key
+            )
+            loss.backward()
+
+        model = module.model[task_key]
+        descriptor = model.get_descriptor()
+        grads, names, shapes = [], [], []
+        for name, param in descriptor.named_parameters():
+            if param.grad is not None:
+                g = param.grad.detach().cpu().float().numpy().ravel()
+            else:
+                g = np.zeros(param.numel(), dtype=np.float32)
+            grads.append(g)
+            names.append(name)
+            shapes.append(list(param.shape))
+
+        grad_vec = np.concatenate(grads) if grads else np.array([], dtype=np.float32)
+        if FLAGS.nbatches > 1:
+            grad_vec /= FLAGS.nbatches
+
+        grads_per_task[task_key] = grad_vec
+        if param_names is None:
+            param_names = names
+            param_shapes = shapes
+
+        trainer.optimizer.zero_grad(set_to_none=True)
+        log.info(
+            "Task '%s': descriptor gradient collected, norm=%.4e",
+            task_key,
+            float(np.linalg.norm(grad_vec)),
+        )
+
+    save_dict = {f"grads_{k}": v for k, v in grads_per_task.items()}
+    save_dict["param_names"] = np.array(param_names, dtype=object)
+    save_dict["param_shapes"] = np.array(param_shapes, dtype=object)
+    np.savez(FLAGS.output, **save_dict)
+    log.info("Descriptor gradient vectors saved to: %s", FLAGS.output)
+
+
+
 @record
 def main(args: Optional[Union[list[str], argparse.Namespace]] = None) -> None:
     if not isinstance(args, argparse.Namespace):
@@ -572,6 +654,8 @@ def main(args: Optional[Union[list[str], argparse.Namespace]] = None) -> None:
             check_frequency=FLAGS.frequency,
             training_script=FLAGS.training_script,
         )
+    elif FLAGS.command == "grad-probe":
+        grad_probe(FLAGS)
     else:
         raise RuntimeError(f"Invalid command {FLAGS.command}!")
 
