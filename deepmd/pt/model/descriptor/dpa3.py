@@ -173,6 +173,12 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             precision=precision,
             seed=child_seed(seed, 1),
             trainable=trainable,
+            n_experts=self.repflow_args.n_experts,
+            moe_top_k=self.repflow_args.moe_top_k,
+            use_node_moe=self.repflow_args.use_node_moe,
+            use_edge_moe=self.repflow_args.use_edge_moe,
+            use_angle_moe=self.repflow_args.use_angle_moe,
+            share_expert=self.repflow_args.share_expert,
         )
 
         self.use_econf_tebd = use_econf_tebd
@@ -568,6 +574,14 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext = node_ebd_ext + sys_cs_embd.unsqueeze(1)
 
         node_ebd_inp = node_ebd_ext[:, :nloc, :]
+
+        # Extract type embedding table for MoE routing
+        type_embeddings: torch.Tensor | None = None
+        if self.repflows.n_experts > 1:
+            type_embeddings = self.type_embedding(
+                torch.arange(self.ntypes, device=extended_coord.device)
+            )
+
         # repflows
         node_ebd, edge_ebd, h2, rot_mat, sw = self.repflows(
             nlist,
@@ -576,6 +590,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext,
             mapping,
             comm_dict=comm_dict,
+            type_embeddings=type_embeddings,
         )
         if self.concat_output_tebd:
             node_ebd = torch.cat([node_ebd, node_ebd_inp], dim=-1)

@@ -1962,6 +1962,16 @@ class RepFlowLayer(NativeOP):
         angle_self_linear = data.pop("angle_self_linear", None)
         a_compress_n_linear = data.pop("a_compress_n_linear", None)
         a_compress_e_linear = data.pop("a_compress_e_linear", None)
+        # Pop MoE-related fields (PT-only, not used in dpmodel)
+        for _moe_key in [
+            "n_experts", "moe_top_k", "use_node_moe", "use_edge_moe",
+            "use_angle_moe", "share_expert", "tebd_dim",
+            "node_self_mlp_type", "node_sym_linear_type",
+            "node_edge_linear_type", "edge_self_linear_type",
+            "edge_angle_linear1_type", "edge_angle_linear2_type",
+            "angle_self_linear_type",
+        ]:
+            data.pop(_moe_key, None)
         update_style = data["update_style"]
         variables = data.pop("@variables", {})
         n_residual = variables.get("n_residual", data.pop("n_residual", []))

@@ -200,6 +200,12 @@ class RepFlowArgs:
         use_exp_switch: bool = False,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
+        n_experts: int = 1,
+        moe_top_k: int = 1,
+        use_node_moe: bool = True,
+        use_edge_moe: bool = False,
+        use_angle_moe: bool = False,
+        share_expert: int = 0,
     ) -> None:
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -230,6 +236,12 @@ class RepFlowArgs:
         self.use_exp_switch = use_exp_switch
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
+        self.n_experts = n_experts
+        self.moe_top_k = moe_top_k
+        self.use_node_moe = use_node_moe
+        self.use_edge_moe = use_edge_moe
+        self.use_angle_moe = use_angle_moe
+        self.share_expert = share_expert
 
     def __getitem__(self, key: str) -> Any:
         if hasattr(self, key):
@@ -265,6 +277,12 @@ class RepFlowArgs:
             "use_exp_switch": self.use_exp_switch,
             "use_dynamic_sel": self.use_dynamic_sel,
             "sel_reduce_factor": self.sel_reduce_factor,
+            "n_experts": self.n_experts,
+            "moe_top_k": self.moe_top_k,
+            "use_node_moe": self.use_node_moe,
+            "use_edge_moe": self.use_edge_moe,
+            "use_angle_moe": self.use_angle_moe,
+            "share_expert": self.share_expert,
         }
 
     @classmethod

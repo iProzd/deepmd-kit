@@ -1,0 +1,332 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{geometry}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+\geometry{margin=2.5cm}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\act}{\sigma}
+\newcommand{\W}{\mathbf{W}}
+\newcommand{\bb}{\mathbf{b}}
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\h}{\mathbf{h}}
+\newcommand{\g}{\mathbf{g}}
+\newcommand{\e}{\mathbf{e}}
+
+\title{MoE-Aware MLP Fusion for DPA3 RepFlowLayer:\\
+Reducing Expert Parallelism Communication Cost}
+\author{Technical Analysis}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Problem Statement}
+
+In the current DPA3 RepFlowLayer, each layer contains \textbf{7 independent MLPs} that can be replaced by MoE layers. In an Expert Parallelism (EP) setting, each MoE layer requires two All-to-All communications (dispatch + combine). With 7 MoE layers per RepFlowLayer and $L$ layers total, the communication overhead is:
+\begin{equation}
+    C_{\text{comm}} = 2 \times 7 \times L \times C_{\text{A2A}}
+\end{equation}
+where $C_{\text{A2A}}$ is the cost of a single All-to-All operation. For $L=6$, this means \textbf{84 All-to-All operations per forward pass}, which is prohibitive.
+
+The goal is to \textbf{fuse MLPs that share the same input} into single MoE layers, reducing the number of independent expert dispatch/combine rounds while preserving model expressiveness.
+
+\section{Current Architecture Analysis}
+
+\subsection{The 7 MLPs and Their Data Flow}
+
+Let $n_i \in \R^{d_n}$ denote the node embedding of atom $i$, $e_{ij} \in \R^{d_e}$ the edge embedding of pair $(i,j)$, and $a_{ijk} \in \R^{d_a}$ the angle embedding of triplet $(i,j,k)$. The 7 MLPs are:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clccl}
+\toprule
+\# & Name & Input dim & Output dim & Input tensor \\
+\midrule
+1 & \texttt{node\_self\_mlp} & $d_n$ & $d_n$ & $n_i$ \\
+2 & \texttt{node\_sym\_linear} & $d_n \cdot k + d_e \cdot k$ & $d_n$ & $\text{GRRG}(n_i, e_{ij}, h_{ij})$ \\
+3 & \texttt{node\_edge\_linear} & $2d_n + d_e$ & $H \cdot d_n$ & $[n_i; n_j; e_{ij}]$ \\
+4 & \texttt{edge\_self\_linear} & $2d_n + d_e$ & $d_e$ & $[n_i; n_j; e_{ij}]$ \\
+5 & \texttt{edge\_angle\_linear1} & $d_a + d_n' + 2d_e'$ & $d_e$ & $[a_{ijk}; n_i'; e_{ik}'; e_{ij}']$ \\
+6 & \texttt{edge\_angle\_linear2} & $d_e$ & $d_e$ & reduced angle$\to$edge \\
+7 & \texttt{angle\_self\_linear} & $d_a + d_n' + 2d_e'$ & $d_a$ & $[a_{ijk}; n_i'; e_{ik}'; e_{ij}']$ \\
+\bottomrule
+\end{tabular}
+\caption{The 7 MLPs in RepFlowLayer. $k$ = \texttt{axis\_neuron}, $H$ = \texttt{n\_multi\_edge\_message}, primed dimensions indicate compressed variants when \texttt{a\_compress\_rate} $> 0$.}
+\label{tab:mlps}
+\end{table}
+
+\subsection{Shared Input Groups}
+
+Two pairs of MLPs consume \textbf{identical input tensors}:
+
+\paragraph{Group A: Edge-info MLPs (\#3 + \#4).}
+Both consume the concatenated edge information:
+\begin{equation}
+    \x_{\text{edge}} = [n_i;\; n_j;\; e_{ij}] \in \R^{2d_n + d_e}
+\end{equation}
+MLP \#3 produces the node$\leftarrow$edge message ($\R^{H \cdot d_n}$), MLP \#4 produces the edge self-update ($\R^{d_e}$).
+
+\paragraph{Group B: Angle-info MLPs (\#5 + \#7).}
+Both consume the concatenated angle information:
+\begin{equation}
+    \x_{\text{angle}} = [a_{ijk};\; n_i';\; e_{ik}';\; e_{ij}'] \in \R^{d_a + d_n' + 2d_e'}
+\end{equation}
+MLP \#5 produces the edge$\leftarrow$angle message ($\R^{d_e}$), MLP \#7 produces the angle self-update ($\R^{d_a}$).
+
+\paragraph{Independent MLPs.}
+MLPs \#1, \#2, and \#6 each have unique inputs and cannot be trivially fused with others.
+
+\section{Proposed Fusion Strategies}
+
+\subsection{Strategy 1: Direct Output Concatenation (Recommended)}
+
+\subsubsection{Fusion A: Edge-info MLPs $\to$ Single MoE}
+
+Replace MLPs \#3 and \#4 with a single fused MLP:
+\begin{equation}
+    [\underbrace{y_{\text{node}}}_{\R^{H \cdot d_n}};\; \underbrace{y_{\text{edge}}}_{\R^{d_e}}] = \act\!\left(\W_{\text{fused}}^{(A)} \cdot \x_{\text{edge}} + \bb_{\text{fused}}^{(A)}\right)
+\end{equation}
+where $\W_{\text{fused}}^{(A)} \in \R^{(H \cdot d_n + d_e) \times (2d_n + d_e)}$. The output is split:
+\begin{align}
+    y_{\text{node}} &= [\act(\W_{\text{fused}}^{(A)} \x_{\text{edge}} + \bb)]_{1:H \cdot d_n} \quad \text{(for node update)} \\
+    y_{\text{edge}} &= [\act(\W_{\text{fused}}^{(A)} \x_{\text{edge}} + \bb)]_{H \cdot d_n + 1 : H \cdot d_n + d_e} \quad \text{(for edge update)}
+\end{align}
+
+\textbf{Expressiveness analysis:} The fused layer has $\W_{\text{fused}} \in \R^{(Hd_n + d_e) \times (2d_n + d_e)}$, while the original two layers have $\W_3 \in \R^{Hd_n \times (2d_n + d_e)}$ and $\W_4 \in \R^{d_e \times (2d_n + d_e)}$. Since:
+\begin{equation}
+    \W_{\text{fused}} = \begin{bmatrix} \W_3 \\ \W_4 \end{bmatrix}, \quad
+    \bb_{\text{fused}} = \begin{bmatrix} \bb_3 \\ \bb_4 \end{bmatrix}
+\end{equation}
+the fused layer is \textbf{strictly equivalent} to the two separate layers --- no expressiveness is lost. The parameter count is identical.
+
+\subsubsection{Fusion B: Angle-info MLPs $\to$ Single MoE}
+
+Replace MLPs \#5 and \#7 with a single fused MLP:
+\begin{equation}
+    [\underbrace{y_{\text{e}\leftarrow\text{a}}}_{\R^{d_e}};\; \underbrace{y_{\text{angle}}}_{\R^{d_a}}] = \act\!\left(\W_{\text{fused}}^{(B)} \cdot \x_{\text{angle}} + \bb_{\text{fused}}^{(B)}\right)
+\end{equation}
+where $\W_{\text{fused}}^{(B)} \in \R^{(d_e + d_a) \times (d_a + d_n' + 2d_e')}$.
+
+Same analysis: $\W_{\text{fused}}^{(B)} = [\W_5; \W_7]$, \textbf{strictly equivalent}, zero expressiveness loss.
+
+\subsubsection{Result: 7 $\to$ 5 MoE Layers}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clcl}
+\toprule
+\# & Fused Name & Tensor Level & Original MLPs \\
+\midrule
+1 & \texttt{node\_self\_mlp} & Node $[N_b, N_{\text{loc}}, d_n]$ & \#1 \\
+2 & \texttt{node\_sym\_linear} & Node $[N_b, N_{\text{loc}}, kd_n + kd_e]$ & \#2 \\
+3' & \texttt{edge\_fused\_linear} & Edge $[N_b, N_{\text{loc}}, N_{\text{nei}}, 2d_n+d_e]$ & \#3 + \#4 \\
+4' & \texttt{angle\_fused\_linear} & Angle $[N_b, N_{\text{loc}}, S_a, S_a, d_a+d_n'+2d_e']$ & \#5 + \#7 \\
+5 & \texttt{edge\_angle\_linear2} & Edge $[N_b, N_{\text{loc}}, N_{\text{nei}}, d_e]$ & \#6 \\
+\bottomrule
+\end{tabular}
+\caption{After Strategy 1 fusion: 5 MoE layers.}
+\end{table}
+
+Communication reduction: $\frac{7-5}{7} = 28.6\%$ fewer All-to-All rounds.
+
+\subsection{Strategy 2: Further Fusion via Shared Projection (Advanced)}
+
+\subsubsection{Motivation}
+
+Strategy 1 only fuses MLPs with identical inputs. Can we go further? The key observation: MLPs \#1 (node self) and \#2 (node sym) both \textbf{output to the same node update list} and operate at the \textbf{same tensor level} (node, $[N_b, N_{\text{loc}}, \cdot]$). If we can unify their inputs, they can be fused.
+
+\subsubsection{Approach: Pre-projection + Concatenation}
+
+Define a unified node input by concatenating the self-embedding and symmetrized features:
+\begin{equation}
+    \x_{\text{node}} = [n_i;\; \text{GRRG}(n_i, e_{ij}, h_{ij})] \in \R^{d_n + kd_n + kd_e}
+\end{equation}
+Then a single fused MLP replaces both \#1 and \#2:
+\begin{equation}
+    [\underbrace{y_{\text{self}}}_{\R^{d_n}};\; \underbrace{y_{\text{sym}}}_{\R^{d_n}}] = \act\!\left(\W_{\text{node}} \cdot \x_{\text{node}} + \bb_{\text{node}}\right)
+\end{equation}
+
+\textbf{Expressiveness analysis:} The original \#1 only sees $n_i$ while \#2 only sees the GRRG features. The fused layer sees both, which is \textbf{strictly more expressive} --- each output can now attend to both self and symmetrized features. However, this changes the model architecture (not just an implementation optimization), so it requires retraining.
+
+\subsubsection{Result: 7 $\to$ 4 MoE Layers}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clcl}
+\toprule
+\# & Fused Name & Tensor Level & Original MLPs \\
+\midrule
+1' & \texttt{node\_fused\_linear} & Node & \#1 + \#2 \\
+2' & \texttt{edge\_fused\_linear} & Edge & \#3 + \#4 \\
+3' & \texttt{angle\_fused\_linear} & Angle & \#5 + \#7 \\
+4 & \texttt{edge\_angle\_linear2} & Edge & \#6 \\
+\bottomrule
+\end{tabular}
+\caption{After Strategy 2 fusion: 4 MoE layers.}
+\end{table}
+
+Communication reduction: $\frac{7-4}{7} = 42.9\%$.
+
+\subsection{Strategy 3: Aggressive Fusion by Tensor Level (Maximum Reduction)}
+
+\subsubsection{Motivation}
+
+In EP, the communication cost is dominated by the \textbf{number of dispatch/combine rounds}, not the data volume per round (since expert output dimension is small relative to batch size). Therefore, the optimal strategy is to minimize the \textbf{number of distinct MoE calls}, ideally one per tensor level.
+
+\subsubsection{Approach: One MoE per Level}
+
+\paragraph{Node level:} Merge \#1 + \#2 as in Strategy 2.
+
+\paragraph{Edge level:} Merge \#3 + \#4 + \#6. This requires restructuring the angle$\to$edge pipeline. Currently:
+\begin{align}
+    y_5 &= \text{MLP}_5(\x_{\text{angle}}) \quad \text{(angle$\to$edge, per-angle)} \\
+    z &= \text{reduce}(y_5) \quad \text{(sum over angles $\to$ per-edge)} \\
+    y_6 &= \text{MLP}_6(z) \quad \text{(refine, per-edge)}
+\end{align}
+MLP \#6 operates on the \textit{reduced} angle output, not the raw edge\_info. To fuse \#6 with \#3+\#4, we need to concatenate the reduced angle output with edge\_info:
+\begin{equation}
+    \x_{\text{edge}}^{+} = [n_i;\; n_j;\; e_{ij};\; z_{\text{angle}\to\text{edge}}] \in \R^{2d_n + 2d_e}
+\end{equation}
+\begin{equation}
+    [\underbrace{y_{\text{node}}}_{\R^{Hd_n}};\; \underbrace{y_{\text{edge\_self}}}_{\R^{d_e}};\; \underbrace{y_{\text{edge\_angle}}}_{\R^{d_e}}] = \act\!\left(\W_{\text{edge}}^{+} \cdot \x_{\text{edge}}^{+} + \bb\right)
+\end{equation}
+
+\textbf{Caveat:} This changes the computation order --- the angle$\to$edge reduction must happen \textit{before} the edge MoE call, which means the angle MoE must complete first. This creates a \textbf{sequential dependency} that may limit pipelining.
+
+\paragraph{Angle level:} MLP \#5 + \#7 fused as in Strategy 1.
+
+\subsubsection{Result: 7 $\to$ 3 MoE Layers}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clcl}
+\toprule
+\# & Fused Name & Tensor Level & Original MLPs \\
+\midrule
+1' & \texttt{node\_moe} & Node & \#1 + \#2 \\
+2' & \texttt{edge\_moe} & Edge & \#3 + \#4 + \#6 \\
+3' & \texttt{angle\_moe} & Angle & \#5 + \#7 \\
+\bottomrule
+\end{tabular}
+\caption{After Strategy 3 fusion: 3 MoE layers (one per tensor level).}
+\end{table}
+
+Communication reduction: $\frac{7-3}{7} = 57.1\%$.
+
+\section{Communication Cost Analysis}
+
+\subsection{EP Communication Model}
+
+In Expert Parallelism with $P$ GPUs and $E$ experts ($E/P$ experts per GPU), each MoE layer requires:
+\begin{itemize}
+    \item \textbf{Dispatch:} All-to-All to send tokens to expert-owning GPUs. Cost: $O\!\left(\frac{B \cdot d_{\text{in}}}{P}\right)$
+    \item \textbf{Combine:} All-to-All to collect expert outputs. Cost: $O\!\left(\frac{B \cdot d_{\text{out}}}{P}\right)$
+\end{itemize}
+where $B$ is the token count (atoms, edges, or angles).
+
+\subsection{Token Counts by Level}
+
+For a system with $N$ atoms, $M$ edges (neighbors), and $A$ angles:
+\begin{align}
+    B_{\text{node}} &= N_b \cdot N_{\text{loc}} \approx N \\
+    B_{\text{edge}} &= N_b \cdot N_{\text{loc}} \cdot N_{\text{nei}} \approx N \cdot \bar{M} \\
+    B_{\text{angle}} &= N_b \cdot N_{\text{loc}} \cdot S_a^2 \approx N \cdot \bar{S}_a^2
+\end{align}
+where $\bar{M} \approx 120$ and $\bar{S}_a \approx 30$ typically. Thus:
+\begin{equation}
+    B_{\text{angle}} \gg B_{\text{edge}} \gg B_{\text{node}}
+\end{equation}
+
+\subsection{Comparative Cost}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+Strategy & \# MoE layers & A2A rounds/layer & Total A2A/model \\
+\midrule
+Baseline (no fusion) & 7 & $2 \times 7 \times L$ & $84$ \\
+Strategy 1 (shared input) & 5 & $2 \times 5 \times L$ & $60$ \\
+Strategy 2 (+ node fusion) & 4 & $2 \times 4 \times L$ & $48$ \\
+Strategy 3 (per-level) & 3 & $2 \times 3 \times L$ & $36$ \\
+\bottomrule
+\end{tabular}
+\caption{Communication rounds for $L=6$ layers. Each round = one All-to-All.}
+\end{table}
+
+\subsection{Weighted Cost by Token Count}
+
+Not all MoE layers have equal communication cost. The angle-level MoE dominates:
+\begin{equation}
+    C_{\text{total}} = \sum_{l=1}^{L} \sum_{m \in \text{MoE}_l} 2 \cdot B_m \cdot d_m
+\end{equation}
+
+\textbf{Key insight:} Fusing angle-level MLPs (\#5 + \#7) provides the largest absolute communication savings because $B_{\text{angle}}$ is the largest token count. Strategy 1's Fusion B alone saves $\sim 50\%$ of angle-level communication.
+
+\section{Compatibility with optim\_update}
+
+The \texttt{optim\_update} optimization decomposes the weight matrix by input components. For the edge-info MLP:
+\begin{equation}
+    \W \cdot [n_i; n_j; e_{ij}] + \bb = \W_{n_i} n_i + \W_{n_j} n_j + \W_e e_{ij} + \bb
+\end{equation}
+This allows computing each term independently and broadcasting, avoiding the expensive explicit concatenation.
+
+For fused layers, the decomposition extends naturally:
+\begin{equation}
+    \W_{\text{fused}} \cdot [n_i; n_j; e_{ij}] + \bb_{\text{fused}} = \begin{bmatrix} \W_{n_i}^{(3)} \\ \W_{n_i}^{(4)} \end{bmatrix} n_i + \begin{bmatrix} \W_{n_j}^{(3)} \\ \W_{n_j}^{(4)} \end{bmatrix} n_j + \begin{bmatrix} \W_e^{(3)} \\ \W_e^{(4)} \end{bmatrix} e_{ij} + \begin{bmatrix} \bb^{(3)} \\ \bb^{(4)} \end{bmatrix}
+\end{equation}
+The split dimensions change but the decomposition structure is preserved. Implementation requires adjusting the \texttt{torch.split} sizes in \texttt{optim\_edge\_update} and \texttt{optim\_angle\_update}.
+
+\section{Recommendations}
+
+\subsection{Immediate (Low Risk)}
+
+\textbf{Implement Strategy 1} --- fuse shared-input MLPs:
+\begin{itemize}
+    \item Fusion A: \texttt{node\_edge\_linear} + \texttt{edge\_self\_linear} $\to$ \texttt{edge\_fused\_linear}
+    \item Fusion B: \texttt{edge\_angle\_linear1} + \texttt{angle\_self\_linear} $\to$ \texttt{angle\_fused\_linear}
+\end{itemize}
+This is \textbf{mathematically equivalent} to the current architecture (zero expressiveness change), requires no retraining of existing models, and reduces MoE layers from 7 to 5 (28.6\% fewer A2A rounds).
+
+\subsection{Medium Term (Requires Retraining)}
+
+\textbf{Implement Strategy 2} --- additionally fuse node-level MLPs:
+\begin{itemize}
+    \item Fusion C: \texttt{node\_self\_mlp} + \texttt{node\_sym\_linear} $\to$ \texttt{node\_fused\_linear}
+\end{itemize}
+This changes the architecture (each output sees both self and sym features), but is \textbf{more expressive}. Reduces to 4 MoE layers (42.9\% fewer A2A rounds). Requires ablation study to verify no accuracy regression.
+
+\subsection{Long Term (Architecture Change)}
+
+\textbf{Implement Strategy 3} --- one MoE per tensor level:
+\begin{itemize}
+    \item Absorb \texttt{edge\_angle\_linear2} into the edge-level fused MoE
+    \item Requires restructuring the angle$\to$edge pipeline
+\end{itemize}
+Reduces to 3 MoE layers (57.1\% fewer A2A rounds). Most invasive change, requires careful validation.
+
+\subsection{Summary}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccc}
+\toprule
+Strategy & MoE layers & A2A reduction & Expressiveness & Retrain? \\
+\midrule
+Baseline & 7 & --- & --- & No \\
+Strategy 1 & 5 & 28.6\% & Identical & No \\
+Strategy 2 & 4 & 42.9\% & $\geq$ original & Yes \\
+Strategy 3 & 3 & 57.1\% & $\geq$ original & Yes \\
+\bottomrule
+\end{tabular}
+\caption{Summary of fusion strategies.}
+\end{table}
+
+\end{document}

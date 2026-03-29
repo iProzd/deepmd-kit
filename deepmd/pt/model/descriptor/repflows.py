@@ -223,6 +223,12 @@ class DescrptBlockRepflows(DescriptorBlock):
         optim_update: bool = True,
         seed: int | list[int] | None = None,
         trainable: bool = True,
+        n_experts: int = 1,
+        moe_top_k: int = 1,
+        use_node_moe: bool = True,
+        use_edge_moe: bool = False,
+        use_angle_moe: bool = False,
+        share_expert: int = 0,
     ) -> None:
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -286,6 +292,14 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.epsilon = 1e-4
         self.seed = seed
 
+        # MoE config
+        self.n_experts = n_experts
+        self.moe_top_k = moe_top_k
+        self.use_node_moe = use_node_moe
+        self.use_edge_moe = use_edge_moe
+        self.use_angle_moe = use_angle_moe
+        self.share_expert = share_expert
+
         self.edge_embd = MLPLayer(
             1,
             self.e_dim,
@@ -332,6 +346,13 @@ class DescrptBlockRepflows(DescriptorBlock):
                     smooth_edge_update=self.smooth_edge_update,
                     seed=child_seed(child_seed(seed, 1), ii),
                     trainable=trainable,
+                    n_experts=self.n_experts,
+                    moe_top_k=self.moe_top_k,
+                    use_node_moe=self.use_node_moe,
+                    use_edge_moe=self.use_edge_moe,
+                    use_angle_moe=self.use_angle_moe,
+                    share_expert=self.share_expert,
+                    tebd_dim=self.n_dim,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -439,6 +460,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         extended_atype_embd: torch.Tensor | None = None,
         mapping: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        type_embeddings: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor | None,
@@ -655,6 +677,8 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_sw,
                 edge_index=edge_index,
                 angle_index=angle_index,
+                type_embeddings=type_embeddings,
+                atom_types=atype,
             )
 
         # nb x nloc x 3 x e_dim

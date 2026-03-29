@@ -1680,6 +1680,59 @@ def dpa3_repflow_args() -> list[Argument]:
             default=10.0,
             doc=doc_sel_reduce_factor,
         ),
+        Argument(
+            "n_experts",
+            int,
+            optional=True,
+            default=1,
+            doc="Number of experts for Mixture of Experts (MoE). "
+            "When set to 1 (default), MoE is disabled and standard MLPLayers are used. "
+            "When > 1, selected MLPLayers are replaced with MoE layers.",
+        ),
+        Argument(
+            "moe_top_k",
+            int,
+            optional=True,
+            default=1,
+            doc="Number of experts to activate per token in MoE layers. "
+            "Must be <= n_experts. Includes both routed and shared experts.",
+        ),
+        Argument(
+            "use_node_moe",
+            bool,
+            optional=True,
+            default=True,
+            doc="Whether to apply MoE to node-related MLPLayers "
+            "(node_self_mlp, node_sym_linear, node_edge_linear). "
+            "Only effective when n_experts > 1.",
+        ),
+        Argument(
+            "use_edge_moe",
+            bool,
+            optional=True,
+            default=False,
+            doc="Whether to apply MoE to edge-related MLPLayers "
+            "(edge_self_linear, edge_angle_linear2). "
+            "Only effective when n_experts > 1.",
+        ),
+        Argument(
+            "use_angle_moe",
+            bool,
+            optional=True,
+            default=False,
+            doc="Whether to apply MoE to angle-related MLPLayers "
+            "(edge_angle_linear1, angle_self_linear). "
+            "Only effective when n_experts > 1.",
+        ),
+        Argument(
+            "share_expert",
+            int,
+            optional=True,
+            default=0,
+            doc="Number of shared experts in MoE layers. "
+            "Shared experts are always active and counted within top_k. "
+            "Must be < moe_top_k.",
+        ),
     ]
 
 
