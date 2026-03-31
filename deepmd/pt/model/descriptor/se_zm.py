@@ -1573,16 +1573,18 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         Notes
         -----
-        - When `use_amp=True`, enables torch.autocast with bfloat16 on CUDA.
+        - When `use_amp=True` and the model is in training mode, enables
+          torch.autocast with bfloat16 on CUDA.
         - Only affects autocast-eligible operations (matmul, conv, etc.).
-        - Does nothing on non-CUDA devices or when `use_amp=False`.
+        - Does nothing during inference (`self.training=False`), on non-CUDA
+          devices, or when `use_amp=False`.
 
         Yields
         ------
         None
             Runs the wrapped region under the configured AMP setting.
         """
-        if not self.use_amp or device.type != "cuda":  # and self.training
+        if not self.use_amp or device.type != "cuda" or not self.training:
             yield
             return
 
