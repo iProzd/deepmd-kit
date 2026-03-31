@@ -32,7 +32,7 @@ ______________________________________________________________________
    - No interaction block is allowed to recompute:
      - `edge_vec`
      - envelope / radial basis
-     - edge-aligned rotation matrices
+     - edge-aligned quaternions
      - Wigner-D blocks
 
 ## Non-Goals (Explicitly Out of Scope)
@@ -106,7 +106,7 @@ they are not user-facing descriptor config keys.
 
 ### Inner Clamping
 
-The `InnerClamp` module (in `se_zm_helper.py`) implements a C2-continuous quintic Hermite
+The `InnerClamp` module (in `se_zm_helper.py`) implements a C3-continuous septic Hermite
 polynomial that maps true distances to effective distances:
 
 ```
@@ -115,7 +115,7 @@ r̃(r) = r_inner                                           if r <= r_inner   (fr
       = r                                                  if r >= r_outer  (identity zone)
 
 where t = (r - r_inner) / (r_outer - r_inner)
-      h(t) = 3t^5 - 8t^4 + 6t^3
+      h(t) = 20t^4 - 45t^5 + 36t^6 - 10t^7
 ```
 
 Boundary conditions: `h(0)=0, h(1)=1, h'(0)=0, h'(1)=1, h''(0)=0, h''(1)=0`.
@@ -130,9 +130,13 @@ diff = diff * scale  # direction preserved, ||diff|| = clamped
 length = clamped
 ```
 
+The polynomial satisfies `h(0)=0`, `h(1)=1`, `h'(0)=0`, `h'(1)=1`,
+`h''(0)=0`, `h''(1)=0`, `h'''(0)=0`, and `h'''(1)=0`, so the frozen zone,
+transition zone, and identity zone match with C3 continuity.
+
 This ensures the descriptor receives *no information* about the true distance when `r < r_inner`.
-All downstream modules — radial basis, envelope, rotation matrix, `EnvironmentInitialEmbedding` —
-see clamped values uniformly. No raw distance is preserved anywhere.
+All downstream modules — radial basis, envelope, edge quaternion construction,
+`EnvironmentInitialEmbedding` — see clamped values uniformly. No raw distance is preserved anywhere.
 
 ### InterPotential (ZBL)
 
@@ -167,9 +171,9 @@ Standard DeePMD nlist path:
        ├─ edges: (src, dst) global indices, edge_vec
        ├─ edge_type_feat: per-edge type embedding (src+dst)
        ├─ edge_rbf: Bessel radial basis via sinc × C² envelope
-       ├─ edge_env: C² cutoff envelope weights (flattened to valid edges)
+       ├─ edge_env: C³ cutoff envelope weights (flattened to valid edges)
        ├─ D_full, Dt_full: block-diagonal Wigner-D matrices
-       └─ inv_sqrt_deg: inverse sqrt degree for normalization
+       └─ inv_sqrt_deg: inverse sqrt smooth degree (`sum(edge_env²)`) for normalization
 
   Radial embedding (computed once):
     └─ radial_feat: (E, lmax+1, C) via RadialMLP(edge_rbf)
@@ -190,7 +194,7 @@ Standard DeePMD nlist path:
       ├─ optional full AttnRes for SO(2) input from `unit_history`
       ├─ optional block AttnRes for SO(2) input from `block_history`
       ├─ main tensor layout is fixed as (N, D, F, Cf), contiguous
-      ├─ SeparableRMSNorm (pre-SO2, per-focus on (N, D, F, Cf))
+      ├─ EquivariantRMSNorm (pre-SO2, per-focus on (N, D, F, Cf))
       ├─ Multi-Focus SO(2) Convolution (enabled for ALL lmax, including lmax=0)
       │  ├─ `pre_focus_mix`: full-channel mixing on (N, D, C)
       │  ├─ rotate/bmm in full width (E, D, C), then SO2 stack on strided (E, F, Dm, Cf)
@@ -237,13 +241,14 @@ ______________________________________________________________________
 - Basis uses a sinc form for stable `r -> 0` gradients: `phi_n(r) = w_n * sinc(w_n * r / pi)`.
 - Frequencies are serialized/deserialized.
 
-### 2. SeparableRMSNorm with Degree Balancing
+### 2. EquivariantRMSNorm with Degree Balancing
 
-- Normalizes `l=0` and `l>0` **separately** (separable design).
-- **Degree Balancing** for `l>0`: each degree `l` contributes equally to the variance, regardless of the number of m components (`2l+1`). This is achieved by weighting each m component by `1/(2l+1)`.
-- Centering and bias are applied only to `l=0`; `l>0` remains zero-mean.
+- Applies one shared RMS over **all retained degrees**, not separate denominators for `l=0` and `l>0`.
+- The scalar slice `l=0` can be mean-centered across channels before RMS evaluation.
+- **Degree Balancing** weights every coefficient from degree `l` by `1/(2l+1)`, then averages uniformly across degrees with factor `1/(lmax+1)`, so each degree contributes equally regardless of multiplicity.
 - Per-l affine scales are expanded to all coefficients via a precomputed degree index.
-- Memory optimization: fused einsum avoids allocating an intermediate `(N, D-1, F, C)` tensor.
+- Bias is applied only to the scalar slice after normalization.
+- Memory optimization: the weighted RMS is computed with fused einsum, and the reduced SO(2) layout uses retained-count weights `2 * min(l, mmax) + 1`.
 
 ### 3. SO3Linear
 
@@ -380,7 +385,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 
    - `outer = r_tilde[:, :, None] * g[:, None, :]` produces `(E, 4, embed_dim)`
    - Scatter-sum by destination node: `env_agg.index_add_(0, dst, outer_flat)`
-   - Normalize by neighbor count (degree normalization)
+   - Normalize by smooth envelope-squared degree
 
 1. **D matrix construction**: Captures local geometry via matrix product:
 
@@ -400,7 +405,7 @@ An optional module that provides physical inductive bias for l=0 features using 
 **Key properties**:
 
 - Uses **global frame** direction (not edge-aligned local frame) to preserve angular information
-- Neighbor count normalization uses actual degree, not `inv_sqrt_deg` from edge cache
+- Normalization uses smooth envelope-squared degree from edge cache
 - `edge_rbf` already includes envelope; r_tilde also uses envelope; no double envelope issue
 - **Near-identity start** is guaranteed by small strengths with zero-initialized logits
 
@@ -441,7 +446,7 @@ Edge cache holds **valid edges** (non-padding, non-excluded):
 
 - padding (`nlist == -1`) is removed
 - excluded type pairs are removed
-- edges with `r >= rcut` are **NOT** removed; their `edge_env=0` (from C² envelope) naturally zeros their messages
+- edges with `r >= rcut` are **NOT** removed; their `edge_env=0` (from C³ envelope) naturally zeros their messages
 
 This design avoids the dynamic-output-size `nonzero` kernel for distance filtering and enables smoother degree/normalization (no discontinuous edge count jumps at rcut boundary).
 
@@ -451,10 +456,10 @@ Let `E` be the number of valid edges:
 - `edge_type_feat`: `(E, C)` per-edge type embeddings (src+dst)
 - `edge_vec`: `(E, 3)` in Å
 - `edge_rbf`: `(E, n_radial)` Bessel radial basis via sinc × C² envelope (trainable frequencies)
-- `edge_env`: `(E, 1)` C² cutoff envelope weights flattened to valid edges
+- `edge_env`: `(E, 1)` C³ cutoff envelope weights flattened to valid edges
 - `D_full`: `(E, D, D)` block-diagonal Wigner-D matrix
 - `Dt_full`: transpose of `D_full`
-- `inv_sqrt_deg`: `(N, 1, 1)` inverse sqrt degree for graph-style normalization
+- `inv_sqrt_deg`: `(N, 1, 1)` inverse sqrt smooth degree for graph-style normalization (`deg = sum(edge_env^2)`)
 
 ______________________________________________________________________
 
@@ -498,7 +503,7 @@ For each edge `(src -> dst)`:
    - no explicit contiguous call here
 1. **Multi-layer SO(2) mixing (pre-norm + residual + LayerScale)**: for each layer in `so2_linears`:
    - Save residual: `residual = x_local`
-   - Pre-norm: apply `inter_norm(x_local)` (ReducedSeparableRMSNorm when `so2_norm=True`, Identity otherwise; last layer always Identity)
+   - Pre-norm: apply `inter_norm(x_local)` (ReducedEquivariantRMSNorm when `so2_norm=True`, Identity otherwise; last layer always Identity)
    - Apply `SO2Linear` (group by `|m|`):
      - `m=0`: standard linear with additive bias (modulated by radial weights and cutoff to preserve strict smoothness on first layer); bias uses in-place add on preallocated output
      - `|m|>0`: 2x2 complex mixing on `(-m, +m)` pairs treated as `(Re, Im)`
@@ -520,6 +525,8 @@ For each edge `(src -> dst)`:
 1. **Rotate back (reduced)**:
    - reuse cached `project_Dt_from_m(Dt_full, coeff_index_m)` (shared across blocks and Script/eager)
    - `x_message = bmm(Dt_from_m, x_local)` gives `(E, D, C)`
+   - apply the inverse-rotation degree rescale for every `l > mmax` to restore
+     the full-basis amplitude after truncated local mixing
 1. **Aggregate with optional head gates**:
 
 - `n_atten_head == 0`: multiply by `edge_env`, scatter-sum by `dst`, then multiply by `inv_sqrt_deg`.
@@ -529,11 +536,12 @@ For each edge `(src -> dst)`:
     - Independent Q/K projections: `q = attn_q_proj(qk_input)`, `k = attn_k_proj(qk_input)`
     - Gather per-edge: `q_edge = q[dst]`, `k_edge = k[src]`, reshape to `(E, F, H, Dh)`
     - `logits = dot(q_edge, k_edge) / sqrt(head_dim) + attn_radial_logit_proj(radial_l0)`
-  - **Stable grouped softmax with envelope-weighted competition**:
+  - **Stable grouped softmax with envelope-gated competition**:
     - destination-wise max subtraction for numerical stability
-    - `unnormalized = exp(logits - grouped_max) * edge_env^p` (default `p=0.5`)
+    - `numerator = edge_env^2 * exp(logits - grouped_max)`
+    - `denominator = softplus(z_bias_raw) * exp(-grouped_max) + sum(edge_env^2 * exp(logits - grouped_max))`
     - normalize per destination (`index_add` denominator)
-  - Split value into `H = n_atten_head` heads, scale by `alpha * edge_env`, `index_add` by `dst`
+  - Split value into `H = n_atten_head` heads, scale by `alpha`, `index_add` by `dst`
   - Apply output-side head gate (G1 style):
     - `gate = sigmoid(attn_output_gate_proj(attn_output_gate_norm(x_l0_node)))`
     - gate is head-specific and query-dependent
@@ -612,9 +620,9 @@ x = block_i(x, edge_cache, radial_feat_i)  # block internally does:
 
 Components:
 
-- `pre_so2_norm`: `SeparableRMSNorm` applied before SO(2) convolution
+- `pre_so2_norm`: `EquivariantRMSNorm` applied before SO(2) convolution
 - `so2_conv`: `SO2Convolution` with pre-norm residual SO(2) mixing, optional per-focus-channel LayerScale, and final SO(3) channel mixing
-- `pre_ffn_norms[i]`: `SeparableRMSNorm` applied before each FFN subblock
+- `pre_ffn_norms[i]`: `EquivariantRMSNorm` applied before each FFN subblock
 - `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and gated activation
 - `adam_ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
 
@@ -678,21 +686,22 @@ Key arguments:
 - `focus_compete: bool` — If True, enable cross-focus softmax competition in SO(2) convolution. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus (default: True)
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
-- `so2_norm: bool` — If True, apply ReducedSeparableRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
+- `so2_norm: bool` — If True, apply ReducedEquivariantRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 4)
 - `so2_attn_res: str` — SO(2)-internal depth-wise attention residual mode inside each interaction block. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 96)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
-- `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and envelope-aware grouped softmax attention with output-side head gate is applied. Competition uses `edge_env^0.5`; value amplitude uses `edge_env`.
+- `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and envelope-gated grouped softmax attention with output-side head gate is applied. Attention uses `w^2 * exp(logit)` in the numerator and `zeta + sum(w^2 * exp(logit))` in the denominator.
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
-- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, DepthAttnRes input-dependent query projection, SeparableRMSNorm centering bias) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: True)
+- `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, DepthAttnRes input-dependent query projection) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: True)
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
 - `full_attn_res: str` — Descriptor-level full AttnRes mode over unit history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `block_attn_res: str` — Descriptor-level block AttnRes mode over block history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final block aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`). Cannot be enabled together with `full_attn_res`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: True)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: True)
+- `random_gamma: bool` — If True, sample an independent random roll `gamma ~ U[0, 2π)` for every edge on every forward call, build a local-`+Z` roll quaternion, and left-compose it with the edge-aligned quaternion before Wigner-D evaluation (default: True)
 
 Optimizer routing note:
 
@@ -817,18 +826,18 @@ ______________________________________________________________________
 
 ## Physics & Numerics
 
-### C² cutoff envelope
+### C³ cutoff envelope
 
-Envelope is DimeNet-style C²-continuous polynomial to enforce smooth PES at `rcut`:
+Envelope is a C³-continuous polynomial to enforce smoother high-order derivatives at `rcut`:
 
 For `x = r / rcut`:
 
-- `E(x) = 1 + x^5 * (-21 + 35*x - 15*x^2)` for `x in [0, 1)`
+- `E(x) = 1 - 56*x^5 + 140*x^6 - 120*x^7 + 35*x^8` for `x in [0, 1)`
 - `E(x) = 0` for `x >= 1`
 
-The coefficients satisfy `E(0)=1, E(1)=0, E'(1)=0, E''(1)=0`, ensuring C² continuity.
+The coefficients satisfy `E(0)=1, E(1)=0, E'(1)=0, E''(1)=0, E'''(1)=0`, ensuring C³ continuity.
 
-The C² envelope is applied in two places:
+The C³ envelope is applied in two places:
 
 1. In `RadialBasis.forward()`: multiplied into the radial basis functions
 1. As `edge_env`: applied to all edge messages
@@ -838,33 +847,59 @@ This double-guarantee ensures:
 - message is 0 at `rcut`
 - d(message)/dr is 0 at `rcut`
 - d²(message)/dr² is 0 at `rcut`
+- d³(message)/dr³ is 0 at `rcut`
 
 ### Conservative forces
 
-- Edge rotations are computed from `edge_vec` without detach.
-- Wigner-D blocks are computed from those rotations and remain differentiable.
-- Vector normalizations clamp squared norms before `sqrt` (e.g. `sqrt(clamp(||x||^2, eps^2))`) to avoid NaN gradients at zero vectors, even in masked branches.
+- Edge-local geometry stays on a single differentiable runtime chain:
+  `edge_vec -> stable edge quaternion -> Wigner-D`.
+- The edge quaternion is built directly from `edge_vec` without detach.
+- Wigner-D blocks are computed from those quaternions and remain differentiable.
+- Vector and quaternion normalizations clamp squared norms before `sqrt`
+  (e.g. `sqrt(clamp(||x||^2, eps^2))`) to avoid NaN gradients at zero vectors or masked branches.
 
 ### Wigner-D blocks (real SH basis)
 
 SeZM uses real-basis Wigner-D blocks to rotate per-degree features between the global frame
 and the edge-aligned local frame. The block-diagonal matrices are computed by
-`WignerDCalculator` in `deepmd/pt/model/descriptor/se_zm_helper.py`.
+`WignerDCalculator` in `deepmd/pt/model/descriptor/SeZM_WignerD.py`.
 
-#### Conventions
+#### Geometric contract
 
-- `rot_mat` is a global->local transform for 3D vectors:
-  - `v_local = rot_mat @ v_global`
-  - It is built by either `init_edge_rot_mat(edge_vec)` (Gram-Schmidt with a reference-axis switch) or `init_edge_rot_mat_frisvad(edge_vec)` (Frisvad ONB with a strict cross-product fallback near `-Z`) so that `rot_mat @ (edge_vec / ||edge_vec||) = (0, 0, 1)`.
+- `build_edge_quaternion(edge_vec)` returns a **global->local** edge rotation in quaternion form.
+- Its rotation matrix `R(q_edge)` satisfies:
+  - `v_local = R(q_edge) @ v_global`
+  - `R(q_edge) @ (edge_vec / ||edge_vec||) = (0, 0, 1)`
+- The quaternion is built from two exact edge-to-`+Z` charts:
+  - a chart regular away from the `-Z` pole
+  - a chart regular away from the `+Z` pole
+- A `C^inf` normalized-linear blend is used only inside their overlap, so the represented
+  edge-aligned rotation stays smooth across both pole neighborhoods.
+- When `random_gamma=True`, SeZM samples a per-edge roll `gamma` and left-composes
+  `q_gamma_z(gamma)` with the edge-aligned quaternion:
+  `q_total = q_gamma_z(gamma) * q_edge`.
+  This preserves the edge-alignment invariant because a local `+Z` roll leaves
+  `(0, 0, 1)` unchanged while randomizing the in-plane gauge.
+
+#### Representation contract
+
 - For each degree `l`, real SH channels are ordered by `m=-l..+l` (index `i = m + l`).
 - `D_full` is block-diagonal with block `l` occupying indices `[l^2 : (l+1)^2)`.
 - `Dt_full = D_full^T` is the inverse rotation (local->global).
+- `l=0` is the scalar identity block.
+- `l=1` is computed directly from the quaternion-induced Cartesian rotation.
+- `l=2` uses a dedicated degree-4 quaternion tensor-contraction kernel.
+- `l=3,4` use dedicated quaternion monomial kernels; when both are required they are
+  emitted by one shared degree-8 matrix multiply.
+- `l>=5` uses the generic quaternion polynomial evaluator, so arbitrary `lmax` remains
+  available without changing the packed representation contract.
 
 #### Usage in message passing
 
 - Rotate to local (reduced): `x_local = bmm(D_full[:, coeff_index_m, :], x_global)`
-- Rotate back (reduced): `x_global = bmm(Dt_full[:, :, coeff_index_m], x_local)`
-- `project_D_to_m` / `project_Dt_from_m` cache the projected blocks keyed by `(lmax, mmax)`.
+- Rotate back (reduced): `x_global = bmm(Dt_full[:, :, coeff_index_m], x_local) * rotate_inv_rescale(l)`
+- `project_D_to_m` / `project_Dt_from_m` cache the projected blocks keyed by the normalized
+  string key `"lmax:mmax"`.
 
 ### Padded neighbor safety
 
@@ -888,8 +923,8 @@ ______________________________________________________________________
 
 Why caching matters:
 
-- The expensive part is edge geometry + Wigner rotations.
-- Message passing blocks reuse the same per-edge rotations and radial features.
+- The expensive part is edge geometry + quaternion/Wigner generation.
+- Message passing blocks reuse the same per-edge rotation objects and radial features.
 - This avoids an O(#blocks) multiplier on per-edge trig/matrix ops.
 
 What is cached / reused:
@@ -901,7 +936,7 @@ What is cached / reused:
 
 - `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused via a single `embedding_bag` reduction and **per-block truncated slices** are prebuilt according to `l_schedule`.
 
-- Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `(lmax, mmax)`, shared by all blocks and available in both eager and TorchScript.
+- Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `"lmax:mmax"`, shared by all blocks and available in both eager and TorchScript.
 
 - Dtypes: `compute_dtype = get_promoted_dtype(dtype)` is set once in `__init__` and reused for geometry, radial basis/MLP, Wigner calculators, and the final l=0 mixer; runtime casts happen once on `extended_coord`, `radial_feat`, and the final scalar output.
 

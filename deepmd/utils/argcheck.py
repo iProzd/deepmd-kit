@@ -371,6 +371,11 @@ def descrpt_se_zm_args() -> list[Argument]:
         "rbf_out_dim=max(32, embed_dim-2*type_dim), "
         "hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))."
     )
+    doc_random_gamma = (
+        "If True, apply a random roll about the edge-aligned local +Z axis before "
+        "building Wigner-D blocks. The roll is sampled independently per edge and "
+        "per forward call."
+    )
     doc_lmax = "Maximum degree, only used when `l_schedule` is None."
     doc_l_schedule = "Pyramid schedule of lmax per block, e.g. [3, 3, 2]. Must be non-increasing. If set, lmax and n_blocks will be ignored."
     doc_mmax = "Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax."
@@ -387,7 +392,7 @@ def descrpt_se_zm_args() -> list[Argument]:
         "with `full_attn_res`."
     )
     doc_so2_norm = (
-        "If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers. "
+        "If True, apply intermediate ReducedEquivariantRMSNorm between SO(2) mixing layers. "
         "When False (default), no normalization is applied between layers."
     )
     doc_so2_layers = "Number of SO(2) mixing layers per block."
@@ -409,9 +414,10 @@ def descrpt_se_zm_args() -> list[Argument]:
         "Number of attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
         "the per-focus stream width `focus_dim = channels // n_focus` must be "
-        "divisible by `n_atten_head`, and envelope-aware grouped softmax attention "
-        "with output-side head gate is applied. Competition uses `edge_env**0.5` "
-        "while value amplitude uses `edge_env`."
+        "divisible by `n_atten_head`, and envelope-gated grouped softmax attention "
+        "with output-side head gate is applied. Attention uses "
+        "`w**2 * exp(logit)` in the numerator and "
+        "`zeta + sum(w**2 * exp(logit))` in the denominator."
     )
     doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
     doc_ffn_blocks = "Number of FFN sublayers per interaction block."
@@ -425,8 +431,6 @@ def descrpt_se_zm_args() -> list[Argument]:
         "- SO2Linear: l=0 bias\n"
         "- GatedActivation: gate linear bias\n"
         "- DepthAttnRes: input-dependent query projection\n"
-        "- SeparableRMSNorm: centering bias\n"
-        "- ReducedSeparableRMSNorm: centering bias\n"
         "- EnvironmentInitialEmbedding MLPs: rbf_proj_layer1/2 and g_layer1/2\n"
         "Attention projections in SO2Convolution "
         "(attn_radial_bias_proj, attn_output_gate_proj) are always bias-free."
@@ -489,6 +493,13 @@ def descrpt_se_zm_args() -> list[Argument]:
             optional=True,
             default=True,
             doc=doc_only_pt_supported + doc_use_env_seed,
+        ),
+        Argument(
+            "random_gamma",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_only_pt_supported + doc_random_gamma,
         ),
         Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
         Argument(

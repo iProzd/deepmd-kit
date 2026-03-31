@@ -10,8 +10,9 @@ This implementation is designed around two non-negotiables:
 2) Speed-first inference: edge geometry and Wigner-D rotation blocks are computed
    exactly once per `forward()` and reused by all interaction blocks.
 
-Core math utilities live in `se_zm_helper.py`, while per-block message passing
-is implemented in `se_zm_block.py`.
+Shared descriptor helpers live in `se_zm_helper.py`, quaternion/Wigner rotation
+utilities live in `SeZM_WignerD.py`, and per-block message passing is implemented
+in `se_zm_block.py`.
 
 Runtime flow at a glance:
 1) Build edge cache and radial features once.
@@ -75,7 +76,7 @@ from .se_zm_block import (
 )
 from .se_zm_helper import (
     ATTN_RES_MODES,
-    C2CutoffEnvelope,
+    C3CutoffEnvelope,
     EdgeFeatureCache,
     EnvironmentInitialEmbedding,
     GeometricInitialEmbedding,
@@ -83,16 +84,20 @@ from .se_zm_helper import (
     RadialBasis,
     RadialMLP,
     SeZMTypeEmbedding,
-    WignerDCalculator,
     build_edge_type_feat,
     edge_cache_to_dtype,
     get_promoted_dtype,
     get_so3_dim_of_lmax,
-    init_edge_rot_mat_frisvad,
     np_safe,
     nvtx_range,
     safe_norm,
     safe_numpy_to_tensor,
+)
+from .SeZM_WignerD import (
+    WignerDCalculator,
+    build_edge_quaternion,
+    quaternion_multiply,
+    quaternion_z_rotation,
 )
 
 if TYPE_CHECKING:
@@ -133,7 +138,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     rcut
         Cutoff radius in Å.
     env_exp
-        C^2 cutoff envelope exponents `[rbf_env_exp, edge_env_exp]`.
+        C^3 cutoff envelope exponents `[rbf_env_exp, edge_env_exp]`.
         - `rbf_env_exp`: Controls radial basis function envelope decay.
         - `edge_env_exp`: Controls message passing edge weight envelope decay.
         Larger values give weaker suppression (values stay near 1.0 longer).
@@ -154,6 +159,10 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         `type_dim=clamp(channels//4, 8, 32)`,
         `rbf_out_dim=max(32, embed_dim-2*type_dim)`,
         `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))`.
+    random_gamma
+        If True, apply a random roll about the edge-aligned local ``+Z`` axis
+        before building the Wigner-D blocks. The roll is sampled independently
+        per edge and per forward call.
     lmax
         Maximum degree, only used when `l_schedule` is None.
     l_schedule
@@ -169,7 +178,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     n_blocks
         Number of blocks (only used when `l_schedule` is None).
     so2_norm
-        If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
+        If True, apply intermediate ReducedEquivariantRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers per block.
@@ -186,9 +195,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     n_atten_head
         Number of attention heads when aggregating messages in SO(2) convolution.
         0 applies a plain envelope-weighted scatter-sum; >0 enables
-        envelope-aware grouped softmax attention with output-side head gate.
-        Competition is weighted by ``edge_env**0.5`` and value amplitude is
-        scaled by ``edge_env``.
+        envelope-gated grouped softmax attention with output-side head gate.
+        Attention uses ``w**2 * exp(logit)`` in the numerator and
+        ``zeta + sum(w**2 * exp(logit))`` in the denominator.
         When enabled, the per-focus stream width
         ``focus_dim = channels // n_focus`` must be divisible by ``n_atten_head``.
     ffn_neurons
@@ -204,8 +213,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         - SO2Linear: l=0 bias
         - GatedActivation: gate linear bias
         - DepthAttnRes: input-dependent query projection
-        - SeparableRMSNorm: centering bias
-        - ReducedSeparableRMSNorm: centering bias
         - EnvironmentInitialEmbedding:
           rbf_proj_layer1/2 and g_layer1/2
         Attention projections in SO2Convolution
@@ -275,6 +282,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
         use_env_seed: bool = True,
+        random_gamma: bool = True,
         lmax: int = 2,
         l_schedule: list[int] | None = None,
         mmax: int | None = None,
@@ -362,6 +370,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.use_amp = bool(use_amp)  # and self.training
         self.trainable = bool(trainable)
         self.seed = seed
+        self.random_gamma = bool(random_gamma)
 
         # === Inner clamping for zone bridging ===
         self.inner_clamp_r_inner = (
@@ -530,8 +539,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             seed=seed_radial_embedding,
         )
 
-        # === C^2 cutoff envelope for edge weight ===
-        self.c2_envelope = C2CutoffEnvelope(rcut=self.rcut, exponent=self.env_exp[1])
+        # === C^3 cutoff envelope for edge weight ===
+        self.edge_envelope = C3CutoffEnvelope(rcut=self.rcut, exponent=self.env_exp[1])
 
         wigner_lmax = self.l_schedule[0]
         # force fp32+
@@ -1142,10 +1151,11 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         - per-edge endpoints: ``src``, ``dst`` and per-edge type features: ``edge_type_feat`` (src+dst)
         - per-edge geometry: ``edge_vec``
-        - per-edge smooth weights: C^2 cutoff envelope ``edge_env``
+        - per-edge smooth weights: C^3 cutoff envelope ``edge_env``
         - per-edge radial basis: ``edge_rbf`` (envelope already baked in)
         - per-edge rotation blocks: block-diagonal Wigner-D matrices ``D_full`` and ``Dt_full``
-        - destination-node normalization: ``inv_sqrt_deg`` for neighbor norm
+        - destination-node smooth normalization: ``inv_sqrt_deg`` from
+          envelope-squared degree ``sum(edge_env**2)``
 
         Notes
         -----
@@ -1224,14 +1234,14 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         # information about the true distance when r < r_inner.
         if self.inner_clamp is not None:
             clamped = self.inner_clamp(length)  # (nf, nloc, nnei, 1)
-            scale = clamped / length.clamp(min=self.eps)
+            scale = clamped / length
             diff = diff * scale  # direction preserved, length → clamped
             length = clamped
 
-        # === Step 4. C^2 envelope weight `sw` ===
-        # sw is the C^2-continuous cutoff envelope weight in [0, 1], applied per neighbor pair.
+        # === Step 4. C^3 envelope weight `sw` ===
+        # sw is the C^3-continuous cutoff envelope weight in [0, 1], applied per neighbor pair.
         with nvtx_range("envelope"):
-            sw = self.c2_envelope(length)  # (nf, nloc, nnei, 1)
+            sw = self.edge_envelope(length)  # (nf, nloc, nnei, 1)
             sw = sw * rearrange(keep, "nf nloc nnei -> nf nloc nnei 1").to(
                 dtype=sw.dtype
             )
@@ -1241,7 +1251,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         #   - it is not padding (nlist >= 0)
         #   - the type pair is allowed (pair_keep_mask)
         # Note: We do NOT filter by `length < rcut` here. Edges beyond rcut have
-        # edge_env=0 (from C2CutoffEnvelope), so their messages naturally vanish.
+        # edge_env=0 (from C3CutoffEnvelope), so their messages naturally vanish.
         # This avoids the dynamic-output-size `nonzero` kernel and enables smoother
         # degree/normalization (no discontinuous edge count jumps at rcut boundary).
         with nvtx_range("filter"):
@@ -1339,45 +1349,27 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         with nvtx_range("radial_basis"):
             edge_rbf = self.radial_basis(edge_len)  # (E, n_radial)
 
-        # === Step 9. Wigner-D blocks ===
-        with nvtx_range("rot_mat"):
-            rot_mat = init_edge_rot_mat_frisvad(  # (E, 3, 3)
-                edge_vec, edge_len=edge_len, eps=self.eps
-            )
+        # === Step 9. Edge quaternion -> Wigner-D blocks ===
         with nvtx_range("wigner_d"):
-            D_full, Dt_full = self.wigner_calc(rot_mat)  # (E, D, D), (E, D, D)
+            D_full, Dt_full = self._build_edge_wigner(
+                edge_vec=edge_vec, edge_len=edge_len
+            )  # (E, D, D), (E, D, D)
 
-        edge_type_feat = build_edge_type_feat(  # (E, C)
+        edge_type_feat = build_edge_type_feat(
             type_ebed, src, dst, num_edges=num_edges
-        )
+        )  # (E, C)
 
-        # === Step 10. Neighbor normalization (destination degree) ===
-        # Compute inverse sqrt degree for graph-style message normalization.
-        with nvtx_range("degree"):
-            deg = torch.zeros(
-                n_nodes, dtype=edge_vec.dtype, device=edge_vec.device
-            )  # (N,)
-            ones = torch.ones_like(dst, dtype=edge_vec.dtype)  # (E,)
-            deg.index_add_(0, dst, ones)  # (N,)
-            inv_sqrt_deg = rearrange(  # (N, 1, 1)
-                torch.rsqrt(deg.clamp(min=1)), "N -> N 1 1"
-            )
-
-        cache = EdgeFeatureCache(
-            src=src,  # (E,)
-            dst=dst,  # (E,)
-            edge_type_feat=edge_type_feat,  # (E, C)
-            edge_vec=edge_vec,  # (E, 3)
-            edge_rbf=edge_rbf,  # (E, n_radial)
-            edge_env=edge_env,  # (E, 1)
-            deg=deg,  # (N,)
-            inv_sqrt_deg=inv_sqrt_deg,  # (N, 1, 1)
-            D_full=D_full,  # (E, D, D)
-            Dt_full=Dt_full,  # (E, D, D)
-            D_to_m_cache={},
-            Dt_from_m_cache={},
+        return self._finalize_edge_cache(
+            n_nodes=n_nodes,
+            src=src,
+            dst=dst,
+            edge_type_feat=edge_type_feat,
+            edge_vec=edge_vec,
+            edge_rbf=edge_rbf,
+            edge_env=edge_env,
+            D_full=D_full,
+            Dt_full=Dt_full,
         )
-        return cache
 
     def build_edge_cache_from_edges(
         self,
@@ -1430,19 +1422,17 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             edge_len = safe_norm(edge_vec, self.eps)
             if self.inner_clamp is not None:
                 clamped = self.inner_clamp(edge_len)
-                scale = clamped / edge_len.clamp(min=self.eps)
+                scale = clamped / edge_len
                 edge_vec = edge_vec * scale
                 edge_len = clamped
-            edge_env = self.c2_envelope(edge_len) * edge_keep_f  # (E, 1)
+            edge_env = self.edge_envelope(edge_len) * edge_keep_f  # (E, 1)
             edge_rbf = self.radial_basis(edge_len) * edge_keep_f  # (E, n_radial)
 
-        # === Step 4. Rotation blocks ===
-        with nvtx_range("rot_mat"):
-            rot_mat = init_edge_rot_mat_frisvad(
-                edge_vec, edge_len=edge_len, eps=self.eps
-            )
+        # === Step 4. Edge quaternion -> Wigner-D blocks ===
         with nvtx_range("wigner_d"):
-            D_full, Dt_full = self.wigner_calc(rot_mat)
+            D_full, Dt_full = self._build_edge_wigner(
+                edge_vec=edge_vec, edge_len=edge_len
+            )  # (E, D, D), (E, D, D)
 
         # === Step 5. Edge type features ===
         edge_type_feat = build_edge_type_feat(
@@ -1450,17 +1440,65 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         )
         edge_type_feat = edge_type_feat * edge_keep_f.to(dtype=edge_type_feat.dtype)
 
-        # === Step 6. Neighbor normalization ===
+        return self._finalize_edge_cache(
+            n_nodes=n_nodes,
+            src=src,
+            dst=dst,
+            edge_type_feat=edge_type_feat,
+            edge_vec=edge_vec,
+            edge_rbf=edge_rbf,
+            edge_env=edge_env,
+            D_full=D_full,
+            Dt_full=Dt_full,
+        )
+
+    def _build_edge_wigner(
+        self,
+        *,
+        edge_vec: torch.Tensor,
+        edge_len: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build packed Wigner blocks from edge vectors through the quaternion path."""
+        edge_quat = build_edge_quaternion(
+            edge_vec,
+            edge_len=edge_len,
+            eps=self.eps,
+        )
+        if self.random_gamma:
+            gamma = torch.rand(
+                edge_quat.shape[0],
+                dtype=edge_quat.dtype,
+                device=edge_quat.device,
+            ) * (2.0 * math.pi)
+            edge_quat = quaternion_multiply(quaternion_z_rotation(gamma), edge_quat)
+        return self.wigner_calc(edge_quat)
+
+    def _finalize_edge_cache(
+        self,
+        *,
+        n_nodes: int,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        edge_type_feat: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_rbf: torch.Tensor,
+        edge_env: torch.Tensor,
+        D_full: torch.Tensor,
+        Dt_full: torch.Tensor,
+    ) -> EdgeFeatureCache:
+        """Assemble the shared edge cache layout for both eager and compile paths."""
         with nvtx_range("degree"):
             deg = torch.zeros(
                 n_nodes, dtype=edge_vec.dtype, device=edge_vec.device
             )  # (N,)
-            deg.index_add_(0, dst, edge_keep_f.squeeze(-1))
+            deg.index_add_(
+                0, dst, edge_env.squeeze(-1).to(dtype=edge_vec.dtype).square()
+            )
             inv_sqrt_deg = rearrange(
-                torch.rsqrt(deg.clamp(min=1)), "N -> N 1 1"
+                torch.rsqrt(deg + self.eps), "N -> N 1 1"
             )  # (N, 1, 1)
 
-        cache = EdgeFeatureCache(
+        return EdgeFeatureCache(
             src=src,
             dst=dst,
             edge_type_feat=edge_type_feat,
@@ -1474,7 +1512,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             D_to_m_cache={},
             Dt_from_m_cache={},
         )
-        return cache
 
     def _edge_type_keep_mask(
         self,
@@ -1694,7 +1731,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     # =========================================================================
     # Statistics interface (interface compatibility only)
     # -------------------------------------------------------------------------
-    # SeZM uses SeparableRMSNorm inside blocks for feature normalization,
+    # SeZM uses EquivariantRMSNorm inside blocks for feature normalization,
     # so mean/stddev are NOT used in forward(). These methods are kept for:
     #   1. Interface compatibility with BaseDescriptor
     #   2. Consistent serialization format (davg/dstd in checkpoint)
@@ -1719,13 +1756,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         """
         Compute statistics (interface compatibility, not used in forward).
 
-        SeZM uses learnable SeparableRMSNorm for normalization, so these
+        SeZM uses learnable EquivariantRMSNorm for normalization, so these
         statistics do not affect the forward pass. This is a no-op that keeps
         mean/stddev at their initialized values (zero/one) for interface consistency.
         """
         del merged, path
         # No-op: mean and stddev are already initialized to zero/one in __init__
-        # and are not used in forward() due to SeparableRMSNorm.
+        # and are not used in forward() due to EquivariantRMSNorm.
 
     def serialize(self) -> dict[str, Any]:
         state = self.state_dict()
@@ -1748,6 +1785,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "n_radial": self.n_radial,
                 "radial_mlp": self.radial_mlp,
                 "use_env_seed": self.use_env_seed,
+                "random_gamma": self.random_gamma,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,
                 "so2_attn_res": self.so2_attn_res_mode,

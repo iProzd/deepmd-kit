@@ -51,6 +51,7 @@ from .se_zm_helper import (
     EdgeFeatureCache,
     build_m_major_index,
     build_m_major_l_index,
+    build_rotate_inv_rescale,
     get_promoted_dtype,
     get_so3_dim_of_lmax,
     init_trunc_normal_fan_in_out,
@@ -60,7 +61,7 @@ from .se_zm_helper import (
     project_D_to_m,
     project_Dt_from_m,
     safe_numpy_to_tensor,
-    segment_softmax_with_env_weight,
+    segment_envelope_gated_softmax,
 )
 
 if TYPE_CHECKING:
@@ -408,25 +409,30 @@ class GatedActivation(nn.Module):
         return obj
 
 
-class SeparableRMSNorm(nn.Module):
+class EquivariantRMSNorm(nn.Module):
     """
-    Separable RMSNorm with Degree Balancing.
+    Degree-balanced equivariant RMS normalization on packed `(l, m)` layout.
 
-    Features:
-        1. Separable: l=0 and l>0 are normalized independently.
-        2. Degree Balancing: For l>0, the RMS is computed such that each degree l
-           contributes equally, regardless of the number of m components (2l+1).
+    The scalar slice `l=0` is optionally mean-centered across channels before the
+    shared RMS is evaluated. All coefficients, including the centered scalar
+    slice, contribute to the same per-sample and per-focus RMS. Degree balancing
+    assigns each coefficient from degree `l` the weight
+    `1 / ((2 * l + 1) * (lmax + 1))`, so each degree contributes equally
+    regardless of its multiplicity. A learnable per-focus, per-degree scale is
+    then expanded to all `m` coefficients, and an optional learnable bias is
+    added only to the scalar slice.
 
     Parameters
     ----------
     lmax
         Maximum spherical harmonic degree.
     channels
-        Channels per (l, m) coefficient in each focus stream.
+        Channels per `(l, m)` coefficient in each focus stream.
     n_focus
-        Number of focus streams. Norm affine parameters are independent per focus.
+        Number of focus streams. Affine parameters are independent per focus.
     centering
-        Whether to apply mean centering for l=0 features.
+        Whether to mean-center the scalar slice `l=0` across channels before
+        RMS normalization.
     eps
         Small epsilon for numerical stability.
     dtype
@@ -443,7 +449,7 @@ class SeparableRMSNorm(nn.Module):
         n_focus: int = 1,
         centering: bool = True,
         *,
-        eps: float = 1e-7,
+        eps: float = 1e-5,
         dtype: torch.dtype,
         trainable: bool,
     ) -> None:
@@ -479,38 +485,24 @@ class SeparableRMSNorm(nn.Module):
             self.register_parameter("bias", None)
 
         # === Step 2. Index and Weight Buffers ===
-        if self.lmax > 0:
-            # Expand index for weight application
-            expand_index = map_degree_idx(self.lmax, device=self.device)[1:]
-            self.register_buffer("expand_index", expand_index, persistent=True)
+        expand_index = map_degree_idx(self.lmax, device=self.device)
+        self.register_buffer("expand_index", expand_index, persistent=True)
 
-            # Degree Balancing: weight each m component by 1/(2l+1) so that each
-            # degree l contributes equally to the variance, regardless of the
-            # number of m components.
-            # Pre-fuse divisors: w_d = 1/(2l+1) / lmax / C, so that
-            #   mean_variance = einsum('ndfc,d->nf', x^2, balance_weight)
-            # avoids allocating the intermediate (N, D-1, F, C) tensor.
-            weights_list = []
-            scale = 1.0 / (self.lmax * self.channels)
-            for l in range(1, self.lmax + 1):
-                w = scale / (2 * l + 1)
-                weights_list.extend([w] * (2 * l + 1))
-            # Shape: (D_non_scalar,) for fused einsum
-            balance_weight = torch.tensor(
-                weights_list, dtype=self.dtype, device=self.device
-            )
-            self.register_buffer("balance_weight", balance_weight, persistent=True)
-        else:
-            self.register_buffer(
-                "expand_index",
-                torch.zeros(0, dtype=torch.long, device=self.device),
-                persistent=True,
-            )
-            self.register_buffer(
-                "balance_weight",
-                torch.zeros(0, dtype=self.dtype, device=self.device),
-                persistent=True,
-            )
+        # Pre-fuse degree balancing and channel averaging into a single weight:
+        #   w_d = 1 / ((2l+1) * (lmax+1) * C)
+        # so that
+        #   mean_variance = einsum('ndfc,d->nf', x^2, balance_weight)
+        # directly computes the shared RMS statistic without allocating an
+        # intermediate (N, D, F, C) buffer beyond x^2 itself.
+        weights_list = []
+        scale = 1.0 / ((self.lmax + 1) * self.channels)
+        for l in range(self.lmax + 1):
+            w = scale / (2 * l + 1)
+            weights_list.extend([w] * (2 * l + 1))
+        balance_weight = torch.tensor(
+            weights_list, dtype=self.dtype, device=self.device
+        )
+        self.register_buffer("balance_weight", balance_weight, persistent=True)
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -520,59 +512,57 @@ class SeparableRMSNorm(nn.Module):
         Parameters
         ----------
         x
-            Features with shape (N, D, F, C) where D=(lmax+1)^2.
+            Features with shape `(N, D, F, C)` where `D = (lmax + 1)^2`.
 
         Returns
         -------
         torch.Tensor
-            Normalized features with shape (N, D, F, C), same dtype as input.
+            Normalized features with shape `(N, D, F, C)`, same dtype as input.
         """
         in_dtype = x.dtype
         x = x.to(dtype=self.dtype)
         x0 = x[:, :1, :, :]  # (N, 1, F, C)
         xt = x[:, 1:, :, :]  # (N, D-1, F, C)
 
-        # === Step 1. l=0: Standard RMS Norm ===
+        # === Step 1. Center the scalar slice ===
         if self.centering:
             x0 = x0 - x0.mean(dim=-1, keepdim=True)
-        inv_rms0 = torch.rsqrt(  # (N, 1, F, 1)
-            x0.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        )
-        x0 = x0 * inv_rms0
 
-        scale0 = self.adam_scale[:, 0, :].reshape(
-            1, 1, self.n_focus, -1
-        )  # (1, 1, F, C)
-        x0 = x0 * scale0
+        # === Step 2. Compute a shared degree-balanced RMS ===
+        mean_variance = x0.square().sum(dim=(1, 3)) * self.balance_weight[0]
+        if xt.numel() > 0:
+            mean_variance = mean_variance + torch.einsum(
+                "ndfc,d->nf", xt * xt, self.balance_weight[1:]
+            )
+        inv_rms = torch.rsqrt(mean_variance + self.eps).unsqueeze(1).unsqueeze(-1)
+
+        x0 = x0 * inv_rms
+        if xt.numel() > 0:
+            xt = xt * inv_rms
+
+        # === Step 3. Apply per-degree affine parameters ===
+        expanded_scale = torch.index_select(
+            self.adam_scale, dim=1, index=self.expand_index
+        )
+        expanded_scale = expanded_scale.permute(1, 0, 2).unsqueeze(0)  # (1, D, F, C)
+        x0 = x0 * expanded_scale[:, :1, :, :]
+        if xt.numel() > 0:
+            xt = xt * expanded_scale[:, 1:, :, :]
+
+        # === Step 4. Add scalar bias and restore layout ===
         if self.centering:
             bias0 = self.bias.reshape(1, 1, self.n_focus, -1)  # (1, 1, F, C)
             x0 = x0 + bias0
 
-        if xt.numel() == 0:
-            return x0.to(dtype=in_dtype)
-
-        # === Step 2. l>0: Degree-Balanced RMS Norm ===
-        # Fused weighted sum: einsum avoids allocating intermediate (N, D-1, F, C) tensor.
-        # balance_weight already pre-fused with 1/(lmax * C).
-        mean_variance = torch.einsum(  # (N, F)
-            "ndfc,d->nf", xt * xt, self.balance_weight
-        )
-        inv_rmst = torch.rsqrt(mean_variance + self.eps).unsqueeze(1).unsqueeze(-1)
-        xt = xt * inv_rmst
-
-        wt = torch.index_select(  # (F, D-1, C)
-            self.adam_scale, dim=1, index=self.expand_index
-        )
-        xt = xt * wt.permute(1, 0, 2).reshape(1, wt.shape[1], self.n_focus, wt.shape[2])
-
-        out = torch.cat([x0, xt], dim=1).to(dtype=in_dtype)
+        out = x0 if xt.numel() == 0 else torch.cat([x0, xt], dim=1)
+        out = out.to(dtype=in_dtype)
         return out
 
     def serialize(self) -> dict[str, Any]:
         trainable = all(p.requires_grad for p in self.parameters())
         state = self.state_dict()
         return {
-            "@class": "SeparableRMSNorm",
+            "@class": "EquivariantRMSNorm",
             "@version": 1,
             "config": {
                 "lmax": self.lmax,
@@ -587,14 +577,14 @@ class SeparableRMSNorm(nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> SeparableRMSNorm:
+    def deserialize(cls, data: dict[str, Any]) -> EquivariantRMSNorm:
         data = data.copy()
         data_cls = data.pop("@class")
-        if data_cls != "SeparableRMSNorm":
-            raise ValueError(f"Invalid class for SeparableRMSNorm: {data_cls}")
+        if data_cls != "EquivariantRMSNorm":
+            raise ValueError(f"Invalid class for EquivariantRMSNorm: {data_cls}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported SeparableRMSNorm version: {version}")
+            raise ValueError(f"Unsupported EquivariantRMSNorm version: {version}")
         config = data.pop("config")
         variables = data.pop("@variables")
         precision = config.pop("precision")
@@ -611,9 +601,19 @@ class SeparableRMSNorm(nn.Module):
         return obj
 
 
-class ReducedSeparableRMSNorm(nn.Module):
+class ReducedEquivariantRMSNorm(nn.Module):
     """
-    Separable RMSNorm for m-major truncated SO(2) layout.
+    Degree-balanced equivariant RMS normalization on reduced m-major layout.
+
+    The scalar slice `l=0` is optionally mean-centered across channels before the
+    shared RMS is evaluated. All retained coefficients, including the centered
+    scalar slice, contribute to the same per-edge and per-focus RMS. Degree
+    balancing assigns each retained coefficient from degree `l` the weight
+    `1 / (n_coeff_l * (lmax + 1))`, where
+    `n_coeff_l = 2 * min(l, mmax) + 1` is the number of retained coefficients
+    for that degree in the reduced layout. A learnable per-focus, per-degree
+    scale is expanded with `degree_index_m`, and an optional learnable bias is
+    added only to the scalar slice.
 
     Parameters
     ----------
@@ -622,15 +622,15 @@ class ReducedSeparableRMSNorm(nn.Module):
     mmax
         Maximum order kept in the truncated layout.
     channels
-        Number of channels per coefficient.
+        Number of channels per retained coefficient.
     degree_index_m
-        Degree index per coefficient in m-major truncated layout, with shape (D_m_trunc,).
+        Degree index per coefficient in m-major truncated layout, with shape
+        `(D_m_trunc,)`.
     n_focus
         Number of focus streams.
-    affine
-        Whether to apply per-l learnable scale.
     centering
-        Whether to mean-center scalar (l=0) features.
+        Whether to mean-center scalar `l=0` features across channels before RMS
+        normalization.
     eps
         Epsilon for numerical stability.
     dtype
@@ -648,9 +648,8 @@ class ReducedSeparableRMSNorm(nn.Module):
         channels: int,
         degree_index_m: torch.Tensor,
         n_focus: int = 1,
-        affine: bool = True,
         centering: bool = True,
-        eps: float = 1e-7,
+        eps: float = 1e-5,
         dtype: torch.dtype,
         trainable: bool,
     ) -> None:
@@ -659,7 +658,6 @@ class ReducedSeparableRMSNorm(nn.Module):
         self.mmax = int(mmax)
         self.channels = int(channels)
         self.n_focus = int(n_focus)
-        self.affine = bool(affine)
         self.centering = bool(centering)
         self.eps = float(eps)
         self.dtype = dtype
@@ -669,44 +667,44 @@ class ReducedSeparableRMSNorm(nn.Module):
             degree_index_m = degree_index_m.to(dtype=torch.long)
         self.register_buffer("degree_index_m", degree_index_m, persistent=True)
 
-        deg_ns = degree_index_m[1:]
-        weights = torch.zeros(deg_ns.numel(), dtype=self.dtype, device=self.device)
-        scale = 1.0 / (max(1, self.lmax) * max(1, self.channels))
-        for l in range(1, self.lmax + 1):
+        # Pre-fuse degree balancing and channel averaging into a single weight:
+        #   w_d = 1 / (n_coeff_l * (lmax+1) * C)
+        # where n_coeff_l is the number of retained coefficients for degree l in
+        # the reduced layout.
+        weights = torch.zeros(
+            degree_index_m.numel(), dtype=self.dtype, device=self.device
+        )
+        scale = 1.0 / ((self.lmax + 1) * self.channels)
+        for l in range(self.lmax + 1):
             n_coeff_l = 2 * min(l, self.mmax) + 1
             w_l = scale / float(n_coeff_l)
-            weights[deg_ns == l] = w_l
+            weights[degree_index_m == l] = w_l
         if torch.any(weights == 0):
             raise ValueError(
-                "ReducedSeparableRMSNorm: balance_weight has zeros; degree_index_m may be invalid."
+                "ReducedEquivariantRMSNorm: balance_weight has zeros; degree_index_m may be invalid."
             )
         self.register_buffer("balance_weight", weights, persistent=True)
 
-        if self.affine:
-            # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
-            self.adam_scale = nn.Parameter(
-                torch.ones(
+        # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
+        self.adam_scale = nn.Parameter(
+            torch.ones(
+                self.n_focus,
+                self.lmax + 1,
+                self.channels,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        )
+        if self.centering:
+            self.bias0 = nn.Parameter(
+                torch.zeros(
                     self.n_focus,
-                    self.lmax + 1,
                     self.channels,
                     dtype=self.dtype,
                     device=self.device,
                 )
             )
-            self.bias0 = (
-                nn.Parameter(
-                    torch.zeros(
-                        self.n_focus,
-                        self.channels,
-                        dtype=self.dtype,
-                        device=self.device,
-                    )
-                )
-                if self.centering
-                else None
-            )
         else:
-            self.register_parameter("adam_scale", None)
             self.register_parameter("bias0", None)
 
         for p in self.parameters():
@@ -722,62 +720,59 @@ class ReducedSeparableRMSNorm(nn.Module):
         Returns
         -------
         torch.Tensor
-            Normalized tensor with shape (E, F, D_m_trunc, C), same dtype as input.
+            Normalized tensor with shape `(E, F, D_m_trunc, C)`, same dtype as
+            input.
         """
         in_dtype = x.dtype
         x = x.to(dtype=self.dtype)
         x0 = x[:, :, :1, :]  # (E, F, 1, C)
         xt = x[:, :, 1:, :]  # (E, F, D_m_trunc-1, C)
 
+        # === Step 1. Center the scalar slice ===
         if self.centering:
             x0 = x0 - x0.mean(dim=-1, keepdim=True)
-        inv_rms0 = torch.rsqrt(  # (E, 1, 1)
-            x0.pow(2).mean(dim=-1, keepdim=True) + self.eps
-        )
-        x0 = x0 * inv_rms0
 
-        if xt.numel() == 0:
-            if self.affine:
-                x0.mul_(self.adam_scale[:, 0, :].reshape(1, self.n_focus, 1, -1))
-                if self.centering:
-                    x0 += self.bias0.reshape(1, self.n_focus, 1, -1)
-            return x0.to(dtype=in_dtype)
-
-        mean_var = torch.einsum(  # (E, F)
-            "efdc,d->ef", xt * xt, self.balance_weight
-        )
-        inv_rmst = torch.rsqrt(mean_var + self.eps).unsqueeze(-1).unsqueeze(-1)
-        xt = xt * inv_rmst
-
-        if self.affine:
-            w = torch.index_select(  # (D_m_trunc, C)
-                self.adam_scale, dim=1, index=self.degree_index_m
+        # === Step 2. Compute a shared degree-balanced RMS ===
+        mean_variance = x0.square().sum(dim=(2, 3)) * self.balance_weight[0]
+        if xt.numel() > 0:
+            mean_variance = mean_variance + torch.einsum(
+                "efdc,d->ef", xt * xt, self.balance_weight[1:]
             )
-            w0 = w[:, 0, :].reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
-            wt = w[:, 1:, :].reshape(
-                1, self.n_focus, w.shape[1] - 1, w.shape[2]
-            )  # (1, F, D_m_trunc-1, C)
-            x0.mul_(w0)
-            xt.mul_(wt)
-            if self.centering:
-                bias0 = self.bias0.reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
-                x0 += bias0
+        inv_rms = torch.rsqrt(mean_variance + self.eps).unsqueeze(-1).unsqueeze(-1)
 
-        out = torch.cat([x0, xt], dim=2).to(dtype=in_dtype)
+        x0 = x0 * inv_rms
+        if xt.numel() > 0:
+            xt = xt * inv_rms
+
+        # === Step 3. Apply per-degree affine parameters ===
+        expanded_scale = torch.index_select(
+            self.adam_scale, dim=1, index=self.degree_index_m
+        )
+        expanded_scale = expanded_scale.unsqueeze(0)  # (1, F, D_m_trunc, C)
+        x0 = x0 * expanded_scale[:, :, :1, :]
+        if xt.numel() > 0:
+            xt = xt * expanded_scale[:, :, 1:, :]
+
+        # === Step 4. Add scalar bias and restore layout ===
+        if self.centering:
+            bias0 = self.bias0.reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
+            x0 = x0 + bias0
+
+        out = x0 if xt.numel() == 0 else torch.cat([x0, xt], dim=2)
+        out = out.to(dtype=in_dtype)
         return out
 
     def serialize(self) -> dict[str, Any]:
         trainable = all(p.requires_grad for p in self.parameters())
         state = self.state_dict()
         return {
-            "@class": "ReducedSeparableRMSNorm",
+            "@class": "ReducedEquivariantRMSNorm",
             "@version": 1,
             "config": {
                 "lmax": self.lmax,
                 "mmax": self.mmax,
                 "channels": self.channels,
                 "n_focus": self.n_focus,
-                "affine": self.affine,
                 "centering": self.centering,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
@@ -787,14 +782,16 @@ class ReducedSeparableRMSNorm(nn.Module):
         }
 
     @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> ReducedSeparableRMSNorm:
+    def deserialize(cls, data: dict[str, Any]) -> ReducedEquivariantRMSNorm:
         data = data.copy()
         data_cls = data.pop("@class")
-        if data_cls != "ReducedSeparableRMSNorm":
-            raise ValueError(f"Invalid class for ReducedSeparableRMSNorm: {data_cls}")
+        if data_cls != "ReducedEquivariantRMSNorm":
+            raise ValueError(f"Invalid class for ReducedEquivariantRMSNorm: {data_cls}")
         version = int(data.pop("@version"))
         if version != 1:
-            raise ValueError(f"Unsupported ReducedSeparableRMSNorm version: {version}")
+            raise ValueError(
+                f"Unsupported ReducedEquivariantRMSNorm version: {version}"
+            )
         config = data.pop("config")
         variables = data.pop("@variables")
         precision = config.pop("precision")
@@ -1704,8 +1701,8 @@ class SO2Convolution(nn.Module):
        `inter_norm -> SO2Linear -> non_linearity -> residual(+LayerScale)`.
     5. rotate local -> global with cached `Dt_from_m`.
     6. edge aggregation (plain envelope scatter or envelope-aware grouped
-       softmax attention with envelope-weighted competition, value envelope
-       decay, and output-side head gate).
+       softmax attention with exact envelope-gated competition and
+       output-side head gate).
     7. `post_focus_mix`: full-channel mixing on aggregated messages.
 
     Equivariance is preserved because both `pre_focus_mix` and `post_focus_mix`
@@ -1728,7 +1725,7 @@ class SO2Convolution(nn.Module):
         Competition logits are constructed only from l=0 scalar channels and the
         resulting invariant weights are broadcast to all (l, m) components.
     so2_norm
-        If True, apply intermediate ReducedSeparableRMSNorm as pre-norm before
+        If True, apply intermediate ReducedEquivariantRMSNorm as pre-norm before
         each SO(2) mixing layer. The last SO(2) layer always uses Identity.
     so2_layers
         Number of SO2Linear layers per convolution (default: 1).
@@ -1743,12 +1740,13 @@ class SO2Convolution(nn.Module):
     n_atten_head
         Number of attention heads used during aggregation.
         - 0: plain envelope-weighted scatter-sum.
-        - >0: envelope-aware grouped softmax attention with output-side head
-          gates.
+        - >0: envelope-gated grouped softmax attention with output-side head
+          gates. Attention uses ``w**2 * exp(logit)`` in the numerator and
+          ``zeta + sum(w**2 * exp(logit))`` in the denominator.
         Requires ``focus_dim % n_atten_head == 0``.
     mlp_bias
-        Whether to use bias in SO2Linear (l=0 bias), GatedActivation (gate linear bias),
-        and ReducedSeparableRMSNorm (centering bias).
+        Whether to use bias in SO2Linear (l=0 bias) and GatedActivation
+        (gate linear bias).
     eps
         Small epsilon for normalization modules.
     dtype
@@ -1793,7 +1791,6 @@ class SO2Convolution(nn.Module):
         self.focus_compete = bool(focus_compete)
         self.focus_softmax_tau = 1.0
         self.focus_label_smoothing = 0.02
-        self.attn_env_logit_power = 0.5
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
         if self.so2_layers < 1:
@@ -1826,8 +1823,19 @@ class SO2Convolution(nn.Module):
         # === Step 1. Precompute coefficient indices for m-major reduced layout ===
         coeff_index_m = build_m_major_index(self.lmax, self.mmax, device=self.device)
         degree_index_m = build_m_major_l_index(self.lmax, self.mmax, device=self.device)
+        degree_index_full = map_degree_idx(self.lmax, device=self.device)
+        rotate_inv_rescale_full = build_rotate_inv_rescale(
+            lmax=self.lmax,
+            mmax=self.mmax,
+            degree_index=degree_index_full,
+            device=self.device,
+            dtype=self.dtype,
+        )
         self.register_buffer("coeff_index_m", coeff_index_m, persistent=True)
         self.register_buffer("degree_index_m", degree_index_m, persistent=True)
+        self.register_buffer(
+            "rotate_inv_rescale_full", rotate_inv_rescale_full, persistent=False
+        )
         self.reduced_dim = int(coeff_index_m.numel())
 
         # === Step 2. Split deterministic seeds at the module top-level ===
@@ -1861,14 +1869,13 @@ class SO2Convolution(nn.Module):
         if self.so2_norm:
             for _ in range(max(0, self.so2_layers - 1)):
                 inter_norms.append(
-                    ReducedSeparableRMSNorm(
+                    ReducedEquivariantRMSNorm(
                         lmax=self.lmax,
                         mmax=self.mmax,
                         channels=self.focus_dim,
                         degree_index_m=self.degree_index_m,
                         n_focus=self.n_focus,
-                        centering=self.mlp_bias,
-                        eps=self.eps,
+                        centering=True,
                         dtype=self.compute_dtype,
                         trainable=trainable,
                     )
@@ -1942,6 +1949,7 @@ class SO2Convolution(nn.Module):
         self.attn_q_proj: FocusLinear | None = None
         self.attn_k_proj: FocusLinear | None = None
         self.adamw_attn_logit_w: nn.Parameter | None = None
+        self.adamw_attn_z_bias_raw: nn.Parameter | None = None
         self.attn_output_gate_norm: ScalarRMSNorm | None = None
         self.adamw_attn_gate_w: nn.Parameter | None = None
         if self.n_atten_head > 0:
@@ -1985,6 +1993,16 @@ class SO2Convolution(nn.Module):
                 mean=0.0,
                 std=0.01,
                 generator=get_generator(child_seed(seed_gate, 2)),
+            )
+            # softplus(0.5413) ~= 1.0 provides balanced initial competition.
+            self.adamw_attn_z_bias_raw = nn.Parameter(
+                torch.full(
+                    (self.n_focus, self.n_atten_head),
+                    0.5413,
+                    dtype=self.compute_dtype,
+                    device=self.device,
+                ),
+                requires_grad=trainable,
             )
             self.attn_output_gate_norm = ScalarRMSNorm(
                 channels=self.focus_dim,
@@ -2242,6 +2260,10 @@ class SO2Convolution(nn.Module):
                 key_mmax=self.mmax,
             )
             x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
+            # Reduced layouts keep only 2*mmax+1 orders for l>mmax. Applying the
+            # inverse-rotation degree rescale after the global lift restores the
+            # full-basis amplitude expected by the block output contract.
+            x_message = x_message * self.rotate_inv_rescale_full.view(1, -1, 1)
 
         # === Step 8. Aggregate with optional head-wise gating ===
         with nvtx_range("SO2Conv/aggregate"):
@@ -2278,17 +2300,17 @@ class SO2Convolution(nn.Module):
                 attn_logits = (q_edge * k_edge).sum(-1) * (self.head_dim**-0.5)
                 attn_logits = attn_logits + radial_bias
 
-                # === Step 8.2. Destination-wise stable softmax with envelope-aware competition ===
-                attn_alpha = segment_softmax_with_env_weight(
+                # === Step 8.2. Destination-wise stable envelope-gated softmax ===
+                attn_alpha = segment_envelope_gated_softmax(
                     logits=attn_logits,
                     edge_env=edge_cache.edge_env.to(dtype=compute_dtype),
                     dst=dst,
                     n_nodes=n_node,
+                    z_bias_raw=self.adamw_attn_z_bias_raw,
                     eps=self.eps,
-                    env_logit_power=self.attn_env_logit_power,
                 )  # (E, F, H)
 
-                # === Step 8.3. Head-wise value aggregation with envelope amplitude decay ===
+                # === Step 8.3. Head-wise value aggregation ===
                 value_heads = x_message.reshape(
                     n_edge,
                     self.ebed_dim_full,
@@ -2296,14 +2318,8 @@ class SO2Convolution(nn.Module):
                     self.n_atten_head,
                     self.head_dim,
                 ).to(dtype=compute_dtype)  # (E, D, F, H, Dh)
-                env_value_weight = edge_cache.edge_env.to(dtype=compute_dtype).squeeze(
-                    -1
-                )  # (E,)
                 weighted_value = value_heads * attn_alpha.reshape(
                     n_edge, 1, self.n_focus, self.n_atten_head, 1
-                )
-                weighted_value = weighted_value * env_value_weight.reshape(
-                    n_edge, 1, 1, 1, 1
                 )
                 out_heads = torch.zeros(
                     n_node,
@@ -2423,7 +2439,8 @@ class EquivariantFFN(nn.Module):
     glu_activation
         If True, use GLU-style gating (e.g., silu -> swiglu, gelu -> geglu).
     mlp_bias
-        Whether to use bias in SO3Linear (l=0 bias) and GatedActivation (gate linear bias).
+        Whether to use bias in SO3Linear (l=0 bias) and GatedActivation
+        (gate linear bias).
     trainable
         Whether parameters are trainable.
     seed
@@ -2608,7 +2625,7 @@ class SeZMInteractionBlock(nn.Module):
     focus_compete
         If True, enable cross-focus softmax competition in SO(2) convolution.
     so2_norm
-        If True, apply intermediate ReducedSeparableRMSNorm between SO(2) mixing layers.
+        If True, apply intermediate ReducedEquivariantRMSNorm between SO(2) mixing layers.
         When False (default), no normalization is applied between layers.
     so2_layers
         Number of SO(2) mixing layers.
@@ -2618,7 +2635,7 @@ class SeZMInteractionBlock(nn.Module):
         ``"dependent"``.
     n_atten_head
         Number of attention heads when aggregating messages in SO(2) convolution.
-        0 means no attention is used; >0 enables envelope-aware grouped softmax
+        0 means no attention is used; >0 enables envelope-gated grouped softmax
         attention with output-side head gate.
     so2_pre_norm
         If True, apply pre-norm before SO(2) convolution.
@@ -2654,8 +2671,6 @@ class SeZMInteractionBlock(nn.Module):
         - SO3Linear: l=0 bias
         - SO2Linear: l=0 bias
         - GatedActivation: gate linear bias
-        - SeparableRMSNorm: centering bias
-        - ReducedSeparableRMSNorm: centering bias
     eps
         Small epsilon for numerical stability.
     dtype
@@ -2758,12 +2773,11 @@ class SeZMInteractionBlock(nn.Module):
 
         # === Step 1. SO(2) convolution branch norms ===
         if self.so2_pre_norm:
-            self.pre_so2_norm: nn.Module = SeparableRMSNorm(
+            self.pre_so2_norm: nn.Module = EquivariantRMSNorm(
                 self.lmax,
                 self.focus_dim,
                 n_focus=self.n_focus,
-                centering=self.mlp_bias,
-                eps=eps,
+                centering=True,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
@@ -2771,12 +2785,11 @@ class SeZMInteractionBlock(nn.Module):
             self.pre_so2_norm = nn.Identity()
 
         if self.so2_post_norm:
-            self.post_so2_norm: nn.Module = SeparableRMSNorm(
+            self.post_so2_norm: nn.Module = EquivariantRMSNorm(
                 self.lmax,
                 self.focus_dim,
                 n_focus=self.n_focus,
-                centering=self.mlp_bias,
-                eps=eps,
+                centering=True,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
@@ -2811,12 +2824,11 @@ class SeZMInteractionBlock(nn.Module):
 
             if self.ffn_pre_norm:
                 pre_ffn_norms.append(
-                    SeparableRMSNorm(
+                    EquivariantRMSNorm(
                         self.lmax,
                         self.channels,
                         n_focus=1,
-                        centering=self.mlp_bias,
-                        eps=eps,
+                        centering=True,
                         dtype=self.compute_dtype,
                         trainable=trainable,
                     )
@@ -2826,12 +2838,11 @@ class SeZMInteractionBlock(nn.Module):
 
             if self.ffn_post_norm:
                 post_ffn_norms.append(
-                    SeparableRMSNorm(
+                    EquivariantRMSNorm(
                         self.lmax,
                         self.channels,
                         n_focus=1,
-                        centering=self.mlp_bias,
-                        eps=eps,
+                        centering=True,
                         dtype=self.compute_dtype,
                         trainable=trainable,
                     )

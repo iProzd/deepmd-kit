@@ -19,6 +19,7 @@
         64
       ],
       "use_env_seed": true,
+      "random_gamma": true,
       "l_schedule": [
         3,
         3,
