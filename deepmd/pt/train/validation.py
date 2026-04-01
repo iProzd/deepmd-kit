@@ -35,6 +35,9 @@ from deepmd.pt.utils.env import (
     GLOBAL_PT_FLOAT_PRECISION,
     RESERVED_PRECISION_DICT,
 )
+from deepmd.pt.utils.lmdb_dataset import (
+    LmdbDataset,
+)
 from deepmd.pt.utils.utils import (
     to_torch_tensor,
 )
@@ -419,13 +422,25 @@ class FullValidator:
             torch.cuda.empty_cache()
 
         system_metrics = []
-        for dataset in self.validation_data.systems:
-            if not isinstance(dataset, DeepmdDataSetForLoader):
-                raise TypeError(
-                    "Full validation expects each dataset in validation_data.systems "
-                    f"to be DeepmdDataSetForLoader, got {type(dataset)!r}."
-                )
-            system_metrics.append(self._evaluate_system(dataset.data_system))
+
+        # LMDB path: create LmdbTestData and evaluate per nloc group
+        if isinstance(self.validation_data, LmdbDataset):
+            from deepmd.dpmodel.utils.lmdb_data import (
+                LmdbTestData,
+            )
+
+            type_map = getattr(self.model, "type_map", None)
+            lmdb_test = LmdbTestData(self.validation_data.lmdb_path, type_map=type_map)
+            for nloc in sorted(lmdb_test.nloc_groups):
+                system_metrics.append(self._evaluate_lmdb_group(lmdb_test, nloc))
+        else:
+            for dataset in self.validation_data.systems:
+                if not isinstance(dataset, DeepmdDataSetForLoader):
+                    raise TypeError(
+                        "Full validation expects each dataset in validation_data.systems "
+                        f"to be DeepmdDataSetForLoader, got {type(dataset)!r}."
+                    )
+                system_metrics.append(self._evaluate_system(dataset.data_system))
 
         aggregated = weighted_average([metric for metric in system_metrics if metric])
         return {
@@ -457,6 +472,31 @@ class FullValidator:
             test_data=test_data,
             natoms=natoms,
             has_pbc=data_system.pbc,
+        )
+
+    def _evaluate_lmdb_group(
+        self, lmdb_test: Any, nloc: int
+    ) -> dict[str, tuple[float, float]]:
+        """Evaluate one nloc group from an LmdbTestData."""
+        test_data = lmdb_test.get_test(nloc=nloc)
+        natoms = int(test_data["type"].shape[1])
+        nframes = int(test_data["coord"].shape[0])
+        prediction = self._predict_outputs(
+            coord=test_data["coord"].reshape(nframes, -1),
+            atom_types=test_data["type"],
+            box=test_data["box"] if lmdb_test.pbc else None,
+            fparam=test_data["fparam"]
+            if bool(test_data.get("find_fparam", 0.0))
+            else None,
+            aparam=test_data["aparam"] if self.model.get_dim_aparam() > 0 else None,
+            natoms=natoms,
+            nframes=nframes,
+        )
+        return _compute_system_metrics(
+            prediction=prediction,
+            test_data=test_data,
+            natoms=natoms,
+            has_pbc=lmdb_test.pbc,
         )
 
     def _predict_outputs(

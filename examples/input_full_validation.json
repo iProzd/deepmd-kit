@@ -218,8 +218,8 @@
     "validation_freq": 10000,
     "save_best": true,
     "max_best_ckpt": 3,
-    "validation_metric": "F:MAE",
+    "validation_metric": "E:MAE",
     "full_val_file": "val.log",
-    "full_val_start": 0.5
+    "full_val_start": 0.0
   }
 }
