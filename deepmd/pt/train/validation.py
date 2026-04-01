@@ -487,8 +487,12 @@ class FullValidator:
             box=test_data["box"] if lmdb_test.pbc else None,
             fparam=test_data["fparam"]
             if bool(test_data.get("find_fparam", 0.0))
+            and self.model.get_dim_fparam() > 0
             else None,
-            aparam=test_data["aparam"] if self.model.get_dim_aparam() > 0 else None,
+            aparam=test_data["aparam"]
+            if bool(test_data.get("find_aparam", 0.0))
+            and self.model.get_dim_aparam() > 0
+            else None,
             natoms=natoms,
             nframes=nframes,
         )
