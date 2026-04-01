@@ -1450,6 +1450,110 @@ def descrpt_dpa3_args() -> list[Argument]:
     ]
 
 
+@descrpt_args_plugin.register("dpa3s", doc=doc_only_pt_supported)
+def descrpt_dpa3s_args() -> list[Argument]:
+    doc_n_dim = "The dimension of node representation."
+    doc_e_dim = "The dimension of edge representation."
+    doc_a_dim = "The dimension of angle representation."
+    doc_nlayers = "The number of repflow layers."
+    doc_e_rcut = "The edge cut-off radius."
+    doc_e_rcut_smth = "Where to start smoothing for edge."
+    doc_e_sel = "Maximally possible number of selected edge neighbors."
+    doc_a_rcut = "The angle cut-off radius."
+    doc_a_rcut_smth = "Where to start smoothing for angle."
+    doc_a_sel = "Maximally possible number of selected angle neighbors."
+    doc_axis_neuron = "The number of dimension of submatrix in the symmetrization ops."
+    doc_sel_reduce_factor = (
+        "Reduction factor applied to neighbor-scale normalization. "
+        "Neighbor-scale normalization will use e_sel/sel_reduce_factor or a_sel/sel_reduce_factor."
+    )
+    doc_concat_output_tebd = "Whether to concat type embedding at the output of the descriptor."
+    doc_add_chg_spin_ebd = (
+        "Whether to add charge and spin embedding to the descriptor. "
+        "When enabled, fparam is expected to have 2 values (charge, spin)."
+    )
+    doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_precision = f"The precision of the embedding net parameters, supported options are {list_to_doc(PRECISION_DICT.keys())} Default follows the interface precision."
+    doc_exclude_types = "The excluded pairs of types which have no interaction with each other."
+    doc_env_protection = "Protection parameter to prevent division by zero errors during environment matrix calculations."
+    doc_trainable = "If the parameters in the embedding net is trainable."
+    doc_seed = "Random seed for parameter initialization."
+    doc_use_econf_tebd = "Whether to use electronic configuration type embedding."
+    doc_use_tebd_bias = "Whether to use bias in the type embedding layer."
+    return [
+        Argument("n_dim", int, optional=True, default=128, doc=doc_n_dim),
+        Argument("e_dim", int, optional=True, default=64, doc=doc_e_dim),
+        Argument("a_dim", int, optional=True, default=32, doc=doc_a_dim),
+        Argument("nlayers", int, optional=True, default=6, doc=doc_nlayers),
+        Argument("e_rcut", float, optional=False, doc=doc_e_rcut),
+        Argument("e_rcut_smth", float, optional=False, doc=doc_e_rcut_smth),
+        Argument("e_sel", [int, str], optional=False, doc=doc_e_sel),
+        Argument("a_rcut", float, optional=False, doc=doc_a_rcut),
+        Argument("a_rcut_smth", float, optional=False, doc=doc_a_rcut_smth),
+        Argument("a_sel", [int, str], optional=False, doc=doc_a_sel),
+        Argument("axis_neuron", int, optional=True, default=4, doc=doc_axis_neuron),
+        Argument(
+            "sel_reduce_factor",
+            float,
+            optional=True,
+            default=10.0,
+            doc=doc_sel_reduce_factor,
+        ),
+        Argument(
+            "concat_output_tebd",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_concat_output_tebd,
+        ),
+        Argument(
+            "add_chg_spin_ebd",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_add_chg_spin_ebd,
+        ),
+        Argument(
+            "activation_function",
+            str,
+            optional=True,
+            default="silu",
+            doc=doc_activation_function,
+        ),
+        Argument("precision", str, optional=True, default="default", doc=doc_precision),
+        Argument(
+            "exclude_types",
+            list[list[int]],
+            optional=True,
+            default=[],
+            doc=doc_exclude_types,
+        ),
+        Argument(
+            "env_protection",
+            float,
+            optional=True,
+            default=0.0,
+            doc=doc_env_protection,
+        ),
+        Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
+        Argument("seed", [int, None], optional=True, doc=doc_seed),
+        Argument(
+            "use_econf_tebd",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_econf_tebd,
+        ),
+        Argument(
+            "use_tebd_bias",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_use_tebd_bias,
+        ),
+    ]
+
+
 # repflow for dpa3
 def dpa3_repflow_args() -> list[Argument]:
     # repflow args
