@@ -1733,6 +1733,25 @@ def dpa3_repflow_args() -> list[Argument]:
             "Shared experts are always active and counted within top_k. "
             "Must be < moe_top_k.",
         ),
+        Argument(
+            "moe_ep_size",
+            int,
+            optional=True,
+            default=1,
+            doc="Number of GPUs for Expert Parallelism (EP). "
+            "When > 1, experts are distributed across GPUs with All-to-All "
+            "communication. Must divide n_experts evenly.",
+        ),
+        Argument(
+            "fuse_moe_mlps",
+            bool,
+            optional=True,
+            default=False,
+            doc="Whether to fuse shared-input MoE MLPs to reduce All-to-All "
+            "communication rounds. Fuses node_edge_linear+edge_self_linear and "
+            "edge_angle_linear1+angle_self_linear into single wide MoE layers. "
+            "Only effective when both MLPs in a pair use MoE.",
+        ),
     ]
 
 

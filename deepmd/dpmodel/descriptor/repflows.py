@@ -1955,14 +1955,14 @@ class RepFlowLayer(NativeOP):
         a_compress_use_split = data["a_compress_use_split"]
         node_self_mlp = data.pop("node_self_mlp")
         node_sym_linear = data.pop("node_sym_linear")
-        node_edge_linear = data.pop("node_edge_linear")
-        edge_self_linear = data.pop("edge_self_linear")
+        node_edge_linear = data.pop("node_edge_linear", None)
+        edge_self_linear = data.pop("edge_self_linear", None)
         edge_angle_linear1 = data.pop("edge_angle_linear1", None)
         edge_angle_linear2 = data.pop("edge_angle_linear2", None)
         angle_self_linear = data.pop("angle_self_linear", None)
         a_compress_n_linear = data.pop("a_compress_n_linear", None)
         a_compress_e_linear = data.pop("a_compress_e_linear", None)
-        # Pop MoE-related fields (PT-only, not used in dpmodel)
+        # Pop MoE/fusion-related fields (PT-only, not used in dpmodel)
         for _moe_key in [
             "n_experts", "moe_top_k", "use_node_moe", "use_edge_moe",
             "use_angle_moe", "share_expert", "tebd_dim",
@@ -1970,6 +1970,8 @@ class RepFlowLayer(NativeOP):
             "node_edge_linear_type", "edge_self_linear_type",
             "edge_angle_linear1_type", "edge_angle_linear2_type",
             "angle_self_linear_type",
+            "fuse_moe_mlps", "edge_fused", "angle_fused",
+            "edge_fused_moe", "angle_fused_moe",
         ]:
             data.pop(_moe_key, None)
         update_style = data["update_style"]

@@ -1,0 +1,41 @@
+{
+  "B_single_gpu_8": {
+    "config": "B_single_gpu",
+    "n_experts": 8,
+    "elapsed": 26.6732140481472,
+    "steps_per_sec": 3.7490795004866047,
+    "loss_first": 258.1920456064097,
+    "loss_last": -2205.9806886829438,
+    "has_nan": false,
+    "a2a_total_ms": 0.0,
+    "a2a_count": 0,
+    "a2a_avg_ms": 0.0,
+    "a2a_pct": 0.0
+  },
+  "C_ep_unfused_8": {
+    "config": "C_ep_unfused",
+    "n_experts": 8,
+    "elapsed": 31.381617359817028,
+    "steps_per_sec": 3.1865789087099827,
+    "loss_first": 750.4157689573942,
+    "loss_last": -1185.1997552920877,
+    "has_nan": false,
+    "a2a_total_ms": 0.0,
+    "a2a_count": 0,
+    "a2a_avg_ms": 0.0,
+    "a2a_pct": 0.0
+  },
+  "D_ep_fused_8": {
+    "config": "D_ep_fused",
+    "n_experts": 8,
+    "elapsed": 23.703927844762802,
+    "steps_per_sec": 4.218710108084227,
+    "loss_first": 768.8620665274002,
+    "loss_last": -1193.2934241706132,
+    "has_nan": false,
+    "a2a_total_ms": 0.0,
+    "a2a_count": 0,
+    "a2a_avg_ms": 0.0,
+    "a2a_pct": 0.0
+  }
+}

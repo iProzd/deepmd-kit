@@ -206,6 +206,8 @@ class RepFlowArgs:
         use_edge_moe: bool = False,
         use_angle_moe: bool = False,
         share_expert: int = 0,
+        moe_ep_size: int = 1,
+        fuse_moe_mlps: bool = False,
     ) -> None:
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -242,6 +244,8 @@ class RepFlowArgs:
         self.use_edge_moe = use_edge_moe
         self.use_angle_moe = use_angle_moe
         self.share_expert = share_expert
+        self.moe_ep_size = moe_ep_size
+        self.fuse_moe_mlps = fuse_moe_mlps
 
     def __getitem__(self, key: str) -> Any:
         if hasattr(self, key):
@@ -283,6 +287,8 @@ class RepFlowArgs:
             "use_edge_moe": self.use_edge_moe,
             "use_angle_moe": self.use_angle_moe,
             "share_expert": self.share_expert,
+            "moe_ep_size": self.moe_ep_size,
+            "fuse_moe_mlps": self.fuse_moe_mlps,
         }
 
     @classmethod

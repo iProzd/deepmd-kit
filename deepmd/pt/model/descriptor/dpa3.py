@@ -122,6 +122,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         use_loc_mapping: bool = True,
         type_map: list[str] | None = None,
         add_chg_spin_ebd: bool = False,
+        ep_group: "torch.distributed.ProcessGroup | None" = None,
     ) -> None:
         super().__init__()
 
@@ -179,6 +180,8 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             use_edge_moe=self.repflow_args.use_edge_moe,
             use_angle_moe=self.repflow_args.use_angle_moe,
             share_expert=self.repflow_args.share_expert,
+            fuse_moe_mlps=self.repflow_args.fuse_moe_mlps,
+            ep_group=ep_group,
         )
 
         self.use_econf_tebd = use_econf_tebd

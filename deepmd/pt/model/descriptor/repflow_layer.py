@@ -18,6 +18,9 @@ from deepmd.pt.model.network.mlp import (
 from deepmd.pt.model.network.moe import (
     MoELayer,
 )
+from deepmd.pt.model.network.moe_fused import (
+    FusedMoELayer,
+)
 from deepmd.pt.model.network.utils import (
     aggregate,
 )
@@ -70,7 +73,9 @@ class RepFlowLayer(torch.nn.Module):
         use_edge_moe: bool = False,
         use_angle_moe: bool = False,
         share_expert: int = 0,
+        fuse_moe_mlps: bool = False,
         tebd_dim: int = 0,
+        ep_group: "torch.distributed.ProcessGroup | None" = None,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -122,7 +127,9 @@ class RepFlowLayer(torch.nn.Module):
         self.use_edge_moe = use_edge_moe
         self.use_angle_moe = use_angle_moe
         self.share_expert = share_expert
+        self.fuse_moe_mlps = fuse_moe_mlps
         self.tebd_dim = tebd_dim
+        self.ep_group = ep_group
         self.use_moe: bool = n_experts > 1
 
         assert update_residual_init in [
@@ -170,6 +177,28 @@ class RepFlowLayer(torch.nn.Module):
                 precision=precision,
                 seed=seed_val,
                 trainable=trainable,
+                ep_group=self.ep_group,
+            )
+
+        def _make_fused_moe(
+            num_in: int,
+            output_dims: list[int],
+            seed_val: int | list[int] | None,
+            bias: bool = True,
+        ) -> FusedMoELayer:
+            return FusedMoELayer(
+                num_in,
+                output_dims,
+                n_experts=self.n_experts,
+                top_k=self.moe_top_k,
+                tebd_dim=self.tebd_dim,
+                share_expert=self.share_expert,
+                bias=bias,
+                activation_function=self.activation_function,
+                precision=precision,
+                seed=seed_val,
+                trainable=trainable,
+                ep_group=self.ep_group,
             )
 
         # node self mlp — JIT requires separate typed attributes
@@ -213,18 +242,47 @@ class RepFlowLayer(torch.nn.Module):
                 )
             )
 
-        # node edge message
+        # node edge message + edge self message (potentially fused)
         self.node_edge_linear_is_moe: bool = self.use_moe and use_node_moe
-        if self.node_edge_linear_is_moe:
-            self.node_edge_linear_moe: MoELayer | None = _make_moe(
-                self.edge_info_dim, self.n_multi_edge_message * n_dim, child_seed(seed, 4),
+        self.edge_self_linear_is_moe: bool = self.use_moe and use_edge_moe
+        # Fusion A: fuse node_edge_linear + edge_self_linear when both are MoE
+        self.edge_fused: bool = (
+            self.fuse_moe_mlps
+            and self.node_edge_linear_is_moe
+            and self.edge_self_linear_is_moe
+        )
+        if self.edge_fused:
+            self.edge_fused_moe: FusedMoELayer | None = _make_fused_moe(
+                self.edge_info_dim,
+                [self.n_multi_edge_message * n_dim, e_dim],
+                child_seed(seed, 4),
             )
+            self.node_edge_linear_moe: MoELayer | None = None
             self.node_edge_linear: MLPLayer | None = None
+            self.edge_self_linear_moe: MoELayer | None = None
+            self.edge_self_linear: MLPLayer | None = None
         else:
-            self.node_edge_linear_moe = None
-            self.node_edge_linear = _make_mlp(
-                self.edge_info_dim, self.n_multi_edge_message * n_dim, child_seed(seed, 4),
-            )
+            self.edge_fused_moe = None
+            if self.node_edge_linear_is_moe:
+                self.node_edge_linear_moe = _make_moe(
+                    self.edge_info_dim, self.n_multi_edge_message * n_dim, child_seed(seed, 4),
+                )
+                self.node_edge_linear = None
+            else:
+                self.node_edge_linear_moe = None
+                self.node_edge_linear = _make_mlp(
+                    self.edge_info_dim, self.n_multi_edge_message * n_dim, child_seed(seed, 4),
+                )
+            if self.edge_self_linear_is_moe:
+                self.edge_self_linear_moe = _make_moe(
+                    self.edge_info_dim, e_dim, child_seed(seed, 6),
+                )
+                self.edge_self_linear = None
+            else:
+                self.edge_self_linear_moe = None
+                self.edge_self_linear = _make_mlp(
+                    self.edge_info_dim, e_dim, child_seed(seed, 6),
+                )
         if self.update_style == "res_residual":
             for head_index in range(self.n_multi_edge_message):
                 self.n_residual.append(
@@ -237,19 +295,6 @@ class RepFlowLayer(torch.nn.Module):
                         trainable=trainable,
                     )
                 )
-
-        # edge self message
-        self.edge_self_linear_is_moe: bool = self.use_moe and use_edge_moe
-        if self.edge_self_linear_is_moe:
-            self.edge_self_linear_moe: MoELayer | None = _make_moe(
-                self.edge_info_dim, e_dim, child_seed(seed, 6),
-            )
-            self.edge_self_linear: MLPLayer | None = None
-        else:
-            self.edge_self_linear_moe = None
-            self.edge_self_linear = _make_mlp(
-                self.edge_info_dim, e_dim, child_seed(seed, 6),
-            )
         if self.update_style == "res_residual":
             self.e_residual.append(
                 get_residual(
@@ -262,6 +307,7 @@ class RepFlowLayer(torch.nn.Module):
                 )
             )
 
+        self.angle_fused: bool = False
         if self.update_angle:
             self.angle_dim = self.a_dim
             if self.a_compress_rate == 0:
@@ -301,18 +347,48 @@ class RepFlowLayer(torch.nn.Module):
                     self.a_compress_n_linear = None
                     self.a_compress_e_linear = None
 
-            # edge angle message
+            # edge angle message + angle self message (potentially fused)
             self.edge_angle_linear1_is_moe: bool = self.use_moe and use_angle_moe
-            if self.edge_angle_linear1_is_moe:
-                self.edge_angle_linear1_moe: MoELayer | None = _make_moe(
-                    self.angle_dim, self.e_dim, child_seed(seed, 10),
+            self.angle_self_linear_is_moe: bool = self.use_moe and use_angle_moe
+            # Fusion B: fuse edge_angle_linear1 + angle_self_linear when both are MoE
+            self.angle_fused: bool = (
+                self.fuse_moe_mlps
+                and self.edge_angle_linear1_is_moe
+                and self.angle_self_linear_is_moe
+            )
+            if self.angle_fused:
+                self.angle_fused_moe: FusedMoELayer | None = _make_fused_moe(
+                    self.angle_dim,
+                    [self.e_dim, self.a_dim],
+                    child_seed(seed, 10),
                 )
+                self.edge_angle_linear1_moe: MoELayer | None = None
                 self.edge_angle_linear1: MLPLayer | None = None
+                self.angle_self_linear_moe: MoELayer | None = None
+                self.angle_self_linear: MLPLayer | None = None
             else:
-                self.edge_angle_linear1_moe = None
-                self.edge_angle_linear1 = _make_mlp(
-                    self.angle_dim, self.e_dim, child_seed(seed, 10),
-                )
+                self.angle_fused_moe = None
+                if self.edge_angle_linear1_is_moe:
+                    self.edge_angle_linear1_moe = _make_moe(
+                        self.angle_dim, self.e_dim, child_seed(seed, 10),
+                    )
+                    self.edge_angle_linear1 = None
+                else:
+                    self.edge_angle_linear1_moe = None
+                    self.edge_angle_linear1 = _make_mlp(
+                        self.angle_dim, self.e_dim, child_seed(seed, 10),
+                    )
+                # angle self message
+                if self.angle_self_linear_is_moe:
+                    self.angle_self_linear_moe = _make_moe(
+                        self.angle_dim, self.a_dim, child_seed(seed, 13),
+                    )
+                    self.angle_self_linear = None
+                else:
+                    self.angle_self_linear_moe = None
+                    self.angle_self_linear = _make_mlp(
+                        self.angle_dim, self.a_dim, child_seed(seed, 13),
+                    )
             self.edge_angle_linear2_is_moe: bool = self.use_moe and use_edge_moe
             if self.edge_angle_linear2_is_moe:
                 self.edge_angle_linear2_moe: MoELayer | None = _make_moe(
@@ -336,18 +412,6 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
 
-            # angle self message
-            self.angle_self_linear_is_moe: bool = self.use_moe and use_angle_moe
-            if self.angle_self_linear_is_moe:
-                self.angle_self_linear_moe: MoELayer | None = _make_moe(
-                    self.angle_dim, self.a_dim, child_seed(seed, 13),
-                )
-                self.angle_self_linear: MLPLayer | None = None
-            else:
-                self.angle_self_linear_moe = None
-                self.angle_self_linear = _make_mlp(
-                    self.angle_dim, self.a_dim, child_seed(seed, 13),
-                )
             if self.update_style == "res_residual":
                 self.a_residual.append(
                     get_residual(
@@ -987,11 +1051,21 @@ class RepFlowLayer(torch.nn.Module):
         else:
             edge_info = None
 
-        # node edge message
+        # node edge message + edge self message
         # nb x nloc x nnei x (h * n_dim)
         if not self.optim_node_edge:
             assert edge_info is not None
-            if self.node_edge_linear_is_moe:
+            if self.edge_fused:
+                # Fusion A: single fused MoE call for both node_edge and edge_self
+                assert self.edge_fused_moe is not None
+                edge_fused_out = self.edge_fused_moe(
+                    edge_info, _type_emb, _atom_types,
+                    edge_index=n2e_index if self.use_dynamic_sel else None,
+                )
+                node_edge_update = edge_fused_out[0] * sw.unsqueeze(-1)
+                # Append edge_self_update here for TorchScript compatibility
+                e_update_list.append(edge_fused_out[1])
+            elif self.node_edge_linear_is_moe:
                 assert self.node_edge_linear_moe is not None
                 node_edge_update = self.node_edge_linear_moe(
                     edge_info, _type_emb, _atom_types,
@@ -1047,42 +1121,42 @@ class RepFlowLayer(torch.nn.Module):
         # update node_ebd
         n_updated = self.list_update(n_update_list, "node")
 
-        # edge self message
-        if not self.optim_edge_self:
-            assert edge_info is not None
-            if self.edge_self_linear_is_moe:
-                assert self.edge_self_linear_moe is not None
-                edge_self_update = self.edge_self_linear_moe(
-                    edge_info, _type_emb, _atom_types,
-                    edge_index=n2e_index if self.use_dynamic_sel else None,
-                )
+        # edge self message (skip if edge_fused — already appended above)
+        if not self.edge_fused:
+            if not self.optim_edge_self:
+                assert edge_info is not None
+                if self.edge_self_linear_is_moe:
+                    assert self.edge_self_linear_moe is not None
+                    e_update_list.append(self.edge_self_linear_moe(
+                        edge_info, _type_emb, _atom_types,
+                        edge_index=n2e_index if self.use_dynamic_sel else None,
+                    ))
+                else:
+                    assert self.edge_self_linear is not None
+                    e_update_list.append(self.act(self.edge_self_linear(edge_info)))
             else:
-                assert self.edge_self_linear is not None
-                edge_self_update = self.act(self.edge_self_linear(edge_info))
-        else:
-            edge_self_update = self.act(
-                self.optim_edge_update(
-                    node_ebd,
-                    node_ebd_ext,
-                    edge_ebd,
-                    nlist,
-                    "edge",
-                )
-                if not self.use_dynamic_sel
-                else self.optim_edge_update_dynamic(
-                    node_ebd,
-                    node_ebd_ext,
-                    edge_ebd,
-                    n2e_index,
-                    n_ext2e_index,
-                    "edge",
-                )
-            )
-        e_update_list.append(edge_self_update)
+                e_update_list.append(self.act(
+                    self.optim_edge_update(
+                        node_ebd,
+                        node_ebd_ext,
+                        edge_ebd,
+                        nlist,
+                        "edge",
+                    )
+                    if not self.use_dynamic_sel
+                    else self.optim_edge_update_dynamic(
+                        node_ebd,
+                        node_ebd_ext,
+                        edge_ebd,
+                        n2e_index,
+                        n_ext2e_index,
+                        "edge",
+                    )
+                ))
 
         if self.update_angle:
-            assert self.angle_self_linear is not None or self.angle_self_linear_moe is not None
-            assert self.edge_angle_linear1 is not None or self.edge_angle_linear1_moe is not None
+            assert self.angle_self_linear is not None or self.angle_self_linear_moe is not None or self.angle_fused
+            assert self.edge_angle_linear1 is not None or self.edge_angle_linear1_moe is not None or self.angle_fused
             assert self.edge_angle_linear2 is not None or self.edge_angle_linear2_moe is not None
             # get angle info
             if self.a_compress_rate != 0:
@@ -1151,11 +1225,21 @@ class RepFlowLayer(torch.nn.Module):
             else:
                 angle_info = None
 
-            # edge angle message
+            # edge angle message + angle self message (potentially fused)
             # nb x nloc x a_nnei x a_nnei x e_dim [OR] n_angle x e_dim
             if not self.optim_angle:
                 assert angle_info is not None
-                if self.edge_angle_linear1_is_moe:
+                if self.angle_fused:
+                    # Fusion B: single fused MoE call for both edge_angle and angle_self
+                    assert self.angle_fused_moe is not None
+                    angle_fused_out = self.angle_fused_moe(
+                        angle_info, _type_emb, _atom_types,
+                        edge_index=n2a_index if self.use_dynamic_sel else None,
+                    )
+                    edge_angle_update = angle_fused_out[0]
+                    # Append angle_self_update here for TorchScript compatibility
+                    a_update_list.append(angle_fused_out[1])
+                elif self.edge_angle_linear1_is_moe:
                     assert self.edge_angle_linear1_moe is not None
                     edge_angle_update = self.edge_angle_linear1_moe(
                         angle_info, _type_emb, _atom_types,
@@ -1255,39 +1339,39 @@ class RepFlowLayer(torch.nn.Module):
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
 
-            # angle self message
+            # angle self message (skip if angle_fused — already appended above)
             # nb x nloc x a_nnei x a_nnei x dim_a
-            if not self.optim_angle:
-                assert angle_info is not None
-                if self.angle_self_linear_is_moe:
-                    assert self.angle_self_linear_moe is not None
-                    angle_self_update = self.angle_self_linear_moe(
-                        angle_info, _type_emb, _atom_types,
-                        edge_index=n2a_index if self.use_dynamic_sel else None,
-                    )
+            if not self.angle_fused:
+                if not self.optim_angle:
+                    assert angle_info is not None
+                    if self.angle_self_linear_is_moe:
+                        assert self.angle_self_linear_moe is not None
+                        a_update_list.append(self.angle_self_linear_moe(
+                            angle_info, _type_emb, _atom_types,
+                            edge_index=n2a_index if self.use_dynamic_sel else None,
+                        ))
+                    else:
+                        assert self.angle_self_linear is not None
+                        a_update_list.append(self.act(self.angle_self_linear(angle_info)))
                 else:
-                    assert self.angle_self_linear is not None
-                    angle_self_update = self.act(self.angle_self_linear(angle_info))
-            else:
-                angle_self_update = self.act(
-                    self.optim_angle_update(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        "angle",
-                    )
-                    if not self.use_dynamic_sel
-                    else self.optim_angle_update_dynamic(
-                        angle_ebd,
-                        node_ebd_for_angle,
-                        edge_ebd_for_angle,
-                        n2a_index,
-                        eij2a_index,
-                        eik2a_index,
-                        "angle",
-                    )
-                )
-            a_update_list.append(angle_self_update)
+                    a_update_list.append(self.act(
+                        self.optim_angle_update(
+                            angle_ebd,
+                            node_ebd_for_angle,
+                            edge_ebd_for_angle,
+                            "angle",
+                        )
+                        if not self.use_dynamic_sel
+                        else self.optim_angle_update_dynamic(
+                            angle_ebd,
+                            node_ebd_for_angle,
+                            edge_ebd_for_angle,
+                            n2a_index,
+                            eij2a_index,
+                            eik2a_index,
+                            "angle",
+                        )
+                    ))
         else:
             # update edge_ebd
             e_updated = self.list_update(e_update_list, "edge")
@@ -1391,27 +1475,37 @@ class RepFlowLayer(torch.nn.Module):
             "use_edge_moe": self.use_edge_moe,
             "use_angle_moe": self.use_angle_moe,
             "share_expert": self.share_expert,
+            "fuse_moe_mlps": self.fuse_moe_mlps,
             "tebd_dim": self.tebd_dim,
             "node_self_mlp": (self.node_self_mlp_moe if self.node_self_mlp_is_moe else self.node_self_mlp).serialize(),
             "node_self_mlp_type": "MoELayer" if self.node_self_mlp_is_moe else "MLPLayer",
             "node_sym_linear": (self.node_sym_linear_moe if self.node_sym_linear_is_moe else self.node_sym_linear).serialize(),
             "node_sym_linear_type": "MoELayer" if self.node_sym_linear_is_moe else "MLPLayer",
-            "node_edge_linear": (self.node_edge_linear_moe if self.node_edge_linear_is_moe else self.node_edge_linear).serialize(),
-            "node_edge_linear_type": "MoELayer" if self.node_edge_linear_is_moe else "MLPLayer",
-            "edge_self_linear": (self.edge_self_linear_moe if self.edge_self_linear_is_moe else self.edge_self_linear).serialize(),
-            "edge_self_linear_type": "MoELayer" if self.edge_self_linear_is_moe else "MLPLayer",
         }
+        if self.edge_fused:
+            data["edge_fused_moe"] = self.edge_fused_moe.serialize()
+            data["edge_fused"] = True
+        else:
+            data["node_edge_linear"] = (self.node_edge_linear_moe if self.node_edge_linear_is_moe else self.node_edge_linear).serialize()
+            data["node_edge_linear_type"] = "MoELayer" if self.node_edge_linear_is_moe else "MLPLayer"
+            data["edge_self_linear"] = (self.edge_self_linear_moe if self.edge_self_linear_is_moe else self.edge_self_linear).serialize()
+            data["edge_self_linear_type"] = "MoELayer" if self.edge_self_linear_is_moe else "MLPLayer"
+            data["edge_fused"] = False
         if self.update_angle:
-            data.update(
-                {
-                    "edge_angle_linear1": (self.edge_angle_linear1_moe if self.edge_angle_linear1_is_moe else self.edge_angle_linear1).serialize(),
-                    "edge_angle_linear1_type": "MoELayer" if self.edge_angle_linear1_is_moe else "MLPLayer",
-                    "edge_angle_linear2": (self.edge_angle_linear2_moe if self.edge_angle_linear2_is_moe else self.edge_angle_linear2).serialize(),
-                    "edge_angle_linear2_type": "MoELayer" if self.edge_angle_linear2_is_moe else "MLPLayer",
-                    "angle_self_linear": (self.angle_self_linear_moe if self.angle_self_linear_is_moe else self.angle_self_linear).serialize(),
-                    "angle_self_linear_type": "MoELayer" if self.angle_self_linear_is_moe else "MLPLayer",
-                }
-            )
+            angle_data = {
+                "edge_angle_linear2": (self.edge_angle_linear2_moe if self.edge_angle_linear2_is_moe else self.edge_angle_linear2).serialize(),
+                "edge_angle_linear2_type": "MoELayer" if self.edge_angle_linear2_is_moe else "MLPLayer",
+            }
+            if self.angle_fused:
+                angle_data["angle_fused_moe"] = self.angle_fused_moe.serialize()
+                angle_data["angle_fused"] = True
+            else:
+                angle_data["edge_angle_linear1"] = (self.edge_angle_linear1_moe if self.edge_angle_linear1_is_moe else self.edge_angle_linear1).serialize()
+                angle_data["edge_angle_linear1_type"] = "MoELayer" if self.edge_angle_linear1_is_moe else "MLPLayer"
+                angle_data["angle_self_linear"] = (self.angle_self_linear_moe if self.angle_self_linear_is_moe else self.angle_self_linear).serialize()
+                angle_data["angle_self_linear_type"] = "MoELayer" if self.angle_self_linear_is_moe else "MLPLayer"
+                angle_data["angle_fused"] = False
+            data.update(angle_data)
             if self.a_compress_rate != 0 and not self.a_compress_use_split:
                 data.update(
                     {
@@ -1450,10 +1544,16 @@ class RepFlowLayer(torch.nn.Module):
         node_self_mlp_type = data.pop("node_self_mlp_type", "MLPLayer")
         node_sym_linear = data.pop("node_sym_linear")
         node_sym_linear_type = data.pop("node_sym_linear_type", "MLPLayer")
-        node_edge_linear = data.pop("node_edge_linear")
+        # Edge fusion: node_edge_linear and edge_self_linear may be absent
+        edge_fused_flag = data.pop("edge_fused", False)
+        edge_fused_moe_data = data.pop("edge_fused_moe", None)
+        node_edge_linear = data.pop("node_edge_linear", None)
         node_edge_linear_type = data.pop("node_edge_linear_type", "MLPLayer")
-        edge_self_linear = data.pop("edge_self_linear")
+        edge_self_linear = data.pop("edge_self_linear", None)
         edge_self_linear_type = data.pop("edge_self_linear_type", "MLPLayer")
+        # Angle fusion: edge_angle_linear1 and angle_self_linear may be absent
+        angle_fused_flag = data.pop("angle_fused", False)
+        angle_fused_moe_data = data.pop("angle_fused_moe", None)
         edge_angle_linear1 = data.pop("edge_angle_linear1", None)
         edge_angle_linear1_type = data.pop("edge_angle_linear1_type", "MLPLayer")
         edge_angle_linear2 = data.pop("edge_angle_linear2", None)
@@ -1491,34 +1591,30 @@ class RepFlowLayer(torch.nn.Module):
             obj.node_sym_linear_moe = None
         obj.node_sym_linear_is_moe = node_sym_linear_type == "MoELayer"
 
-        if node_edge_linear_type == "MoELayer":
-            obj.node_edge_linear_moe = MoELayer.deserialize(node_edge_linear)
-            obj.node_edge_linear = None
+        if edge_fused_flag and edge_fused_moe_data is not None:
+            obj.edge_fused = True
+            obj.edge_fused_moe = FusedMoELayer.deserialize(edge_fused_moe_data)
         else:
-            obj.node_edge_linear = MLPLayer.deserialize(node_edge_linear)
-            obj.node_edge_linear_moe = None
-        obj.node_edge_linear_is_moe = node_edge_linear_type == "MoELayer"
+            if node_edge_linear is not None:
+                if node_edge_linear_type == "MoELayer":
+                    obj.node_edge_linear_moe = MoELayer.deserialize(node_edge_linear)
+                    obj.node_edge_linear = None
+                else:
+                    obj.node_edge_linear = MLPLayer.deserialize(node_edge_linear)
+                    obj.node_edge_linear_moe = None
+                obj.node_edge_linear_is_moe = node_edge_linear_type == "MoELayer"
 
-        if edge_self_linear_type == "MoELayer":
-            obj.edge_self_linear_moe = MoELayer.deserialize(edge_self_linear)
-            obj.edge_self_linear = None
-        else:
-            obj.edge_self_linear = MLPLayer.deserialize(edge_self_linear)
-            obj.edge_self_linear_moe = None
-        obj.edge_self_linear_is_moe = edge_self_linear_type == "MoELayer"
+            if edge_self_linear is not None:
+                if edge_self_linear_type == "MoELayer":
+                    obj.edge_self_linear_moe = MoELayer.deserialize(edge_self_linear)
+                    obj.edge_self_linear = None
+                else:
+                    obj.edge_self_linear = MLPLayer.deserialize(edge_self_linear)
+                    obj.edge_self_linear_moe = None
+                obj.edge_self_linear_is_moe = edge_self_linear_type == "MoELayer"
 
         if update_angle:
-            assert isinstance(edge_angle_linear1, dict)
             assert isinstance(edge_angle_linear2, dict)
-            assert isinstance(angle_self_linear, dict)
-            if edge_angle_linear1_type == "MoELayer":
-                obj.edge_angle_linear1_moe = MoELayer.deserialize(edge_angle_linear1)
-                obj.edge_angle_linear1 = None
-            else:
-                obj.edge_angle_linear1 = MLPLayer.deserialize(edge_angle_linear1)
-                obj.edge_angle_linear1_moe = None
-            obj.edge_angle_linear1_is_moe = edge_angle_linear1_type == "MoELayer"
-
             if edge_angle_linear2_type == "MoELayer":
                 obj.edge_angle_linear2_moe = MoELayer.deserialize(edge_angle_linear2)
                 obj.edge_angle_linear2 = None
@@ -1527,13 +1623,29 @@ class RepFlowLayer(torch.nn.Module):
                 obj.edge_angle_linear2_moe = None
             obj.edge_angle_linear2_is_moe = edge_angle_linear2_type == "MoELayer"
 
-            if angle_self_linear_type == "MoELayer":
-                obj.angle_self_linear_moe = MoELayer.deserialize(angle_self_linear)
-                obj.angle_self_linear = None
+            if angle_fused_flag and angle_fused_moe_data is not None:
+                obj.angle_fused = True
+                obj.angle_fused_moe = FusedMoELayer.deserialize(angle_fused_moe_data)
             else:
-                obj.angle_self_linear = MLPLayer.deserialize(angle_self_linear)
-                obj.angle_self_linear_moe = None
-            obj.angle_self_linear_is_moe = angle_self_linear_type == "MoELayer"
+                if edge_angle_linear1 is not None:
+                    assert isinstance(edge_angle_linear1, dict)
+                    if edge_angle_linear1_type == "MoELayer":
+                        obj.edge_angle_linear1_moe = MoELayer.deserialize(edge_angle_linear1)
+                        obj.edge_angle_linear1 = None
+                    else:
+                        obj.edge_angle_linear1 = MLPLayer.deserialize(edge_angle_linear1)
+                        obj.edge_angle_linear1_moe = None
+                    obj.edge_angle_linear1_is_moe = edge_angle_linear1_type == "MoELayer"
+
+                if angle_self_linear is not None:
+                    assert isinstance(angle_self_linear, dict)
+                    if angle_self_linear_type == "MoELayer":
+                        obj.angle_self_linear_moe = MoELayer.deserialize(angle_self_linear)
+                        obj.angle_self_linear = None
+                    else:
+                        obj.angle_self_linear = MLPLayer.deserialize(angle_self_linear)
+                        obj.angle_self_linear_moe = None
+                    obj.angle_self_linear_is_moe = angle_self_linear_type == "MoELayer"
             if a_compress_rate != 0 and not a_compress_use_split:
                 assert isinstance(a_compress_n_linear, dict)
                 assert isinstance(a_compress_e_linear, dict)
