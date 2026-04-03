@@ -248,21 +248,39 @@ class MoELayer(nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """MoE for flat (dynamic_sel) inputs: x [n_flat, dim]."""
+        """MoE for flat (dynamic_sel) inputs: x [n_flat, dim].
+
+        Efficient implementation: compute all expert outputs on the full
+        input, then combine via routing weights. This avoids the O(topk *
+        n_experts) nested loop with boolean-mask indexing (which creates many
+        small, GPU-inefficient kernel launches) and instead uses O(n_experts)
+        dense matrix multiplications on the full token set.
+
+        weights:  [n_flat, routed_top_k]
+        indices:  [n_flat, routed_top_k]  — global expert IDs
+        """
         n_flat = x.shape[0]
+
+        # Compute all expert outputs: each is [n_flat, num_out]
+        expert_outputs: list[torch.Tensor] = []
+        for expert in self.experts:
+            expert_outputs.append(expert(x))
+
+        # Accumulate per-expert routing weights via scatter_add
+        # per_expert_weight: [n_flat, routed_experts]
+        per_expert_weight = torch.zeros(
+            n_flat, self.routed_experts, dtype=x.dtype, device=x.device
+        )
+        per_expert_weight.scatter_add_(1, indices, weights)
+
+        # Weighted sum of expert outputs
         output = torch.zeros(
             n_flat, self.num_out, dtype=x.dtype, device=x.device
         )
-        for k in range(self.routed_top_k):
-            w_k = weights[:, k]
-            idx_k = indices[:, k]
-            for e_idx, expert in enumerate(self.experts):
-                mask = idx_k == e_idx
-                if mask.any():
-                    expert_out = expert(x[mask])
-                    output[mask] = (
-                        output[mask] + w_k[mask].unsqueeze(-1) * expert_out
-                    )
+        for e_idx in range(len(expert_outputs)):
+            w_e = per_expert_weight[:, e_idx].unsqueeze(-1)  # [n_flat, 1]
+            output = output + w_e * expert_outputs[e_idx]
+
         for se in self.shared_experts:
             output = output + se(x)
         return output
