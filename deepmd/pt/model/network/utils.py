@@ -161,9 +161,9 @@ class GaussianRBF(nn.Module):
         super().__init__()
         self.num_basis = num_basis
         self.rcut = rcut
-        means = torch.linspace(0.0, rcut, num_basis)
+        means = torch.linspace(0.0, rcut, num_basis, device="cpu")
         spacing = rcut / (num_basis - 1)
-        betas = torch.full((num_basis,), 1.0 / (2.0 * spacing * spacing))
+        betas = torch.full((num_basis,), 1.0 / (2.0 * spacing * spacing), device="cpu")
         if trainable:
             self.means = nn.Parameter(means)
             self.betas = nn.Parameter(betas)
