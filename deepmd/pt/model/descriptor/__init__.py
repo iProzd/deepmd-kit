@@ -22,6 +22,9 @@ from .dpa3s import (
 from .dpa3s_v1_rbf import (
     DescrptDPA3V1,
 )
+from .dpa3s_v2_rbf_norm import (
+    DescrptDPA3V2,
+)
 from .env_mat import (
     prod_env_mat,
 )
@@ -61,6 +64,7 @@ __all__ = [
     "DescrptDPA3",
     "DescrptDPA3S",
     "DescrptDPA3V1",
+    "DescrptDPA3V2",
     "DescrptHybrid",
     "DescrptSeA",
     "DescrptSeAttenV2",
