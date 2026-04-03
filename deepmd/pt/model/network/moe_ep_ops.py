@@ -197,3 +197,181 @@ def ep_moe_forward(x_sorted, send_splits, recv_splits, group,
         if (expert_ids == i).any():
             used_experts.add(i)
     return h_ret, used_experts
+
+
+# ================================================================== #
+#  GPU-level A2A: deduplicate tokens per destination GPU              #
+# ================================================================== #
+
+
+class _EPMoEGPULevelBackward(Function):
+    """Backward pass of GPU-level fused EP MoE.
+
+    forward(): 1st backward — combine_bwd_A2A + expert_bwd (multi-expert fan-out) + dispatch_bwd_A2A
+    backward(): 2nd backward — NO cross-rank communication (deadlock-free)
+    """
+
+    @staticmethod
+    def forward(ctx, grad_h_ret, h_recv, send_splits, recv_splits, group,
+                experts, recv_eid_matrix, recv_weight_matrix, num_experts):
+        """1st backward with GPU-level A2A.
+
+        Parameters
+        ----------
+        grad_h_ret : Tensor [N_dedup_send, num_out]
+        h_recv : Tensor [N_dedup_recv, dim_in]
+        recv_eid_matrix : Tensor [N_dedup_recv, max_experts_per_token] — local expert IDs, -1 = pad
+        recv_weight_matrix : Tensor [N_dedup_recv, max_experts_per_token] — routing weights
+        """
+        # Step 1: Combine backward A2A
+        grad_combined = _a2a_raw(grad_h_ret, send_splits, recv_splits, group)
+
+        # Step 2: Expert backward with create_graph=True
+        # grad_combined is gradient of the weighted sum of expert outputs
+        # We need gradient w.r.t. h_recv
+        grad_h_recv = torch.zeros_like(h_recv)
+        n_recv = h_recv.shape[0]
+        max_k = recv_eid_matrix.shape[1] if n_recv > 0 else 0
+
+        for i, expert in enumerate(experts):
+            # Find tokens assigned to this expert
+            mask_2d = recv_eid_matrix == i  # [N_dedup_recv, max_k]
+            token_mask = mask_2d.any(dim=1)  # [N_dedup_recv]
+            if not token_mask.any():
+                continue
+            # Get the weight for this expert per token
+            # For each token hitting this expert, find the weight
+            weight_for_expert = (recv_weight_matrix * mask_2d.float()).sum(dim=1)  # [N_dedup_recv]
+            w_active = weight_for_expert[token_mask]  # [n_active]
+
+            h_in = h_recv[token_mask].detach().requires_grad_(True)
+            with torch.enable_grad():
+                result = expert(h_in)
+            # grad of weighted output: grad_combined * weight
+            grad_out = grad_combined[token_mask] * w_active.unsqueeze(-1)
+            grad_i = torch.autograd.grad(
+                result, h_in,
+                grad_outputs=grad_out,
+                create_graph=True,
+            )[0]
+            grad_h_recv = grad_h_recv.clone()
+            grad_h_recv[token_mask] = grad_h_recv[token_mask] + grad_i
+
+        # Step 3: Dispatch backward A2A
+        grad_x_sorted = _a2a_raw(grad_h_recv, recv_splits, send_splits, group)
+
+        ctx.save_for_backward(grad_h_recv)
+        return grad_x_sorted
+
+    @staticmethod
+    def backward(ctx, grad2_x_sorted):
+        """2nd backward: no A2A, safe for any topological sort order."""
+        return None, None, None, None, None, None, None, None, None
+
+
+class _EPMoEGPULevelForward(Function):
+    """GPU-level fused EP MoE: dispatch A2A + multi-expert fan-out + combine A2A.
+
+    Unlike expert-level, each received token can be processed by MULTIPLE local
+    experts. The results are weighted-summed locally before the combine A2A.
+    This reduces A2A volume when top_k > 1 and experts_per_gpu > 1.
+    """
+
+    @staticmethod
+    def forward(ctx, x_sorted, send_splits, recv_splits, group,
+                experts, recv_eid_matrix, recv_weight_matrix, num_out):
+        """
+        Parameters
+        ----------
+        x_sorted : Tensor [N_dedup_send, dim_in] — deduplicated tokens sorted by target GPU
+        recv_eid_matrix : Tensor [N_dedup_recv, max_experts_per_token] — local expert IDs, -1 = pad
+        recv_weight_matrix : Tensor [N_dedup_recv, max_experts_per_token] — routing weights
+        """
+        h_recv = _a2a_raw(x_sorted, send_splits, recv_splits, group)
+
+        n_recv = h_recv.shape[0]
+        combined_out = torch.zeros(
+            n_recv, num_out, dtype=h_recv.dtype, device=h_recv.device
+        )
+        used_experts = set()
+
+        for i, expert in enumerate(experts):
+            # mask_2d: which (token, slot) pairs target this expert
+            mask_2d = recv_eid_matrix == i  # [N_dedup_recv, max_k]
+            token_mask = mask_2d.any(dim=1)  # [N_dedup_recv]
+            if not token_mask.any():
+                continue
+            used_experts.add(i)
+            # Compute the weight for this expert per active token
+            weight_for_expert = (recv_weight_matrix * mask_2d.float()).sum(dim=1)  # [N_dedup_recv]
+            w_active = weight_for_expert[token_mask]  # [n_active]
+
+            h_in = h_recv[token_mask]
+            result = expert(h_in)  # [n_active, num_out]
+            combined_out = combined_out.clone()
+            combined_out[token_mask] = combined_out[token_mask] + result * w_active.unsqueeze(-1)
+
+        ctx.group = group
+        ctx.send_splits = send_splits
+        ctx.recv_splits = recv_splits
+        ctx.experts = experts
+        ctx.recv_eid_matrix = recv_eid_matrix
+        ctx.recv_weight_matrix = recv_weight_matrix
+        ctx.num_experts = len(experts)
+        ctx.used_experts = used_experts
+        ctx.save_for_backward(h_recv)
+
+        h_ret = _a2a_raw(combined_out, recv_splits, send_splits, group)
+        return h_ret
+
+    @staticmethod
+    def backward(ctx, grad_h_ret):
+        h_recv, = ctx.saved_tensors
+
+        grad_x_sorted = _EPMoEGPULevelBackward.apply(
+            grad_h_ret, h_recv,
+            ctx.send_splits, ctx.recv_splits, ctx.group,
+            ctx.experts, ctx.recv_eid_matrix, ctx.recv_weight_matrix,
+            ctx.num_experts,
+        )
+
+        return grad_x_sorted, None, None, None, None, None, None, None
+
+
+def ep_moe_gpu_level_forward(x_sorted, send_splits, recv_splits, group,
+                             experts, recv_eid_matrix, recv_weight_matrix,
+                             num_out):
+    """GPU-level fused EP MoE forward: dedup dispatch + multi-expert compute + combine.
+
+    Unlike ep_moe_forward which sends one token copy per expert, this sends one
+    token copy per unique destination GPU. On the receiving side, each token is
+    fanned out to multiple local experts and the weighted results are combined
+    before sending back. This reduces A2A communication volume.
+
+    Parameters
+    ----------
+    x_sorted : Tensor [N_dedup_send, dim_in] — deduplicated tokens sorted by target GPU
+    send_splits : list[int] — dispatch send splits (per GPU, not per expert)
+    recv_splits : list[int] — dispatch recv splits
+    group : ProcessGroup
+    experts : nn.ModuleList — local experts
+    recv_eid_matrix : Tensor [N_dedup_recv, max_experts_per_token] — local expert IDs, -1 = pad
+    recv_weight_matrix : Tensor [N_dedup_recv, max_experts_per_token] — routing weights
+    num_out : int — output dimension
+
+    Returns
+    -------
+    h_ret : Tensor [N_dedup_send, num_out] — combined output
+    used_experts : set[int] — indices of experts that received tokens
+    """
+    h_ret = _EPMoEGPULevelForward.apply(
+        x_sorted, send_splits, recv_splits, group,
+        experts, recv_eid_matrix, recv_weight_matrix, num_out,
+    )
+    used_experts = set()
+    n_recv = sum(recv_splits)
+    if n_recv > 0:
+        for i in range(len(experts)):
+            if (recv_eid_matrix == i).any():
+                used_experts.add(i)
+    return h_ret, used_experts

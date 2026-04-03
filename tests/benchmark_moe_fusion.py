@@ -217,7 +217,8 @@ def run_training(
 # Model creation helper
 # ---------------------------------------------------------------------------
 def make_model(n_experts, fuse, ep_group, nlayers, n_dim, e_dim, a_dim,
-               e_rcut, e_sel, a_rcut, a_sel, moe_ep_size):
+               e_rcut, e_sel, a_rcut, a_sel, moe_ep_size,
+               gpu_level_a2a=False):
     from deepmd.pt.model.descriptor.dpa3 import DescrptDPA3
     use_moe = n_experts > 1
     return DescrptDPA3(
@@ -239,6 +240,7 @@ def make_model(n_experts, fuse, ep_group, nlayers, n_dim, e_dim, a_dim,
         },
         ntypes=2, precision="float32", seed=1,
         ep_group=ep_group,
+        gpu_level_a2a=gpu_level_a2a,
     ).cuda()
 
 
@@ -300,18 +302,20 @@ def main():
 
         configs = []
         if n_experts == 1:
-            configs.append(("A_baseline", False, None, 1))
+            configs.append(("A_baseline", False, None, 1, False))
         if n_experts > 1:
-            configs.append(("B_single_gpu", False, None, 1))
-            configs.append(("C_ep_unfused", False, ep_group, 2))
-            configs.append(("D_ep_fused", True, ep_group, 2))
+            configs.append(("B_single_gpu", False, None, 1, False))
+            configs.append(("C_ep_unfused", False, ep_group, 2, False))
+            configs.append(("D_ep_fused", True, ep_group, 2, False))
+            configs.append(("E_ep_fused_gpulvl", True, ep_group, 2, True))
 
-        for config_name, fuse, grp, moe_ep in configs:
+        for config_name, fuse, grp, moe_ep, gpu_lvl in configs:
             label = {
                 "A_baseline": "Single expert baseline",
                 "B_single_gpu": f"{n_experts} experts, 1 GPU",
                 "C_ep_unfused": f"{n_experts} experts, EP unfused",
                 "D_ep_fused": f"{n_experts} experts, EP fused",
+                "E_ep_fused_gpulvl": f"{n_experts} experts, EP fused + GPU-level A2A",
             }[config_name]
 
             log(rank, f"\n  [{config_name}] {label}...")
@@ -321,7 +325,8 @@ def main():
 
             model = make_model(
                 n_experts=n_experts, fuse=fuse, ep_group=grp,
-                moe_ep_size=moe_ep, **model_args,
+                moe_ep_size=moe_ep, gpu_level_a2a=gpu_lvl,
+                **model_args,
             )
 
             # Sync params for EP configs

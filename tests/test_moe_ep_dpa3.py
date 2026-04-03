@@ -296,8 +296,138 @@ def test_gradient_stability(rank, ep_group, num_experts=4, steps=20):
 
 
 # ======================================================================
-# Benchmark: EP vs single-GPU
+# Test 5: GPU-level A2A correctness vs expert-level A2A
 # ======================================================================
+def test_gpu_level_vs_expert_level(rank, ep_group, num_experts=4):
+    """Compare GPU-level A2A MoELayer output against expert-level A2A reference."""
+    from deepmd.pt.model.network.moe import MoELayer
+
+    torch.manual_seed(42)
+    num_in, num_out = 32, 32
+    tebd_dim = 32
+    top_k = 2
+    ntypes = 3
+    nb, nloc = 2, 8
+
+    ep_size = dist.get_world_size(group=ep_group)
+    ep_rank = dist.get_rank(group=ep_group)
+    experts_per_gpu = num_experts // ep_size
+
+    # --- Expert-level EP model ---
+    moe_expert_lvl = MoELayer(
+        num_in, num_out, num_experts, top_k, tebd_dim,
+        ep_group=ep_group, seed=123, gpu_level_a2a=False,
+    ).cuda()
+
+    # --- GPU-level EP model (same weights) ---
+    moe_gpu_lvl = MoELayer(
+        num_in, num_out, num_experts, top_k, tebd_dim,
+        ep_group=ep_group, seed=123, gpu_level_a2a=True,
+    ).cuda()
+
+    # Copy weights from expert_lvl to gpu_lvl
+    moe_gpu_lvl.load_state_dict(moe_expert_lvl.state_dict())
+
+    # Sync gate weights across ranks
+    dist.broadcast(moe_expert_lvl.gate.matrix.data, src=0)
+    dist.broadcast(moe_gpu_lvl.gate.matrix.data, src=0)
+
+    # Sync expert weights
+    for local_i in range(experts_per_gpu):
+        for p_el, p_gl in zip(
+            moe_expert_lvl.experts[local_i].parameters(),
+            moe_gpu_lvl.experts[local_i].parameters(),
+        ):
+            dist.broadcast(p_el.data, src=0, group=ep_group)
+            p_gl.data.copy_(p_el.data)
+
+    # Same input on all ranks
+    torch.manual_seed(999)
+    type_emb = torch.randn(ntypes, tebd_dim, device="cuda")
+    atom_types = torch.randint(0, ntypes, (nb, nloc), device="cuda")
+    dist.broadcast(type_emb, src=0, group=ep_group)
+    dist.broadcast(atom_types, src=0, group=ep_group)
+
+    # Test node-level input [nb, nloc, dim]
+    x_node = torch.randn(nb, nloc, num_in, device="cuda")
+    dist.broadcast(x_node, src=0, group=ep_group)
+    with torch.no_grad():
+        out_el = moe_expert_lvl(x_node, type_emb, atom_types)
+        out_gl = moe_gpu_lvl(x_node, type_emb, atom_types)
+    diff_node = (out_el - out_gl).abs().max().item()
+
+    # Test edge-level input [nb, nloc, nnei, dim]
+    nnei = 10
+    x_edge = torch.randn(nb, nloc, nnei, num_in, device="cuda")
+    dist.broadcast(x_edge, src=0, group=ep_group)
+    with torch.no_grad():
+        out_el_e = moe_expert_lvl(x_edge, type_emb, atom_types)
+        out_gl_e = moe_gpu_lvl(x_edge, type_emb, atom_types)
+    diff_edge = (out_el_e - out_gl_e).abs().max().item()
+
+    log(rank, f"  [GPU-lvl-correctness] E={num_experts} node_diff={diff_node:.2e} edge_diff={diff_edge:.2e}")
+    assert diff_node < 1e-4, f"Node GPU-level vs expert-level diff too large: {diff_node}"
+    assert diff_edge < 1e-4, f"Edge GPU-level vs expert-level diff too large: {diff_edge}"
+
+    log(rank, "[PASS] test_gpu_level_vs_expert_level")
+
+
+# ======================================================================
+# Test 6: GPU-level A2A 2nd-order gradient flow
+# ======================================================================
+def test_gpu_level_2nd_order_grad(rank, ep_group, num_experts=4):
+    """Verify GPU-level A2A MoELayer supports 2nd-order autograd (force training)."""
+    from deepmd.pt.model.network.moe import MoELayer
+
+    torch.manual_seed(42)
+    num_in, num_out = 32, 32
+    tebd_dim = 32
+    top_k = 2
+    ntypes = 3
+    nb, nloc = 2, 8
+
+    moe = MoELayer(
+        num_in, num_out, num_experts, top_k, tebd_dim,
+        ep_group=ep_group, seed=42, gpu_level_a2a=True,
+    ).cuda()
+
+    dist.broadcast(moe.gate.matrix.data, src=0)
+
+    type_emb = torch.randn(ntypes, tebd_dim, device="cuda")
+    atom_types = torch.randint(0, ntypes, (nb, nloc), device="cuda")
+    dist.broadcast(type_emb, src=0, group=ep_group)
+    dist.broadcast(atom_types, src=0, group=ep_group)
+
+    positions = torch.randn(nb, nloc, 3, device="cuda", requires_grad=True)
+    encoder = nn.Linear(3, num_in, bias=False).cuda()
+    dist.broadcast(encoder.weight.data, src=0, group=ep_group)
+
+    hidden = encoder(positions)
+    out = moe(hidden, type_emb, atom_types)
+    energy = out.sum(dim=-1).sum(dim=-1)
+
+    force = -torch.autograd.grad(
+        energy.sum(), positions, create_graph=True, retain_graph=True
+    )[0]
+    assert force.shape == positions.shape, f"Force shape mismatch: {force.shape}"
+    assert not torch.isnan(force).any(), "Force has NaN"
+
+    force_target = torch.randn_like(force)
+    force_loss = nn.functional.mse_loss(force, force_target)
+    force_loss.backward()
+
+    has_grad = 0
+    for name, p in moe.named_parameters():
+        if p.grad is not None and p.grad.abs().max() > 0:
+            assert not torch.isnan(p.grad).any(), f"NaN grad in {name}"
+            has_grad += 1
+
+    log(rank, f"  [GPU-lvl-2nd-order] E={num_experts} params_with_grad={has_grad} force_loss={force_loss.item():.4f}")
+    assert has_grad > 0, "No parameter received gradient through 2nd-order path"
+
+    log(rank, "[PASS] test_gpu_level_2nd_order_grad")
+
+
 def bench_moelayer(rank, ep_group, num_experts, dim, nb, nloc, ntypes,
                    warmup=10, steps=50):
     """Benchmark MoELayer: EP (all ranks) then local (rank 0 only).
@@ -443,6 +573,13 @@ def main():
             test_ep_2nd_order_grad(rank, ep_group, num_experts=n_exp)
 
         test_gradient_stability(rank, ep_group, num_experts=4, steps=20)
+
+        # GPU-level A2A tests
+        log(rank, "\n--- GPU-level A2A Tests ---")
+        for n_exp in [2, 4, 6]:
+            log(rank, f"\n  num_experts={n_exp}")
+            test_gpu_level_vs_expert_level(rank, ep_group, num_experts=n_exp)
+            test_gpu_level_2nd_order_grad(rank, ep_group, num_experts=n_exp)
 
         log(rank, "\n" + "=" * 70)
         log(rank, "[PASS] All correctness tests passed")

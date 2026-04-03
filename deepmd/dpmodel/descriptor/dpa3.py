@@ -208,6 +208,7 @@ class RepFlowArgs:
         share_expert: int = 0,
         moe_ep_size: int = 1,
         fuse_moe_mlps: bool = False,
+        moe_gpu_level_a2a: bool = False,
     ) -> None:
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -246,6 +247,7 @@ class RepFlowArgs:
         self.share_expert = share_expert
         self.moe_ep_size = moe_ep_size
         self.fuse_moe_mlps = fuse_moe_mlps
+        self.moe_gpu_level_a2a = moe_gpu_level_a2a
 
     def __getitem__(self, key: str) -> Any:
         if hasattr(self, key):
@@ -289,6 +291,7 @@ class RepFlowArgs:
             "share_expert": self.share_expert,
             "moe_ep_size": self.moe_ep_size,
             "fuse_moe_mlps": self.fuse_moe_mlps,
+            "moe_gpu_level_a2a": self.moe_gpu_level_a2a,
         }
 
     @classmethod

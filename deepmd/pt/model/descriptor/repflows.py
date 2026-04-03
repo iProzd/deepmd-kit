@@ -231,6 +231,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         share_expert: int = 0,
         fuse_moe_mlps: bool = False,
         ep_group: "torch.distributed.ProcessGroup | None" = None,
+        gpu_level_a2a: bool = False,
     ) -> None:
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -303,6 +304,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.share_expert = share_expert
         self.fuse_moe_mlps = fuse_moe_mlps
         self.ep_group = ep_group
+        self.gpu_level_a2a = gpu_level_a2a
 
         self.edge_embd = MLPLayer(
             1,
@@ -359,6 +361,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                     fuse_moe_mlps=self.fuse_moe_mlps,
                     tebd_dim=self.n_dim,
                     ep_group=self.ep_group,
+                    gpu_level_a2a=self.gpu_level_a2a,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)

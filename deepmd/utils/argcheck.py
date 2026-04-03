@@ -1752,6 +1752,15 @@ def dpa3_repflow_args() -> list[Argument]:
             "edge_angle_linear1+angle_self_linear into single wide MoE layers. "
             "Only effective when both MLPs in a pair use MoE.",
         ),
+        Argument(
+            "moe_gpu_level_a2a",
+            bool,
+            optional=True,
+            default=False,
+            doc="When True and EP is active, deduplicate tokens per destination "
+            "GPU before All-to-All dispatch. Reduces communication volume when "
+            "multiple selected experts reside on the same GPU.",
+        ),
     ]
 
 

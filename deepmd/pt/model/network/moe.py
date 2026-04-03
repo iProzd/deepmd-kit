@@ -58,6 +58,10 @@ class MoELayer(nn.Module):
         Whether parameters are trainable.
     ep_group : dist.ProcessGroup or None
         Process group for Expert Parallelism. None = single-GPU (all experts local).
+    gpu_level_a2a : bool
+        When True and EP is active, deduplicate tokens per destination GPU
+        before A2A dispatch. Reduces communication volume when multiple selected
+        experts reside on the same GPU.
     """
 
     def __init__(
@@ -74,6 +78,7 @@ class MoELayer(nn.Module):
         seed: int | list[int] | None = None,
         trainable: bool = True,
         ep_group: dist.ProcessGroup | None = None,
+        gpu_level_a2a: bool = False,
     ) -> None:
         super().__init__()
         assert n_experts > 1, "MoELayer requires n_experts > 1"
@@ -93,6 +98,7 @@ class MoELayer(nn.Module):
 
         # Expert Parallelism config
         self.ep_group = ep_group
+        self.gpu_level_a2a = gpu_level_a2a
         if ep_group is not None:
             self.ep_size: int = dist.get_world_size(group=ep_group)
             self.ep_rank: int = dist.get_rank(group=ep_group)
@@ -368,6 +374,153 @@ class MoELayer(nn.Module):
         )
         return send_splits, recv_splits, send_perm, recv_eids
 
+    def _ep_dispatch_info_gpu_level(
+        self,
+        indices: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> tuple[list[int], list[int], torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor]:
+        """Compute GPU-level All-to-All dispatch metadata (no gradients).
+
+        Instead of expanding each token by routed_top_k (expert-level), this
+        deduplicates by destination GPU: each token sends at most 1 copy per
+        unique destination GPU, along with metadata about which local experts
+        and weights to apply on the receiving side.
+
+        Parameters
+        ----------
+        indices : torch.Tensor
+            [N_tokens, routed_top_k] — global expert IDs per token.
+        weights : torch.Tensor
+            [N_tokens, routed_top_k] — routing weights per token.
+
+        Returns
+        -------
+        send_splits : list[int]
+            Number of deduplicated token entries to send to each rank.
+        recv_splits : list[int]
+            Number of deduplicated token entries to receive from each rank.
+        send_perm : torch.Tensor
+            [N_dedup] — maps each dedup entry to original token index.
+        send_gpu_ids : torch.Tensor
+            [N_dedup] — target GPU for each dedup entry (sorted).
+        recv_eid_matrix : torch.Tensor
+            [N_dedup_recv, max_experts_per_token] — local expert IDs, -1 = pad.
+        recv_weight_matrix : torch.Tensor
+            [N_dedup_recv, max_experts_per_token] — routing weights, 0 = pad.
+        dedup_to_token : torch.Tensor
+            [N_dedup] — maps each dedup entry back to original token index
+            (needed for un-aggregation on the send side).
+        """
+        n_tokens = indices.shape[0]
+        device = indices.device
+
+        # Compute target GPU and local expert ID for each (token, top_k) pair
+        target_gpus = indices // self.experts_per_gpu   # [N, top_k]
+        local_eids = indices % self.experts_per_gpu     # [N, top_k]
+
+        # For each token, find unique destination GPUs
+        # Build dedup entries: (token_idx, target_gpu) pairs, unique per token
+        # Strategy: for each token, group experts by target GPU
+
+        # Flatten to per-(token, gpu) pairs, then deduplicate
+        token_idx_rep = torch.arange(
+            n_tokens, device=device
+        ).unsqueeze(1).expand_as(target_gpus).reshape(-1)
+        flat_target = target_gpus.reshape(-1)
+
+        # Create unique (token, gpu) pairs using combined key
+        combined = token_idx_rep * self.ep_size + flat_target  # unique per (token, gpu)
+        unique_combined, inverse = torch.unique(combined, sorted=True, return_inverse=True)
+
+        n_dedup = unique_combined.shape[0]
+        dedup_token_idx = unique_combined // self.ep_size   # [N_dedup]
+        dedup_gpu_id = unique_combined % self.ep_size       # [N_dedup]
+
+        # Build eid_matrix and weight_matrix for dedup entries
+        # For each dedup entry, collect local expert IDs and weights
+        # Max possible experts per dedup entry = experts_per_gpu (but typically << top_k)
+        max_k = min(self.routed_top_k, self.experts_per_gpu)
+        eid_matrix = torch.full(
+            (n_dedup, max_k), -1, dtype=torch.int64, device=device
+        )
+        weight_matrix = torch.zeros(
+            n_dedup, max_k, dtype=weights.dtype, device=device
+        )
+
+        # Fill: for each original (token, top_k) entry, find which dedup slot it maps to
+        # inverse maps flat_index -> dedup_index
+        flat_local_eids = local_eids.reshape(-1)
+        flat_weights = weights.reshape(-1)
+
+        # For each dedup entry, we need to assign slots for its experts
+        # Use scatter: count per dedup entry first, then fill
+        slot_counter = torch.zeros(n_dedup, dtype=torch.int64, device=device)
+        for k in range(self.routed_top_k):
+            # Index into the flattened arrays
+            flat_idx = torch.arange(n_tokens, device=device) * self.routed_top_k + k
+            dedup_idx = inverse[flat_idx]   # which dedup entry
+            slot = slot_counter[dedup_idx]  # which slot in that entry
+
+            # Only fill if slot < max_k (shouldn't overflow with correct max_k)
+            valid = slot < max_k
+            if valid.all():
+                eid_matrix[dedup_idx, slot] = local_eids[:, k]
+                weight_matrix[dedup_idx, slot] = weights[:, k]
+            else:
+                valid_dedup = dedup_idx[valid]
+                valid_slot = slot[valid]
+                eid_matrix[valid_dedup, valid_slot] = local_eids[valid, k]
+                weight_matrix[valid_dedup, valid_slot] = weights[valid, k]
+
+            slot_counter[dedup_idx] += 1
+
+        # Sort dedup entries by target GPU
+        sort_perm = torch.argsort(dedup_gpu_id, stable=True)
+        dedup_token_idx = dedup_token_idx[sort_perm]
+        dedup_gpu_id_sorted = dedup_gpu_id[sort_perm]
+        eid_matrix = eid_matrix[sort_perm]
+        weight_matrix = weight_matrix[sort_perm]
+
+        send_splits = [
+            (dedup_gpu_id_sorted == i).sum().item() for i in range(self.ep_size)
+        ]
+
+        # Exchange recv counts
+        send_t = torch.tensor(send_splits, device=device, dtype=torch.int64)
+        recv_t = torch.zeros_like(send_t)
+        dist.all_to_all_single(recv_t, send_t, group=self.ep_group)
+        recv_splits = recv_t.tolist()
+
+        # Exchange eid_matrix and weight_matrix
+        # all_to_all_single operates on the first dimension, so 2D tensors work
+        # directly with per-row split sizes
+        total_recv = sum(recv_splits)
+        recv_eid_matrix = torch.empty(
+            total_recv, max_k, dtype=torch.int64, device=device
+        )
+        dist.all_to_all_single(
+            recv_eid_matrix,
+            eid_matrix.contiguous(),
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=self.ep_group,
+        )
+
+        recv_weight_matrix = torch.empty(
+            total_recv, max_k, dtype=weight_matrix.dtype, device=device
+        )
+        dist.all_to_all_single(
+            recv_weight_matrix,
+            weight_matrix.contiguous(),
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=self.ep_group,
+        )
+
+        return (send_splits, recv_splits, dedup_token_idx, dedup_gpu_id_sorted,
+                recv_eid_matrix, recv_weight_matrix, dedup_token_idx)
+
     def _ep_local_experts(
         self,
         h: torch.Tensor,
@@ -425,7 +578,21 @@ class MoELayer(nn.Module):
 
         Uses fused dispatch+compute+combine (ep_moe_forward) to prevent NCCL
         deadlocks from autograd topological sort reordering.
+
+        When gpu_level_a2a=True, tokens are deduplicated per destination GPU
+        before A2A, reducing communication volume.
         """
+        if self.gpu_level_a2a:
+            return self._moe_ep_flat_gpu_level(x, weights, indices)
+        return self._moe_ep_flat_expert_level(x, weights, indices)
+
+    def _moe_ep_flat_expert_level(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expert-level EP MoE for flat inputs (original implementation)."""
         from deepmd.pt.model.network.moe_ep_ops import ep_moe_forward
 
         n_flat = x.shape[0]
@@ -481,6 +648,59 @@ class MoELayer(nn.Module):
             output = output + se(x)
         return output
 
+    def _moe_ep_flat_gpu_level(
+        self,
+        x: torch.Tensor,
+        weights: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """GPU-level EP MoE for flat inputs: x [n_flat, dim].
+
+        Deduplicates tokens per destination GPU before A2A. Each unique
+        (token, target_gpu) pair sends only 1 copy. The receiving side
+        fans out to multiple local experts and combines locally.
+        """
+        from deepmd.pt.model.network.moe_ep_ops import ep_moe_gpu_level_forward
+
+        n_flat = x.shape[0]
+        dim = x.shape[-1]
+
+        # GPU-level dispatch metadata (no grad)
+        (send_splits, recv_splits, dedup_token_idx, dedup_gpu_ids,
+         recv_eid_matrix, recv_weight_matrix, _) = (
+            self._ep_dispatch_info_gpu_level(indices, weights)
+        )
+
+        # Gather deduplicated tokens (differentiable indexing)
+        x_dedup = x[dedup_token_idx]  # [N_dedup, dim]
+
+        # Fused GPU-level dispatch A2A + multi-expert compute + combine A2A
+        h_ret, used_experts = ep_moe_gpu_level_forward(
+            x_dedup, send_splits, recv_splits, self.ep_group,
+            self.experts, recv_eid_matrix, recv_weight_matrix, self.num_out,
+        )
+
+        # Add ghost terms for ALL experts
+        ghost_sum = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        for expert in self.experts:
+            dummy = expert(torch.zeros(
+                1, dim, dtype=x.dtype, device=x.device
+            ))
+            ghost_sum = ghost_sum + dummy.sum() * 0.0
+        h_ret = h_ret + ghost_sum
+
+        # Scatter-add results back to original token positions
+        # Each dedup entry contributes to its original token (already weighted on recv side)
+        output = torch.zeros(
+            n_flat, self.num_out, dtype=x.dtype, device=x.device
+        )
+        output = output.index_add(0, dedup_token_idx, h_ret)
+
+        # Add shared experts (local, no dispatch)
+        for se in self.shared_experts:
+            output = output + se(x)
+        return output
+
     def _moe_ep_batched(
         self,
         x: torch.Tensor,
@@ -488,6 +708,22 @@ class MoELayer(nn.Module):
         atom_indices: torch.Tensor,
     ) -> torch.Tensor:
         """EP MoE for batched inputs with arbitrary middle dims.
+
+        x: [nb, nloc, *mid, dim_in]
+        atom_weights: [nb, nloc, routed_top_k]
+        atom_indices: [nb, nloc, routed_top_k]
+        """
+        if self.gpu_level_a2a:
+            return self._moe_ep_batched_gpu_level(x, atom_weights, atom_indices)
+        return self._moe_ep_batched_expert_level(x, atom_weights, atom_indices)
+
+    def _moe_ep_batched_expert_level(
+        self,
+        x: torch.Tensor,
+        atom_weights: torch.Tensor,
+        atom_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """Expert-level EP MoE for batched inputs (original implementation).
 
         x: [nb, nloc, *mid, dim_in]
         atom_weights: [nb, nloc, routed_top_k]
@@ -574,6 +810,85 @@ class MoELayer(nn.Module):
         h_topk = h_unperm.reshape(n_tokens, self.routed_top_k, self.num_out)
         w_topk = flat_weights.reshape(n_tokens, self.routed_top_k)
         output_flat = (h_topk * w_topk.unsqueeze(-1)).sum(dim=1)
+
+        # Reshape back to original shape
+        output = output_flat.reshape(nb, nloc, *mid_shape, self.num_out)
+
+        # Add shared experts (local, no dispatch)
+        for se in self.shared_experts:
+            output = output + se(x)
+        return output
+
+    def _moe_ep_batched_gpu_level(
+        self,
+        x: torch.Tensor,
+        atom_weights: torch.Tensor,
+        atom_indices: torch.Tensor,
+    ) -> torch.Tensor:
+        """GPU-level EP MoE for batched inputs.
+
+        x: [nb, nloc, *mid, dim_in]
+        atom_weights: [nb, nloc, routed_top_k]
+        atom_indices: [nb, nloc, routed_top_k]
+
+        Same as _moe_ep_batched_expert_level but deduplicates tokens per
+        destination GPU before A2A to reduce communication volume.
+        """
+        from deepmd.pt.model.network.moe_ep_ops import ep_moe_gpu_level_forward
+
+        orig_shape = x.shape  # [nb, nloc, *mid, dim_in]
+        nb, nloc = atom_weights.shape[:2]
+        dim_in = x.shape[-1]
+        mid_shape = orig_shape[2:-1]
+        mid_size = 1
+        for s in mid_shape:
+            mid_size *= s
+
+        # Flatten: [nb, nloc, *mid, dim_in] -> [nb * nloc * mid_size, dim_in]
+        x_flat = x.reshape(nb * nloc * mid_size, dim_in)
+
+        # Expand routing to match flattened tokens
+        atom_indices_flat = atom_indices.reshape(nb * nloc, self.routed_top_k)
+        atom_weights_flat = atom_weights.reshape(nb * nloc, self.routed_top_k)
+        if mid_size > 1:
+            atom_indices_flat = atom_indices_flat.unsqueeze(1).expand(
+                -1, mid_size, -1
+            ).reshape(-1, self.routed_top_k)
+            atom_weights_flat = atom_weights_flat.unsqueeze(1).expand(
+                -1, mid_size, -1
+            ).reshape(-1, self.routed_top_k)
+
+        n_tokens = x_flat.shape[0]
+
+        # GPU-level dispatch metadata
+        (send_splits, recv_splits, dedup_token_idx, dedup_gpu_ids,
+         recv_eid_matrix, recv_weight_matrix, _) = (
+            self._ep_dispatch_info_gpu_level(atom_indices_flat, atom_weights_flat)
+        )
+
+        # Gather deduplicated tokens
+        x_dedup = x_flat[dedup_token_idx]
+
+        # Fused GPU-level dispatch A2A + multi-expert compute + combine A2A
+        h_ret, used_experts = ep_moe_gpu_level_forward(
+            x_dedup, send_splits, recv_splits, self.ep_group,
+            self.experts, recv_eid_matrix, recv_weight_matrix, self.num_out,
+        )
+
+        # Add ghost terms for ALL experts
+        ghost_sum = torch.tensor(0.0, dtype=x.dtype, device=x.device)
+        for expert in self.experts:
+            dummy = expert(torch.zeros(
+                1, dim_in, dtype=x.dtype, device=x.device
+            ))
+            ghost_sum = ghost_sum + dummy.sum() * 0.0
+        h_ret = h_ret + ghost_sum
+
+        # Scatter-add results back to original token positions
+        output_flat = torch.zeros(
+            n_tokens, self.num_out, dtype=x.dtype, device=x.device
+        )
+        output_flat = output_flat.index_add(0, dedup_token_idx, h_ret)
 
         # Reshape back to original shape
         output = output_flat.reshape(nb, nloc, *mid_shape, self.num_out)

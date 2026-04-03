@@ -245,7 +245,15 @@ def _convert_preset_out_bias_to_array(
 
 def get_standard_model(model_params: dict) -> BaseModel:
     model_params_old = model_params
+    # Extract non-picklable EP runtime params before deepcopy
+    descriptor_params = model_params.get("descriptor", {})
+    _ep_group = descriptor_params.pop("ep_group", None)
+    _gpu_level_a2a = descriptor_params.pop("gpu_level_a2a", False)
     model_params = copy.deepcopy(model_params)
+    # Re-inject only into the copy (not model_params_old, which gets json.dumps'd)
+    if _ep_group is not None:
+        model_params["descriptor"]["ep_group"] = _ep_group
+        model_params["descriptor"]["gpu_level_a2a"] = _gpu_level_a2a
     ntypes = len(model_params["type_map"])
     descriptor, fitting, fitting_net_type = _get_standard_model_components(
         model_params, ntypes

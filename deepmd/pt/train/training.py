@@ -110,6 +110,10 @@ from deepmd.utils.path import (
 
 log = logging.getLogger(__name__)
 
+# Module-level holder for EP runtime params (ProcessGroup objects can't be
+# pickled/deepcopied, so we pass them out-of-band instead of in model_params).
+_EP_RUNTIME_PARAMS: dict[str, Any] = {}
+
 
 class Trainer:
     def __init__(
@@ -155,6 +159,12 @@ class Trainer:
         self.world_size = dist.get_world_size() if self.is_distributed else 1
         self.num_model = len(self.model_keys)
         self.model_prob = None
+
+        # Expert Parallelism (EP) setup
+        self.ep_group = None
+        self.dp_group = None
+        self.ep_size = 1
+        self._setup_expert_parallelism(model_params)
 
         # Iteration config
         self.num_steps = training_params.get("numb_steps")
@@ -773,12 +783,22 @@ class Trainer:
                 self.wrapper = fully_shard(self.wrapper, reshard_after_forward=reshard)
             else:
                 # zero_stage=0 or 1: standard DDP (ZeRO-1 will wrap the optimizer)
-                self.wrapper = DDP(
-                    self.wrapper,
-                    device_ids=[LOCAL_RANK],
-                    find_unused_parameters=True,
-                    output_device=LOCAL_RANK,
-                )
+                if self.ep_size > 1:
+                    # EP mode: skip DDP wrapping entirely. Gradient sync is
+                    # handled manually in _ep_gradient_sync() because:
+                    #  - Expert params: all-reduce within dp_group only
+                    #    (different EP ranks hold different experts)
+                    #  - Shared params: all-reduce within global group
+                    #    (gate, shared_experts, fitting_net, etc.)
+                    # DDP can only use ONE process_group, so it can't do both.
+                    pass
+                else:
+                    self.wrapper = DDP(
+                        self.wrapper,
+                        device_ids=[LOCAL_RANK],
+                        find_unused_parameters=True,
+                        output_device=LOCAL_RANK,
+                    )
 
         # TODO add lr warmups for multitask
         # author: iProzd
@@ -927,7 +947,7 @@ class Trainer:
 
     def _get_inner_module(self) -> ModelWrapper:
         """Unwrap DDP if needed. FSDP2 is in-place so no unwrapping required."""
-        if self.is_distributed and self.zero_stage <= 1:
+        if self.is_distributed and self.zero_stage <= 1 and self.ep_size <= 1:
             return self.wrapper.module
         return self.wrapper
 
@@ -948,6 +968,88 @@ class Trainer:
             )
         else:
             self.optimizer.load_state_dict(optimizer_state_dict)
+
+    def _setup_expert_parallelism(self, model_params: dict[str, Any]) -> None:
+        """Set up Expert Parallelism (EP) device mesh if configured.
+
+        Detects moe_ep_size from descriptor config. When ep_size > 1 and
+        distributed training is active, creates a 2D device mesh (dp, ep)
+        and injects ep_group/gpu_level_a2a into model_params["descriptor"]
+        so they propagate to DescrptDPA3 during model construction.
+        """
+        if not self.is_distributed:
+            return
+
+        # Extract moe_ep_size from descriptor config
+        descriptor_params = model_params.get("descriptor", {})
+        repflow_params = descriptor_params.get("repflow", {})
+        moe_ep_size = repflow_params.get("moe_ep_size", 1)
+
+        if moe_ep_size <= 1:
+            return
+
+        if self.world_size % moe_ep_size != 0:
+            raise ValueError(
+                f"world_size ({self.world_size}) must be divisible by "
+                f"moe_ep_size ({moe_ep_size})"
+            )
+
+        from torch.distributed.device_mesh import init_device_mesh
+
+        dp_size = self.world_size // moe_ep_size
+        self.ep_size = moe_ep_size
+        mesh = init_device_mesh(
+            "cuda", (dp_size, moe_ep_size), mesh_dim_names=("dp", "ep")
+        )
+        self.ep_group = mesh["ep"].get_group()
+        self.dp_group = mesh["dp"].get_group()
+
+        # Inject runtime EP params into descriptor config for model construction.
+        # These are non-picklable, so we use a module-level holder that
+        # get_single_model() reads instead of putting them in model_params.
+        gpu_level_a2a = repflow_params.get("moe_gpu_level_a2a", False)
+        _EP_RUNTIME_PARAMS["ep_group"] = self.ep_group
+        _EP_RUNTIME_PARAMS["gpu_level_a2a"] = gpu_level_a2a
+
+        log.info(
+            f"Expert Parallelism enabled: ep_size={moe_ep_size}, "
+            f"dp_size={dp_size}, gpu_level_a2a={gpu_level_a2a}"
+        )
+
+    def _is_routed_expert_param(self, name: str) -> bool:
+        """Check if a parameter belongs to a routed expert (not shared).
+
+        Routed expert params contain '.experts.' in name but NOT '.shared_experts.'.
+        These exist only on a subset of EP ranks and must be synced within
+        dp_group only (not globally).
+        """
+        return ".experts." in name and ".shared_experts." not in name
+
+    def _ep_gradient_sync(self) -> None:
+        """Manual gradient sync for Expert Parallelism.
+
+        DDP cannot handle EP because it uses a single process_group for all
+        parameters. In EP mode, different ranks hold different routed experts
+        (same parameter names but different semantics). The correct sync is:
+
+        - Routed expert params: all-reduce within dp_group
+          (only ranks with the SAME expert subset should average)
+        - Shared params: all-reduce within the default (global) group
+          (gate, shared_experts, fitting_net, encoder, etc.)
+        """
+        dp_size = dist.get_world_size(group=self.dp_group)
+        for name, p in self.wrapper.named_parameters():
+            if p.grad is None:
+                continue
+            if self._is_routed_expert_param(name):
+                # Routed experts: sync only within dp_group
+                if dp_size > 1:
+                    dist.all_reduce(p.grad, group=self.dp_group)
+                    p.grad /= dp_size
+            else:
+                # Shared params: sync globally across all ranks
+                dist.all_reduce(p.grad)
+                p.grad /= self.world_size
 
     def run(self) -> None:
         fout = (
@@ -1012,6 +1114,9 @@ class Trainer:
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                 )
                 loss.backward()
+                # EP mode: manual gradient sync (DDP is not used)
+                if self.ep_size > 1:
+                    self._ep_gradient_sync()
                 # === Initialize gradient diagnostics variables ===
                 total_norm: torch.Tensor | None = None
                 pre_clip_named_norms: list[tuple[str, float]] = []
@@ -1757,7 +1862,17 @@ def get_single_model(
     if "use_srtab" in _model_params:
         model = get_zbl_model(deepcopy(_model_params)).to(DEVICE)
     else:
-        model = get_model(deepcopy(_model_params)).to(DEVICE)
+        model_params_copy = deepcopy(_model_params)
+
+        # Inject non-picklable EP runtime params after deepcopy
+        if _EP_RUNTIME_PARAMS:
+            descriptor_params = model_params_copy.get("descriptor", {})
+            descriptor_params["ep_group"] = _EP_RUNTIME_PARAMS.get("ep_group")
+            descriptor_params["gpu_level_a2a"] = _EP_RUNTIME_PARAMS.get(
+                "gpu_level_a2a", False
+            )
+
+        model = get_model(model_params_copy).to(DEVICE)
     return model
 
 

@@ -33,6 +33,7 @@ class FusedMoELayer(torch.nn.Module):
         seed: int | list[int] | None = None,
         trainable: bool = True,
         ep_group: "torch.distributed.ProcessGroup | None" = None,
+        gpu_level_a2a: bool = False,
     ):
         super().__init__()
         self.num_in = num_in
@@ -54,6 +55,7 @@ class FusedMoELayer(torch.nn.Module):
             seed=seed,
             trainable=trainable,
             ep_group=ep_group,
+            gpu_level_a2a=gpu_level_a2a,
         )
 
     def forward(

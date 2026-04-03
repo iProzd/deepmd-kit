@@ -76,6 +76,7 @@ class RepFlowLayer(torch.nn.Module):
         fuse_moe_mlps: bool = False,
         tebd_dim: int = 0,
         ep_group: "torch.distributed.ProcessGroup | None" = None,
+        gpu_level_a2a: bool = False,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -130,6 +131,7 @@ class RepFlowLayer(torch.nn.Module):
         self.fuse_moe_mlps = fuse_moe_mlps
         self.tebd_dim = tebd_dim
         self.ep_group = ep_group
+        self.gpu_level_a2a = gpu_level_a2a
         self.use_moe: bool = n_experts > 1
 
         assert update_residual_init in [
@@ -178,6 +180,7 @@ class RepFlowLayer(torch.nn.Module):
                 seed=seed_val,
                 trainable=trainable,
                 ep_group=self.ep_group,
+                gpu_level_a2a=self.gpu_level_a2a,
             )
 
         def _make_fused_moe(
@@ -199,6 +202,7 @@ class RepFlowLayer(torch.nn.Module):
                 seed=seed_val,
                 trainable=trainable,
                 ep_group=self.ep_group,
+                gpu_level_a2a=self.gpu_level_a2a,
             )
 
         # node self mlp — JIT requires separate typed attributes

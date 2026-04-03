@@ -123,6 +123,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         type_map: list[str] | None = None,
         add_chg_spin_ebd: bool = False,
         ep_group: "torch.distributed.ProcessGroup | None" = None,
+        gpu_level_a2a: bool = False,
     ) -> None:
         super().__init__()
 
@@ -182,6 +183,7 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             share_expert=self.repflow_args.share_expert,
             fuse_moe_mlps=self.repflow_args.fuse_moe_mlps,
             ep_group=ep_group,
+            gpu_level_a2a=gpu_level_a2a,
         )
 
         self.use_econf_tebd = use_econf_tebd
