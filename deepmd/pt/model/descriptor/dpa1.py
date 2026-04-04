@@ -656,6 +656,8 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
         nlist: torch.Tensor,
         mapping: Optional[torch.Tensor] = None,
         comm_dict: Optional[dict[str, torch.Tensor]] = None,
+        fparam: Optional[torch.Tensor] = None,
+        case_embd: Optional[torch.Tensor] = None,
     ):
         """Compute the descriptor.
 
@@ -671,6 +673,10 @@ class DescrptDPA1(BaseDescriptor, torch.nn.Module):
             The index mapping, not required by this descriptor.
         comm_dict
             The data needed for communication for parallel inference.
+        fparam
+            The frame-level parameters. shape: nf x nfparam
+        case_embd
+            The case (dataset) embedding for multitask training with shared fitting. shape: nf x dim_case_embd
 
         Returns
         -------
