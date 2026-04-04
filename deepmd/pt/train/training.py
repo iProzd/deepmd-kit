@@ -559,12 +559,13 @@ class Trainer:
                     for kk in rm_list:
                         state_dict.pop(kk)
                     state_dict["_extra_state"]["model_params"] = old_model_params
-                    out_shape_list = [
-                        "model.Default.atomic_model.out_bias",
-                        "model.Default.atomic_model.out_std",
-                    ]
+                    out_shape_list = []
+                    for model_key in self.model_keys:
+                        out_shape_list.append(f"model.{model_key}.atomic_model.out_bias")
+                        out_shape_list.append(f"model.{model_key}.atomic_model.out_std")
                     for kk in out_shape_list:
-                        state_dict[kk] = state_dict[kk][:1, :, :1]
+                        if kk in state_dict:
+                            state_dict[kk] = state_dict[kk][:1, :, :1]
                     self.wrapper.load_state_dict(state_dict)
 
                 # change bias for fine-tuning
