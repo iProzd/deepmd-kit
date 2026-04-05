@@ -10,9 +10,7 @@ This implementation is designed around two non-negotiables:
 2) Speed-first inference: edge geometry and Wigner-D rotation blocks are computed
    exactly once per `forward()` and reused by all interaction blocks.
 
-Shared descriptor helpers live in `se_zm_helper.py`, quaternion/Wigner rotation
-utilities live in `SeZM_WignerD.py`, and per-block message passing is implemented
-in `se_zm_block.py`.
+Shared descriptor building blocks are re-exported by `sezm_nn/__init__.py`.
 
 Runtime flow at a glance:
 1) Build edge cache and radial features once.
@@ -68,36 +66,32 @@ from deepmd.pt.utils.update_sel import (
 from .base_descriptor import (
     BaseDescriptor,
 )
-from .se_zm_block import (
-    DepthAttnRes,
-    EquivariantFFN,
-    ScalarRMSNorm,
-    SeZMInteractionBlock,
-)
-from .se_zm_helper import (
+from .sezm_nn import (
     ATTN_RES_MODES,
     C3CutoffEnvelope,
+    DepthAttnRes,
     EdgeFeatureCache,
     EnvironmentInitialEmbedding,
+    EquivariantFFN,
     GeometricInitialEmbedding,
     InnerClamp,
     RadialBasis,
     RadialMLP,
+    ScalarRMSNorm,
+    SeZMInteractionBlock,
     SeZMTypeEmbedding,
+    WignerDCalculator,
+    build_edge_quaternion,
     build_edge_type_feat,
     edge_cache_to_dtype,
     get_promoted_dtype,
     get_so3_dim_of_lmax,
     np_safe,
     nvtx_range,
-    safe_norm,
-    safe_numpy_to_tensor,
-)
-from .SeZM_WignerD import (
-    WignerDCalculator,
-    build_edge_quaternion,
     quaternion_multiply,
     quaternion_z_rotation,
+    safe_norm,
+    safe_numpy_to_tensor,
 )
 
 if TYPE_CHECKING:

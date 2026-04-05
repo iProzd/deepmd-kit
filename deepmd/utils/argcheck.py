@@ -347,7 +347,7 @@ def descrpt_se_a_args() -> list[Argument]:
     doc=doc_only_pt_supported + doc_se_zm,
 )
 def descrpt_se_zm_args() -> list[Argument]:
-    # Follows exact order of docstring in se_zm.py DescrptSeZM class
+    # Follows exact order of docstring in sezm.py DescrptSeZM class
     doc_sel = 'The maximum number of neighbors. It can be:\n\n\
     - `int`: the total maximum number of neighbors within `rcut` (all types combined)\n\n\
     - `list[int]`: sel[i] specifies the maximum number of type-i neighbors within `rcut`\n\n\

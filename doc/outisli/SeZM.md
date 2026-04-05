@@ -5,8 +5,43 @@ SeZM is the model branch built on top of the SeZM descriptor.
 
 This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_zm`) implemented in:
 
-- `deepmd/pt/model/descriptor/se_zm.py`
-- `deepmd/pt/model/descriptor/se_zm_block.py`
+- `deepmd/pt/model/descriptor/sezm.py`
+- `deepmd/pt/model/descriptor/sezm_nn/`
+
+### Module Layout
+
+- `deepmd/pt/model/descriptor/sezm.py`
+  - top-level `DescrptSeZM`
+  - descriptor orchestration, config parsing, edge-cache construction, block scheduling
+  - imports all submodules through `deepmd/pt/model/descriptor/sezm_nn/__init__.py`
+- `deepmd/pt/model/descriptor/sezm_nn/__init__.py`
+  - public re-export layer for descriptor code, model code, and tests
+- `deepmd/pt/model/descriptor/sezm_nn/utils.py`
+  - NVTX helpers, dtype promotion, serialization helpers, small numerical utilities
+- `deepmd/pt/model/descriptor/sezm_nn/edge.py`
+  - `EdgeFeatureCache`, edge type feature construction, cache dtype conversion
+- `deepmd/pt/model/descriptor/sezm_nn/indexing.py`
+  - packed `(l, m)` indexing, reduced-layout indexing, rotation projection helpers
+- `deepmd/pt/model/descriptor/sezm_nn/radial.py`
+  - `C3CutoffEnvelope`, `InnerClamp`, `RadialBasis`, `RadialMLP`
+- `deepmd/pt/model/descriptor/sezm_nn/embedding.py`
+  - `SeZMTypeEmbedding`, `GeometricInitialEmbedding`, `EnvironmentInitialEmbedding`
+- `deepmd/pt/model/descriptor/sezm_nn/norm.py`
+  - `EquivariantRMSNorm`, `ReducedEquivariantRMSNorm`, `ScalarRMSNorm`
+- `deepmd/pt/model/descriptor/sezm_nn/attention.py`
+  - destination-wise envelope-gated softmax for SO(2) attention
+- `deepmd/pt/model/descriptor/sezm_nn/attn_res.py`
+  - `DepthAttnRes`
+- `deepmd/pt/model/descriptor/sezm_nn/so3.py`
+  - `FocusLinear`, `GatedActivation`, `SO3Linear`
+- `deepmd/pt/model/descriptor/sezm_nn/so2.py`
+  - `SO2Linear`, `SO2Convolution`
+- `deepmd/pt/model/descriptor/sezm_nn/ffn.py`
+  - `EquivariantFFN`
+- `deepmd/pt/model/descriptor/sezm_nn/block.py`
+  - `SeZMInteractionBlock`
+- `deepmd/pt/model/descriptor/sezm_nn/wignerd.py`
+  - quaternion edge-frame construction and `WignerDCalculator`
 
 ______________________________________________________________________
 
@@ -106,7 +141,7 @@ they are not user-facing descriptor config keys.
 
 ### Inner Clamping
 
-The `InnerClamp` module (in `se_zm_helper.py`) implements a C3-continuous septic Hermite
+The `InnerClamp` module (in `deepmd/pt/model/descriptor/sezm_nn/radial.py`) implements a C3-continuous septic Hermite
 polynomial that maps true distances to effective distances:
 
 ```
@@ -862,7 +897,7 @@ This double-guarantee ensures:
 
 SeZM uses real-basis Wigner-D blocks to rotate per-degree features between the global frame
 and the edge-aligned local frame. The block-diagonal matrices are computed by
-`WignerDCalculator` in `deepmd/pt/model/descriptor/SeZM_WignerD.py`.
+`WignerDCalculator` in `deepmd/pt/model/descriptor/sezm_nn/wignerd.py`.
 
 #### Geometric contract
 

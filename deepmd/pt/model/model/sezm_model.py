@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 from deepmd.pt.model.atomic_model.sezm_atomic_model import (
     SeZMAtomicModel,
 )
-from deepmd.pt.model.descriptor.se_zm_helper import (
+from deepmd.pt.model.descriptor.sezm_nn import (
     nvtx_range,
 )
 from deepmd.pt.model.model.dp_model import (

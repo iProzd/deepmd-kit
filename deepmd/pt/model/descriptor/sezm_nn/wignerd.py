@@ -1,18 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """
-Quaternion-driven Wigner-D and edge-rotation utilities for SeZM.
+Quaternion-based Wigner-D and edge-frame utilities for SeZM.
 
-This module isolates the edge-aligned rotation machinery from the descriptor
-helper collection:
-- stable edge quaternion construction for the local ``+Z`` convention;
-- quaternion algebra used by the rotation pipeline;
-- hybrid Wigner-D evaluation with specialized ``l=2,3,4`` kernels and a
-  generic ``l>=5`` polynomial path.
-
-The public contract is intentionally small:
-- `build_edge_quaternion(edge_vec)` constructs the global->local edge rotation;
-- `WignerDCalculator` returns block-diagonal `D_full` / `Dt_full` matrices in
-  the SeZM packed real spherical-harmonics basis.
+This module defines the quaternion helpers and Wigner-D evaluator used to
+construct edge-aligned SO(3) rotation blocks in SeZM.
 """
 
 from __future__ import (
@@ -35,7 +26,7 @@ from deepmd.pt.utils import (
     env,
 )
 
-from .se_zm_helper import (
+from .utils import (
     nvtx_range,
 )
 

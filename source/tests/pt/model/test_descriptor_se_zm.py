@@ -13,21 +13,17 @@ if torch_set_num_interop_threads is not None:
 if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
-from deepmd.pt.model.descriptor.se_zm import (
+from deepmd.pt.model.descriptor.sezm import (
     DescrptSeZM,
 )
-from deepmd.pt.model.descriptor.se_zm_block import (
-    SO2Linear,
-)
-from deepmd.pt.model.descriptor.se_zm_helper import (
+from deepmd.pt.model.descriptor.sezm_nn import (
     InnerClamp,
-    so3_packed_index,
-)
-from deepmd.pt.model.descriptor.SeZM_WignerD import (
+    SO2Linear,
     WignerDCalculator,
     build_edge_quaternion,
     quaternion_multiply,
     quaternion_to_rotation_matrix,
+    so3_packed_index,
 )
 from deepmd.pt.model.model import (
     get_sezm_model,

@@ -42,7 +42,7 @@ from .se_t_tebd import (
     DescrptBlockSeTTebd,
     DescrptSeTTebd,
 )
-from .se_zm import (
+from .sezm import (
     DescrptSeZM,
 )
 

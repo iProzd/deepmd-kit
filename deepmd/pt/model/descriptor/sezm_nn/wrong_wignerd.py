@@ -9,11 +9,11 @@ to introduce force/PES roughness in SeZM:
 - `init_edge_rot_mat`
 - `init_edge_rot_mat_frisvad`
 
-Shared helpers that are still valid are imported from `se_zm_helper.py`.
+Shared helpers that are still valid are imported from the split `sezm_nn` package.
 Only the archived buggy implementations themselves are kept in this file.
 
 Do not use this module for production code. The live implementation should stay in
-`se_zm_helper.py`.
+`sezm_nn`.
 """
 
 from __future__ import (
@@ -32,10 +32,12 @@ from deepmd.pt.utils import (
     env,
 )
 
-from .se_zm_helper import (
+from .indexing import (
+    so3_packed_index,
+)
+from .utils import (
     nvtx_range,
     safe_norm,
-    so3_packed_index,
 )
 
 
