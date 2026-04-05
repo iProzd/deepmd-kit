@@ -695,6 +695,7 @@ Rules:
     `D_m_trunc = sum_{l=0..lmax} (2*min(mmax, l)+1)`
   - rotate-to-local computes only these coefficients via a **row-subset** of Wigner-D
   - rotate-back treats omitted coefficients as zero via a **column-subset** of Wigner-D
+  - when `use_triton=True` on supported CUDA dtypes, these two subset-rotation paths are fused into Triton custom ops with custom backward
   - `SO2Linear` operates directly on the reduced layout (no gather from full D)
 
 Note: unlike `l_schedule`, `m_schedule` does NOT change the **global node tensor** packed layout
@@ -735,8 +736,9 @@ Key arguments:
 - `full_attn_res: str` — Descriptor-level full AttnRes mode over unit history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `block_attn_res: str` — Descriptor-level block AttnRes mode over block history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final block aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`). Cannot be enabled together with `full_attn_res`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: True)
+- `use_triton: bool` — If True, opt into fused Triton SO(2) rotation kernels on supported CUDA dtypes. The default is `False` because the current Triton rotation path is not consistently faster than the eager reference path (default: False)
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: True)
-- `random_gamma: bool` — If True, sample an independent random roll `gamma ~ U[0, 2π)` for every edge on every forward call, build a local-`+Z` roll quaternion, and left-compose it with the edge-aligned quaternion before Wigner-D evaluation (default: True)
+- `random_gamma: bool` — If True, sample an independent random roll `gamma ~ U[0, 2π)` for every edge on every forward call, build a local-`+Z` roll quaternion, and left-compose it with the edge-aligned quaternion before Wigner-D evaluation (default: False)
 
 Optimizer routing note:
 
@@ -971,9 +973,19 @@ What is cached / reused:
 
 - `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused via a single `embedding_bag` reduction and **per-block truncated slices** are prebuilt according to `l_schedule`.
 
-- Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `"lmax:mmax"`, shared by all blocks and available in both eager and TorchScript.
+- Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `"lmax:mmax"` in the eager fallback path. When `use_triton=True` and CUDA+dtypes are supported, `SO2Convolution` skips these materialized projections and uses the Triton package under `deepmd/pt/model/descriptor/sezm_nn/triton/` for fused `global -> local reduced` and `local reduced -> global` rotations.
 
 - Dtypes: `compute_dtype = get_promoted_dtype(dtype)` is set once in `__init__` and reused for geometry, radial basis/MLP, Wigner calculators, and the final l=0 mixer; runtime casts happen once on `extended_coord`, `radial_feat`, and the final scalar output.
+
+- Triton package layout: Triton code is split by responsibility instead of keeping kernels, launchers, fallback policy, and autograd glue in one file. `constants.py` defines shared tile and mode constants, `dispatch.py` owns the single dispatch policy entry, `custom_ops.py` only launches Triton kernels, `autograd.py` owns the public API and eager fallback glue, and `kernels_small.py` / `kernels_generic.py` keep the math kernels separated.
+
+- Triton dispatch: `use_triton` is the user-facing opt-in switch. When it is `True`, `SO2Convolution` decides once in `__init__` whether Triton rotations are actually enabled from the module device/dtype, then resolves a fixed `rotation_mode` from `(dim_full, reduced_dim)`. The dispatch modes are `SMALL_LE1` / `SMALL_L2` / `SMALL_L3` for specialized kernels, `GENERIC_TILED` for the large-`l` tiled path, and `EAGER_REFERENCE` for the generic small-`K` case that would violate Triton's `K >= 16` `tl.dot` constraint.
+
+- Small-l Triton kernels: `lmax<=3` uses dedicated kernel families with custom backward. `lmax=0,1` share the `SMALL_LE1` family through the packed full dimensions `1` and `4`; `lmax=2` uses `SMALL_L2`; `lmax=3` uses `SMALL_L3`. These specialized kernels keep one padded `16x16` block in registers and block only along the channel axis.
+
+- Generic tiled Triton kernels: once `dim_full` exceeds the specialized families, SeZM uses the tiled kernels in `kernels_generic.py`. They keep `BLOCK_FULL = BLOCK_REDUCED = 16` so every `tl.dot` sees a legal tile, and all float32 contractions use `input_precision="ieee"` to match eager PyTorch numerics instead of TF32.
+
+- Eager fallback boundary: non-CUDA or unsupported dtypes still use the eager PyTorch projection + `bmm` path. Even on CUDA, the generic path falls back to eager when `reduced_dim < 16`, because that case cannot satisfy Triton's current `tl.dot` contraction constraint.
 
 ______________________________________________________________________
 

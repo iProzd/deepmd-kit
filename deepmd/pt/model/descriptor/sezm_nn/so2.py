@@ -57,6 +57,12 @@ from .so3 import (
     GatedActivation,
     SO3Linear,
 )
+from .triton import (
+    resolve_triton_rotation_mode,
+    rotate_back_triton,
+    rotate_to_local_triton,
+    sezm_triton_enabled,
+)
 from .utils import (
     ATTN_RES_MODES,
     get_promoted_dtype,
@@ -173,7 +179,7 @@ class SO2Linear(nn.Module):
         self.register_buffer(
             "m0_idx",
             torch.arange(m0_size, device=self.device, dtype=torch.long),
-            persistent=True,
+            persistent=False,
         )
 
         pos_indices_list: list[torch.Tensor] = []
@@ -202,22 +208,22 @@ class SO2Linear(nn.Module):
 
         if len(pos_indices_list) > 0:
             self.register_buffer(
-                "pos_indices", torch.cat(pos_indices_list), persistent=True
+                "pos_indices", torch.cat(pos_indices_list), persistent=False
             )
             self.register_buffer(
-                "neg_indices", torch.cat(neg_indices_list), persistent=True
+                "neg_indices", torch.cat(neg_indices_list), persistent=False
             )
             self._m_ranges = m_ranges
         else:
             self.register_buffer(
                 "pos_indices",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=True,
+                persistent=False,
             )
             self.register_buffer(
                 "neg_indices",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=True,
+                persistent=False,
             )
             self._m_ranges = []
 
@@ -507,6 +513,9 @@ class SO2Convolution(nn.Module):
     mlp_bias
         Whether to use bias in SO2Linear (l=0 bias) and GatedActivation
         (gate linear bias).
+    use_triton
+        If True, opt into fused Triton SO(2) rotation kernels on supported
+        CUDA dtypes. The eager projection path remains the default.
     eps
         Small epsilon for normalization modules.
     dtype
@@ -531,6 +540,7 @@ class SO2Convolution(nn.Module):
         layer_scale: bool = False,
         n_atten_head: int = 0,
         mlp_bias: bool = True,
+        use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -573,12 +583,17 @@ class SO2Convolution(nn.Module):
             None if self.n_atten_head == 0 else int(self.focus_dim // self.n_atten_head)
         )
         self.mlp_bias = bool(mlp_bias)
+        self.use_triton = bool(use_triton)
         self.eps = float(eps)
         self.ebed_dim_full = get_so3_dim_of_lmax(self.lmax)
         self.dtype = dtype
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
         self.compute_dtype = get_promoted_dtype(self.dtype)
+        self.use_triton_rotations = self.use_triton and sezm_triton_enabled(
+            device=self.device,
+            dtype=self.dtype,
+        )
 
         # === Step 1. Precompute coefficient indices for m-major reduced layout ===
         coeff_index_m = build_m_major_index(self.lmax, self.mmax, device=self.device)
@@ -591,12 +606,16 @@ class SO2Convolution(nn.Module):
             device=self.device,
             dtype=self.dtype,
         )
-        self.register_buffer("coeff_index_m", coeff_index_m, persistent=True)
-        self.register_buffer("degree_index_m", degree_index_m, persistent=True)
+        self.register_buffer("coeff_index_m", coeff_index_m, persistent=False)
+        self.register_buffer("degree_index_m", degree_index_m, persistent=False)
         self.register_buffer(
             "rotate_inv_rescale_full", rotate_inv_rescale_full, persistent=False
         )
         self.reduced_dim = int(coeff_index_m.numel())
+        self.triton_rotation_mode = resolve_triton_rotation_mode(
+            dim_full=self.ebed_dim_full,
+            reduced_dim=self.reduced_dim,
+        )
 
         # === Step 2. Split deterministic seeds at the module top-level ===
         seed_so2_stack = child_seed(seed, 0)
@@ -885,16 +904,26 @@ class SO2Convolution(nn.Module):
         # === Step 2. Rotate to edge-aligned local frame ===
         with nvtx_range("SO2Conv/rotate_to_local"):
             D_full = edge_cache.D_full
-            D_m_prime = project_D_to_m(
-                D_full=D_full,
-                coeff_index_m=self.coeff_index_m,
-                ebed_dim_full=self.ebed_dim_full,
-                cache=edge_cache.D_to_m_cache,
-                key_lmax=self.lmax,
-                key_mmax=self.mmax,
-            )
-            x_src = x.index_select(0, src)  # (E, D, C)
-            x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m, C)
+            if self.use_triton_rotations:
+                x_local = rotate_to_local_triton(
+                    x=x,
+                    src=src,
+                    wigner=D_full,
+                    coeff_index=self.coeff_index_m,
+                    dim_full=self.ebed_dim_full,
+                    rotation_mode=self.triton_rotation_mode,
+                )  # (E, D_m, C)
+            else:
+                D_m_prime = project_D_to_m(
+                    D_full=D_full,
+                    coeff_index_m=self.coeff_index_m,
+                    ebed_dim_full=self.ebed_dim_full,
+                    cache=edge_cache.D_to_m_cache,
+                    key_lmax=self.lmax,
+                    key_mmax=self.mmax,
+                )
+                x_src = x.index_select(0, src)  # (E, D, C)
+                x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m, C)
 
         # === Step 3. Select radial/type features for reduced layout ===
         with nvtx_range("SO2Conv/radial_fuse"):
@@ -1011,15 +1040,24 @@ class SO2Convolution(nn.Module):
         # === Step 7. Rotate back to global frame ===
         with nvtx_range("SO2Conv/rotate_back"):
             Dt_full = edge_cache.Dt_full
-            Dt_from_m = project_Dt_from_m(
-                Dt_full=Dt_full,
-                coeff_index_m=self.coeff_index_m,
-                ebed_dim_full=self.ebed_dim_full,
-                cache=edge_cache.Dt_from_m_cache,
-                key_lmax=self.lmax,
-                key_mmax=self.mmax,
-            )
-            x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
+            if self.use_triton_rotations:
+                x_message = rotate_back_triton(
+                    x_local=x_local,
+                    wigner=Dt_full,
+                    coeff_index=self.coeff_index_m,
+                    dim_full=self.ebed_dim_full,
+                    rotation_mode=self.triton_rotation_mode,
+                )  # (E, D, C)
+            else:
+                Dt_from_m = project_Dt_from_m(
+                    Dt_full=Dt_full,
+                    coeff_index_m=self.coeff_index_m,
+                    ebed_dim_full=self.ebed_dim_full,
+                    cache=edge_cache.Dt_from_m_cache,
+                    key_lmax=self.lmax,
+                    key_mmax=self.mmax,
+                )
+                x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
             # Reduced layouts keep only 2*mmax+1 orders for l>mmax. Applying the
             # inverse-rotation degree rescale after the global lift restores the
             # full-basis amplitude expected by the block output contract.
@@ -1132,6 +1170,7 @@ class SO2Convolution(nn.Module):
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "mlp_bias": self.mlp_bias,
+                "use_triton": self.use_triton,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,

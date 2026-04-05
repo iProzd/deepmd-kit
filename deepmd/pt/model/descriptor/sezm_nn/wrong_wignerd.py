@@ -191,8 +191,8 @@ class WignerDCalculator(nn.Module):
             start, end = l * l, (l + 1) * (l + 1)
             J_full[start:end, start:end] = J_l
 
-        self.register_buffer("J_full", J_full, persistent=True)
-        self.register_buffer("Jt_full", J_full.T.contiguous(), persistent=True)
+        self.register_buffer("J_full", J_full, persistent=False)
+        self.register_buffer("Jt_full", J_full.T.contiguous(), persistent=False)
 
         # === Step 3. Precompute indices for Z_full construction ===
         self._precompute_z_indices()
@@ -598,7 +598,7 @@ class WignerDCalculator(nn.Module):
             dtype=torch.long,
             device=self.device,
         )
-        self.register_buffer("m0_indices", m0_indices, persistent=True)
+        self.register_buffer("m0_indices", m0_indices, persistent=False)
 
         # === Step 2. Indices for m>0 rotation blocks ===
         pos_indices: list[int] = []
@@ -617,17 +617,17 @@ class WignerDCalculator(nn.Module):
         self.register_buffer(
             "pos_indices",
             torch.tensor(pos_indices, dtype=torch.long, device=self.device),
-            persistent=True,
+            persistent=False,
         )
         self.register_buffer(
             "neg_indices",
             torch.tensor(neg_indices, dtype=torch.long, device=self.device),
-            persistent=True,
+            persistent=False,
         )
         self.register_buffer(
             "m_values",
             torch.tensor(m_values, dtype=self.dtype, device=self.device),
-            persistent=True,
+            persistent=False,
         )
 
     def serialize(self) -> dict[str, Any]:

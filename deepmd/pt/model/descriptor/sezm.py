@@ -240,6 +240,10 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
         the memory usage, while persevering model accuracy.
+    use_triton
+        If True, opt into the fused Triton SO(2) rotation kernels on supported
+        CUDA dtypes. The default is False because the current Triton rotation
+        path is not consistently faster than the eager reference path.
     exclude_types
         List of excluded type pairs.
     precision
@@ -276,7 +280,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
         use_env_seed: bool = True,
-        random_gamma: bool = True,
+        random_gamma: bool = False,
         lmax: int = 2,
         l_schedule: list[int] | None = None,
         mmax: int | None = None,
@@ -298,6 +302,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         activation_function: str = "silu",
         glu_activation: bool = True,
         use_amp: bool = True,
+        use_triton: bool = False,
         exclude_types: list[tuple[int, int]] | None = None,
         precision: str = "float32",
         eps: float = 1e-7,
@@ -362,6 +367,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.mlp_bias = bool(mlp_bias)
         self.layer_scale = bool(layer_scale)
         self.use_amp = bool(use_amp)  # and self.training
+        self.use_triton = bool(use_triton)
         self.trainable = bool(trainable)
         self.seed = seed
         self.random_gamma = bool(random_gamma)
@@ -579,6 +585,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     activation_function=self.activation_function,
                     glu_activation=self.glu_activation,
                     mlp_bias=self.mlp_bias,
+                    use_triton=self.use_triton,
                     eps=self.eps,
                     dtype=self.dtype,
                     seed=child_seed(seed_blocks, block_idx),
@@ -632,15 +639,20 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.register_buffer(
             "_empty_tensor",
             torch.empty(0, device=env.DEVICE, dtype=env.GLOBAL_PT_FLOAT_PRECISION),
+            persistent=False,
         )
 
         # === Statistics buffers (interface compatibility) ===
         self.stats: dict[str, Any] | None = None
         self.register_buffer(
-            "mean", torch.zeros(0, dtype=self.dtype, device=self.device)
+            "mean",
+            torch.zeros(0, dtype=self.dtype, device=self.device),
+            persistent=False,
         )
         self.register_buffer(
-            "stddev", torch.ones(0, dtype=self.dtype, device=self.device)
+            "stddev",
+            torch.ones(0, dtype=self.dtype, device=self.device),
+            persistent=False,
         )
 
     def forward(
@@ -1797,6 +1809,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "mlp_bias": self.mlp_bias,
                 "use_amp": self.use_amp,
+                "use_triton": self.use_triton,
                 "exclude_types": self.exclude_types,
                 "eps": self.eps,
                 "trainable": self.trainable,
@@ -1881,11 +1894,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Ignore mean/stddev from checkpoint."""
-        for key in ["mean", "stddev"]:
-            full_key = prefix + key
-            state_dict.pop(full_key, None)
-            state_dict[full_key] = getattr(self, key)
+        """Ignore legacy checkpoint state that is rebuilt at construction."""
+        expected_keys = {prefix + key for key in self.state_dict().keys()}
+        for full_key in list(state_dict.keys()):
+            if full_key.startswith(prefix) and full_key not in expected_keys:
+                state_dict.pop(full_key)
+
         super()._load_from_state_dict(
             state_dict,
             prefix,

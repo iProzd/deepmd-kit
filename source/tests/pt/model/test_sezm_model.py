@@ -533,6 +533,7 @@ class TestSeZMModelBridging(unittest.TestCase):
                 "mlp_bias": True,
                 "layer_scale": True,
                 "use_amp": False,
+                "use_triton": False,
                 "activation_function": "silu",
                 "glu_activation": True,
                 "precision": "float32",

@@ -233,7 +233,7 @@ class GatedActivation(nn.Module):
                     self.lmax, self.mmax, device=self.device
                 )
                 expand_index = degree_index[1:] - 1
-            self.register_buffer("expand_index", expand_index, persistent=True)
+            self.register_buffer("expand_index", expand_index, persistent=False)
 
             # Linear to generate lmax independent gates from scalar features
             self.gate_linear: nn.Module = FocusLinear(
@@ -262,7 +262,7 @@ class GatedActivation(nn.Module):
             self.register_buffer(
                 "expand_index",
                 torch.zeros(0, dtype=torch.long, device=self.device),
-                persistent=True,
+                persistent=False,
             )
             self.gate_linear = nn.Identity()
 
@@ -494,7 +494,7 @@ class SO3Linear(nn.Module):
         self.register_buffer(
             "expand_index",
             map_degree_idx(self.lmax, device=self.device),
-            persistent=True,
+            persistent=False,
         )
 
         for p in self.parameters():

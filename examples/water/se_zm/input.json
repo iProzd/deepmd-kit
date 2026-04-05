@@ -19,7 +19,7 @@
         64
       ],
       "use_env_seed": true,
-      "random_gamma": true,
+      "random_gamma": false,
       "l_schedule": [
         3,
         3,
@@ -47,6 +47,7 @@
       "activation_function": "silu",
       "glu_activation": true,
       "use_amp": true,
+      "use_triton": false,
       "precision": "float32",
       "seed": 7,
       "_comment": "that's all"

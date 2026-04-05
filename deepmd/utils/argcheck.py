@@ -461,6 +461,11 @@ def descrpt_se_zm_args() -> list[Argument]:
         "This does not provide accelerations under fp32 precision but will decrease "
         "the memory usage, while preserving model accuracy."
     )
+    doc_use_triton = (
+        "If True, opt into fused Triton SO(2) rotation kernels on supported CUDA "
+        "dtypes. The default is False because the current Triton rotation path is "
+        "not consistently faster than the eager reference path."
+    )
     doc_exclude_types = "The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1."
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
     doc_eps = "Small epsilon for numerical stability in division and normalization."
@@ -498,7 +503,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             "random_gamma",
             bool,
             optional=True,
-            default=True,
+            default=False,
             doc=doc_only_pt_supported + doc_random_gamma,
         ),
         Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
@@ -594,6 +599,13 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_glu_activation,
         ),
         Argument("use_amp", bool, optional=True, default=True, doc=doc_use_amp),
+        Argument(
+            "use_triton",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_use_triton,
+        ),
         Argument(
             "exclude_types",
             list[list[int]],

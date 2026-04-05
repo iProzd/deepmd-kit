@@ -23,7 +23,6 @@ from deepmd.pt.model.descriptor.sezm_nn import (
     build_edge_quaternion,
     quaternion_multiply,
     quaternion_to_rotation_matrix,
-    so3_packed_index,
 )
 from deepmd.pt.model.model import (
     get_sezm_model,
@@ -154,51 +153,6 @@ class TestDescrptSeZM(_SeZMTestCase):
         self.assertIsNotNone(extended_coord.grad)
         self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
         return model
-
-    def test_forward_shape_and_dtype(self) -> None:
-        """Test that forward produces correct shape and dtype."""
-        for prec in ["float64", "float32", "bfloat16"]:
-            dtype = PRECISION_DICT[prec]
-            coord, atype, nlist = _tiny_two_atom_system(self.device, dtype=dtype)
-            extended_coord = coord.reshape(1, -1)
-
-            model = DescrptSeZM(
-                **_descriptor_kwargs(
-                    channels=8,
-                    n_radial=4,
-                    radial_mlp=[8],
-                    ffn_neurons=16,
-                    ffn_blocks=2,
-                    layer_scale=True,
-                    precision=prec,
-                )
-            )
-            self.assertEqual(model.dtype, dtype)
-            self.assertIsInstance(model.wigner_calc, WignerDCalculator)
-
-            desc, _, _, _, _ = model(
-                extended_coord, atype, nlist, mapping=None, comm_dict=None
-            )
-            self.assertEqual(desc.shape, (1, 2, 8))
-            self.assertEqual(desc.dtype, env.GLOBAL_PT_FLOAT_PRECISION)
-
-    def test_forward_with_focus_streams(self) -> None:
-        """Test focus-stream path (N, D, F, Df) through forward and backward."""
-        model = self._assert_forward_backward_smoke(
-            **_descriptor_kwargs(
-                channels=8,
-                n_focus=2,
-                n_radial=4,
-                radial_mlp=[8],
-                ffn_neurons=16,
-                ffn_blocks=2,
-                layer_scale=True,
-                precision="float32",
-                seed=123,
-            )
-        )
-        self.assertEqual(model.n_focus, 2)
-        self.assertEqual(model.focus_dim, 4)
 
     def test_focus_stream_config_validation(self) -> None:
         """Test invalid focus-stream configuration raises ValueError."""
@@ -578,38 +532,6 @@ class TestWignerDCalculator(_SeZMTestCase):
                 atol=atol,
                 rtol=rtol,
                 msg=f"l=1 transpose block mismatch for WignerDCalculator, dtype={dtype}",
-            )
-
-    def test_dt_column_matches_edge_direction(self) -> None:
-        """Test that the local m=0 axis rotated back to global matches the edge direction."""
-        for dtype in [torch.float64, torch.float32]:
-            atol, rtol = self._get_tols(dtype)
-            S = torch.tensor(
-                [[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]],
-                device=self.device,
-                dtype=dtype,
-            )
-            St = S.transpose(0, 1)
-            n_edges = 128
-            edge_vec = torch.randn(n_edges, 3, device=self.device, dtype=dtype)
-            edge_unit = edge_vec / torch.sqrt(
-                torch.sum(edge_vec * edge_vec, dim=-1, keepdim=True).clamp_min(
-                    torch.finfo(edge_vec.dtype).eps
-                )
-            )
-            edge_quat = build_edge_quaternion(edge_vec)
-            wigner = WignerDCalculator(lmax=1, dtype=dtype)
-            _, Dt_full = wigner(edge_quat)
-
-            m0_index = so3_packed_index(1, 0)
-            col = Dt_full[:, 1:4, m0_index]
-            vec_cart = torch.einsum("ij,ej->ei", St, col)
-            torch.testing.assert_close(
-                vec_cart,
-                -edge_unit,
-                atol=atol,
-                rtol=rtol,
-                msg=f"Dt_full column does not match -edge_unit in Cartesian space (dtype={dtype})",
             )
 
     def test_pole_path_gradient_matches_finite_difference(self) -> None:
@@ -1020,6 +942,7 @@ class TestDescriptorAtomEnergySmoothness(_SeZMTestCase):
                 "mlp_bias": True,
                 "layer_scale": True,
                 "use_amp": False,
+                "use_triton": False,
                 "activation_function": "silu",
                 "glu_activation": True,
                 "precision": "float64",

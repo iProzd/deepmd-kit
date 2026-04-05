@@ -132,6 +132,9 @@ class SeZMInteractionBlock(nn.Module):
         - SO3Linear: l=0 bias
         - SO2Linear: l=0 bias
         - GatedActivation: gate linear bias
+    use_triton
+        If True, opt into fused Triton SO(2) rotation kernels inside
+        ``SO2Convolution`` when the runtime supports them.
     eps
         Small epsilon for numerical stability.
     dtype
@@ -166,6 +169,7 @@ class SeZMInteractionBlock(nn.Module):
         activation_function: str,
         glu_activation: bool = True,
         mlp_bias: bool = True,
+        use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
         seed: int | list[int] | None,
@@ -220,6 +224,7 @@ class SeZMInteractionBlock(nn.Module):
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
+        self.use_triton = bool(use_triton)
         self.eps = float(eps)
         self.dtype = dtype
         self.device = env.DEVICE
@@ -269,6 +274,7 @@ class SeZMInteractionBlock(nn.Module):
             layer_scale=self.layer_scale,
             n_atten_head=n_atten_head,
             mlp_bias=self.mlp_bias,
+            use_triton=self.use_triton,
             eps=self.eps,
             dtype=dtype,
             seed=seed_so2_conv,
@@ -714,6 +720,7 @@ class SeZMInteractionBlock(nn.Module):
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,
+                "use_triton": self.use_triton,
                 "layer_scale": self.layer_scale,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
