@@ -38,6 +38,9 @@ from deepmd.pt.utils.utils import (
     ActivationFn,
 )
 
+from .norm import (
+    RMSNorm,
+)
 from .utils import (
     np_safe,
     safe_numpy_to_tensor,
@@ -46,7 +49,7 @@ from .utils import (
 
 class RadialMLP(nn.Module):
     """
-    Radial MLP with LayerNorm and configurable activation.
+    Radial MLP with channel RMSNorm and configurable activation.
 
     Parameters
     ----------
@@ -62,12 +65,12 @@ class RadialMLP(nn.Module):
 
     Architecture
     ------------
-    Linear → LayerNorm → Activation for all hidden layers,
-    with the final layer being a plain Linear (no LN, no activation).
+    Linear → RMSNorm → Activation for all hidden layers,
+    with the final layer being a plain Linear (no norm, no activation).
 
     Notes
     -----
-    All bias terms are disabled (Linear bias=False, LayerNorm bias=False) to
+    All bias terms are disabled (Linear bias=False, RMSNorm bias-free) to
     guarantee ``RadialMLP(0) = 0``. This is required because the compile path
     pads masked edges with zero ``edge_rbf``; any non-zero bias would leak
     spurious features into GIE scatter, causing energy divergence between
@@ -106,14 +109,13 @@ class RadialMLP(nn.Module):
                 trainable=trainable,
             )
             modules.append(linear)
-            # Last layer: no LayerNorm/activation
+            # Last layer: no RMSNorm/activation
             if i < n_layers - 2:
                 modules.append(
-                    nn.LayerNorm(
-                        mlp_layers[i + 1],
-                        bias=False,
+                    RMSNorm(
+                        channels=mlp_layers[i + 1],
                         dtype=self.dtype,
-                        device=self.device,
+                        trainable=trainable,
                     )
                 )
                 modules.append(ActivationFn(self.activation_function))

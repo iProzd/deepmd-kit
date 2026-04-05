@@ -42,6 +42,7 @@ from .indexing import (
 from .norm import (
     EquivariantRMSNorm,
     ReducedEquivariantRMSNorm,
+    RMSNorm,
     ScalarRMSNorm,
 )
 from .radial import (
@@ -90,6 +91,7 @@ __all__ = [
     "GatedActivation",
     "GeometricInitialEmbedding",
     "InnerClamp",
+    "RMSNorm",
     "RadialBasis",
     "RadialMLP",
     "ReducedEquivariantRMSNorm",

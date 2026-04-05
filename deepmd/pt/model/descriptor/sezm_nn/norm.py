@@ -2,8 +2,8 @@
 """
 Normalization layers for the SeZM descriptor.
 
-This module defines the packed-layout, reduced-layout, and scalar RMS
-normalization layers used throughout SeZM.
+This module defines the packed-layout, reduced-layout, generic, and scalar
+RMS normalization layers used throughout SeZM.
 """
 
 from __future__ import (
@@ -32,6 +32,110 @@ from .utils import (
     np_safe,
     safe_numpy_to_tensor,
 )
+
+
+class RMSNorm(nn.Module):
+    """
+    Generic RMSNorm on tensors with shape `(..., C)`.
+
+    This is the plain channel-wise RMS normalization used for non-equivariant
+    branches whose last axis stores feature channels. A learnable affine scale is
+    applied on the channel axis only, while all leading axes are treated as batch
+    dimensions.
+
+    Parameters
+    ----------
+    channels
+        Feature dimension of the last axis.
+    eps
+        Small epsilon for numerical stability.
+    dtype
+        Parameter and computation dtype. Caller should pass compute_dtype (fp32+)
+        for numerical stability.
+    trainable
+        Whether parameters are trainable.
+    """
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        eps: float = 1e-7,
+        dtype: torch.dtype,
+        trainable: bool,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.dtype = dtype
+        self.device = env.DEVICE
+        self.eps = float(eps)
+
+        # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
+        self.adam_scale = nn.Parameter(
+            torch.ones(self.channels, dtype=self.dtype, device=self.device)
+        )
+
+        for p in self.parameters():
+            p.requires_grad = trainable
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        x
+            Input tensor with shape `(..., C)`.
+
+        Returns
+        -------
+        torch.Tensor
+            Normalized tensor with shape `(..., C)`, same dtype as input.
+        """
+        in_dtype = x.dtype
+        x = x.to(dtype=self.dtype)
+
+        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        scale = self.adam_scale.view(*([1] * (x.ndim - 1)), self.channels)
+        x = x * inv_rms * scale
+        return x.to(dtype=in_dtype)
+
+    def serialize(self) -> dict[str, Any]:
+        trainable = all(p.requires_grad for p in self.parameters())
+        state = self.state_dict()
+        return {
+            "@class": "RMSNorm",
+            "@version": 1,
+            "config": {
+                "channels": self.channels,
+                "eps": self.eps,
+                "precision": RESERVED_PRECISION_DICT[self.dtype],
+                "trainable": trainable,
+            },
+            "@variables": {key: np_safe(value) for key, value in state.items()},
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict[str, Any]) -> RMSNorm:
+        data = data.copy()
+        data_cls = data.pop("@class")
+        if data_cls != "RMSNorm":
+            raise ValueError(f"Invalid class for RMSNorm: {data_cls}")
+        version = int(data.pop("@version"))
+        if version != 1:
+            raise ValueError(f"Unsupported RMSNorm version: {version}")
+        config = data.pop("config")
+        variables = data.pop("@variables")
+        precision = config.pop("precision")
+        config["dtype"] = PRECISION_DICT[precision]
+        obj = cls(**config)
+        template = obj.state_dict()
+        state = {
+            key: safe_numpy_to_tensor(
+                value, device=template[key].device, dtype=template[key].dtype
+            )
+            for key, value in variables.items()
+        }
+        obj.load_state_dict(state)
+        return obj
 
 
 class EquivariantRMSNorm(nn.Module):
