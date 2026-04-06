@@ -2810,7 +2810,7 @@ def sezm_model_args() -> Argument:
                 "bridging_r_inner",
                 float,
                 optional=True,
-                default=1.0,
+                default=0.9,
                 doc="Inner clamping radius in Å. Distances below this are frozen for the ML model. "
                 "Only used when bridging_method is set. "
                 "When using ZBL bridging, set training_data.min_pair_dist to the same value "
@@ -2820,7 +2820,7 @@ def sezm_model_args() -> Argument:
                 "bridging_r_outer",
                 float,
                 optional=True,
-                default=1.5,
+                default=1.3,
                 doc="Outer clamping radius in Å. The transition zone [bridging_r_inner, bridging_r_outer] "
                 "uses a C2-continuous quintic Hermite polynomial. Only used when bridging_method is set.",
             ),

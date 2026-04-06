@@ -548,8 +548,8 @@ class TestSeZMModelBridging(unittest.TestCase):
             "use_compile": False,
             "n_node": 256,
             "bridging_method": bridging_method,
-            "bridging_r_inner": 1.0,
-            "bridging_r_outer": 1.5,
+            "bridging_r_inner": 0.9,
+            "bridging_r_outer": 1.3,
         }
 
     def test_bridging_none_unchanged(self) -> None:

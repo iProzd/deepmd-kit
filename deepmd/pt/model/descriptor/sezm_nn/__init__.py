@@ -20,6 +20,10 @@ from .edge import (
     build_edge_type_feat,
     edge_cache_to_dtype,
 )
+from .edge_cache import (
+    build_edge_cache,
+    build_edge_cache_from_edges,
+)
 from .embedding import (
     EnvironmentInitialEmbedding,
     GeometricInitialEmbedding,
@@ -102,6 +106,8 @@ __all__ = [
     "SeZMInteractionBlock",
     "SeZMTypeEmbedding",
     "WignerDCalculator",
+    "build_edge_cache",
+    "build_edge_cache_from_edges",
     "build_edge_quaternion",
     "build_edge_type_feat",
     "build_l_major_index",

@@ -70,11 +70,6 @@ ______________________________________________________________________
      - edge-aligned quaternions
      - Wigner-D blocks
 
-## Non-Goals (Explicitly Out of Scope)
-
-- Top-K neighbor selection: **not allowed**. Use `rcut` and masks only.
-- External equivariant libraries (e.g. e3nn): **not allowed**.
-
 ______________________________________________________________________
 
 ## Model Integration (PyTorch)
@@ -132,8 +127,8 @@ where `r` is the true interatomic distance and `r̃` is the clamped distance see
 | Parameter          | Type  | Default  | Description                                              |
 | ------------------ | ----- | -------- | -------------------------------------------------------- |
 | `bridging_method`  | str   | `"none"` | Bridging formula. `"none"` to disable, `"ZBL"` to enable |
-| `bridging_r_inner` | float | 1.0      | Inner clamping radius in Å. Descriptor frozen below this |
-| `bridging_r_outer` | float | 1.5      | Outer clamping radius in Å. Transition zone upper bound  |
+| `bridging_r_inner` | float | 0.9      | Inner clamping radius in Å. Descriptor frozen below this |
+| `bridging_r_outer` | float | 1.3      | Outer clamping radius in Å. Transition zone upper bound  |
 
 These are model-level parameters. When `bridging_method != "none"`, the model factory injects
 `inner_clamp_r_inner` and `inner_clamp_r_outer` into the descriptor parameters automatically;
@@ -483,7 +478,7 @@ Edge cache holds **valid edges** (non-padding, non-excluded):
 - excluded type pairs are removed
 - edges with `r >= rcut` are **NOT** removed; their `edge_env=0` (from C³ envelope) naturally zeros their messages
 
-This design avoids the dynamic-output-size `nonzero` kernel for distance filtering and enables smoother degree/normalization (no discontinuous edge count jumps at rcut boundary).
+This design avoids the dynamic-output-size `nonzero` kernel for distance filtering and enables smoother degree/normalization (no discontinuous edge count jumps at `rcut` boundary).
 
 Let `E` be the number of valid edges:
 
@@ -895,6 +890,34 @@ This double-guarantee ensures:
 - Vector and quaternion normalizations clamp squared norms before `sqrt`
   (e.g. `sqrt(clamp(||x||^2, eps^2))`) to avoid NaN gradients at zero vectors or masked branches.
 
+### Smooth PES validation
+
+For SeZM, the most useful smoothness regression test is **not** force-vs-finite-difference
+agreement by itself. A force check can pass even when the PES shape is still not the clean
+single-bowl curve expected around a symmetric equilibrium structure.
+
+The recommended unit-test probes are direct **total-energy** scans:
+
+- use one hard-coded symmetric **eight-atom two-sublattice template** in fractional coordinates:
+  - `[0,0,0]`, `[0,1/2,1/2]`, `[1/2,0,1/2]`, `[1/2,1/2,0]`, `[1/2,1/2,1/2]`, `[1/2,0,0]`, `[0,1/2,0]`, `[0,0,1/2]`
+- scale the cubic lattice so the nearest-neighbor distance matches the target boundary:
+  - non-bridged near-cutoff probe: `r_nn = 4.95` Å with `rcut = 5.0` Å
+  - bridged inner-boundary probe: `r_nn = r_inner = 0.9` Å
+  - bridged outer-boundary probe: `r_nn = r_outer = 1.3` Å
+- displace atom `0` along `x` over `[-0.1, 0.1]` Å
+- enable `bridging_method="ZBL"` only for the `r_inner` / `r_outer` probes
+
+The test should validate the shape directly from the sampled energy curve:
+
+1. the second derivative keeps one sign over the whole scan window
+1. the first derivative keeps one sign on the left branch and the opposite sign on the right branch
+1. the equilibrium point is the unique extremum at the center of the scan
+
+Because the probes intentionally use **randomized model weights**, the non-bridged near-cutoff
+curve may be either bowl-up or bowl-down; both are acceptable as long as the curve is a single
+smooth extremum. For the bridged `r_inner` / `r_outer` probes, the additional ZBL repulsion should
+keep the curve bowl-up with a minimum at the symmetric center.
+
 ### Wigner-D blocks (real SH basis)
 
 SeZM uses real-basis Wigner-D blocks to rotate per-degree features between the global frame
@@ -941,7 +964,7 @@ and the edge-aligned local frame. The block-diagonal matrices are computed by
 ### Padded neighbor safety
 
 - Padding edges (`nlist == -1`) are removed before any normalization or angle computation.
-- Padding indices are replaced with 0 (any valid index) during gather; their values are masked out by `keep = valid_nlist & pair_keep_mask`, avoiding the extra `cat` operation for sentinel coordinates.
+- Only valid edges enter coordinate gather and subsequent geometry / radial / rotation evaluation.
 - `PairExcludeMask` returns a **keep mask** (1=keep, 0=excluded). It does not remove padding by itself, so always combine it with `nlist >= 0`.
 - No zero-length vector is normalized for padding edges.
 

@@ -6,6 +6,6 @@ This directory stores a minimal configuration for training SeZM
 Run:
 
 ```bash
-cd examples/water/se_zm
+cd examples/water/sezm
 dp --pt train input_torch.json
 ```

@@ -82,8 +82,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         n_node: int | None = None,
         n_edge: int = 0,
         bridging_method: str = "none",
-        bridging_r_inner: float = 1.0,
-        bridging_r_outer: float = 1.5,
+        bridging_r_inner: float = 0.9,
+        bridging_r_outer: float = 1.3,
         **kwargs: Any,
     ) -> None:
         DPModelCommon.__init__(self)

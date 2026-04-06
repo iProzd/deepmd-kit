@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import itertools
-import math
 import unittest
 
 # NOTE: avoid torch thread reconfiguration errors during import.
@@ -105,7 +104,7 @@ def _attention_descriptor_kwargs(
         so2_attn_res="dependent",
         ffn_neurons=16,
         ffn_blocks=2,
-        layer_scale=True,
+        layer_scale=False,
         precision=precision,
         seed=seed,
     )
@@ -264,7 +263,7 @@ class TestDescrptSeZM(_SeZMTestCase):
             model = DescrptSeZM(
                 **_descriptor_kwargs(
                     ffn_blocks=2,
-                    layer_scale=True,
+                    layer_scale=False,
                     precision=prec,
                 )
             )
@@ -885,29 +884,41 @@ class TestDescriptorInnerClamp(_SeZMTestCase):
         )
 
 
-class TestDescriptorAtomEnergySmoothness(_SeZMTestCase):
-    """Test descriptor-driven atom-energy C3 smoothness at key boundaries."""
+class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
+    """Test PES smoothness from scaled symmetric eight-atom probes."""
 
-    PROBE_WEIGHT_SUFFIXES = (
-        "so2_conv.post_focus_mix.weight",
-        "ffns.0.so3_linear_2.weight",
-        "output_ffn.so3_linear_2.weight",
-        "fitting_net.filter_layers.networks.0.output_layer.matrix",
-    )
-    MAX_SMOOTH_ORDER = 3
-    DERIVATIVE_RTOLS = (1.0e-6, 1.0e-5, 1.0e-4)
+    RANDOM_WEIGHT_BASE_SEED = 184
+    RANDOM_WEIGHT_STD = 0.1
+    N_DISPLACEMENT_POINTS = 201
+    MAX_DISPLACEMENT = 0.1
+    RCUT_NEAR_DISTANCE = 4.95
+    BRIDGING_R_INNER = 0.9
+    BRIDGING_R_OUTER = 1.3
+    ENERGY_SPAN_MARGIN = 1.0e-7
+    FIRST_DERIVATIVE_MARGIN = 5.0e-7
+    SECOND_DERIVATIVE_MARGIN = 5.0e-4
+    EXTREMUM_MARGIN = 1.0e-9
 
     def setUp(self) -> None:
         super().setUp()
         self.dtype = torch.float64
-        self.rcut = 3.0
-        self.r_inner = 1.0
-        self.r_outer = 1.5
-        self.cutoff_deltas = (1.0e-4, 5.0e-4, 1.0e-3)
-        self.atype = torch.zeros((1, 5), dtype=torch.int32, device=self.device)
-        self.box = torch.tensor(
-            [[20.0, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0, 20.0]],
+        self.symmetry_frac_coord = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.0, 0.5, 0.5],
+                [0.5, 0.0, 0.5],
+                [0.5, 0.5, 0.0],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.0, 0.0],
+                [0.0, 0.5, 0.0],
+                [0.0, 0.0, 0.5],
+            ],
             dtype=self.dtype,
+            device=self.device,
+        ).view(1, 8, 3)
+        self.symmetry_atype = torch.tensor(
+            [[0, 0, 0, 0, 1, 1, 1, 1]],
+            dtype=torch.int32,
             device=self.device,
         )
 
@@ -915,33 +926,36 @@ class TestDescriptorAtomEnergySmoothness(_SeZMTestCase):
         self,
         n_atten_head: int,
         *,
+        use_amp: bool,
         bridging_method: str = "none",
+        bridging_r_inner: float = 0.9,
+        bridging_r_outer: float = 1.3,
     ) -> dict:
-        """Build a small SeZM model for cutoff smoothness probing."""
+        """Build the SeZM probe model used for one PES scan."""
         params = {
             "type": "SeZM",
-            "type_map": ["O"],
+            "type_map": ["Na", "Cl"],
             "descriptor": {
                 "type": "SeZM",
-                "sel": [4],
-                "rcut": self.rcut,
-                "channels": 4,
+                "sel": [16, 16],
+                "rcut": 5.0,
+                "channels": 16,
                 "n_focus": 1,
-                "focus_compete": False,
-                "n_radial": 3,
-                "radial_mlp": [6],
-                "use_env_seed": False,
+                "focus_compete": True,
+                "n_radial": 6,
+                "radial_mlp": [16],
+                "use_env_seed": True,
                 "l_schedule": [1, 0],
                 "mmax": 1,
                 "so2_norm": False,
                 "so2_layers": 1,
                 "n_atten_head": n_atten_head,
                 "sandwich_norm": [True, False, True, False],
-                "ffn_neurons": 8,
+                "ffn_neurons": 16,
                 "ffn_blocks": 1,
                 "mlp_bias": True,
-                "layer_scale": True,
-                "use_amp": False,
+                "layer_scale": False,
+                "use_amp": use_amp,
                 "use_triton": False,
                 "activation_function": "silu",
                 "glu_activation": True,
@@ -954,370 +968,281 @@ class TestDescriptorAtomEnergySmoothness(_SeZMTestCase):
                 "precision": "float64",
                 "seed": 7,
             },
-            "use_compile": False,
-            "n_node": 32,
         }
         if bridging_method.lower() != "none":
             params["bridging_method"] = bridging_method
-            params["bridging_r_inner"] = self.r_inner
-            params["bridging_r_outer"] = self.r_outer
+            params["bridging_r_inner"] = bridging_r_inner
+            params["bridging_r_outer"] = bridging_r_outer
         return params
 
-    def _build_geometry_sensitive_model(
+    def _build_scaled_symmetric_structure(
+        self,
+        nearest_distance: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scale one symmetric eight-atom template to a target nearest-neighbor distance."""
+        lattice = 2.0 * nearest_distance
+        coord = self.symmetry_frac_coord * lattice
+        box = torch.tensor(
+            [[lattice, 0.0, 0.0, 0.0, lattice, 0.0, 0.0, 0.0, lattice]],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        return coord, box
+
+    def _stable_parameter_seed(self, name: str) -> int:
+        """Return an order-independent seed derived from one parameter name."""
+        seed_value = self.RANDOM_WEIGHT_BASE_SEED
+        for idx, char in enumerate(name):
+            seed_value += (idx + 1) * ord(char)
+        return seed_value
+
+    def _build_random_weight_model(
         self,
         n_atten_head: int,
         *,
+        use_amp: bool,
         bridging_method: str = "none",
+        bridging_r_inner: float = 0.9,
+        bridging_r_outer: float = 1.3,
     ) -> torch.nn.Module:
-        """Build a deterministic probe model that is not constant in geometry."""
+        """Build a probe model and randomize all floating-point parameters."""
         model = get_sezm_model(
             self._build_model_params(
                 n_atten_head,
+                use_amp=use_amp,
                 bridging_method=bridging_method,
+                bridging_r_inner=bridging_r_inner,
+                bridging_r_outer=bridging_r_outer,
             )
         ).to(
             device=self.device,
             dtype=self.dtype,
         )
-        generator = torch.Generator(device=self.device)
-        generator.manual_seed(
-            1234 + n_atten_head + (100 if bridging_method != "none" else 0)
-        )
-        touched = 0
+        randomized = 0
 
-        # === Step 1. Open the zero-initialized residual/output path ===
+        # Assign deterministic random weights by parameter name.
         with torch.no_grad():
             for name, param in model.named_parameters():
                 if not param.is_floating_point():
                     continue
-                if name.endswith(self.PROBE_WEIGHT_SUFFIXES):
-                    param.normal_(mean=0.0, std=0.1, generator=generator)
-                    touched += 1
+                generator = torch.Generator(device=self.device)
+                generator.manual_seed(self._stable_parameter_seed(name))
+                param.normal_(
+                    mean=0.0,
+                    std=self.RANDOM_WEIGHT_STD,
+                    generator=generator,
+                )
+                randomized += 1
 
-        self.assertGreater(touched, 0, "No smoothness probe weights were updated")
+        self.assertGreater(randomized, 0, "No floating-point parameters were randomized")
         model.eval()
         return model
 
-    def _build_coord(
-        self,
-        moving_distance: torch.Tensor,
-        static_neighbor_distances: tuple[float, float, float],
-    ) -> torch.Tensor:
-        """Build a five-atom system with one neighbor crossing the cutoff."""
-        zero = moving_distance.new_zeros(())
-        first, second, third = static_neighbor_distances
-        return torch.stack(
-            [
-                torch.stack([zero, zero, zero]),
-                torch.stack([moving_distance.new_tensor(first), zero, zero]),
-                torch.stack([zero, moving_distance.new_tensor(second), zero]),
-                torch.stack([zero, zero, moving_distance.new_tensor(third)]),
-                torch.stack([moving_distance, zero, zero]),
-            ],
-            dim=0,
-        ).reshape(1, 5, 3)
-
-    def _center_atom_energy(
+    def _scan_total_energy_curve(
         self,
         model: torch.nn.Module,
-        moving_distance: torch.Tensor,
-        static_neighbor_distances: tuple[float, float, float],
-    ) -> torch.Tensor:
-        """Return the center atom energy for the five-atom probe system."""
-        coord = self._build_coord(moving_distance, static_neighbor_distances)
-        result = model(coord, self.atype, box=self.box)
-        return result["atom_energy"][0, 0, 0]
-
-    def _build_pole_path_coord_batch(self, moving_x: torch.Tensor) -> torch.Tensor:
-        """Build a batched five-atom pole-crossing geometry with shape (batch, 5, 3)."""
-        return self._build_signed_pole_path_coord_batch(moving_x, pole_sign=1.0)
-
-    def _build_signed_pole_path_coord_batch(
-        self,
-        moving_x: torch.Tensor,
         *,
-        pole_sign: float,
-    ) -> torch.Tensor:
-        """Build a batched five-atom pole-crossing geometry for one pole sign."""
-        zero = torch.zeros_like(moving_x)
-        return torch.stack(
-            [
-                torch.stack([zero, zero, zero], dim=-1),
-                torch.stack(
-                    [moving_x, zero, torch.full_like(moving_x, pole_sign)],
-                    dim=-1,
-                ),
-                torch.stack(
-                    [
-                        torch.full_like(moving_x, 1.15),
-                        torch.full_like(moving_x, 0.25),
-                        torch.full_like(moving_x, 0.10),
-                    ],
-                    dim=-1,
-                ),
-                torch.stack(
-                    [
-                        torch.full_like(moving_x, -0.65),
-                        torch.full_like(moving_x, 1.05),
-                        torch.full_like(moving_x, 0.20),
-                    ],
-                    dim=-1,
-                ),
-                torch.stack(
-                    [
-                        torch.full_like(moving_x, 0.20),
-                        torch.full_like(moving_x, -0.45),
-                        torch.full_like(moving_x, 1.35),
-                    ],
-                    dim=-1,
-                ),
-            ],
-            dim=1,
-        )
-
-    def _center_atom_energy_on_pole_path(
-        self,
-        model: torch.nn.Module,
-        moving_x: torch.Tensor,
-        *,
-        pole_sign: float = 1.0,
-    ) -> torch.Tensor:
-        """Return center-atom energies for a batched pole-crossing probe path."""
-        coord = self._build_signed_pole_path_coord_batch(
-            moving_x,
-            pole_sign=pole_sign,
-        )
-        atype = self.atype.expand(moving_x.shape[0], -1)
-        box = self.box.expand(moving_x.shape[0], -1)
-        result = model(coord, atype, box=box)
-        return result["atom_energy"][:, 0, 0]
-
-    def _center_atom_energy_derivatives(
-        self,
-        model: torch.nn.Module,
-        distance_value: float,
-        static_neighbor_distances: tuple[float, float, float],
-        max_order: int = MAX_SMOOTH_ORDER,
-    ) -> tuple[torch.Tensor, ...]:
-        """Compute atom-energy derivatives up to one target order."""
-        moving_distance = torch.tensor(
-            distance_value,
+        nearest_distance: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Scan total energies while displacing atom 0 along x."""
+        displacements = torch.linspace(
+            -self.MAX_DISPLACEMENT,
+            self.MAX_DISPLACEMENT,
+            self.N_DISPLACEMENT_POINTS,
             dtype=self.dtype,
             device=self.device,
-            requires_grad=True,
         )
-        current = self._center_atom_energy(
-            model,
-            moving_distance,
-            static_neighbor_distances,
+        coord0, box = self._build_scaled_symmetric_structure(nearest_distance)
+        coord = coord0.repeat(displacements.shape[0], 1, 1)
+        coord[:, 0, 0] += displacements
+        result = model(
+            coord,
+            self.symmetry_atype.expand(displacements.shape[0], -1),
+            box=box.expand(displacements.shape[0], -1),
         )
-        derivatives = [current]
-        for order in range(1, max_order + 1):
-            current = torch.autograd.grad(
-                current,
-                moving_distance,
-                create_graph=order < max_order,
-            )[0]
-            derivatives.append(current)
-        return tuple(value.detach() for value in derivatives)
+        return displacements, result["energy"][:, 0].detach()
 
-    def _assert_probe_is_geometry_sensitive(
+    def _collect_curve_statistics(
         self,
-        model: torch.nn.Module,
-        n_atten_head: int,
-        *,
-        probe_distances: tuple[float, float],
-        static_neighbor_distances: tuple[float, float, float],
-    ) -> None:
-        """Ensure the probe is not constant with respect to the moving neighbor."""
-        inside_distance, outside_distance = probe_distances
-        energy_inside = self._center_atom_energy(
-            model,
-            torch.tensor(inside_distance, dtype=self.dtype, device=self.device),
-            static_neighbor_distances,
+        energies: torch.Tensor,
+        displacements: torch.Tensor,
+    ) -> dict[str, float | str]:
+        """Compute derivative and extremum statistics for one energy curve."""
+        step = displacements[1] - displacements[0]
+        first = (energies[2:] - energies[:-2]) / (2.0 * step)
+        second = (energies[2:] - 2.0 * energies[1:-1] + energies[:-2]) / (step * step)
+        center_idx = energies.shape[0] // 2
+        deriv_center_idx = first.shape[0] // 2
+        left_first = first[:deriv_center_idx]
+        right_first = first[deriv_center_idx + 1 :]
+        center_energy = energies[center_idx]
+        other_energies = torch.cat((energies[:center_idx], energies[center_idx + 1 :]))
+
+        bowl_up = bool(
+            torch.all(left_first < -self.FIRST_DERIVATIVE_MARGIN)
+            and torch.all(right_first > self.FIRST_DERIVATIVE_MARGIN)
+            and torch.all(second > self.SECOND_DERIVATIVE_MARGIN)
+            and torch.all(center_energy <= other_energies + self.EXTREMUM_MARGIN)
         )
-        energy_outside = self._center_atom_energy(
-            model,
-            torch.tensor(outside_distance, dtype=self.dtype, device=self.device),
-            static_neighbor_distances,
+        bowl_down = bool(
+            torch.all(left_first > self.FIRST_DERIVATIVE_MARGIN)
+            and torch.all(right_first < -self.FIRST_DERIVATIVE_MARGIN)
+            and torch.all(second < -self.SECOND_DERIVATIVE_MARGIN)
+            and torch.all(center_energy >= other_energies - self.EXTREMUM_MARGIN)
+        )
+
+        if bowl_up:
+            curve_kind = "minimum"
+        elif bowl_down:
+            curve_kind = "maximum"
+        else:
+            curve_kind = "invalid"
+
+        return {
+            "curve_kind": curve_kind,
+            "energy_span": float((energies.max() - energies.min()).abs()),
+            "left_abs_min": float(left_first.abs().min()),
+            "right_abs_min": float(right_first.abs().min()),
+            "curvature_abs_min": float(second.abs().min()),
+        }
+
+    def _assert_curve_has_usable_signal(
+        self,
+        stats: dict[str, float | str],
+        *,
+        label: str,
+        n_atten_head: int,
+    ) -> None:
+        """Check that the scanned curve has enough signal above numerical noise."""
+        self.assertGreater(
+            stats["energy_span"],
+            self.ENERGY_SPAN_MARGIN,
+            f"{label} energy curve became nearly flat for n_atten_head={n_atten_head}: {stats}",
         )
         self.assertGreater(
-            abs((energy_inside - energy_outside).item()),
-            1.0e-5,
-            f"Probe became nearly constant for n_atten_head={n_atten_head}",
+            stats["left_abs_min"],
+            self.FIRST_DERIVATIVE_MARGIN,
+            f"{label} left-branch slope is too small for n_atten_head={n_atten_head}: {stats}",
+        )
+        self.assertGreater(
+            stats["right_abs_min"],
+            self.FIRST_DERIVATIVE_MARGIN,
+            f"{label} right-branch slope is too small for n_atten_head={n_atten_head}: {stats}",
+        )
+        self.assertGreater(
+            stats["curvature_abs_min"],
+            self.SECOND_DERIVATIVE_MARGIN,
+            f"{label} curvature is too small for n_atten_head={n_atten_head}: {stats}",
         )
 
-    def _predict_derivative_from_taylor(
+    def _assert_cutoff_near_energy_curve_is_smooth(
         self,
-        boundary_derivatives: tuple[torch.Tensor, ...],
-        *,
-        shift: torch.Tensor,
-        derivative_order: int,
-    ) -> torch.Tensor:
-        """Predict one derivative from a C3 Taylor expansion at the boundary."""
-        predicted = boundary_derivatives[derivative_order]
-        for order in range(derivative_order + 1, self.MAX_SMOOTH_ORDER + 1):
-            predicted = predicted + (
-                boundary_derivatives[order]
-                * shift.pow(order - derivative_order)
-                / math.factorial(order - derivative_order)
-            )
-        return predicted
-
-    def _assert_boundary_is_c3_smooth(
-        self,
-        model: torch.nn.Module,
-        *,
         n_atten_head: int,
-        boundary: float,
-        static_neighbor_distances: tuple[float, float, float],
-        derivative_atols: tuple[float, float, float],
+        *,
+        use_amp: bool,
     ) -> None:
-        """
-        Check C3 smoothness via derivative-wise Taylor consistency.
-
-        The current SeZM implementation guarantees C3 smoothness at the tested
-        boundaries, so this helper verifies derivative orders 0, 1, and 2
-        against a third-order Taylor expansion built from the boundary values.
-        """
-        boundary_derivatives = self._center_atom_energy_derivatives(
-            model,
-            boundary,
-            static_neighbor_distances,
-        )
-        for value in boundary_derivatives:
-            self.assertTrue(torch.isfinite(value).all().item())
-
-        for delta in self.cutoff_deltas:
-            for shift in (-delta, delta):
-                with self.subTest(
-                    n_atten_head=n_atten_head,
-                    boundary=boundary,
-                    delta=delta,
-                    shift=shift,
-                ):
-                    side_derivatives = self._center_atom_energy_derivatives(
-                        model,
-                        boundary + shift,
-                        static_neighbor_distances,
-                    )
-                    for value in side_derivatives:
-                        self.assertTrue(torch.isfinite(value).all().item())
-
-                    shift_tensor = boundary_derivatives[0].new_tensor(shift)
-                    for derivative_order, atol, rtol in zip(
-                        range(self.MAX_SMOOTH_ORDER),
-                        derivative_atols,
-                        self.DERIVATIVE_RTOLS,
-                        strict=True,
-                    ):
-                        predicted = self._predict_derivative_from_taylor(
-                            boundary_derivatives,
-                            shift=shift_tensor,
-                            derivative_order=derivative_order,
-                        )
-                        torch.testing.assert_close(
-                            side_derivatives[derivative_order],
-                            predicted,
-                            atol=atol,
-                            rtol=rtol,
-                            msg=(
-                                f"C3 smoothness failed for derivative order {derivative_order} at boundary={boundary}"
-                            ),
-                        )
-
-    def _assert_cutoff_smoothness(self, n_atten_head: int) -> None:
-        """Check center atom energy smoothness across multiple cutoff offsets."""
-        static_neighbor_distances = (1.0, 1.2, 1.4)
-        model = self._build_geometry_sensitive_model(n_atten_head)
-        self._assert_probe_is_geometry_sensitive(
-            model,
+        """Check that the non-bridged near-cutoff probe keeps one smooth extremum."""
+        model = self._build_random_weight_model(
             n_atten_head,
-            probe_distances=(2.0, 3.2),
-            static_neighbor_distances=static_neighbor_distances,
+            use_amp=use_amp,
         )
-        self._assert_boundary_is_c3_smooth(
+        displacements, energies = self._scan_total_energy_curve(
             model,
+            nearest_distance=self.RCUT_NEAR_DISTANCE,
+        )
+        self.assertTrue(torch.isfinite(energies).all().item())
+
+        stats = self._collect_curve_statistics(energies, displacements)
+        self._assert_curve_has_usable_signal(
+            stats,
+            label=f"Near-cutoff (use_amp={use_amp})",
             n_atten_head=n_atten_head,
-            boundary=self.rcut,
-            static_neighbor_distances=static_neighbor_distances,
-            derivative_atols=(2.0e-7, 2.0e-6, 5.0e-5),
+        )
+        self.assertIn(
+            stats["curve_kind"],
+            {"minimum", "maximum"},
+            (
+                "Near-cutoff energy curve is not a single smooth bowl "
+                f"for n_atten_head={n_atten_head}, use_amp={use_amp}: {stats}"
+            ),
         )
 
-    def _assert_inner_clamp_smoothness(self, n_atten_head: int) -> None:
-        """Check center atom energy smoothness at r_inner and r_outer."""
-        static_neighbor_distances = (1.2, 1.8, 2.2)
-        model = self._build_geometry_sensitive_model(
-            n_atten_head,
-            bridging_method="ZBL",
-        )
-        self._assert_probe_is_geometry_sensitive(
-            model,
-            n_atten_head,
-            probe_distances=(0.8, 1.8),
-            static_neighbor_distances=static_neighbor_distances,
-        )
-        for boundary in (self.r_inner, self.r_outer):
-            self._assert_boundary_is_c3_smooth(
-                model,
-                n_atten_head=n_atten_head,
-                boundary=boundary,
-                static_neighbor_distances=static_neighbor_distances,
-                derivative_atols=(5.0e-7, 5.0e-6, 5.0e-3),
-            )
-
-    def _assert_pole_path_force_matches_finite_difference(
+    def _assert_bridged_boundary_energy_curve_is_smooth(
         self,
         n_atten_head: int,
+        *,
+        use_amp: bool,
+        nearest_distance: float,
+        boundary_label: str,
     ) -> None:
-        """Check analytic center-atom force against numerical force on a pole path."""
-        model = self._build_geometry_sensitive_model(n_atten_head)
-        for pole_sign in (1.0, -1.0):
-            moving_x = torch.linspace(
-                -0.1,
-                0.1,
-                201,
-                dtype=self.dtype,
-                device=self.device,
-                requires_grad=True,
-            )
-            energy = self._center_atom_energy_on_pole_path(
-                model,
-                moving_x,
-                pole_sign=pole_sign,
-            )
-            self.assertTrue(torch.isfinite(energy).all().item())
-            analytic_force = -torch.autograd.grad(energy.sum(), moving_x)[0]
-            numerical_force = -(energy.detach()[2:] - energy.detach()[:-2]) / (
-                2.0 * (moving_x.detach()[1] - moving_x.detach()[0])
-            )
-            torch.testing.assert_close(
-                analytic_force[1:-1].detach(),
-                numerical_force,
-                atol=1.0e-6,
-                rtol=2.0e-4,
-                msg=(
-                    f"Pole-path force mismatch for n_atten_head={n_atten_head}, pole_sign={pole_sign}"
-                ),
-            )
+        """Check that one bridged boundary probe keeps one smooth minimum."""
+        model = self._build_random_weight_model(
+            n_atten_head,
+            use_amp=use_amp,
+            bridging_method="ZBL",
+            bridging_r_inner=self.BRIDGING_R_INNER,
+            bridging_r_outer=self.BRIDGING_R_OUTER,
+        )
+        displacements, energies = self._scan_total_energy_curve(
+            model,
+            nearest_distance=nearest_distance,
+        )
+        self.assertTrue(torch.isfinite(energies).all().item())
 
-    def test_center_atom_energy_is_c3_smooth_across_attention_modes(self) -> None:
-        """Test cutoff C3 smoothness for both plain and attention aggregation."""
-        for n_atten_head in (0, 2):
-            with self.subTest(n_atten_head=n_atten_head):
-                self._assert_cutoff_smoothness(n_atten_head)
+        stats = self._collect_curve_statistics(energies, displacements)
+        self._assert_curve_has_usable_signal(
+            stats,
+            label=f"Bridged {boundary_label} (use_amp={use_amp})",
+            n_atten_head=n_atten_head,
+        )
+        self.assertEqual(
+            stats["curve_kind"],
+            "minimum",
+            (
+                f"Bridged {boundary_label} probe should form one symmetric repulsive bowl "
+                f"for n_atten_head={n_atten_head}, use_amp={use_amp}: {stats}"
+            ),
+        )
 
-    def test_inner_clamp_boundaries_preserve_c3_smoothness(self) -> None:
-        """Test r_inner and r_outer C3 smoothness for both aggregation modes."""
-        for n_atten_head in (0, 2):
-            with self.subTest(n_atten_head=n_atten_head):
-                self._assert_inner_clamp_smoothness(n_atten_head)
+    def test_scaled_cutoff_near_energy_curve_is_smooth_across_attention_modes(
+        self,
+    ) -> None:
+        """Check the non-bridged near-cutoff PES shape across attention and AMP modes."""
+        for use_amp in (False, True):
+            for n_atten_head in (0, 2):
+                with self.subTest(n_atten_head=n_atten_head, use_amp=use_amp):
+                    self._assert_cutoff_near_energy_curve_is_smooth(
+                        n_atten_head,
+                        use_amp=use_amp,
+                    )
 
-    def test_center_atom_force_matches_finite_difference_across_pole_path(self) -> None:
-        """Test pole-path force smoothness for both plain and attention aggregation."""
-        for n_atten_head in (0, 2):
-            with self.subTest(n_atten_head=n_atten_head):
-                self._assert_pole_path_force_matches_finite_difference(n_atten_head)
+    def test_scaled_bridging_inner_energy_curve_is_smooth_across_attention_modes(
+        self,
+    ) -> None:
+        """Check the bridged near-r_inner PES shape across attention and AMP modes."""
+        for use_amp in (False, True):
+            for n_atten_head in (0, 2):
+                with self.subTest(n_atten_head=n_atten_head, use_amp=use_amp):
+                    self._assert_bridged_boundary_energy_curve_is_smooth(
+                        n_atten_head,
+                        use_amp=use_amp,
+                        nearest_distance=self.BRIDGING_R_INNER,
+                        boundary_label="r_inner",
+                    )
+
+    def test_scaled_bridging_outer_energy_curve_is_smooth_across_attention_modes(
+        self,
+    ) -> None:
+        """Check the bridged near-r_outer PES shape across attention and AMP modes."""
+        for use_amp in (False, True):
+            for n_atten_head in (0, 2):
+                with self.subTest(n_atten_head=n_atten_head, use_amp=use_amp):
+                    self._assert_bridged_boundary_energy_curve_is_smooth(
+                        n_atten_head,
+                        use_amp=use_amp,
+                        nearest_distance=self.BRIDGING_R_OUTER,
+                        boundary_label="r_outer",
+                    )
 
 
 if __name__ == "__main__":
