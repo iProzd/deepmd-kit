@@ -1032,24 +1032,55 @@ class Trainer:
         parameters. In EP mode, different ranks hold different routed experts
         (same parameter names but different semantics). The correct sync is:
 
-        - Routed expert params: all-reduce within dp_group
-          (only ranks with the SAME expert subset should average)
+        - Routed expert params: all-reduce within dp_group, then scale by
+          1/ep_size. Expert grads accumulate contributions from all EP ranks
+          via A2A backward (a sum, not average), so dividing by ep_size
+          converts to an average matching the shared param convention.
         - Shared params: all-reduce within the default (global) group
           (gate, shared_experts, fitting_net, encoder, etc.)
+
+        Gradients are batched into flat buffers to minimize all-reduce calls.
         """
         dp_size = dist.get_world_size(group=self.dp_group)
+
+        # Partition gradients into expert vs shared buckets
+        expert_grads: list[torch.Tensor] = []
+        shared_grads: list[torch.Tensor] = []
         for name, p in self.wrapper.named_parameters():
             if p.grad is None:
                 continue
             if self._is_routed_expert_param(name):
-                # Routed experts: sync only within dp_group
-                if dp_size > 1:
-                    dist.all_reduce(p.grad, group=self.dp_group)
-                    p.grad /= dp_size
+                expert_grads.append(p.grad)
             else:
-                # Shared params: sync globally across all ranks
-                dist.all_reduce(p.grad)
-                p.grad /= self.world_size
+                shared_grads.append(p.grad)
+
+        # Batch all-reduce for shared params (global group)
+        if shared_grads:
+            flat = torch._utils._flatten_dense_tensors(shared_grads)
+            dist.all_reduce(flat)
+            flat /= self.world_size
+            for g, synced in zip(
+                shared_grads,
+                torch._utils._unflatten_dense_tensors(flat, shared_grads),
+            ):
+                g.copy_(synced)
+
+        # Batch all-reduce for expert params (dp_group) + scale by ep_size
+        if expert_grads:
+            if dp_size > 1:
+                flat = torch._utils._flatten_dense_tensors(expert_grads)
+                dist.all_reduce(flat, group=self.dp_group)
+                flat /= dp_size
+                for g, synced in zip(
+                    expert_grads,
+                    torch._utils._unflatten_dense_tensors(flat, expert_grads),
+                ):
+                    g.copy_(synced)
+            # Expert grads receive the raw SUM of contributions from all
+            # EP ranks through A2A backward. Divide by ep_size to average.
+            if self.ep_size > 1:
+                for g in expert_grads:
+                    g /= self.ep_size
 
     def run(self) -> None:
         fout = (

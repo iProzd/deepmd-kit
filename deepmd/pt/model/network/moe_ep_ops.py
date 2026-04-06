@@ -74,21 +74,47 @@ class _EPMoEBackward(Function):
         # Step 1: Combine backward A2A
         grad_expert_out = _a2a_raw(grad_h_ret, send_splits, recv_splits, group)
 
-        # Step 2: Expert backward with create_graph=True for 2nd-order
-        grad_h_recv = torch.zeros_like(h_recv)
+        # Step 2: Expert backward
+        # We need TWO things from each expert's backward:
+        #   a) grad w.r.t. h_in (for chain rule to upstream)
+        #   b) grad w.r.t. expert.weight/bias (accumulated into .grad)
+        # torch.autograd.grad only gives (a), so we call result.backward()
+        # separately to accumulate (b).
+
+        # Sort tokens by expert_id for contiguous slicing
+        sort_idx = torch.argsort(expert_ids, stable=True)
+        expert_counts = torch.bincount(expert_ids, minlength=num_experts)
+        h_recv_sorted = h_recv[sort_idx]
+        grad_out_sorted = grad_expert_out[sort_idx]
+
+        grad_parts: list[torch.Tensor] = []
+        offset = 0
         for i, expert in enumerate(experts):
-            mask = expert_ids == i
-            if mask.any():
-                h_in = h_recv[mask].detach().requires_grad_(True)
+            cnt = expert_counts[i].item()
+            if cnt > 0:
+                h_in = h_recv_sorted[offset:offset + cnt].detach().requires_grad_(True)
+                g_out = grad_out_sorted[offset:offset + cnt]
                 with torch.enable_grad():
                     result = expert(h_in)
+                # (a) Compute grad w.r.t. h_in for chain rule
                 grad_i = torch.autograd.grad(
                     result, h_in,
-                    grad_outputs=grad_expert_out[mask],
+                    grad_outputs=g_out,
                     create_graph=True,
+                    retain_graph=True,
                 )[0]
-                grad_h_recv = grad_h_recv.clone()
-                grad_h_recv[mask] = grad_i
+                grad_parts.append(grad_i)
+                # (b) Accumulate expert parameter gradients
+                result.backward(g_out, retain_graph=False)
+            else:
+                grad_parts.append(h_recv.new_empty(0, h_recv.shape[1]))
+            offset += cnt
+
+        # Concatenate and unsort back to original order
+        grad_h_recv_sorted = torch.cat(grad_parts, dim=0)
+        inv_idx = torch.empty_like(sort_idx)
+        inv_idx[sort_idx] = torch.arange(sort_idx.shape[0], device=sort_idx.device)
+        grad_h_recv = grad_h_recv_sorted[inv_idx]
 
         # Step 3: Dispatch backward A2A
         grad_x_sorted = _a2a_raw(grad_h_recv, recv_splits, send_splits, group)
@@ -123,18 +149,30 @@ class _EPMoEForward(Function):
                 experts, expert_ids, num_out):
         h_recv = _a2a_raw(x_sorted, send_splits, recv_splits, group)
 
-        expert_out = torch.zeros(
-            h_recv.shape[0], num_out, dtype=h_recv.dtype, device=h_recv.device
-        )
+        n_recv = h_recv.shape[0]
+        # Sort tokens by expert_id so each expert's slice is contiguous
+        sort_idx = torch.argsort(expert_ids, stable=True)
+        expert_counts = torch.bincount(expert_ids, minlength=len(experts))
+        h_sorted = h_recv[sort_idx]
+
+        # Run each expert on its contiguous slice — no clone needed
+        results: list[torch.Tensor] = []
         used_experts = set()
+        offset = 0
         for i, expert in enumerate(experts):
-            mask = expert_ids == i
-            if mask.any():
-                h_in = h_recv[mask]
-                result = expert(h_in)
-                expert_out = expert_out.clone()
-                expert_out[mask] = result
+            cnt = expert_counts[i].item()
+            if cnt > 0:
+                results.append(expert(h_sorted[offset:offset + cnt]))
                 used_experts.add(i)
+            else:
+                results.append(h_sorted.new_empty(0, num_out))
+            offset += cnt
+
+        # Concatenate results (in sorted order) and unsort back to original order
+        expert_out_sorted = torch.cat(results, dim=0)  # [n_recv, num_out]
+        inv_idx = torch.empty_like(sort_idx)
+        inv_idx[sort_idx] = torch.arange(n_recv, device=sort_idx.device)
+        expert_out = expert_out_sorted[inv_idx]
 
         ctx.group = group
         ctx.send_splits = send_splits
@@ -227,11 +265,10 @@ class _EPMoEGPULevelBackward(Function):
         grad_combined = _a2a_raw(grad_h_ret, send_splits, recv_splits, group)
 
         # Step 2: Expert backward with create_graph=True
-        # grad_combined is gradient of the weighted sum of expert outputs
-        # We need gradient w.r.t. h_recv
-        grad_h_recv = torch.zeros_like(h_recv)
+        # Collect (indices, grad_i) per expert, then index_add once to avoid clone
         n_recv = h_recv.shape[0]
-        max_k = recv_eid_matrix.shape[1] if n_recv > 0 else 0
+        all_indices: list[torch.Tensor] = []
+        all_grads: list[torch.Tensor] = []
 
         for i, expert in enumerate(experts):
             # Find tokens assigned to this expert
@@ -239,23 +276,31 @@ class _EPMoEGPULevelBackward(Function):
             token_mask = mask_2d.any(dim=1)  # [N_dedup_recv]
             if not token_mask.any():
                 continue
-            # Get the weight for this expert per token
-            # For each token hitting this expert, find the weight
-            weight_for_expert = (recv_weight_matrix * mask_2d.float()).sum(dim=1)  # [N_dedup_recv]
-            w_active = weight_for_expert[token_mask]  # [n_active]
+            weight_for_expert = (recv_weight_matrix * mask_2d.float()).sum(dim=1)
+            w_active = weight_for_expert[token_mask]
 
             h_in = h_recv[token_mask].detach().requires_grad_(True)
             with torch.enable_grad():
                 result = expert(h_in)
             # grad of weighted output: grad_combined * weight
             grad_out = grad_combined[token_mask] * w_active.unsqueeze(-1)
+            # (a) Compute grad w.r.t. h_in for chain rule
             grad_i = torch.autograd.grad(
                 result, h_in,
                 grad_outputs=grad_out,
                 create_graph=True,
+                retain_graph=True,
             )[0]
-            grad_h_recv = grad_h_recv.clone()
-            grad_h_recv[token_mask] = grad_h_recv[token_mask] + grad_i
+            all_indices.append(token_mask.nonzero(as_tuple=True)[0])
+            all_grads.append(grad_i)
+            # (b) Accumulate expert parameter gradients
+            result.backward(grad_out, retain_graph=False)
+
+        grad_h_recv = torch.zeros_like(h_recv)
+        if all_grads:
+            flat_idx = torch.cat(all_indices, dim=0)
+            flat_grad = torch.cat(all_grads, dim=0)
+            grad_h_recv = grad_h_recv.index_add(0, flat_idx, flat_grad)
 
         # Step 3: Dispatch backward A2A
         grad_x_sorted = _a2a_raw(grad_h_recv, recv_splits, send_splits, group)
@@ -290,9 +335,9 @@ class _EPMoEGPULevelForward(Function):
         h_recv = _a2a_raw(x_sorted, send_splits, recv_splits, group)
 
         n_recv = h_recv.shape[0]
-        combined_out = torch.zeros(
-            n_recv, num_out, dtype=h_recv.dtype, device=h_recv.device
-        )
+        # Collect (token_indices, weighted_results) per expert, then scatter_add once
+        all_indices: list[torch.Tensor] = []
+        all_results: list[torch.Tensor] = []
         used_experts = set()
 
         for i, expert in enumerate(experts):
@@ -303,13 +348,21 @@ class _EPMoEGPULevelForward(Function):
                 continue
             used_experts.add(i)
             # Compute the weight for this expert per active token
-            weight_for_expert = (recv_weight_matrix * mask_2d.float()).sum(dim=1)  # [N_dedup_recv]
-            w_active = weight_for_expert[token_mask]  # [n_active]
+            weight_for_expert = (recv_weight_matrix * mask_2d.float()).sum(dim=1)
+            w_active = weight_for_expert[token_mask]
 
             h_in = h_recv[token_mask]
             result = expert(h_in)  # [n_active, num_out]
-            combined_out = combined_out.clone()
-            combined_out[token_mask] = combined_out[token_mask] + result * w_active.unsqueeze(-1)
+            all_indices.append(token_mask.nonzero(as_tuple=True)[0])
+            all_results.append(result * w_active.unsqueeze(-1))
+
+        combined_out = torch.zeros(
+            n_recv, num_out, dtype=h_recv.dtype, device=h_recv.device
+        )
+        if all_results:
+            flat_idx = torch.cat(all_indices, dim=0)
+            flat_res = torch.cat(all_results, dim=0)
+            combined_out = combined_out.index_add(0, flat_idx, flat_res)
 
         ctx.group = group
         ctx.send_splits = send_splits

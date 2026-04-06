@@ -364,9 +364,9 @@ class MoELayer(nn.Module):
         local_eid = flat_expert_ids % self.experts_per_gpu
 
         send_perm = torch.argsort(target_gpu, stable=True)
-        send_splits = [
-            (target_gpu == i).sum().item() for i in range(self.ep_size)
-        ]
+        send_splits = torch.bincount(
+            target_gpu, minlength=self.ep_size
+        ).tolist()
 
         # Exchange recv counts
         send_t = torch.tensor(
@@ -500,9 +500,9 @@ class MoELayer(nn.Module):
         eid_matrix = eid_matrix[sort_perm]
         weight_matrix = weight_matrix[sort_perm]
 
-        send_splits = [
-            (dedup_gpu_id_sorted == i).sum().item() for i in range(self.ep_size)
-        ]
+        send_splits = torch.bincount(
+            dedup_gpu_id_sorted, minlength=self.ep_size
+        ).tolist()
 
         # Exchange recv counts
         send_t = torch.tensor(send_splits, device=device, dtype=torch.int64)
@@ -546,41 +546,58 @@ class MoELayer(nn.Module):
     ) -> torch.Tensor:
         """Run each local expert on its assigned tokens.
 
-        Uses clone-before-scatter to avoid in-place ops for autograd.
+        Uses sort-based contiguous slicing to avoid repeated clone() calls.
         Adds zero-contribution from unused experts to maintain autograd graph
         connectivity for 2nd-order derivatives.
         """
-        out = torch.zeros(
-            h.shape[0], self.num_out, dtype=h.dtype, device=h.device
-        )
+        n = h.shape[0]
         # Maintain graph connectivity: h -> out.
-        # When h is 0-element (this GPU received no tokens), h.sum() is a
-        # scalar 0 with grad_fn, keeping the dispatch A2A in the autograd
-        # graph so that gradients flow back through A2A to the original input.
         ghost = h.sum() * 0.0
-        # Track unused experts for graph connectivity
-        unused_expert_sum = torch.tensor(
+
+        if n == 0:
+            out = torch.zeros(
+                0, self.num_out, dtype=h.dtype, device=h.device
+            )
+            # All experts unused — add parameter ghost
+            unused_param_sum = sum(
+                p.sum() for expert in self.experts for p in expert.parameters()
+            ) * 0.0
+            return out + ghost + unused_param_sum
+
+        # Sort tokens by expert_id for contiguous slicing
+        sort_idx = torch.argsort(expert_ids, stable=True)
+        expert_counts = torch.bincount(expert_ids, minlength=len(self.experts))
+        h_sorted = h[sort_idx]
+
+        results: list[torch.Tensor] = []
+        used_set: set[int] = set()
+        offset = 0
+        for i, expert in enumerate(self.experts):
+            cnt = expert_counts[i].item()
+            if cnt > 0:
+                results.append(expert(h_sorted[offset:offset + cnt]))
+                used_set.add(i)
+            else:
+                results.append(h_sorted.new_empty(0, self.num_out))
+            offset += cnt
+
+        # Concatenate and unsort back to original order
+        out_sorted = torch.cat(results, dim=0)
+        inv_idx = torch.empty_like(sort_idx)
+        inv_idx[sort_idx] = torch.arange(n, device=sort_idx.device)
+        out = out_sorted[inv_idx]
+
+        # Add zero-contribution from unused experts via cheap parameter sum
+        unused_param_sum = sum(
+            p.sum()
+            for i, expert in enumerate(self.experts)
+            if i not in used_set
+            for p in expert.parameters()
+        ) * 0.0 if len(used_set) < len(self.experts) else torch.tensor(
             0.0, dtype=h.dtype, device=h.device
         )
-        for i, expert in enumerate(self.experts):
-            mask = expert_ids == i
-            if mask.any():
-                result = expert(h[mask])
-                out = out.clone()  # avoid in-place for autograd
-                out[mask] = result
-            else:
-                # Add zero-contribution to keep expert in computation graph.
-                # This ensures 2nd-order gradients flow through all params.
-                # IMPORTANT: Always use torch.zeros (not h[:1]) to avoid
-                # creating backward paths through A2A that would differ
-                # between ranks, causing NCCL deadlocks with create_graph=True.
-                # The `ghost` term already handles A2A graph connectivity.
-                dummy = expert(torch.zeros(
-                    1, h.shape[-1], dtype=h.dtype, device=h.device
-                ))
-                unused_expert_sum = unused_expert_sum + dummy.sum() * 0.0
         # Add zero-valued terms that connect h and unused experts to the graph
-        out = out + ghost + unused_expert_sum
+        out = out + ghost + unused_param_sum
         return out
 
     def _moe_ep_flat(
@@ -643,12 +660,10 @@ class MoELayer(nn.Module):
         # have different used_experts sets, so conditionally skipping
         # experts would create asymmetric graphs and cause NCCL deadlocks
         # from topological sort reordering during loss.backward().
-        ghost_sum = torch.tensor(0.0, dtype=x.dtype, device=x.device)
-        for expert in self.experts:
-            dummy = expert(torch.zeros(
-                1, dim, dtype=x.dtype, device=x.device
-            ))
-            ghost_sum = ghost_sum + dummy.sum() * 0.0
+        # Use parameter sum instead of dummy forward to avoid costly matmuls.
+        ghost_sum = sum(
+            p.sum() for expert in self.experts for p in expert.parameters()
+        ) * 0.0
         h_ret = h_ret + ghost_sum
 
         # Un-permute
@@ -699,12 +714,9 @@ class MoELayer(nn.Module):
         )
 
         # Add ghost terms for ALL experts
-        ghost_sum = torch.tensor(0.0, dtype=x.dtype, device=x.device)
-        for expert in self.experts:
-            dummy = expert(torch.zeros(
-                1, dim, dtype=x.dtype, device=x.device
-            ))
-            ghost_sum = ghost_sum + dummy.sum() * 0.0
+        ghost_sum = sum(
+            p.sum() for expert in self.experts for p in expert.parameters()
+        ) * 0.0
         h_ret = h_ret + ghost_sum
 
         # Scatter-add results back to original token positions
@@ -808,12 +820,9 @@ class MoELayer(nn.Module):
 
         # Add ghost terms for ALL experts (not just unused) to ensure
         # identical autograd graph structure on all ranks. See _moe_ep_flat.
-        ghost_sum = torch.tensor(0.0, dtype=x.dtype, device=x.device)
-        for expert in self.experts:
-            dummy = expert(torch.zeros(
-                1, dim_in, dtype=x.dtype, device=x.device
-            ))
-            ghost_sum = ghost_sum + dummy.sum() * 0.0
+        ghost_sum = sum(
+            p.sum() for expert in self.experts for p in expert.parameters()
+        ) * 0.0
         h_ret = h_ret + ghost_sum
 
         # Un-permute
@@ -894,12 +903,9 @@ class MoELayer(nn.Module):
         )
 
         # Add ghost terms for ALL experts
-        ghost_sum = torch.tensor(0.0, dtype=x.dtype, device=x.device)
-        for expert in self.experts:
-            dummy = expert(torch.zeros(
-                1, dim_in, dtype=x.dtype, device=x.device
-            ))
-            ghost_sum = ghost_sum + dummy.sum() * 0.0
+        ghost_sum = sum(
+            p.sum() for expert in self.experts for p in expert.parameters()
+        ) * 0.0
         h_ret = h_ret + ghost_sum
 
         # Scatter-add results back to original token positions
