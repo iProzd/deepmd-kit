@@ -22,7 +22,10 @@
       "use_tebd_bias": false,
       "precision": "float32",
       "concat_output_tebd": false,
-      "seed": 1
+      "seed": 1,
+      "tebd_mode": "embedding",
+      "mlp_init": "glorot",
+      "bias_init_zero": true
     },
     "fitting_net": {
       "neuron": [240, 240, 240],

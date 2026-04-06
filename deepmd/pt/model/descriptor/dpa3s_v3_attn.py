@@ -125,6 +125,10 @@ class RepFlowLayerV3(torch.nn.Module):
         precision: str = "float64",
         seed: int | list[int] | None = None,
         trainable: bool = True,
+        mlp_init: str = "default",
+        bias_init_zero: bool = False,
+        gate_bias_zero: bool = False,
+        norm_position: str = "post",
     ) -> None:
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -147,17 +151,19 @@ class RepFlowLayerV3(torch.nn.Module):
         self.seed = seed
         self.prec = PRECISION_DICT[precision]
         self.act = ActivationFn(activation_function)
+        self.mlp_init = mlp_init
+        self.bias_init_zero = bias_init_zero
+        self.gate_bias_zero = gate_bias_zero
+        self.norm_position = norm_position
 
         self.dynamic_e_sel = self.nnei / self.sel_reduce_factor
         self.dynamic_a_sel_sqrt = (self.a_sel / self.sel_reduce_factor) ** 0.5
 
         # Step 1: Angle → Edge
-        # Input: [angle_ebd (a_dim), edge_ik (e_dim), edge_ij (e_dim)]
         self.angle_mlp = MLPLayer(
-            a_dim + 2 * e_dim, e_dim,
+            a_dim + 2 * e_dim, e_dim, init=mlp_init,
             precision=precision, seed=child_seed(seed, 0), trainable=trainable,
         )
-        # Created on CPU to avoid inheriting sentinel device from test framework
         with torch.device("cpu"):
             self.edge_norm = RMSNorm(e_dim)
         self.e_residual = get_residual(
@@ -167,15 +173,15 @@ class RepFlowLayerV3(torch.nn.Module):
 
         # Step 2: Edge-gated Attention → Node
         self.gate_linear = MLPLayer(
-            e_dim, 1, bias=True,
+            e_dim, 1, bias=True, init=mlp_init,
             precision=precision, seed=child_seed(seed, 2), trainable=trainable,
         )
         self.value_linear = MLPLayer(
-            n_dim, n_dim, bias=False,
+            n_dim, n_dim, bias=False, init=mlp_init,
             precision=precision, seed=child_seed(seed, 3), trainable=trainable,
         )
         self.edge_value_linear = MLPLayer(
-            e_dim, n_dim, bias=False,
+            e_dim, n_dim, bias=False, init=mlp_init,
             precision=precision, seed=child_seed(seed, 4), trainable=trainable,
         )
         with torch.device("cpu"):
@@ -188,7 +194,7 @@ class RepFlowLayerV3(torch.nn.Module):
         # Step 3: SwiGLU FFN
         self.ffn = SwiGLUFFN(
             n_dim, hidden_mult=ffn_hidden_mult,
-            precision=precision, seed=child_seed(seed, 6),
+            precision=precision, seed=child_seed(seed, 6), init=mlp_init,
         )
         with torch.device("cpu"):
             self.node_ffn_norm = RMSNorm(n_dim)
@@ -196,6 +202,14 @@ class RepFlowLayerV3(torch.nn.Module):
             n_dim, 0.1, "const",
             precision=precision, seed=child_seed(seed, 7), trainable=trainable,
         )
+
+        # Bias zeroing
+        if bias_init_zero:
+            for m in [self.angle_mlp, self.gate_linear]:
+                if m.bias is not None:
+                    m.bias.data.zero_()
+        if gate_bias_zero and self.gate_linear.bias is not None:
+            self.gate_linear.bias.data.zero_()
 
     def _angle_to_edge(
         self,
@@ -206,18 +220,23 @@ class RepFlowLayerV3(torch.nn.Module):
         a_sw: torch.Tensor,
         n_edge: int,
     ) -> torch.Tensor:
-        """Aggregate angle information into edge embeddings.
-
-        Returns updated edge_ebd after RMSNorm(edge + residual * angle_msg).
-        """
-        edge_ik = torch.index_select(edge_ebd, 0, eik2a_index)
-        edge_ij = torch.index_select(edge_ebd, 0, eij2a_index)
+        """Aggregate angle information into edge embeddings."""
+        if self.norm_position == "pre":
+            edge_ebd_normed = self.edge_norm(edge_ebd)
+            edge_ik = torch.index_select(edge_ebd_normed, 0, eik2a_index)
+            edge_ij = torch.index_select(edge_ebd_normed, 0, eij2a_index)
+        else:
+            edge_ik = torch.index_select(edge_ebd, 0, eik2a_index)
+            edge_ij = torch.index_select(edge_ebd, 0, eij2a_index)
         angle_info = torch.cat([angle_ebd, edge_ik, edge_ij], dim=-1)
         angle_msg = self.act(self.angle_mlp(angle_info))
         weighted = angle_msg * a_sw.unsqueeze(-1)
         edge_update = aggregate(weighted, eij2a_index, average=False, num_owner=n_edge)
         edge_update = edge_update / self.dynamic_a_sel_sqrt
-        return self.edge_norm(edge_ebd + self.e_residual * edge_update)
+        if self.norm_position == "pre":
+            return edge_ebd + self.e_residual * edge_update
+        else:
+            return self.edge_norm(edge_ebd + self.e_residual * edge_update)
 
     def _edge_to_node(
         self,
@@ -229,27 +248,33 @@ class RepFlowLayerV3(torch.nn.Module):
         n_ext2e_index: torch.Tensor,
         nb: int,
         nloc: int,
+        node_ebd_normed_ext: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Edge-gated attention aggregation into node embeddings.
-
-        gate = sigmoid(gate_linear(edge_ebd))
-        value = value_linear(nei_node) + edge_value_linear(edge_ebd)
-        msg = gate * sw * value
-        Returns RMSNorm(node + residual * aggregated_msg).
-        """
-        nei_node = torch.index_select(
-            node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
-        )
+        """Edge-gated attention aggregation into node embeddings."""
+        if self.norm_position == "pre" and node_ebd_normed_ext is not None:
+            nei_node = torch.index_select(
+                node_ebd_normed_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
+            )
+        else:
+            nei_node = torch.index_select(
+                node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
+            )
         gate = torch.sigmoid(self.gate_linear(edge_ebd))  # n_edge x 1
         value = self.value_linear(nei_node) + self.edge_value_linear(edge_ebd)
         msg = gate * sw.unsqueeze(-1) * value
         node_msg = aggregate(msg, n2e_index, average=False, num_owner=nb * nloc)
         node_msg = node_msg.reshape(nb, nloc, -1) / self.dynamic_e_sel
-        return self.node_attn_norm(node_ebd + self.n_residual_attn * node_msg)
+        if self.norm_position == "pre":
+            return node_ebd + self.n_residual_attn * node_msg
+        else:
+            return self.node_attn_norm(node_ebd + self.n_residual_attn * node_msg)
 
     def _node_ffn(self, node_ebd: torch.Tensor) -> torch.Tensor:
         """SwiGLU FFN with residual + RMSNorm."""
-        return self.node_ffn_norm(node_ebd + self.n_residual_ffn * self.ffn(node_ebd))
+        if self.norm_position == "pre":
+            return node_ebd + self.n_residual_ffn * self.ffn(self.node_ffn_norm(node_ebd))
+        else:
+            return self.node_ffn_norm(node_ebd + self.n_residual_ffn * self.ffn(node_ebd))
 
     def forward(
         self,
@@ -273,6 +298,13 @@ class RepFlowLayerV3(torch.nn.Module):
         node_ebd = node_ebd_ext[:, :nloc, :]
         del a_nlist, nlist_mask, a_nlist_mask, nnei
 
+        # Pre-LN: construct normed ext tensor (same pattern as V2)
+        node_ebd_normed_ext = None
+        if self.norm_position == "pre":
+            node_ebd_normed = self.node_attn_norm(node_ebd)
+            node_ebd_normed_ext = node_ebd_ext.clone()
+            node_ebd_normed_ext[:, :nloc, :] = node_ebd_normed
+
         # Step 1: angle → edge
         edge_ebd = self._angle_to_edge(
             angle_ebd, edge_ebd, eij2a_index, eik2a_index, a_sw, n_edge
@@ -281,6 +313,7 @@ class RepFlowLayerV3(torch.nn.Module):
         node_ebd = self._edge_to_node(
             node_ebd, node_ebd_ext, edge_ebd, sw,
             n2e_index, n_ext2e_index, nb, nloc,
+            node_ebd_normed_ext=node_ebd_normed_ext,
         )
         # Step 3: SwiGLU FFN
         node_ebd = self._node_ffn(node_ebd)
@@ -291,7 +324,7 @@ class RepFlowLayerV3(torch.nn.Module):
     def serialize(self) -> dict:
         return {
             "@class": "RepFlowLayerV3",
-            "@version": 1,
+            "@version": 2,
             "e_rcut": self.e_rcut,
             "e_rcut_smth": self.e_rcut_smth,
             "e_sel": self.e_sel,
@@ -306,6 +339,10 @@ class RepFlowLayerV3(torch.nn.Module):
             "ffn_hidden_mult": self.ffn_hidden_mult,
             "activation_function": self.activation_function,
             "precision": self.precision,
+            "mlp_init": self.mlp_init,
+            "bias_init_zero": self.bias_init_zero,
+            "gate_bias_zero": self.gate_bias_zero,
+            "norm_position": self.norm_position,
             "angle_mlp": self.angle_mlp.serialize(),
             "edge_norm": self.edge_norm.serialize(),
             "gate_linear": self.gate_linear.serialize(),
@@ -324,8 +361,12 @@ class RepFlowLayerV3(torch.nn.Module):
     @classmethod
     def deserialize(cls, data: dict) -> "RepFlowLayerV3":
         data = data.copy()
-        check_version_compatibility(data.pop("@version"), 1, 1)
+        check_version_compatibility(data.pop("@version"), 2, 1)
         data.pop("@class")
+        data.pop("mlp_init", "default")
+        data.pop("bias_init_zero", False)
+        data.pop("gate_bias_zero", False)
+        data.pop("norm_position", "post")
         angle_mlp = data.pop("angle_mlp")
         edge_norm = data.pop("edge_norm")
         gate_linear = data.pop("gate_linear")
@@ -393,6 +434,10 @@ class DescrptBlockRepflowV3(DescriptorBlock):
         fix_stat_std: float = 0.3,
         seed: int | list[int] | None = None,
         trainable: bool = True,
+        mlp_init: str = "default",
+        bias_init_zero: bool = False,
+        gate_bias_zero: bool = False,
+        norm_position: str = "post",
     ) -> None:
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -434,6 +479,10 @@ class DescrptBlockRepflowV3(DescriptorBlock):
         self.activation_function = activation_function
         self.act = ActivationFn(activation_function)
         self.prec = PRECISION_DICT[precision]
+        self.mlp_init = mlp_init
+        self.bias_init_zero = bias_init_zero
+        self.gate_bias_zero = gate_bias_zero
+        self.norm_position = norm_position
 
         self.reinit_exclude(exclude_types)
         self.env_protection = env_protection
@@ -446,13 +495,16 @@ class DescrptBlockRepflowV3(DescriptorBlock):
         self.angle_basis = ChebyshevBasis(num_basis=num_angle_basis)
 
         self.edge_embd = MLPLayer(
-            num_edge_basis, self.e_dim,
+            num_edge_basis, self.e_dim, init=mlp_init,
             precision=precision, seed=child_seed(seed, 0), trainable=trainable,
         )
         self.angle_embd = MLPLayer(
-            num_angle_basis, self.a_dim,
+            num_angle_basis, self.a_dim, init=mlp_init,
             precision=precision, bias=False, seed=child_seed(seed, 1), trainable=trainable,
         )
+
+        if bias_init_zero and self.edge_embd.bias is not None:
+            self.edge_embd.bias.data.zero_()
 
         layers = []
         for ii in range(nlayers):
@@ -474,6 +526,10 @@ class DescrptBlockRepflowV3(DescriptorBlock):
                     precision=precision,
                     seed=child_seed(child_seed(seed, 2), ii),
                     trainable=trainable,
+                    mlp_init=mlp_init,
+                    bias_init_zero=bias_init_zero,
+                    gate_bias_zero=gate_bias_zero,
+                    norm_position=norm_position,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -848,6 +904,11 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
         type_map: list[str] | None = None,
         concat_output_tebd: bool = False,
         add_chg_spin_ebd: bool = False,
+        tebd_mode: str = "linear",
+        mlp_init: str = "default",
+        bias_init_zero: bool = False,
+        gate_bias_zero: bool = False,
+        norm_position: str = "post",
     ) -> None:
         super().__init__()
 
@@ -874,16 +935,32 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
             precision=precision,
             seed=child_seed(seed, 1),
             trainable=trainable,
+            mlp_init=mlp_init,
+            bias_init_zero=bias_init_zero,
+            gate_bias_zero=gate_bias_zero,
+            norm_position=norm_position,
         )
 
-        self.type_embedding = TypeEmbedNet(
-            ntypes, n_dim, precision=precision,
-            seed=child_seed(seed, 2),
-            use_econf_tebd=use_econf_tebd,
-            use_tebd_bias=use_tebd_bias,
-            type_map=type_map,
-            trainable=trainable,
-        )
+        self.tebd_mode = tebd_mode
+        if tebd_mode == "linear":
+            self.type_embedding = TypeEmbedNet(
+                ntypes, n_dim, precision=precision,
+                seed=child_seed(seed, 2),
+                use_econf_tebd=use_econf_tebd,
+                use_tebd_bias=use_tebd_bias,
+                type_map=type_map,
+                trainable=trainable,
+            )
+        elif tebd_mode == "embedding":
+            if use_econf_tebd:
+                raise ValueError(
+                    "use_econf_tebd is not supported with tebd_mode='embedding'"
+                )
+            self.type_embedding = torch.nn.Embedding(
+                ntypes + 1, n_dim, padding_idx=ntypes
+            )
+        else:
+            raise ValueError(f"Unknown tebd_mode: {tebd_mode}")
 
         self.ntypes = ntypes
         self.n_dim = n_dim
@@ -913,6 +990,10 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
         self.tebd_dim = n_dim
         self.concat_output_tebd = concat_output_tebd
         self.add_chg_spin_ebd = add_chg_spin_ebd
+        self.mlp_init = mlp_init
+        self.bias_init_zero = bias_init_zero
+        self.gate_bias_zero = gate_bias_zero
+        self.norm_position = norm_position
 
         if self.add_chg_spin_ebd:
             self.act = ActivationFn(activation_function)
@@ -1017,7 +1098,17 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
         assert self.type_map is not None
         remap_index, has_new_type = get_index_between_two_maps(self.type_map, type_map)
         self.type_map = type_map
-        self.type_embedding.change_type_map(type_map=type_map)
+        if self.tebd_mode == "linear":
+            self.type_embedding.change_type_map(type_map=type_map)
+        elif self.tebd_mode == "embedding":
+            old_weight = self.type_embedding.weight.data
+            new_ntypes = len(type_map)
+            new_emb = torch.nn.Embedding(
+                new_ntypes + 1, self.n_dim, padding_idx=new_ntypes
+            )
+            new_emb.weight.data[:-1] = old_weight[remap_index]
+            new_emb.weight.data[-1] = 0.0
+            self.type_embedding = new_emb
         self.exclude_types = map_pair_exclude_types(self.exclude_types, remap_index)
         self.ntypes = len(type_map)
         repflow = self.repflows
@@ -1039,7 +1130,7 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
         data = {
             "@class": "Descriptor",
             "type": "dpa3s_v3_attn",
-            "@version": 1,
+            "@version": 2,
             "ntypes": self.ntypes,
             "n_dim": self.n_dim,
             "e_dim": self.e_dim,
@@ -1066,7 +1157,11 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
             "concat_output_tebd": self.concat_output_tebd,
             "add_chg_spin_ebd": self.add_chg_spin_ebd,
             "type_map": self.type_map,
-            "type_embedding": self.type_embedding.embedding.serialize(),
+            "tebd_mode": self.tebd_mode,
+            "mlp_init": self.mlp_init,
+            "bias_init_zero": self.bias_init_zero,
+            "gate_bias_zero": self.gate_bias_zero,
+            "norm_position": self.norm_position,
             "repflow_variable": {
                 "edge_basis": repflows.edge_basis.serialize(),
                 "angle_basis": repflows.angle_basis.serialize(),
@@ -1080,6 +1175,10 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
                 },
             },
         }
+        if self.tebd_mode == "linear":
+            data["type_embedding"] = self.type_embedding.embedding.serialize()
+        elif self.tebd_mode == "embedding":
+            data["type_embedding_weight"] = to_numpy_array(self.type_embedding.weight)
         if self.add_chg_spin_ebd:
             data["chg_embedding"] = self.chg_embedding.embedding.serialize()
             data["spin_embedding"] = self.spin_embedding.embedding.serialize()
@@ -1090,18 +1189,23 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
     def deserialize(cls, data: dict) -> "DescrptDPA3V3":
         data = data.copy()
         version = data.pop("@version")
-        check_version_compatibility(version, 1, 1)
+        check_version_compatibility(version, 2, 1)
         data.pop("@class")
         data.pop("type")
         repflow_variable = data.pop("repflow_variable").copy()
-        type_embedding = data.pop("type_embedding")
+        tebd_mode = data.get("tebd_mode", "linear")
+        type_embedding = data.pop("type_embedding", None)
+        type_embedding_weight = data.pop("type_embedding_weight", None)
         chg_embedding = data.pop("chg_embedding", None)
         spin_embedding = data.pop("spin_embedding", None)
         mix_cs_mlp = data.pop("mix_cs_mlp", None)
         obj = cls(**data)
-        obj.type_embedding.embedding = TypeEmbedNetConsistent.deserialize(
-            type_embedding
-        )
+        if tebd_mode == "linear" and type_embedding is not None:
+            obj.type_embedding.embedding = TypeEmbedNetConsistent.deserialize(
+                type_embedding
+            )
+        elif tebd_mode == "embedding" and type_embedding_weight is not None:
+            obj.type_embedding.weight.data = to_torch_tensor(type_embedding_weight)
 
         if obj.add_chg_spin_ebd and chg_embedding is not None:
             obj.chg_embedding.embedding = TypeEmbedNetConsistent.deserialize(
@@ -1160,8 +1264,8 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext = self.type_embedding(extended_atype[:, :nloc])
         else:
             node_ebd_ext = self.type_embedding(extended_atype)
-
-        if self.add_chg_spin_ebd and fparam is not None:
+        if self.tebd_mode == "embedding":
+            node_ebd_ext = node_ebd_ext.to(dtype=self.prec)
             assert self.chg_embedding is not None
             assert self.spin_embedding is not None
             charge = fparam[:, 0].to(dtype=torch.int64) + 100

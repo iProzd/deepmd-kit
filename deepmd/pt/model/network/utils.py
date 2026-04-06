@@ -339,6 +339,9 @@ class SwiGLUFFN(nn.Module):
         Parameter precision.
     seed : int or list[int] or None
         Random seed for initialization.
+    init : str
+        Weight initialization method for internal MLPLayers.
+        Supported: "default", "glorot", "kaiming_normal".
     """
 
     def __init__(
@@ -347,6 +350,7 @@ class SwiGLUFFN(nn.Module):
         hidden_mult: float = 4.0,
         precision: str = "float32",
         seed: int | list[int] | None = None,
+        init: str = "default",
     ) -> None:
         from deepmd.dpmodel.utils.seed import (
             child_seed,
@@ -362,16 +366,17 @@ class SwiGLUFFN(nn.Module):
         self.dim = dim
         self.hidden_mult = hidden_mult
         self.precision = precision
+        self.init = init
         hidden_dim = int(dim * hidden_mult)
         self.hidden_dim = hidden_dim
         self.w_gate = MLPLayer(
-            dim, hidden_dim, bias=False, precision=precision, seed=child_seed(seed, 0)
+            dim, hidden_dim, bias=False, precision=precision, init=init, seed=child_seed(seed, 0)
         )
         self.w_up = MLPLayer(
-            dim, hidden_dim, bias=False, precision=precision, seed=child_seed(seed, 1)
+            dim, hidden_dim, bias=False, precision=precision, init=init, seed=child_seed(seed, 1)
         )
         self.w_down = MLPLayer(
-            hidden_dim, dim, bias=False, precision=precision, seed=child_seed(seed, 2)
+            hidden_dim, dim, bias=False, precision=precision, init=init, seed=child_seed(seed, 2)
         )
         self.act = ActivationFn("silu")
 
@@ -394,10 +399,11 @@ class SwiGLUFFN(nn.Module):
         """Serialize the module to a dict."""
         return {
             "@class": "SwiGLUFFN",
-            "@version": 1,
+            "@version": 2,
             "dim": self.dim,
             "hidden_mult": self.hidden_mult,
             "precision": self.precision,
+            "init": self.init,
             "w_gate": self.w_gate.serialize(),
             "w_up": self.w_up.serialize(),
             "w_down": self.w_down.serialize(),
@@ -414,6 +420,7 @@ class SwiGLUFFN(nn.Module):
             dim=data["dim"],
             hidden_mult=data["hidden_mult"],
             precision=data["precision"],
+            init=data.get("init", "default"),
         )
         obj.w_gate = MLPLayer.deserialize(data["w_gate"])
         obj.w_up = MLPLayer.deserialize(data["w_up"])
