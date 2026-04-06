@@ -17,6 +17,8 @@ from .constants import (
     TRITON_BLOCK_CHANNEL,
     TRITON_BLOCK_FULL,
     TRITON_BLOCK_REDUCED,
+    TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE,
+    TRITON_EDGE_GEOMETRY_RBF_BLOCK_RADIAL,
     TRITON_GRID_E_STRIDE,
     TRITON_SMALL_BLOCK_CHANNEL,
     TritonRotationMode,
@@ -42,6 +44,11 @@ if SEZM_TRITON_AVAILABLE:
         wrap_triton,
     )
 
+    from .kernels_edge_geometry_rbf import (
+        edge_geometry_rbf_bwd_accum_kernel,
+        edge_geometry_rbf_bwd_coord_kernel,
+        edge_geometry_rbf_forward_kernel,
+    )
     from .kernels_generic import (
         rotate_back_bwd_dw_kernel,
         rotate_back_bwd_dx_kernel,
@@ -159,6 +166,22 @@ if SEZM_TRITON_AVAILABLE:
             TRITON_GRID_E_STRIDE,
             (dim_full + TRITON_BLOCK_FULL - 1) // TRITON_BLOCK_FULL,
             (reduced_dim + TRITON_BLOCK_REDUCED - 1) // TRITON_BLOCK_REDUCED,
+        )
+
+    def _edge_geometry_rbf_grid(num_edges: int, n_radial: int) -> tuple[int, int]:
+        """Return the standard grid for the fused edge geometry/RBF chain."""
+        return (
+            (num_edges + TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE - 1)
+            // TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE,
+            (n_radial + TRITON_EDGE_GEOMETRY_RBF_BLOCK_RADIAL - 1)
+            // TRITON_EDGE_GEOMETRY_RBF_BLOCK_RADIAL,
+        )
+
+    def _edge_geometry_rbf_coord_grid(num_edges: int) -> tuple[int]:
+        """Return the edge-only grid for geometry/RBF coordinate gradients."""
+        return (
+            (num_edges + TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE - 1)
+            // TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE,
         )
 
     def _launch_rotate_to_local_small_forward(
@@ -656,4 +679,183 @@ if SEZM_TRITON_AVAILABLE:
             BLOCK_CHANNEL=TRITON_BLOCK_CHANNEL,
             GRID_E_STRIDE=TRITON_GRID_E_STRIDE,
             num_warps=1,
+        )
+
+    @triton_op(
+        "deepmd::_kernel_sezm_edge_geometry_rbf",
+        mutates_args=("edge_vec", "edge_len", "edge_env", "edge_rbf"),
+    )
+    def _kernel_sezm_edge_geometry_rbf(
+        coord_flat: torch.Tensor,
+        center_coord_index: torch.Tensor,
+        neighbor_coord_index: torch.Tensor,
+        freqs: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_len: torch.Tensor,
+        edge_env: torch.Tensor,
+        edge_rbf: torch.Tensor,
+        eps: float,
+        rcut: float,
+        edge_env_a: float,
+        edge_env_b: float,
+        edge_env_c: float,
+        edge_env_d: float,
+        edge_env_exponent: int,
+        radial_env_a: float,
+        radial_env_b: float,
+        radial_env_c: float,
+        radial_env_d: float,
+        radial_env_exponent: int,
+        r_inner: float,
+        r_outer: float,
+        has_inner_clamp: bool,
+    ) -> None:
+        """Launch the fused edge geometry/RBF forward kernel."""
+        wrap_triton(edge_geometry_rbf_forward_kernel)[
+            _edge_geometry_rbf_grid(center_coord_index.shape[0], freqs.numel())
+        ](
+            coord_flat,
+            center_coord_index,
+            neighbor_coord_index,
+            freqs,
+            edge_vec,
+            edge_len,
+            edge_env,
+            edge_rbf,
+            center_coord_index.shape[0],
+            freqs.numel(),
+            coord_flat.stride(0),
+            coord_flat.stride(1),
+            edge_vec.stride(0),
+            edge_vec.stride(1),
+            edge_rbf.stride(0),
+            edge_rbf.stride(1),
+            eps,
+            rcut,
+            edge_env_a,
+            edge_env_b,
+            edge_env_c,
+            edge_env_d,
+            radial_env_a,
+            radial_env_b,
+            radial_env_c,
+            radial_env_d,
+            r_inner,
+            r_outer,
+            EDGE_ENV_EXPONENT=int(edge_env_exponent),
+            RADIAL_ENV_EXPONENT=int(radial_env_exponent),
+            HAS_INNER_CLAMP=bool(has_inner_clamp),
+            BLOCK_EDGE=TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE,
+            BLOCK_RADIAL=TRITON_EDGE_GEOMETRY_RBF_BLOCK_RADIAL,
+            num_warps=4,
+        )
+
+    @triton_op(
+        "deepmd::_kernel_sezm_edge_geometry_rbf_bwd_accum",
+        mutates_args=("grad_r_total", "grad_freq"),
+    )
+    def _kernel_sezm_edge_geometry_rbf_bwd_accum(
+        grad_edge_len: torch.Tensor,
+        grad_edge_env: torch.Tensor,
+        grad_edge_rbf: torch.Tensor,
+        coord_flat: torch.Tensor,
+        center_coord_index: torch.Tensor,
+        neighbor_coord_index: torch.Tensor,
+        freqs: torch.Tensor,
+        grad_r_total: torch.Tensor,
+        grad_freq: torch.Tensor,
+        eps: float,
+        rcut: float,
+        edge_env_a: float,
+        edge_env_b: float,
+        edge_env_c: float,
+        edge_env_d: float,
+        edge_env_exponent: int,
+        radial_env_a: float,
+        radial_env_b: float,
+        radial_env_c: float,
+        radial_env_d: float,
+        radial_env_exponent: int,
+        r_inner: float,
+        r_outer: float,
+        has_inner_clamp: bool,
+    ) -> None:
+        """Launch the fused edge geometry/RBF accumulation kernel."""
+        wrap_triton(edge_geometry_rbf_bwd_accum_kernel)[
+            _edge_geometry_rbf_grid(center_coord_index.shape[0], freqs.numel())
+        ](
+            grad_edge_len,
+            grad_edge_env,
+            grad_edge_rbf,
+            coord_flat,
+            center_coord_index,
+            neighbor_coord_index,
+            freqs,
+            grad_r_total,
+            grad_freq,
+            center_coord_index.shape[0],
+            freqs.numel(),
+            coord_flat.stride(0),
+            coord_flat.stride(1),
+            grad_edge_rbf.stride(0),
+            grad_edge_rbf.stride(1),
+            eps,
+            rcut,
+            edge_env_a,
+            edge_env_b,
+            edge_env_c,
+            edge_env_d,
+            radial_env_a,
+            radial_env_b,
+            radial_env_c,
+            radial_env_d,
+            r_inner,
+            r_outer,
+            EDGE_ENV_EXPONENT=int(edge_env_exponent),
+            RADIAL_ENV_EXPONENT=int(radial_env_exponent),
+            HAS_INNER_CLAMP=bool(has_inner_clamp),
+            BLOCK_EDGE=TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE,
+            BLOCK_RADIAL=TRITON_EDGE_GEOMETRY_RBF_BLOCK_RADIAL,
+            num_warps=4,
+        )
+
+    @triton_op(
+        "deepmd::_kernel_sezm_edge_geometry_rbf_bwd_coord",
+        mutates_args=("grad_coord",),
+    )
+    def _kernel_sezm_edge_geometry_rbf_bwd_coord(
+        grad_edge_vec: torch.Tensor,
+        grad_r_total: torch.Tensor,
+        coord_flat: torch.Tensor,
+        center_coord_index: torch.Tensor,
+        neighbor_coord_index: torch.Tensor,
+        grad_coord: torch.Tensor,
+        eps: float,
+        r_inner: float,
+        r_outer: float,
+        has_inner_clamp: bool,
+    ) -> None:
+        """Launch the fused edge geometry/RBF coordinate backward kernel."""
+        wrap_triton(edge_geometry_rbf_bwd_coord_kernel)[
+            _edge_geometry_rbf_coord_grid(center_coord_index.shape[0])
+        ](
+            grad_edge_vec,
+            grad_r_total,
+            coord_flat,
+            center_coord_index,
+            neighbor_coord_index,
+            grad_coord,
+            center_coord_index.shape[0],
+            coord_flat.stride(0),
+            coord_flat.stride(1),
+            grad_edge_vec.stride(0),
+            grad_edge_vec.stride(1),
+            grad_coord.stride(0),
+            grad_coord.stride(1),
+            eps,
+            r_inner,
+            r_outer,
+            HAS_INNER_CLAMP=bool(has_inner_clamp),
+            BLOCK_EDGE=TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE,
+            num_warps=4,
         )

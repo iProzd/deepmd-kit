@@ -15,14 +15,12 @@ from .attn_res import (
 from .block import (
     SeZMInteractionBlock,
 )
-from .edge import (
-    EdgeFeatureCache,
-    build_edge_type_feat,
-    edge_cache_to_dtype,
-)
 from .edge_cache import (
+    EdgeFeatureCache,
     build_edge_cache,
     build_edge_cache_from_edges,
+    build_edge_type_feat,
+    edge_cache_to_dtype,
 )
 from .embedding import (
     EnvironmentInitialEmbedding,

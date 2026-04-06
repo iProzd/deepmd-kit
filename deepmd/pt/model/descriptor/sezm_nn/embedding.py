@@ -46,7 +46,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from .edge import (
+    from .edge_cache import (
         EdgeFeatureCache,
     )
 

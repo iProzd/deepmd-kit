@@ -198,6 +198,8 @@ Text diagram (single forward pass):
 Standard DeePMD nlist path:
   Inputs: extended_coord, extended_atype, nlist, mapping
     └─ EdgeFeatureCache (built once via build_edge_cache)
+       ├─ standard-path geometry/RBF chain (`not training` on supported CUDA+dtypes):
+       │  fused `coord_gather -> edge_vec -> edge_len -> inner_clamp -> edge_env -> edge_rbf`
        ├─ edges: (src, dst) global indices, edge_vec
        ├─ edge_type_feat: per-edge type embedding (src+dst)
        ├─ edge_rbf: Bessel radial basis via sinc × C² envelope
@@ -690,7 +692,7 @@ Rules:
     `D_m_trunc = sum_{l=0..lmax} (2*min(mmax, l)+1)`
   - rotate-to-local computes only these coefficients via a **row-subset** of Wigner-D
   - rotate-back treats omitted coefficients as zero via a **column-subset** of Wigner-D
-  - when `use_triton=True` on supported CUDA dtypes, these two subset-rotation paths are fused into Triton custom ops with custom backward
+  - when `DP_TRITON=1` environment variable is set and the model is in eval mode (not training), these two subset-rotation paths are fused into Triton custom ops with custom backward on supported CUDA dtypes
   - `SO2Linear` operates directly on the reduced layout (no gather from full D)
 
 Note: unlike `l_schedule`, `m_schedule` does NOT change the **global node tensor** packed layout
@@ -731,7 +733,7 @@ Key arguments:
 - `full_attn_res: str` — Descriptor-level full AttnRes mode over unit history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `block_attn_res: str` — Descriptor-level block AttnRes mode over block history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final block aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`). Cannot be enabled together with `full_attn_res`
 - `use_amp: bool` — If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. This does not provide accelerations under fp32 precision but will decrease the memory usage, while preserving model accuracy (default: True)
-- `use_triton: bool` — If True, opt into fused Triton SO(2) rotation kernels on supported CUDA dtypes. The default is `False` because the current Triton rotation path is not consistently faster than the eager reference path (default: False)
+- Triton rotation kernels are controlled by the `DP_TRITON` environment variable. Set `DP_TRITON=1` to enable fused Triton SO(2) rotation kernels on supported CUDA dtypes. This only affects the SO(2) rotation path and only in eval/inference mode (not training); the standard-path edge geometry/RBF chain has its own automatic eval-only Triton gate.
 - `use_env_seed: bool` — If True, apply environment matrix initial embedding as FiLM on l=0 features using 4D `[s, s*r_hat]` representation. Internal dimensions are derived from `channels`: `embed_dim=min(channels, 128)`, `axis_dim=min(4 if embed_dim < 64 else 8, embed_dim-1)`, `type_dim=clamp(channels//4, 8, 32)`, `rbf_out_dim=max(32, embed_dim-2*type_dim)`, `hidden_dim=min(256, max(2*embed_dim, rbf_out_dim+2*type_dim))` (default: True)
 - `random_gamma: bool` — If True, sample an independent random roll `gamma ~ U[0, 2π)` for every edge on every forward call, build a local-`+Z` roll quaternion, and left-compose it with the edge-aligned quaternion before Wigner-D evaluation (default: False)
 
@@ -996,13 +998,21 @@ What is cached / reused:
 
 - `radial_feat`: computed once in `compute_dtype`, GIE consumes the pure radial part `radial_feat[:, 1:, :]` (no type fusion), then type embeddings are fused via a single `embedding_bag` reduction and **per-block truncated slices** are prebuilt according to `l_schedule`.
 
-- Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `"lmax:mmax"` in the eager fallback path. When `use_triton=True` and CUDA+dtypes are supported, `SO2Convolution` skips these materialized projections and uses the Triton package under `deepmd/pt/model/descriptor/sezm_nn/triton/` for fused `global -> local reduced` and `local reduced -> global` rotations.
+- Standard-path geometry/RBF Triton path: when the descriptor is in eval/inference mode (`self.training=False`) and the geometry dtype is a supported CUDA dtype, `build_edge_cache()` replaces the eager chain
+  `coord_gather -> edge_vec -> edge_len -> inner_clamp -> edge_env -> edge_rbf`
+  with the fused Triton geometry/RBF chain under `deepmd/pt/model/descriptor/sezm_nn/triton/`.
+  Training always falls back to the eager geometry/RBF chain so the force/virial high-order
+  derivative path keeps the original PyTorch autograd behavior.
+
+- Parallel rotation projection caches: `project_D_to_m` / `project_Dt_from_m` project block-diagonal Wigner-D to the m-major truncated layout keyed by `"lmax:mmax"` in the eager fallback path. When `DP_TRITON=1` is set, the model is in eval mode, and CUDA+dtypes are supported, `SO2Convolution` skips these materialized projections and uses the Triton package under `deepmd/pt/model/descriptor/sezm_nn/triton/` for fused `global -> local reduced` and `local reduced -> global` rotations.
 
 - Dtypes: `compute_dtype = get_promoted_dtype(dtype)` is set once in `__init__` and reused for geometry, radial basis/MLP, Wigner calculators, and the final l=0 mixer; runtime casts happen once on `extended_coord`, `radial_feat`, and the final scalar output.
 
-- Triton package layout: Triton code is split by responsibility instead of keeping kernels, launchers, fallback policy, and autograd glue in one file. `constants.py` defines shared tile and mode constants, `dispatch.py` owns the single dispatch policy entry, `custom_ops.py` only launches Triton kernels, `autograd.py` owns the public API and eager fallback glue, and `kernels_small.py` / `kernels_generic.py` keep the math kernels separated.
+- Triton package layout: Triton code is split by responsibility instead of keeping kernels, launchers, fallback policy, and autograd glue in one file. `constants.py` defines shared tile and mode constants, `dispatch.py` owns the single dispatch policy entry, `custom_ops.py` only launches Triton kernels, `autograd.py` owns the public API and eager fallback glue, and `kernels_small.py` / `kernels_generic.py` / `kernels_edge_geometry_rbf.py` keep the math kernels separated by responsibility.
 
-- Triton dispatch: `use_triton` is the user-facing opt-in switch. When it is `True`, `SO2Convolution` decides once in `__init__` whether Triton rotations are actually enabled from the module device/dtype, then resolves a fixed `rotation_mode` from `(dim_full, reduced_dim)`. The dispatch modes are `SMALL_LE1` / `SMALL_L2` / `SMALL_L3` for specialized kernels, `GENERIC_TILED` for the large-`l` tiled path, and `EAGER_REFERENCE` for the generic small-`K` case that would violate Triton's `K >= 16` `tl.dot` constraint.
+- Triton dispatch: `DP_TRITON` environment variable is the user-facing opt-in switch. When it is set to `1` (and the model is in eval mode), `SO2Convolution` decides once in `__init__` whether Triton rotations are actually enabled from the module device/dtype, then resolves a fixed `rotation_mode` from `(dim_full, reduced_dim)`. The dispatch modes are `SMALL_LE1` / `SMALL_L2` / `SMALL_L3` for specialized kernels, `GENERIC_TILED` for the large-`l` tiled path, and `EAGER_REFERENCE` for the generic small-`K` case that would violate Triton's `K >= 16` `tl.dot` constraint.
+
+- Edge geometry/RBF dispatch: the fused geometry/RBF chain is not user-configurable. `build_edge_cache()` simply checks `self.training`; eval/inference mode is allowed to use Triton, while training always uses the eager gather/clamp/envelope/radial chain. Unsupported devices or dtypes still fall back to eager inside the public Triton API.
 
 - Small-l Triton kernels: `lmax<=3` uses dedicated kernel families with custom backward. `lmax=0,1` share the `SMALL_LE1` family through the packed full dimensions `1` and `4`; `lmax=2` uses `SMALL_L2`; `lmax=3` uses `SMALL_L3`. These specialized kernels keep one padded `16x16` block in registers and block only along the channel axis.
 

@@ -73,7 +73,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from .edge import (
+    from .edge_cache import (
         EdgeFeatureCache,
     )
 
@@ -904,7 +904,7 @@ class SO2Convolution(nn.Module):
         # === Step 2. Rotate to edge-aligned local frame ===
         with nvtx_range("SO2Conv/rotate_to_local"):
             D_full = edge_cache.D_full
-            if self.use_triton_rotations:
+            if self.use_triton_rotations and not self.training:
                 x_local = rotate_to_local_triton(
                     x=x,
                     src=src,
@@ -1040,7 +1040,7 @@ class SO2Convolution(nn.Module):
         # === Step 7. Rotate back to global frame ===
         with nvtx_range("SO2Conv/rotate_back"):
             Dt_full = edge_cache.Dt_full
-            if self.use_triton_rotations:
+            if self.use_triton_rotations and not self.training:
                 x_message = rotate_back_triton(
                     x_local=x_local,
                     wigner=Dt_full,
@@ -1170,7 +1170,6 @@ class SO2Convolution(nn.Module):
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "mlp_bias": self.mlp_bias,
-                "use_triton": self.use_triton,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,

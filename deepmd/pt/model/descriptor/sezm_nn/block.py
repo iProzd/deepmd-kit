@@ -51,7 +51,7 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from .edge import (
+    from .edge_cache import (
         EdgeFeatureCache,
     )
 
@@ -720,7 +720,6 @@ class SeZMInteractionBlock(nn.Module):
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,
-                "use_triton": self.use_triton,
                 "layer_scale": self.layer_scale,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],

@@ -12,6 +12,9 @@ if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
 from deepmd.pt.model.descriptor.sezm_nn import (
+    C3CutoffEnvelope,
+    InnerClamp,
+    RadialBasis,
     build_m_major_index,
     project_D_to_m,
     project_Dt_from_m,
@@ -19,6 +22,7 @@ from deepmd.pt.model.descriptor.sezm_nn import (
 from deepmd.pt.model.descriptor.sezm_nn.triton import (
     SEZM_TRITON_AVAILABLE,
     TritonRotationMode,
+    edge_geometry_rbf_triton,
     resolve_triton_rotation_mode,
     rotate_back_triton,
     rotate_to_local_triton,
@@ -55,6 +59,173 @@ class TestSeZMTritonDispatch(unittest.TestCase):
         self.assertEqual(
             resolve_triton_rotation_mode(dim_full=25, reduced_dim=16),
             TritonRotationMode.GENERIC_TILED,
+        )
+
+
+@unittest.skipUnless(
+    TRITON_CUDA_AVAILABLE,
+    "SeZM Triton rotation tests require CUDA and Triton.",
+)
+class TestSeZMTritonEdgeGeometryRBF(unittest.TestCase):
+    """Validate the Triton edge geometry/RBF chain against eager reference."""
+
+    def _eager_reference(
+        self,
+        *,
+        coord_flat: torch.Tensor,
+        center_idx: torch.Tensor,
+        neighbor_idx: torch.Tensor,
+        edge_envelope: C3CutoffEnvelope,
+        radial_basis: RadialBasis,
+        inner_clamp: InnerClamp | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute the eager reference geometry/RBF chain."""
+        center_pos = coord_flat.index_select(0, center_idx)
+        neighbor_pos = coord_flat.index_select(0, neighbor_idx)
+        edge_vec = neighbor_pos - center_pos
+        edge_len = torch.sqrt(
+            torch.sum(edge_vec * edge_vec, dim=-1, keepdim=True) + 1.0e-14
+        )
+        if inner_clamp is not None:
+            clamped = inner_clamp(edge_len)
+            edge_vec = edge_vec * (clamped / edge_len)
+            edge_len = clamped
+        edge_env = edge_envelope(edge_len)
+        edge_rbf = radial_basis(edge_len)
+        return edge_vec, edge_len, edge_env, edge_rbf
+
+    def test_edge_geometry_rbf_matches_reference_forward_backward(self) -> None:
+        """Compare fused geometry/RBF chain with eager gather/clamp/envelope/rbf."""
+        device = torch.device("cuda")
+        dtype = torch.float32
+        coord_ref = torch.randn(
+            12,
+            3,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        coord_triton = coord_ref.detach().clone().requires_grad_(True)
+        center_idx = torch.randint(0, 12, (9,), device=device, dtype=torch.long)
+        neighbor_idx = torch.randint(0, 12, (9,), device=device, dtype=torch.long)
+        edge_envelope = C3CutoffEnvelope(rcut=6.0, exponent=5).to(device)
+        radial_ref = RadialBasis(rcut=6.0, n_radial=6, dtype=dtype, exponent=7).to(
+            device
+        )
+        radial_triton = RadialBasis(rcut=6.0, n_radial=6, dtype=dtype, exponent=7).to(
+            device
+        )
+        radial_triton.load_state_dict(radial_ref.state_dict())
+
+        out_ref = self._eager_reference(
+            coord_flat=coord_ref,
+            center_idx=center_idx,
+            neighbor_idx=neighbor_idx,
+            edge_envelope=edge_envelope,
+            radial_basis=radial_ref,
+            inner_clamp=None,
+        )
+        out_triton = edge_geometry_rbf_triton(
+            coord_flat=coord_triton,
+            center_coord_index=center_idx,
+            neighbor_coord_index=neighbor_idx,
+            edge_envelope=edge_envelope,
+            radial_basis=radial_triton,
+            eps=1.0e-7,
+            inner_clamp=None,
+        )
+        for ref, tri in zip(out_ref, out_triton, strict=True):
+            torch.testing.assert_close(tri, ref, atol=1.0e-5, rtol=1.0e-5)
+
+        grad_out = tuple(torch.randn_like(ref) for ref in out_ref)
+        grad_coord_ref, grad_freq_ref = torch.autograd.grad(
+            out_ref,
+            (coord_ref, radial_ref.adam_freqs),
+            grad_outputs=grad_out,
+        )
+        grad_coord_triton, grad_freq_triton = torch.autograd.grad(
+            out_triton,
+            (coord_triton, radial_triton.adam_freqs),
+            grad_outputs=grad_out,
+        )
+        torch.testing.assert_close(
+            grad_coord_triton,
+            grad_coord_ref,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+        torch.testing.assert_close(
+            grad_freq_triton,
+            grad_freq_ref,
+            atol=2.0e-5,
+            rtol=2.0e-5,
+        )
+
+    def test_edge_geometry_rbf_matches_reference_with_inner_clamp(self) -> None:
+        """Compare the clamped Triton path with eager reference."""
+        device = torch.device("cuda")
+        dtype = torch.float32
+        coord_ref = torch.randn(
+            10,
+            3,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        coord_triton = coord_ref.detach().clone().requires_grad_(True)
+        center_idx = torch.randint(0, 10, (7,), device=device, dtype=torch.long)
+        neighbor_idx = torch.randint(0, 10, (7,), device=device, dtype=torch.long)
+        edge_envelope = C3CutoffEnvelope(rcut=6.0, exponent=5).to(device)
+        radial_ref = RadialBasis(rcut=6.0, n_radial=4, dtype=dtype, exponent=7).to(
+            device
+        )
+        radial_triton = RadialBasis(rcut=6.0, n_radial=4, dtype=dtype, exponent=7).to(
+            device
+        )
+        radial_triton.load_state_dict(radial_ref.state_dict())
+        inner_clamp = InnerClamp(0.9, 1.3).to(device)
+
+        out_ref = self._eager_reference(
+            coord_flat=coord_ref,
+            center_idx=center_idx,
+            neighbor_idx=neighbor_idx,
+            edge_envelope=edge_envelope,
+            radial_basis=radial_ref,
+            inner_clamp=inner_clamp,
+        )
+        out_triton = edge_geometry_rbf_triton(
+            coord_flat=coord_triton,
+            center_coord_index=center_idx,
+            neighbor_coord_index=neighbor_idx,
+            edge_envelope=edge_envelope,
+            radial_basis=radial_triton,
+            eps=1.0e-7,
+            inner_clamp=inner_clamp,
+        )
+        for ref, tri in zip(out_ref, out_triton, strict=True):
+            torch.testing.assert_close(tri, ref, atol=2.0e-5, rtol=2.0e-5)
+
+        loss_ref = sum(x.square().sum() for x in out_ref)
+        loss_triton = sum(x.square().sum() for x in out_triton)
+        grad_coord_ref, grad_freq_ref = torch.autograd.grad(
+            loss_ref,
+            (coord_ref, radial_ref.adam_freqs),
+        )
+        grad_coord_triton, grad_freq_triton = torch.autograd.grad(
+            loss_triton,
+            (coord_triton, radial_triton.adam_freqs),
+        )
+        torch.testing.assert_close(
+            grad_coord_triton,
+            grad_coord_ref,
+            atol=3.0e-5,
+            rtol=3.0e-5,
+        )
+        torch.testing.assert_close(
+            grad_freq_triton,
+            grad_freq_ref,
+            atol=3.0e-5,
+            rtol=3.0e-5,
         )
 
 

@@ -956,7 +956,6 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
                 "mlp_bias": True,
                 "layer_scale": False,
                 "use_amp": use_amp,
-                "use_triton": False,
                 "activation_function": "silu",
                 "glu_activation": True,
                 "precision": "float64",
@@ -1034,7 +1033,9 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
                 )
                 randomized += 1
 
-        self.assertGreater(randomized, 0, "No floating-point parameters were randomized")
+        self.assertGreater(
+            randomized, 0, "No floating-point parameters were randomized"
+        )
         model.eval()
         return model
 

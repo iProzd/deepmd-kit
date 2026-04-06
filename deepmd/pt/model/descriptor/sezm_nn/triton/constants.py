@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Shared constants and feature flags for SeZM Triton rotations."""
+"""Shared constants and feature flags for SeZM Triton kernels."""
 
 from __future__ import (
     annotations,
@@ -32,6 +32,8 @@ TRITON_BLOCK_REDUCED = 16
 TRITON_BLOCK_CHANNEL = 32
 TRITON_SMALL_BLOCK_CHANNEL = 128
 TRITON_SMALL_FULL_DIM = 16
+TRITON_EDGE_GEOMETRY_RBF_BLOCK_EDGE = 128
+TRITON_EDGE_GEOMETRY_RBF_BLOCK_RADIAL = 16
 
 
 class TritonRotationMode(IntEnum):

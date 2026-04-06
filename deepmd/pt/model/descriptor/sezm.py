@@ -31,6 +31,7 @@ from __future__ import (
 )
 
 import math
+import os
 from contextlib import (
     contextmanager,
 )
@@ -237,10 +238,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
         the memory usage, while persevering model accuracy.
-    use_triton
-        If True, opt into the fused Triton SO(2) rotation kernels on supported
-        CUDA dtypes. The default is False because the current Triton rotation
-        path is not consistently faster than the eager reference path.
     exclude_types
         List of excluded type pairs.
     precision
@@ -299,7 +296,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         activation_function: str = "silu",
         glu_activation: bool = True,
         use_amp: bool = True,
-        use_triton: bool = False,
         exclude_types: list[tuple[int, int]] | None = None,
         precision: str = "float32",
         eps: float = 1e-7,
@@ -364,8 +360,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.mlp_bias = bool(mlp_bias)
         self.layer_scale = bool(layer_scale)
         self.use_amp = bool(use_amp)  # and self.training
-        self.use_triton = bool(use_triton)
         self.trainable = bool(trainable)
+        self.use_triton = os.environ.get("DP_TRITON", "0").lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self.seed = seed
         self.random_gamma = bool(random_gamma)
 
@@ -763,6 +764,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 n_radial=self.radial_basis.n_radial,
                 random_gamma=self.random_gamma,
                 wigner_calc=self.wigner_calc,
+                use_geometry_rbf_triton=(self.use_triton and not self.training),
             )
 
         lmax_0 = self.l_schedule[0]
@@ -1438,7 +1440,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "mlp_bias": self.mlp_bias,
                 "use_amp": self.use_amp,
-                "use_triton": self.use_triton,
                 "exclude_types": self.exclude_types,
                 "eps": self.eps,
                 "trainable": self.trainable,

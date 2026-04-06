@@ -15,15 +15,18 @@ import math
 from collections.abc import (
     Callable,
 )
+from typing import (
+    NamedTuple,
+)
 
 import torch
+import torch.nn.functional as F
 from einops import (
     rearrange,
 )
 
-from .edge import (
-    EdgeFeatureCache,
-    build_edge_type_feat,
+from .triton import (
+    edge_geometry_rbf_triton,
 )
 from .utils import (
     get_promoted_dtype,
@@ -40,150 +43,58 @@ WignerCalculatorFn = Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]]
 EdgeTypeKeepMaskFn = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
-def _get_empty_edge_cache(
-    *,
-    n_nodes: int,
-    n_radial: int,
-    n_channel: int,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> EdgeFeatureCache:
+class EdgeFeatureCache(NamedTuple):
     """
-    Allocate an empty edge cache for one SeZM forward pass.
+    Global edge feature cache created once per forward().
+
+    All tensors are aligned on the same edge axis (E = number of valid edges).
 
     Parameters
     ----------
-    n_nodes
-        Number of local nodes in the flattened frame-major layout.
-    n_radial
-        Number of radial basis channels.
-    n_channel
-        Edge type feature width.
-    device
-        Target device for the cache tensors.
-    dtype
-        Target floating-point dtype for the cache tensors.
-
-    Returns
-    -------
-    EdgeFeatureCache
-        Empty cache with valid tensor shapes and neutral degree normalization.
+    src
+        Source node indices with shape (E,).
+    dst
+        Destination node indices with shape (E,).
+    edge_type_feat
+        Per-edge type embeddings with shape (E, C), computed as src+dst.
+    edge_vec
+        Edge vectors with shape (E, 3) in Å.
+    edge_rbf
+        Radial basis with shape (E, n_radial).
+        The C^3 cutoff envelope is already baked in.
+    edge_env
+        C^3 cutoff envelope weights with shape (E, 1).
+    deg
+        Envelope-squared smooth degree with shape (N,), computed as
+        ``sum(edge_env**2)`` over incoming edges.
+        Used for smooth normalization in EnvironmentInitialEmbedding.
+    inv_sqrt_deg
+        Inverse square root smooth degree normalization with shape (N, 1, 1).
+    D_full
+        Block-diagonal Wigner-D matrix with shape (E, D, D) where D=(lmax+1)^2.
+        Used for efficient batched rotation. None if not available.
+    Dt_full
+        Transpose of D_full with shape (E, D, D). None if not available.
+    D_to_m_cache
+        Lazy cache for projected D matrices keyed by a normalized
+        ``"lmax:mmax"`` identifier.
+    Dt_from_m_cache
+        Lazy cache for projected Dt matrices keyed by a normalized
+        ``"lmax:mmax"`` identifier.
     """
-    empty_long = torch.empty(0, dtype=torch.long, device=device)
-    empty_vec = torch.empty(0, 3, dtype=dtype, device=device)
-    empty_rbf = torch.empty(0, n_radial, dtype=dtype, device=device)
-    empty_type_feat = torch.empty(0, n_channel, dtype=dtype, device=device)
-    deg = torch.zeros(n_nodes, dtype=dtype, device=device)
-    inv_sqrt_deg = torch.ones(n_nodes, 1, 1, dtype=dtype, device=device)
-    return EdgeFeatureCache(
-        src=empty_long,
-        dst=empty_long,
-        edge_type_feat=empty_type_feat,
-        edge_vec=empty_vec,
-        edge_rbf=empty_rbf,
-        edge_env=torch.empty(0, 1, dtype=dtype, device=device),
-        deg=deg,
-        inv_sqrt_deg=inv_sqrt_deg,
-        D_full=None,
-        Dt_full=None,
-        D_to_m_cache={},
-        Dt_from_m_cache={},
-    )
 
-
-def _build_standard_edge_index(
-    *,
-    nlist: torch.Tensor,
-    mapping: torch.Tensor | None,
-    pair_keep_mask: torch.Tensor,
-    nall: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Flatten DeePMD valid neighbor slots into per-edge indices.
-
-    This helper keeps the original edge semantics used by the eager standard path:
-
-    - padding slots (``nlist == -1``) are removed
-    - excluded type pairs are removed
-    - no distance-based filtering is applied here; edges beyond ``rcut`` remain
-      in the cache and are later zeroed naturally by the smooth envelope
-
-    Parameters
-    ----------
-    nlist
-        DeePMD neighbor list with shape ``(nf, nloc, nnei)``.
-    mapping
-        Optional extended-to-local mapping with shape ``(nf, nall)``.
-    pair_keep_mask
-        Pair exclusion keep mask with shape ``(nf, nloc, nnei)``.
-    nall
-        Number of atoms on the extended axis per frame.
-
-    Returns
-    -------
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        ``(src, dst, center_coord_index, neighbor_coord_index)`` for the valid
-        standard-path edges. All tensors have shape ``(E,)``.
-    """
-    nf, nloc, nnei = nlist.shape
-    nlist_flat = nlist.reshape(-1)
-
-    # === Step 1. Identify valid edge slots ===
-    # An edge is valid if:
-    #   - it is not padding (nlist >= 0)
-    #   - the type pair is allowed (pair_keep_mask)
-    # Note: We do NOT filter by distance here. Edges beyond rcut stay in the
-    # cache and will later get edge_env=0 from the cutoff envelope.
-    valid_nlist = nlist >= 0
-    edge_keep = (valid_nlist & pair_keep_mask).reshape(-1)
-    edge_slot = torch.nonzero(edge_keep).squeeze(-1).to(dtype=torch.long)
-
-    if edge_slot.numel() == 0:
-        empty = torch.empty(0, dtype=torch.long, device=nlist.device)
-        return empty, empty, empty, empty
-
-    # === Step 2. Decode flat edge slots ===
-    # edge_slot indexes the flattened (nf, nloc, nnei) axis in row-major order.
-    # Convert it back to:
-    #   frame_idx   in [0, nf)
-    #   center_local in [0, nloc)
-    #   neighbor_ext from the extended axis in [0, nall)
-    frame_idx = edge_slot // (nloc * nnei)
-    rem = edge_slot % (nloc * nnei)
-    center_local = rem // nnei
-    neighbor_ext = nlist_flat.index_select(0, edge_slot)
-
-    if mapping is None:
-        # Neighbor indices are already local indices in [0, nloc).
-        src_local = neighbor_ext
-    else:
-        # Map extended index -> local index for each frame.
-        # mapping_flat packs (nf, nall), so frame k uses offset k * nall.
-        mapping_flat = mapping.reshape(-1)
-        src_local = mapping_flat.index_select(0, frame_idx * nall + neighbor_ext)
-
-    src_ok = (src_local >= 0) & (src_local < nloc)
-    if not bool(src_ok.all()):
-        # Drop edges that map outside the local range, e.g. broken mapping
-        # or ghost-only neighbors.
-        frame_idx = frame_idx[src_ok]
-        center_local = center_local[src_ok]
-        neighbor_ext = neighbor_ext[src_ok]
-        src_local = src_local[src_ok]
-
-    if src_local.numel() == 0:
-        empty = torch.empty(0, dtype=torch.long, device=nlist.device)
-        return empty, empty, empty, empty
-
-    # === Step 3. Build node and coordinate indices ===
-    # dst is the center atom: per-frame local index -> global node index.
-    # src is the neighbor atom: per-frame local index -> global node index.
-    # The coordinate indices still point to the extended coordinate tensor.
-    src = frame_idx * nloc + src_local
-    dst = frame_idx * nloc + center_local
-    center_coord_index = frame_idx * nall + center_local
-    neighbor_coord_index = frame_idx * nall + neighbor_ext
-    return src, dst, center_coord_index, neighbor_coord_index
+    src: torch.Tensor
+    dst: torch.Tensor
+    edge_type_feat: torch.Tensor
+    edge_vec: torch.Tensor
+    edge_rbf: torch.Tensor
+    edge_env: torch.Tensor
+    deg: torch.Tensor
+    inv_sqrt_deg: torch.Tensor
+    D_full: torch.Tensor | None = None
+    Dt_full: torch.Tensor | None = None
+    D_to_m_cache: dict[str, torch.Tensor] | None = None
+    Dt_from_m_cache: dict[str, torch.Tensor] | None = None
 
 
 def build_edge_cache(
@@ -200,6 +111,7 @@ def build_edge_cache(
     n_radial: int,
     random_gamma: bool,
     wigner_calc: WignerCalculatorFn,
+    use_geometry_rbf_triton: bool = False,
 ) -> EdgeFeatureCache:
     """
     Build the global edge cache from DeePMD padded neighbor list.
@@ -260,6 +172,9 @@ def build_edge_cache(
     wigner_calc
         Callable that converts edge-aligned quaternions into packed Wigner-D
         blocks.
+    use_geometry_rbf_triton
+        Whether to allow the standard-path fused Triton geometry/RBF chain
+        ``gather -> vec -> len -> clamp -> env -> rbf``.
 
     Returns
     -------
@@ -292,36 +207,53 @@ def build_edge_cache(
             dtype=extended_coord.dtype,
         )
 
-    # === Step 3. Gather per-edge geometry ===
-    # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
-    # edge_len is the (possibly clamped) scalar distance.
-    with nvtx_range("edge_geom"):
-        coord_flat = coord.reshape(nf * nall, 3)
-        center_pos = coord_flat.index_select(0, center_coord_index)
-        neighbor_pos = coord_flat.index_select(0, neighbor_coord_index)
-        edge_vec = neighbor_pos - center_pos  # (E, 3)
-        edge_len = safe_norm(edge_vec, eps)  # (E, 1)
+    # === Step 3-6. Edge geometry/RBF chain ===
+    # This segment covers:
+    #   gather -> edge_vec -> edge_len -> inner_clamp -> edge_env -> edge_rbf
+    # The Triton path is only used on the standard non-compile path when the
+    # caller explicitly allows it (descriptor eval/inference path).
+    coord_flat = coord.reshape(nf * nall, 3)
+    if use_geometry_rbf_triton:
+        with nvtx_range("edge_geometry_rbf_triton"):
+            edge_vec, edge_len, edge_env, edge_rbf = edge_geometry_rbf_triton(
+                coord_flat=coord_flat,
+                center_coord_index=center_coord_index,
+                neighbor_coord_index=neighbor_coord_index,
+                edge_envelope=edge_envelope,
+                radial_basis=radial_basis,
+                eps=eps,
+                inner_clamp=inner_clamp,
+            )
+    else:
+        # === Step 3. Gather per-edge geometry ===
+        # edge_vec points from center -> neighbor: r_ij = r_j - r_i (in Å).
+        # edge_len is the scalar distance.
+        with nvtx_range("edge_geom"):
+            center_pos = coord_flat.index_select(0, center_coord_index)
+            neighbor_pos = coord_flat.index_select(0, neighbor_coord_index)
+            edge_vec = neighbor_pos - center_pos  # (E, 3)
+            edge_len = safe_norm(edge_vec, eps)  # (E, 1)
 
-    # === Step 4. Inner clamping for zone bridging ===
-    # Freeze the descriptor below r_inner: both scalar distance and
-    # displacement vector are clamped so the descriptor sees no
-    # information about the true distance when r < r_inner.
-    if inner_clamp is not None:
-        clamped = inner_clamp(edge_len)  # (E, 1)
-        scale = clamped / edge_len
-        edge_vec = edge_vec * scale  # direction preserved, length -> clamped
-        edge_len = clamped
+        # === Step 4. Inner clamping for zone bridging ===
+        # Freeze the descriptor below r_inner: both scalar distance and
+        # displacement vector are clamped so the descriptor sees no
+        # information about the true distance when r < r_inner.
+        if inner_clamp is not None:
+            clamped = inner_clamp(edge_len)  # (E, 1)
+            scale = clamped / edge_len
+            edge_vec = edge_vec * scale  # direction preserved, length -> clamped
+            edge_len = clamped
 
-    # === Step 5. C^3 envelope weight ===
-    # Edges with r >= rcut are not removed from the cache. Their envelope is
-    # exactly zero, so messages vanish naturally while degree normalization
-    # remains smooth at the cutoff boundary.
-    with nvtx_range("envelope"):
-        edge_env = edge_envelope(edge_len)  # (E, 1)
+        # === Step 5. C^3 envelope weight ===
+        # Edges with r >= rcut are not removed from the cache. Their envelope is
+        # exactly zero, so messages vanish naturally while degree normalization
+        # remains smooth at the cutoff boundary.
+        with nvtx_range("envelope"):
+            edge_env = edge_envelope(edge_len)  # (E, 1)
 
-    # === Step 6. Radial basis (envelope already baked in) ===
-    with nvtx_range("radial_basis"):
-        edge_rbf = radial_basis(edge_len)  # (E, n_radial)
+        # === Step 6. Radial basis (envelope already baked in) ===
+        with nvtx_range("radial_basis"):
+            edge_rbf = radial_basis(edge_len)  # (E, n_radial)
 
     # === Step 7. Edge quaternion -> Wigner-D blocks ===
     with nvtx_range("wigner_d"):
@@ -579,4 +511,250 @@ def _finalize_edge_cache(
         Dt_full=Dt_full,
         D_to_m_cache={},
         Dt_from_m_cache={},
+    )
+
+
+def _get_empty_edge_cache(
+    *,
+    n_nodes: int,
+    n_radial: int,
+    n_channel: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> EdgeFeatureCache:
+    """
+    Allocate an empty edge cache for one SeZM forward pass.
+
+    Parameters
+    ----------
+    n_nodes
+        Number of local nodes in the flattened frame-major layout.
+    n_radial
+        Number of radial basis channels.
+    n_channel
+        Edge type feature width.
+    device
+        Target device for the cache tensors.
+    dtype
+        Target floating-point dtype for the cache tensors.
+
+    Returns
+    -------
+    EdgeFeatureCache
+        Empty cache with valid tensor shapes and neutral degree normalization.
+    """
+    empty_long = torch.empty(0, dtype=torch.long, device=device)
+    empty_vec = torch.empty(0, 3, dtype=dtype, device=device)
+    empty_rbf = torch.empty(0, n_radial, dtype=dtype, device=device)
+    empty_type_feat = torch.empty(0, n_channel, dtype=dtype, device=device)
+    deg = torch.zeros(n_nodes, dtype=dtype, device=device)
+    inv_sqrt_deg = torch.ones(n_nodes, 1, 1, dtype=dtype, device=device)
+    return EdgeFeatureCache(
+        src=empty_long,
+        dst=empty_long,
+        edge_type_feat=empty_type_feat,
+        edge_vec=empty_vec,
+        edge_rbf=empty_rbf,
+        edge_env=torch.empty(0, 1, dtype=dtype, device=device),
+        deg=deg,
+        inv_sqrt_deg=inv_sqrt_deg,
+        D_full=None,
+        Dt_full=None,
+        D_to_m_cache={},
+        Dt_from_m_cache={},
+    )
+
+
+def _build_standard_edge_index(
+    *,
+    nlist: torch.Tensor,
+    mapping: torch.Tensor | None,
+    pair_keep_mask: torch.Tensor,
+    nall: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Flatten DeePMD valid neighbor slots into per-edge indices.
+
+    This helper keeps the original edge semantics used by the eager standard path:
+
+    - padding slots (``nlist == -1``) are removed
+    - excluded type pairs are removed
+    - no distance-based filtering is applied here; edges beyond ``rcut`` remain
+      in the cache and are later zeroed naturally by the smooth envelope
+
+    Parameters
+    ----------
+    nlist
+        DeePMD neighbor list with shape ``(nf, nloc, nnei)``.
+    mapping
+        Optional extended-to-local mapping with shape ``(nf, nall)``.
+    pair_keep_mask
+        Pair exclusion keep mask with shape ``(nf, nloc, nnei)``.
+    nall
+        Number of atoms on the extended axis per frame.
+
+    Returns
+    -------
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(src, dst, center_coord_index, neighbor_coord_index)`` for the valid
+        standard-path edges. All tensors have shape ``(E,)``.
+    """
+    nf, nloc, nnei = nlist.shape
+    nlist_flat = nlist.reshape(-1)
+
+    # === Step 1. Identify valid edge slots ===
+    # An edge is valid if:
+    #   - it is not padding (nlist >= 0)
+    #   - the type pair is allowed (pair_keep_mask)
+    # Note: We do NOT filter by distance here. Edges beyond rcut stay in the
+    # cache and will later get edge_env=0 from the cutoff envelope.
+    valid_nlist = nlist >= 0
+    edge_keep = (valid_nlist & pair_keep_mask).reshape(-1)
+    edge_slot = torch.nonzero(edge_keep).squeeze(-1).to(dtype=torch.long)
+
+    if edge_slot.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=nlist.device)
+        return empty, empty, empty, empty
+
+    # === Step 2. Decode flat edge slots ===
+    # edge_slot indexes the flattened (nf, nloc, nnei) axis in row-major order.
+    # Convert it back to:
+    #   frame_idx   in [0, nf)
+    #   center_local in [0, nloc)
+    #   neighbor_ext from the extended axis in [0, nall)
+    frame_idx = edge_slot // (nloc * nnei)
+    rem = edge_slot % (nloc * nnei)
+    center_local = rem // nnei
+    neighbor_ext = nlist_flat.index_select(0, edge_slot)
+
+    if mapping is None:
+        # Neighbor indices are already local indices in [0, nloc).
+        src_local = neighbor_ext
+    else:
+        # Map extended index -> local index for each frame.
+        # mapping_flat packs (nf, nall), so frame k uses offset k * nall.
+        mapping_flat = mapping.reshape(-1)
+        src_local = mapping_flat.index_select(0, frame_idx * nall + neighbor_ext)
+
+    src_ok = (src_local >= 0) & (src_local < nloc)
+    if not bool(src_ok.all()):
+        # Drop edges that map outside the local range, e.g. broken mapping
+        # or ghost-only neighbors.
+        frame_idx = frame_idx[src_ok]
+        center_local = center_local[src_ok]
+        neighbor_ext = neighbor_ext[src_ok]
+        src_local = src_local[src_ok]
+
+    if src_local.numel() == 0:
+        empty = torch.empty(0, dtype=torch.long, device=nlist.device)
+        return empty, empty, empty, empty
+
+    # === Step 3. Build node and coordinate indices ===
+    # dst is the center atom: per-frame local index -> global node index.
+    # src is the neighbor atom: per-frame local index -> global node index.
+    # The coordinate indices still point to the extended coordinate tensor.
+    src = frame_idx * nloc + src_local
+    dst = frame_idx * nloc + center_local
+    center_coord_index = frame_idx * nall + center_local
+    neighbor_coord_index = frame_idx * nall + neighbor_ext
+    return src, dst, center_coord_index, neighbor_coord_index
+
+
+def build_edge_type_feat(
+    type_ebed: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    num_edges: int | None = None,
+) -> torch.Tensor:
+    """
+    Build per-edge type features by summing src/dst embeddings.
+
+    Parameters
+    ----------
+    type_ebed
+        Per-node type embedding with shape (N, C).
+    src
+        Source node indices with shape (E,).
+    dst
+        Destination node indices with shape (E,).
+    num_edges
+        Number of edges. When provided, avoids calling `numel()` on GPU tensors.
+
+    Returns
+    -------
+    torch.Tensor
+        Per-edge type features with shape (E, C).
+    """
+    if num_edges is None:
+        num_edges = int(src.numel())
+    if num_edges == 0:
+        return type_ebed.new_empty((0, type_ebed.shape[1]))
+
+    # === Step 1. Normalize index dtypes ===
+    if src.dtype != torch.long:
+        src = src.to(dtype=torch.long)
+    if dst.dtype != torch.long:
+        dst = dst.to(dtype=torch.long)
+
+    # === Step 2. Pack edge indices as a 2-item bag ===
+    pair_index = torch.stack((src, dst), dim=1).reshape(-1)
+
+    # === Step 3. Reduce with a single embedding_bag ===
+    offsets = torch.arange(
+        0, 2 * num_edges, step=2, device=src.device, dtype=torch.long
+    )
+    return F.embedding_bag(
+        pair_index,
+        type_ebed,
+        offsets,
+        mode="sum",
+        include_last_offset=False,
+    )
+
+
+def edge_cache_to_dtype(
+    cache: EdgeFeatureCache, dtype: torch.dtype
+) -> EdgeFeatureCache:
+    """
+    Convert all floating-point tensors in EdgeFeatureCache to the specified dtype.
+
+    Integer tensors (src, dst) are unchanged. This is a standalone function
+    (not a method) to keep it side-effect free.
+
+    Parameters
+    ----------
+    cache
+        The edge feature cache to convert.
+    dtype
+        Target dtype for floating-point tensors.
+
+    Returns
+    -------
+    EdgeFeatureCache
+        New cache with converted tensors.
+    """
+    # Handle Optional tensors explicitly.
+    # Use local variables with explicit None check and assignment.
+    _D_full = cache.D_full
+    _Dt_full = cache.Dt_full
+    D_full: torch.Tensor | None = None
+    Dt_full: torch.Tensor | None = None
+    if _D_full is not None:
+        D_full = _D_full.to(dtype=dtype)
+    if _Dt_full is not None:
+        Dt_full = _Dt_full.to(dtype=dtype)
+
+    return EdgeFeatureCache(
+        src=cache.src,
+        dst=cache.dst,
+        edge_type_feat=cache.edge_type_feat.to(dtype=dtype),
+        edge_vec=cache.edge_vec.to(dtype=dtype),
+        edge_rbf=cache.edge_rbf.to(dtype=dtype),
+        edge_env=cache.edge_env.to(dtype=dtype),
+        deg=cache.deg.to(dtype=dtype),
+        inv_sqrt_deg=cache.inv_sqrt_deg.to(dtype=dtype),
+        D_full=D_full,
+        Dt_full=Dt_full,
+        D_to_m_cache=None if cache.D_to_m_cache is None else {},
+        Dt_from_m_cache=None if cache.Dt_from_m_cache is None else {},
     )
