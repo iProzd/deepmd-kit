@@ -1266,6 +1266,8 @@ class DescrptDPA3V3(BaseDescriptor, torch.nn.Module):
             node_ebd_ext = self.type_embedding(extended_atype)
         if self.tebd_mode == "embedding":
             node_ebd_ext = node_ebd_ext.to(dtype=self.prec)
+
+        if self.add_chg_spin_ebd and fparam is not None:
             assert self.chg_embedding is not None
             assert self.spin_embedding is not None
             charge = fparam[:, 0].to(dtype=torch.int64) + 100

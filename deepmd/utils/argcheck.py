@@ -1679,6 +1679,27 @@ def descrpt_dpa3s_v1_rbf_args() -> list[Argument]:
             default=False,
             doc=doc_use_tebd_bias,
         ),
+        Argument(
+            "tebd_mode",
+            str,
+            optional=True,
+            default="linear",
+            doc="Type embedding mode. 'linear': one-hot + MLPLayer (TypeEmbedNet). 'embedding': nn.Embedding with independent per-type vectors.",
+        ),
+        Argument(
+            "mlp_init",
+            str,
+            optional=True,
+            default="default",
+            doc="Weight initialization method for MLPLayers. Supported: 'default', 'glorot', 'kaiming_normal'.",
+        ),
+        Argument(
+            "bias_init_zero",
+            bool,
+            optional=True,
+            default=False,
+            doc="If True, initialize all MLPLayer biases to zero.",
+        ),
     ]
 
 
@@ -1802,6 +1823,27 @@ def descrpt_dpa3s_v2_rbf_norm_args() -> list[Argument]:
             optional=True,
             default=False,
             doc=doc_use_tebd_bias,
+        ),
+        Argument(
+            "tebd_mode",
+            str,
+            optional=True,
+            default="linear",
+            doc="Type embedding mode. 'linear': one-hot + MLPLayer (TypeEmbedNet). 'embedding': nn.Embedding with independent per-type vectors.",
+        ),
+        Argument(
+            "mlp_init",
+            str,
+            optional=True,
+            default="default",
+            doc="Weight initialization method for MLPLayers. Supported: 'default', 'glorot', 'kaiming_normal'.",
+        ),
+        Argument(
+            "bias_init_zero",
+            bool,
+            optional=True,
+            default=False,
+            doc="If True, initialize all MLPLayer biases to zero.",
         ),
     ]
 
@@ -1934,6 +1976,41 @@ def descrpt_dpa3s_v3_attn_args() -> list[Argument]:
             optional=True,
             default=False,
             doc=doc_use_tebd_bias,
+        ),
+        Argument(
+            "tebd_mode",
+            str,
+            optional=True,
+            default="linear",
+            doc="Type embedding mode. 'linear': one-hot + MLPLayer (TypeEmbedNet). 'embedding': nn.Embedding with independent per-type vectors.",
+        ),
+        Argument(
+            "mlp_init",
+            str,
+            optional=True,
+            default="default",
+            doc="Weight initialization method for MLPLayers. Supported: 'default', 'glorot', 'kaiming_normal'.",
+        ),
+        Argument(
+            "bias_init_zero",
+            bool,
+            optional=True,
+            default=False,
+            doc="If True, initialize all MLPLayer biases to zero.",
+        ),
+        Argument(
+            "gate_bias_zero",
+            bool,
+            optional=True,
+            default=False,
+            doc="If True, initialize gate_linear bias to zero so sigmoid starts at 0.5.",
+        ),
+        Argument(
+            "norm_position",
+            str,
+            optional=True,
+            default="post",
+            doc="RMSNorm position. 'post': Post-LN (norm after residual). 'pre': Pre-LN (norm before computation, more stable).",
         ),
     ]
 
