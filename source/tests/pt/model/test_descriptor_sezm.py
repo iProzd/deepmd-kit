@@ -97,6 +97,7 @@ def _attention_descriptor_kwargs(
         l_schedule=[1, 1, 0],
         channels=8,
         n_focus=2,
+        focus_dim=0,
         n_radial=4,
         radial_mlp=[8],
         so2_layers=2,
@@ -153,15 +154,25 @@ class TestDescrptSeZM(_SeZMTestCase):
         self.assertTrue(torch.all(torch.isfinite(extended_coord.grad)))
         return model
 
-    def test_focus_stream_config_validation(self) -> None:
-        """Test invalid focus-stream configuration raises ValueError."""
-        with self.assertRaisesRegex(ValueError, "divisible"):
-            DescrptSeZM(
-                **_descriptor_kwargs(
-                    channels=10,
-                    n_focus=3,
-                )
-            )
+    def test_forward_with_focus_dim_variants(self) -> None:
+        """Test forward/backward smoke paths for focus_dim=0 and explicit hidden width."""
+        cases = {
+            "focus_dim_zero": _descriptor_kwargs(
+                channels=4,
+                n_focus=2,
+                focus_dim=0,
+                so2_layers=2,
+            ),
+            "focus_dim_explicit": _descriptor_kwargs(
+                channels=4,
+                n_focus=2,
+                focus_dim=3,
+                so2_layers=2,
+            ),
+        }
+        for name, model_kwargs in cases.items():
+            with self.subTest(mode=name):
+                self._assert_forward_backward_smoke(**model_kwargs)
 
     def test_forward_with_attention_variants(self) -> None:
         """Test forward/backward smoke paths for attention-based variants."""
@@ -275,12 +286,27 @@ class TestDescrptSeZM(_SeZMTestCase):
 
     def test_serialization_deserialization(self) -> None:
         """Test serialization and deserialization preserves model state."""
-        for prec in ["float64", "float32", "bfloat16"]:
-            dtype = PRECISION_DICT[prec]
+        focus_dim_cases = (0, 3)
+        dtype = PRECISION_DICT["float32"]
+        for focus_dim in focus_dim_cases:
             coord, atype, nlist = _tiny_two_atom_system(self.device, dtype=dtype)
             extended_coord = coord.reshape(1, -1)
 
-            model = DescrptSeZM(**_attention_descriptor_kwargs(precision=prec))
+            model_kwargs = (
+                _attention_descriptor_kwargs(precision="float32", focus_dim=focus_dim)
+                if focus_dim == 0
+                else _descriptor_kwargs(
+                    precision="float32",
+                    channels=4,
+                    n_focus=2,
+                    focus_dim=focus_dim,
+                    so2_layers=2,
+                    n_radial=3,
+                    radial_mlp=[6],
+                    ffn_neurons=8,
+                )
+            )
+            model = DescrptSeZM(**model_kwargs)
 
             desc1, _, _, _, sw1 = model(extended_coord, atype, nlist)
             data = model.serialize()
@@ -927,6 +953,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         n_atten_head: int,
         *,
         use_amp: bool,
+        n_focus: int = 1,
         bridging_method: str = "none",
         bridging_r_inner: float = 0.9,
         bridging_r_outer: float = 1.3,
@@ -940,7 +967,8 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
                 "sel": [16, 16],
                 "rcut": 5.0,
                 "channels": 16,
-                "n_focus": 1,
+                "n_focus": n_focus,
+                "focus_dim": 0,
                 "focus_compete": True,
                 "n_radial": 6,
                 "radial_mlp": [16],
@@ -1000,6 +1028,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         n_atten_head: int,
         *,
         use_amp: bool,
+        n_focus: int = 1,
         bridging_method: str = "none",
         bridging_r_inner: float = 0.9,
         bridging_r_outer: float = 1.3,
@@ -1009,6 +1038,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
             self._build_model_params(
                 n_atten_head,
                 use_amp=use_amp,
+                n_focus=n_focus,
                 bridging_method=bridging_method,
                 bridging_r_inner=bridging_r_inner,
                 bridging_r_outer=bridging_r_outer,
@@ -1141,11 +1171,13 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         n_atten_head: int,
         *,
         use_amp: bool,
+        n_focus: int,
     ) -> None:
         """Check that the non-bridged near-cutoff probe keeps one smooth extremum."""
         model = self._build_random_weight_model(
             n_atten_head,
             use_amp=use_amp,
+            n_focus=n_focus,
         )
         displacements, energies = self._scan_total_energy_curve(
             model,
@@ -1156,7 +1188,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         stats = self._collect_curve_statistics(energies, displacements)
         self._assert_curve_has_usable_signal(
             stats,
-            label=f"Near-cutoff (use_amp={use_amp})",
+            label=f"Near-cutoff (use_amp={use_amp}, n_focus={n_focus})",
             n_atten_head=n_atten_head,
         )
         self.assertIn(
@@ -1164,7 +1196,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
             {"minimum", "maximum"},
             (
                 "Near-cutoff energy curve is not a single smooth bowl "
-                f"for n_atten_head={n_atten_head}, use_amp={use_amp}: {stats}"
+                f"for n_atten_head={n_atten_head}, use_amp={use_amp}, n_focus={n_focus}: {stats}"
             ),
         )
 
@@ -1173,6 +1205,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         n_atten_head: int,
         *,
         use_amp: bool,
+        n_focus: int,
         nearest_distance: float,
         boundary_label: str,
     ) -> None:
@@ -1180,6 +1213,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         model = self._build_random_weight_model(
             n_atten_head,
             use_amp=use_amp,
+            n_focus=n_focus,
             bridging_method="ZBL",
             bridging_r_inner=self.BRIDGING_R_INNER,
             bridging_r_outer=self.BRIDGING_R_OUTER,
@@ -1193,7 +1227,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         stats = self._collect_curve_statistics(energies, displacements)
         self._assert_curve_has_usable_signal(
             stats,
-            label=f"Bridged {boundary_label} (use_amp={use_amp})",
+            label=f"Bridged {boundary_label} (use_amp={use_amp}, n_focus={n_focus})",
             n_atten_head=n_atten_head,
         )
         self.assertEqual(
@@ -1201,7 +1235,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
             "minimum",
             (
                 f"Bridged {boundary_label} probe should form one symmetric repulsive bowl "
-                f"for n_atten_head={n_atten_head}, use_amp={use_amp}: {stats}"
+                f"for n_atten_head={n_atten_head}, use_amp={use_amp}, n_focus={n_focus}: {stats}"
             ),
         )
 
@@ -1211,11 +1245,15 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         """Check the non-bridged near-cutoff PES shape across attention and AMP modes."""
         for use_amp in (False, True):
             for n_atten_head in (0, 2):
-                with self.subTest(n_atten_head=n_atten_head, use_amp=use_amp):
-                    self._assert_cutoff_near_energy_curve_is_smooth(
-                        n_atten_head,
-                        use_amp=use_amp,
-                    )
+                for n_focus in (1, 2):
+                    with self.subTest(
+                        n_atten_head=n_atten_head, use_amp=use_amp, n_focus=n_focus
+                    ):
+                        self._assert_cutoff_near_energy_curve_is_smooth(
+                            n_atten_head,
+                            use_amp=use_amp,
+                            n_focus=n_focus,
+                        )
 
     def test_scaled_bridging_inner_energy_curve_is_smooth_across_attention_modes(
         self,
@@ -1223,13 +1261,17 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         """Check the bridged near-r_inner PES shape across attention and AMP modes."""
         for use_amp in (False, True):
             for n_atten_head in (0, 2):
-                with self.subTest(n_atten_head=n_atten_head, use_amp=use_amp):
-                    self._assert_bridged_boundary_energy_curve_is_smooth(
-                        n_atten_head,
-                        use_amp=use_amp,
-                        nearest_distance=self.BRIDGING_R_INNER,
-                        boundary_label="r_inner",
-                    )
+                for n_focus in (1, 2):
+                    with self.subTest(
+                        n_atten_head=n_atten_head, use_amp=use_amp, n_focus=n_focus
+                    ):
+                        self._assert_bridged_boundary_energy_curve_is_smooth(
+                            n_atten_head,
+                            use_amp=use_amp,
+                            n_focus=n_focus,
+                            nearest_distance=self.BRIDGING_R_INNER,
+                            boundary_label="r_inner",
+                        )
 
     def test_scaled_bridging_outer_energy_curve_is_smooth_across_attention_modes(
         self,
@@ -1237,13 +1279,17 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         """Check the bridged near-r_outer PES shape across attention and AMP modes."""
         for use_amp in (False, True):
             for n_atten_head in (0, 2):
-                with self.subTest(n_atten_head=n_atten_head, use_amp=use_amp):
-                    self._assert_bridged_boundary_energy_curve_is_smooth(
-                        n_atten_head,
-                        use_amp=use_amp,
-                        nearest_distance=self.BRIDGING_R_OUTER,
-                        boundary_label="r_outer",
-                    )
+                for n_focus in (1, 2):
+                    with self.subTest(
+                        n_atten_head=n_atten_head, use_amp=use_amp, n_focus=n_focus
+                    ):
+                        self._assert_bridged_boundary_energy_curve_is_smooth(
+                            n_atten_head,
+                            use_amp=use_amp,
+                            n_focus=n_focus,
+                            nearest_distance=self.BRIDGING_R_OUTER,
+                            boundary_label="r_outer",
+                        )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@
       "so2_layers": 4,
       "so2_attn_res": "none",
       "n_focus": 1,
+      "focus_dim": 0,
       "n_atten_head": 0,
       "ffn_neurons": 96,
       "ffn_blocks": 1,

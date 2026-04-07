@@ -403,15 +403,18 @@ def descrpt_se_zm_args() -> list[Argument]:
     )
     attn_res_modes = {"none", "independent", "dependent"}
     doc_n_focus = (
-        "Number of parallel focus streams. Per-stream width is "
-        "`focus_dim = channels // n_focus`; `channels` must be divisible by `n_focus`."
+        "Number of parallel focus streams used only inside the SO(2) convolution."
+    )
+    doc_focus_dim = (
+        "Hidden width per focus stream inside the SO(2) convolution. "
+        "`0` means using `channels`."
     )
     doc_n_atten_head = (
         "Number of attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
-        "the per-focus stream width `focus_dim = channels // n_focus` must be "
-        "divisible by `n_atten_head`, and envelope-gated grouped softmax attention "
-        "with output-side head gate is applied. Attention uses "
+        "the effective per-focus hidden width `focus_dim` (or `channels` when "
+        "`focus_dim=0`) must be divisible by `n_atten_head`, and envelope-gated "
+        "grouped softmax attention with output-side head gate is applied. Attention uses "
         "`w**2 * exp(logit)` in the numerator and "
         "`zeta + sum(w**2 * exp(logit))` in the denominator."
     )
@@ -434,7 +437,7 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_layer_scale = (
         "If True, apply learnable LayerScale (init 1e-3) on residual branches: "
         "SO(2) branch uses per-focus-channel scales "
-        "(shape `(n_focus, channels//n_focus)`) on each SO(2) mixing layer, "
+        "(shape `(n_focus, focus_dim)`) on each SO(2) mixing layer, "
         "and FFN branch uses per-channel scales (shape `(channels,)`) on each "
         "FFN residual branch."
     )
@@ -525,6 +528,15 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_so2_attn_res,
         ),
         Argument("n_focus", int, optional=True, default=1, doc=doc_n_focus),
+        Argument(
+            "focus_dim",
+            int,
+            optional=True,
+            default=0,
+            extra_check=lambda x: x >= 0,
+            extra_check_errmsg="must be >= 0",
+            doc=doc_focus_dim,
+        ),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
         Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
         Argument(

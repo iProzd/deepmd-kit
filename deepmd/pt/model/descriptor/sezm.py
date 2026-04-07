@@ -19,11 +19,13 @@ Runtime flow at a glance:
 
 Layout notes
 ------------
-- Node-level backbone features use contiguous `(N, D, F, Cf)` where
-  `D=(lmax+1)^2`, `F=n_focus`, `Cf=channels//n_focus`.
-- Node-level equivariant operators use `(N, D, F, Cf)` convention.
+- Node-level backbone features use contiguous `(N, D, 1, C)` where
+  `D=(lmax+1)^2` and `C=channels`.
+- The singleton focus axis is kept only to reuse the existing equivariant
+  operators; real multi-focus structure lives strictly inside `SO2Convolution`.
 - Edge-level SO(2) internal operators keep m-major reduced layout
-  `(E, F, D_m_trunc, Cf)`.
+  `(E, F, D_m_trunc, Cf)` with `F=n_focus` and `Cf=focus_dim` inside the
+  SO(2) branch only.
 """
 
 from __future__ import (
@@ -178,18 +180,19 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         SO(2)-internal depth-wise attention residual mode inside each interaction
         block. Must be one of ``"none"``, ``"independent"``, or ``"dependent"``.
     n_focus
-        Number of parallel focus streams. The per-stream channel width is
-        ``focus_dim = channels // n_focus``. Must divide ``channels`` exactly.
-        Cross-focus softmax competition inside SO(2) convolution is enabled
-        automatically when ``n_focus > 1``.
+        Number of parallel focus streams used only inside the SO(2) convolution.
+        Node-level backbone tensors still keep a singleton focus axis.
+    focus_dim
+        Hidden width per focus stream inside the SO(2) convolution.
+        ``focus_dim=0`` means using ``channels``.
     n_atten_head
         Number of attention heads when aggregating messages in SO(2) convolution.
         0 applies a plain envelope-weighted scatter-sum; >0 enables
         envelope-gated grouped softmax attention with output-side head gate.
         Attention uses ``w**2 * exp(logit)`` in the numerator and
         ``zeta + sum(w**2 * exp(logit))`` in the denominator.
-        When enabled, the per-focus stream width
-        ``focus_dim = channels // n_focus`` must be divisible by ``n_atten_head``.
+        When enabled, the SO(2)-internal per-focus width ``focus_dim`` must be
+        divisible by ``n_atten_head``.
     ffn_neurons
         Hidden sizes for the equivariant FFN in each block and the final scalar output FFN.
     ffn_blocks
@@ -282,6 +285,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         so2_layers: int = 4,
         so2_attn_res: str = "none",
         n_focus: int = 1,
+        focus_dim: int = 0,
         n_atten_head: int = 0,
         ffn_neurons: int = 96,
         ffn_blocks: int = 1,
@@ -327,11 +331,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.n_focus = int(n_focus)
         if self.n_focus < 1:
             raise ValueError("`n_focus` must be >= 1")
-        if self.channels % self.n_focus != 0:
-            raise ValueError(
-                f"`channels` ({self.channels}) must be divisible by `n_focus` ({self.n_focus})"
-            )
-        self.focus_dim = self.channels // self.n_focus
+        self.focus_dim = int(focus_dim)
+        if self.focus_dim < 0:
+            raise ValueError("`focus_dim` must be >= 0")
         self.n_radial = int(n_radial)
         if radial_mlp is None:
             radial_mlp = [64]
@@ -435,7 +437,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "`full_attn_res` and `block_attn_res` cannot both be enabled"
             )
         self.n_atten_head = int(n_atten_head)
-        if self.n_atten_head > 0 and self.focus_dim % self.n_atten_head != 0:
+        so2_focus_dim = self.channels if self.focus_dim == 0 else self.focus_dim
+        if self.n_atten_head > 0 and so2_focus_dim % self.n_atten_head != 0:
             raise ValueError(
                 "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
             )
@@ -562,6 +565,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     mmax=m_b,
                     channels=self.channels,
                     n_focus=self.n_focus,
+                    focus_dim=self.focus_dim,
                     so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
                     so2_attn_res=self.so2_attn_res_mode,
@@ -803,11 +807,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 shift = shift_strength * torch.tanh(shift_hat)  # (N, C)
                 x0_out = x0 * scale + shift
 
-        # === Step 7. Build l=0 features ===
-        x = type_ebed.new_zeros(
-            n_nodes, ebed_dim_0, self.n_focus, self.focus_dim
-        )  # (N, D, F, Cf)
-        x[:, 0, :, :] = x0_out.reshape(n_nodes, self.n_focus, self.focus_dim)
+        # === Step 7. Build backbone l=0 features ===
+        x = type_ebed.new_zeros(n_nodes, ebed_dim_0, 1, self.channels)  # (N, D, 1, C)
+        x[:, 0, 0, :] = x0_out
 
         # === Step 8. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
@@ -817,7 +819,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                     edge_cache=edge_cache,
                     radial_feat=radial_feat[:, 1:, :],
-                ).reshape(n_nodes, ebed_dim_0, self.n_focus, self.focus_dim)
+                ).unsqueeze(2)
 
         # === Step 9. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
@@ -834,7 +836,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === Step 10. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
-            x = x.to(dtype=self.dtype)  # (N, D, F, Cf)
+            x = x.to(dtype=self.dtype)  # (N, D, 1, C)
             if edge_cache.src.numel() > 0:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
@@ -984,11 +986,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 shift = shift_strength * torch.tanh(shift_hat)  # (N, C)
                 x0_out = x0 * scale + shift
 
-        # === Step 6. Build l=0 features ===
-        x = type_ebed.new_zeros(
-            n_nodes, ebed_dim_0, self.n_focus, self.focus_dim
-        )  # (N, D, F, Cf)
-        x[:, 0, :, :] = x0_out.reshape(n_nodes, self.n_focus, self.focus_dim)
+        # === Step 6. Build backbone l=0 features ===
+        x = type_ebed.new_zeros(n_nodes, ebed_dim_0, 1, self.channels)  # (N, D, 1, C)
+        x[:, 0, 0, :] = x0_out
 
         # === Step 7. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
@@ -997,7 +997,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     n_nodes=n_nodes,
                     edge_cache=edge_cache,
                     radial_feat=radial_feat[:, 1:, :],
-                ).reshape(n_nodes, ebed_dim_0, self.n_focus, self.focus_dim)
+                ).unsqueeze(2)
 
         # === Step 8. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
@@ -1016,7 +1016,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === Step 9. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
-            x = x.to(dtype=self.dtype)  # (N, D, F, Cf)
+            x = x.to(dtype=self.dtype)  # (N, D, 1, C)
             if edge_cache.src.numel() > 0:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
@@ -1055,7 +1055,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         Parameters
         ----------
         x
-            Initial node features with shape (N, D, F, Cf).
+            Initial node features with shape (N, D, 1, C).
         edge_cache
             Per-edge cache.
         radial_feat_per_block
@@ -1064,7 +1064,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         Returns
         -------
         torch.Tensor
-            Output features with shape (N, D, F, Cf).
+            Output features with shape (N, D, 1, C).
         """
         if not self.use_full_attn_res and not self.use_block_attn_res:
             # === Fast path without descriptor-level attention residuals ===
@@ -1422,6 +1422,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "so2_layers": self.so2_layers,
                 "so2_attn_res": self.so2_attn_res_mode,
                 "n_focus": self.n_focus,
+                "focus_dim": self.focus_dim,
                 "ffn_neurons": self.ffn_neurons,
                 "ffn_blocks": self.ffn_blocks,
                 "layer_scale": self.layer_scale,

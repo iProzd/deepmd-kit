@@ -460,7 +460,7 @@ class SO2Convolution(nn.Module):
     performs edge message passing in the reduced m-major local layout. The
     operation pipeline is:
 
-    1. `pre_focus_mix`: full-channel mixing on node features `(N, D, C)`.
+    1. `pre_focus_mix`: project node features `(N, D, C)` to the SO(2) hidden width.
     2. rotate global -> local reduced basis with cached `D_to_m`.
     3. radial modulation in reduced layout.
     4. `so2_layers` stacked local mixers:
@@ -469,7 +469,7 @@ class SO2Convolution(nn.Module):
     6. edge aggregation (plain envelope scatter or envelope-aware grouped
        softmax attention with exact envelope-gated competition and
        output-side head gate).
-    7. `post_focus_mix`: full-channel mixing on aggregated messages.
+    7. `post_focus_mix`: project aggregated hidden messages back to `(N, D, C)`.
 
     Equivariance is preserved because both `pre_focus_mix` and `post_focus_mix`
     only mix the channel axis for each `(l, m)` coefficient and never mix
@@ -484,8 +484,10 @@ class SO2Convolution(nn.Module):
     channels
         Number of channels per (l, m) coefficient.
     n_focus
-        Number of focus streams. Internal width is
-        ``focus_dim = channels // n_focus``.
+        Number of focus streams inside the SO(2) branch.
+    focus_dim
+        Hidden width per focus stream inside SO(2).
+        ``focus_dim=0`` means using ``channels``.
     focus_compete
         If True, apply cross-focus softmax competition in SO(2) local layout.
         Competition logits are constructed only from l=0 scalar channels and the
@@ -509,7 +511,8 @@ class SO2Convolution(nn.Module):
         - >0: envelope-gated grouped softmax attention with output-side head
           gates. Attention uses ``w**2 * exp(logit)`` in the numerator and
           ``zeta + sum(w**2 * exp(logit))`` in the denominator.
-        Requires ``focus_dim % n_atten_head == 0``.
+        Requires the effective per-focus width to satisfy
+        ``focus_dim % n_atten_head == 0``.
     mlp_bias
         Whether to use bias in SO2Linear (l=0 bias) and GatedActivation
         (gate linear bias).
@@ -533,6 +536,7 @@ class SO2Convolution(nn.Module):
         mmax: int | None = None,
         channels: int,
         n_focus: int = 1,
+        focus_dim: int = 0,
         focus_compete: bool = True,
         so2_norm: bool = False,
         so2_layers: int = 4,
@@ -555,9 +559,14 @@ class SO2Convolution(nn.Module):
             raise ValueError("`mmax` must be <= `lmax`")
         self.channels = int(channels)
         self.n_focus = int(n_focus)
-        if self.channels % self.n_focus != 0:
-            raise ValueError("`channels` must be divisible by `n_focus`")
-        self.focus_dim = self.channels // self.n_focus
+        if self.n_focus < 1:
+            raise ValueError("`n_focus` must be >= 1")
+        self.focus_dim = int(focus_dim)
+        if self.focus_dim < 0:
+            raise ValueError("`focus_dim` must be >= 0")
+        self.so2_focus_dim = self.channels if self.focus_dim == 0 else self.focus_dim
+        self.hidden_channels = int(self.n_focus * self.so2_focus_dim)
+        self.use_hidden_projection = self.hidden_channels != self.channels
         self.focus_compete = bool(focus_compete)
         self.focus_softmax_tau = 1.0
         self.focus_label_smoothing = 0.02
@@ -575,12 +584,14 @@ class SO2Convolution(nn.Module):
         self.n_atten_head = int(n_atten_head)
         if self.n_atten_head < 0:
             raise ValueError("`n_atten_head` must be non-negative")
-        if self.n_atten_head > 0 and self.focus_dim % self.n_atten_head != 0:
+        if self.n_atten_head > 0 and self.so2_focus_dim % self.n_atten_head != 0:
             raise ValueError(
                 "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
             )
         self.head_dim = (
-            None if self.n_atten_head == 0 else int(self.focus_dim // self.n_atten_head)
+            None
+            if self.n_atten_head == 0
+            else int(self.so2_focus_dim // self.n_atten_head)
         )
         self.mlp_bias = bool(mlp_bias)
         self.use_triton = bool(use_triton)
@@ -624,6 +635,7 @@ class SO2Convolution(nn.Module):
         seed_so3_post = child_seed(seed, 3)
         seed_gate = child_seed(seed, 4)
         seed_depth_attn = child_seed(seed, 5)
+        seed_radial_hidden = child_seed(seed, 6)
 
         # === Step 3. Multiple SO2Linear layers ===
         self.so2_linears = nn.ModuleList(
@@ -631,8 +643,8 @@ class SO2Convolution(nn.Module):
                 SO2Linear(
                     lmax=self.lmax,
                     mmax=self.mmax,
-                    in_channels=self.focus_dim,
-                    out_channels=self.focus_dim,
+                    in_channels=self.so2_focus_dim,
+                    out_channels=self.so2_focus_dim,
                     n_focus=self.n_focus,
                     dtype=self.dtype,
                     mlp_bias=self.mlp_bias,
@@ -651,7 +663,7 @@ class SO2Convolution(nn.Module):
                     ReducedEquivariantRMSNorm(
                         lmax=self.lmax,
                         mmax=self.mmax,
-                        channels=self.focus_dim,
+                        channels=self.so2_focus_dim,
                         degree_index_m=self.degree_index_m,
                         n_focus=self.n_focus,
                         centering=True,
@@ -672,7 +684,7 @@ class SO2Convolution(nn.Module):
                 GatedActivation(
                     lmax=self.lmax,
                     mmax=self.mmax,
-                    channels=self.focus_dim,
+                    channels=self.so2_focus_dim,
                     n_focus=self.n_focus,
                     dtype=self.dtype,
                     mlp_bias=self.mlp_bias,
@@ -689,7 +701,7 @@ class SO2Convolution(nn.Module):
             self.so2_layer_attn_res: nn.ModuleList | None = nn.ModuleList(
                 [
                     DepthAttnRes(
-                        channels=self.channels,
+                        channels=self.hidden_channels,
                         input_dependent=self.so2_attn_res_mode == "dependent",
                         eps=self.eps,
                         bias=self.mlp_bias,
@@ -710,7 +722,7 @@ class SO2Convolution(nn.Module):
                     nn.Parameter(
                         torch.ones(
                             self.n_focus,
-                            self.focus_dim,
+                            self.so2_focus_dim,
                             dtype=self.dtype,
                             device=self.device,
                         )
@@ -733,15 +745,15 @@ class SO2Convolution(nn.Module):
         self.adamw_attn_gate_w: nn.Parameter | None = None
         if self.n_atten_head > 0:
             self.attn_qk_norm = ScalarRMSNorm(
-                channels=self.focus_dim,
+                channels=self.so2_focus_dim,
                 n_focus=self.n_focus,
                 eps=self.eps,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
             self.attn_q_proj = FocusLinear(
-                in_channels=self.focus_dim,
-                out_channels=self.focus_dim,
+                in_channels=self.so2_focus_dim,
+                out_channels=self.so2_focus_dim,
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
                 bias=False,
@@ -749,8 +761,8 @@ class SO2Convolution(nn.Module):
                 trainable=trainable,
             )
             self.attn_k_proj = FocusLinear(
-                in_channels=self.focus_dim,
-                out_channels=self.focus_dim,
+                in_channels=self.so2_focus_dim,
+                out_channels=self.so2_focus_dim,
                 n_focus=self.n_focus,
                 dtype=self.compute_dtype,
                 bias=False,
@@ -759,7 +771,7 @@ class SO2Convolution(nn.Module):
             )
             self.adamw_attn_logit_w = nn.Parameter(
                 torch.empty(
-                    self.focus_dim,
+                    self.so2_focus_dim,
                     self.n_focus,
                     self.n_atten_head,
                     dtype=self.compute_dtype,
@@ -784,7 +796,7 @@ class SO2Convolution(nn.Module):
                 requires_grad=trainable,
             )
             self.attn_output_gate_norm = ScalarRMSNorm(
-                channels=self.focus_dim,
+                channels=self.so2_focus_dim,
                 n_focus=self.n_focus,
                 eps=self.eps,
                 dtype=self.compute_dtype,
@@ -792,7 +804,7 @@ class SO2Convolution(nn.Module):
             )
             self.adamw_attn_gate_w = nn.Parameter(
                 torch.empty(
-                    self.focus_dim,
+                    self.so2_focus_dim,
                     self.n_focus,
                     self.n_atten_head,
                     dtype=self.compute_dtype,
@@ -813,7 +825,7 @@ class SO2Convolution(nn.Module):
         self.focus_compete_bias: nn.Parameter | None = None
         if self.focus_compete and self.n_focus > 1:
             self.focus_compete_norm = ScalarRMSNorm(
-                channels=self.focus_dim,
+                channels=self.so2_focus_dim,
                 n_focus=self.n_focus,
                 eps=self.eps,
                 dtype=self.compute_dtype,
@@ -821,7 +833,7 @@ class SO2Convolution(nn.Module):
             )
             self.adamw_focus_compete_w = nn.Parameter(
                 torch.empty(
-                    self.focus_dim,
+                    self.so2_focus_dim,
                     self.n_focus,
                     dtype=self.compute_dtype,
                     device=self.device,
@@ -844,12 +856,25 @@ class SO2Convolution(nn.Module):
                     requires_grad=trainable,
                 )
 
-        # === Step 8. Pre-focus channel mixing ===
-        # This mixes the full channel width before focus slicing.
+        # === Step 8. Optional radial hidden projection ===
+        self.radial_hidden_proj: FocusLinear | None = None
+        if self.use_hidden_projection:
+            self.radial_hidden_proj = FocusLinear(
+                in_channels=self.channels,
+                out_channels=self.hidden_channels,
+                n_focus=1,
+                dtype=self.dtype,
+                bias=False,
+                seed=seed_radial_hidden,
+                trainable=trainable,
+            )
+
+        # === Step 9. Pre-focus channel mixing ===
+        # This projects the full channel width before the SO(2) focus split.
         self.pre_focus_mix = SO3Linear(
             lmax=self.lmax,
             in_channels=self.channels,
-            out_channels=self.channels,
+            out_channels=self.hidden_channels,
             n_focus=1,
             dtype=dtype,
             mlp_bias=self.mlp_bias,
@@ -857,10 +882,10 @@ class SO2Convolution(nn.Module):
             seed=seed_so3_pre,
         )
 
-        # === Step 9. Post-focus channel mixing ===
+        # === Step 10. Post-focus channel mixing ===
         self.post_focus_mix = SO3Linear(
             lmax=self.lmax,
-            in_channels=self.channels,
+            in_channels=self.hidden_channels,
             out_channels=self.channels,
             n_focus=1,
             dtype=dtype,
@@ -912,7 +937,7 @@ class SO2Convolution(nn.Module):
                     coeff_index=self.coeff_index_m,
                     dim_full=self.ebed_dim_full,
                     rotation_mode=self.triton_rotation_mode,
-                )  # (E, D_m, C)
+                )  # (E, D_m, H)
             else:
                 D_m_prime = project_D_to_m(
                     D_full=D_full,
@@ -922,21 +947,25 @@ class SO2Convolution(nn.Module):
                     key_lmax=self.lmax,
                     key_mmax=self.mmax,
                 )
-                x_src = x.index_select(0, src)  # (E, D, C)
-                x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m, C)
+                x_src = x.index_select(0, src)  # (E, D, H)
+                x_local = torch.bmm(D_m_prime, x_src)  # (E, D_m, H)
 
         # === Step 3. Select radial/type features for reduced layout ===
         with nvtx_range("SO2Conv/radial_fuse"):
             rad_feat = radial_feat[:, self.degree_index_m, :]  # (E, D_m, C)
+            if self.radial_hidden_proj is not None:
+                rad_feat = self.radial_hidden_proj(
+                    rad_feat.reshape(n_edge * self.reduced_dim, 1, self.channels)
+                ).reshape(n_edge, self.reduced_dim, self.hidden_channels)
             x_local.mul_(rad_feat)
             rad_feat_l0_focus = rad_feat[:, 0, :].reshape(
-                n_edge, self.n_focus, self.focus_dim
+                n_edge, self.n_focus, self.so2_focus_dim
             )  # (E, F, Cf)
 
         # === Step 4. Convert to SO(2) internal focus layout ===
         with nvtx_range("SO2Conv/reshape_for_so2"):
             x_local = x_local.reshape(
-                n_edge, self.reduced_dim, self.n_focus, self.focus_dim
+                n_edge, self.reduced_dim, self.n_focus, self.so2_focus_dim
             ).transpose(1, 2)  # (E, F, D_m, Cf), strided
             if self.focus_compete and self.n_focus > 1:
                 focus_gate_src = x_local[:, :, 0, :]
@@ -946,14 +975,14 @@ class SO2Convolution(nn.Module):
 
             def so2_l0_extractor(v: torch.Tensor) -> torch.Tensor:
                 """Extract scalar features from SO(2) reduced layout."""
-                return v[:, :, 0, :].reshape(v.shape[0], self.channels)
+                return v[:, :, 0, :].reshape(v.shape[0], self.hidden_channels)
 
             if self.use_so2_attn_res:
                 so2_depth_sources = [x_local]
                 for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
                     zip(self.so2_linears, self.so2_inter_norms, self.non_linearities)
                 ):
-                    x_local = self.so2_layer_attn_res[layer_idx](
+                    x_local: torch.Tensor = self.so2_layer_attn_res[layer_idx](
                         sources=so2_depth_sources,
                         scalar_extractor=so2_l0_extractor,
                         current_x=x_local,
@@ -965,7 +994,7 @@ class SO2Convolution(nn.Module):
                     if layer_idx == 0 and so2_linear.bias0 is not None:
                         # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
                         bias0 = so2_linear.bias0.view(
-                            self.n_focus, self.focus_dim
+                            self.n_focus, self.so2_focus_dim
                         ).unsqueeze(0)
                         bias_correction = bias0 * (
                             rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1)
@@ -976,9 +1005,9 @@ class SO2Convolution(nn.Module):
                     x_local = non_linear(x_local)
 
                     if self.layer_scale:
-                        scale = self.adam_so2_layer_scales[layer_idx].reshape(
-                            1, self.n_focus, 1, self.focus_dim
-                        )
+                        scale: torch.Tensor = self.adam_so2_layer_scales[
+                            layer_idx
+                        ].reshape(1, self.n_focus, 1, self.so2_focus_dim)
                         x_local = residual + scale * x_local
                     else:
                         x_local = residual + x_local
@@ -994,7 +1023,7 @@ class SO2Convolution(nn.Module):
                     if layer_idx == 0 and so2_linear.bias0 is not None:
                         # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
                         bias0 = so2_linear.bias0.view(
-                            self.n_focus, self.focus_dim
+                            self.n_focus, self.so2_focus_dim
                         ).unsqueeze(0)
                         bias_correction = bias0 * (
                             rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1)
@@ -1006,7 +1035,7 @@ class SO2Convolution(nn.Module):
 
                     if self.layer_scale:
                         scale = self.adam_so2_layer_scales[layer_idx].reshape(
-                            1, self.n_focus, 1, self.focus_dim
+                            1, self.n_focus, 1, self.so2_focus_dim
                         )
                         x_local = residual + scale * x_local
                     else:
@@ -1034,8 +1063,8 @@ class SO2Convolution(nn.Module):
         with nvtx_range("SO2Conv/reshape_for_rotate_back"):
             x_local = x_local.transpose(1, 2).contiguous()  # (E, D_m, F, Cf)
             x_local = x_local.reshape(
-                n_edge, self.reduced_dim, self.channels
-            )  # (E, D_m, C)
+                n_edge, self.reduced_dim, self.hidden_channels
+            )  # (E, D_m, H)
 
         # === Step 7. Rotate back to global frame ===
         with nvtx_range("SO2Conv/rotate_back"):
@@ -1047,7 +1076,7 @@ class SO2Convolution(nn.Module):
                     coeff_index=self.coeff_index_m,
                     dim_full=self.ebed_dim_full,
                     rotation_mode=self.triton_rotation_mode,
-                )  # (E, D, C)
+                )  # (E, D, H)
             else:
                 Dt_from_m = project_Dt_from_m(
                     Dt_full=Dt_full,
@@ -1057,7 +1086,7 @@ class SO2Convolution(nn.Module):
                     key_lmax=self.lmax,
                     key_mmax=self.mmax,
                 )
-                x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C)
+                x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, H)
             # Reduced layouts keep only 2*mmax+1 orders for l>mmax. Applying the
             # inverse-rotation degree rescale after the global lift restores the
             # full-basis amplitude expected by the block output contract.
@@ -1071,12 +1100,12 @@ class SO2Convolution(nn.Module):
                 out = x.new_zeros(x.shape, dtype=self.compute_dtype)
                 out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
                 out.mul_(edge_cache.inv_sqrt_deg.to(dtype=self.compute_dtype))
-                out = out.to(dtype=self.dtype)  # (N, D, C)
+                out = out.to(dtype=self.dtype)  # (N, D, H)
             else:
                 # === Step 8.1. Build attention logits from scalar channels ===
                 compute_dtype = self.compute_dtype
                 x_l0_node = x[:, 0, :].reshape(
-                    n_node, self.n_focus, self.focus_dim
+                    n_node, self.n_focus, self.so2_focus_dim
                 )  # (N, F, Cf)
                 qk_input = self.attn_qk_norm(x_l0_node.to(dtype=compute_dtype))
                 q_node = self.attn_q_proj(qk_input)  # (N, F, Cf)
@@ -1087,8 +1116,8 @@ class SO2Convolution(nn.Module):
                 k_edge = k_node.index_select(0, src).reshape(
                     n_edge, self.n_focus, self.n_atten_head, self.head_dim
                 )  # (E, F, H, Dh)
-                radial_l0 = radial_feat[:, 0, :].reshape(
-                    n_edge, self.n_focus, self.focus_dim
+                radial_l0 = rad_feat[:, 0, :].reshape(
+                    n_edge, self.n_focus, self.so2_focus_dim
                 )  # (E, F, Cf)
                 radial_bias = torch.einsum(
                     "efi,ifo->efo",
@@ -1143,9 +1172,9 @@ class SO2Convolution(nn.Module):
                 )  # (N, D, F, H, Dh)
 
                 # === Step 8.5. Merge heads (softmax path has no degree norm) ===
-                out = out_heads.reshape(n_node, self.ebed_dim_full, self.channels).to(
-                    dtype=self.dtype
-                )  # (N, D, C)
+                out = out_heads.reshape(
+                    n_node, self.ebed_dim_full, self.hidden_channels
+                ).to(dtype=self.dtype)  # (N, D, H)
 
         # === Step 9. Final channel mixing ===
         with nvtx_range("SO2Conv/post_focus_mix"):
@@ -1163,6 +1192,7 @@ class SO2Convolution(nn.Module):
                 "mmax": self.mmax,
                 "channels": self.channels,
                 "n_focus": self.n_focus,
+                "focus_dim": self.focus_dim,
                 "focus_compete": self.focus_compete,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,

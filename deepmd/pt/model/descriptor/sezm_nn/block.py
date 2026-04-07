@@ -69,8 +69,8 @@ class SeZMInteractionBlock(nn.Module):
     unit and each FFN subblock. In AttnRes paths, these shortcuts are replaced by
     selective depth-wise aggregation before each unit.
 
-    `SO2Convolution` internally handles `pre_focus_mix`/`post_focus_mix`, so this
-    block operates on the canonical node layout `(N, D, F, Cf)` at boundaries.
+    `SO2Convolution` internally handles the real multi-focus expansion, so this
+    block keeps a singleton-focus backbone layout `(N, D, 1, C)` at boundaries.
 
     Parameters
     ----------
@@ -81,8 +81,10 @@ class SeZMInteractionBlock(nn.Module):
     channels
         Total channels per (l, m) coefficient.
     n_focus
-        Number of multi-focus streams used by SO(2) branch. Per-focus width is
-        ``focus_dim = channels // n_focus``.
+        Number of multi-focus streams used only by the internal SO(2) branch.
+    focus_dim
+        Hidden width per focus stream used inside the SO(2) branch.
+        ``focus_dim=0`` means using ``channels``.
     focus_compete
         If True, enable cross-focus softmax competition in SO(2) convolution.
     so2_norm
@@ -152,6 +154,7 @@ class SeZMInteractionBlock(nn.Module):
         mmax: int | None = None,
         channels: int,
         n_focus: int = 1,
+        focus_dim: int = 0,
         focus_compete: bool = True,
         so2_norm: bool = False,
         so2_layers: int = 4,
@@ -184,9 +187,11 @@ class SeZMInteractionBlock(nn.Module):
             raise ValueError("`mmax` must be <= `lmax`")
         self.channels = int(channels)
         self.n_focus = int(n_focus)
-        if self.channels % self.n_focus != 0:
-            raise ValueError("`channels` must be divisible by `n_focus`")
-        self.focus_dim = self.channels // self.n_focus
+        if self.n_focus < 1:
+            raise ValueError("`n_focus` must be >= 1")
+        self.focus_dim = int(focus_dim)
+        if self.focus_dim < 0:
+            raise ValueError("`focus_dim` must be >= 0")
         self.focus_compete = bool(focus_compete)
         self.so2_norm = bool(so2_norm)
         self.so2_layers = int(so2_layers)
@@ -241,8 +246,8 @@ class SeZMInteractionBlock(nn.Module):
         if self.so2_pre_norm:
             self.pre_so2_norm: nn.Module = EquivariantRMSNorm(
                 self.lmax,
-                self.focus_dim,
-                n_focus=self.n_focus,
+                self.channels,
+                n_focus=1,
                 centering=True,
                 dtype=self.compute_dtype,
                 trainable=trainable,
@@ -253,8 +258,8 @@ class SeZMInteractionBlock(nn.Module):
         if self.so2_post_norm:
             self.post_so2_norm: nn.Module = EquivariantRMSNorm(
                 self.lmax,
-                self.focus_dim,
-                n_focus=self.n_focus,
+                self.channels,
+                n_focus=1,
                 centering=True,
                 dtype=self.compute_dtype,
                 trainable=trainable,
@@ -267,6 +272,7 @@ class SeZMInteractionBlock(nn.Module):
             mmax=self.mmax,
             channels=self.channels,
             n_focus=self.n_focus,
+            focus_dim=self.focus_dim,
             focus_compete=self.focus_compete,
             so2_norm=self.so2_norm,
             so2_layers=self.so2_layers,
@@ -428,7 +434,7 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         x
-            Features with shape (N, D, F, Cf), where F*Cf=channels.
+            Features with shape `(N, D, 1, C)`.
         edge_cache
             Edge cache.
         radial_feat
@@ -460,7 +466,7 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         value
-            Canonical node features with shape (N, D, F, Cf).
+            Canonical node features with shape `(N, D, 1, C)`.
 
         Returns
         -------
@@ -481,7 +487,7 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         x
-            Canonical node features with shape (N, D, F, Cf).
+            Canonical node features with shape `(N, D, 1, C)`.
         edge_cache
             Edge cache.
         radial_feat
@@ -490,7 +496,7 @@ class SeZMInteractionBlock(nn.Module):
         Returns
         -------
         torch.Tensor
-            SO(2) unit output with shape (N, D, F, Cf).
+            SO(2) unit output with shape `(N, D, 1, C)`.
         """
         n_node = x.shape[0]
         ebed_dim = x.shape[1]
@@ -499,9 +505,7 @@ class SeZMInteractionBlock(nn.Module):
         so2_unit_output = self.so2_conv(
             x_pre.reshape(n_node, ebed_dim, channels), edge_cache, radial_feat
         )
-        return self.post_so2_norm(
-            so2_unit_output.reshape(n_node, ebed_dim, self.n_focus, self.focus_dim)
-        )
+        return self.post_so2_norm(so2_unit_output.unsqueeze(2))
 
     def _run_ffn_unit(self, x: torch.Tensor, unit_idx: int) -> torch.Tensor:
         """
@@ -510,14 +514,14 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         x
-            Canonical node features with shape (N, D, F, Cf).
+            Canonical node features with shape `(N, D, 1, C)`.
         unit_idx
             FFN subblock index.
 
         Returns
         -------
         torch.Tensor
-            FFN unit output with shape (N, D, F, Cf).
+            FFN unit output with shape `(N, D, 1, C)`.
         """
         n_node = x.shape[0]
         ebed_dim = x.shape[1]
@@ -528,7 +532,7 @@ class SeZMInteractionBlock(nn.Module):
         y = self.post_ffn_norms[unit_idx](y)
         if self.layer_scale:
             y = y * self.adam_ffn_layer_scales[unit_idx]
-        return y.squeeze(2).reshape(n_node, ebed_dim, self.n_focus, self.focus_dim)
+        return y
 
     def _forward_with_residual_shortcuts(
         self,
@@ -548,7 +552,7 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         x
-            Canonical node features with shape (N, D, F, Cf).
+            Canonical node features with shape `(N, D, 1, C)`.
         edge_cache
             Edge cache.
         radial_feat
@@ -592,14 +596,14 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         x
-            Current block input with shape (N, D, F, Cf).
+            Current block input with shape `(N, D, 1, C)`.
         edge_cache
             Edge cache.
         radial_feat
             Per-edge radial features with shape (E, lmax+1, C).
         unit_history
             Truncated history in canonical node layout. Each source has shape
-            (N, D, F, Cf).
+            `(N, D, 1, C)`.
 
         Returns
         -------
@@ -652,14 +656,14 @@ class SeZMInteractionBlock(nn.Module):
         Parameters
         ----------
         x
-            Current block input with shape (N, D, F, Cf).
+            Current block input with shape `(N, D, 1, C)`.
         edge_cache
             Edge cache.
         radial_feat
             Per-edge radial features with shape (E, lmax+1, C).
         unit_history
             Truncated block history in canonical node layout. Each source has shape
-            (N, D, F, Cf).
+            `(N, D, 1, C)`.
 
         Returns
         -------
@@ -704,6 +708,7 @@ class SeZMInteractionBlock(nn.Module):
                 "mmax": self.mmax,
                 "channels": self.channels,
                 "n_focus": self.n_focus,
+                "focus_dim": self.focus_dim,
                 "focus_compete": self.focus_compete,
                 "so2_norm": self.so2_norm,
                 "so2_layers": self.so2_layers,

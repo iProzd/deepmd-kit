@@ -225,13 +225,13 @@ Standard DeePMD nlist path:
       ├─ truncate every source in the active history to the current `D_i`
       ├─ optional full AttnRes for SO(2) input from `unit_history`
       ├─ optional block AttnRes for SO(2) input from `block_history`
-      ├─ main tensor layout is fixed as (N, D, F, Cf), contiguous
-      ├─ EquivariantRMSNorm (pre-SO2, per-focus on (N, D, F, Cf))
+      ├─ main tensor layout is fixed as (N, D, 1, C), contiguous
+      ├─ EquivariantRMSNorm (pre-SO2, singleton-focus on (N, D, 1, C))
       ├─ Multi-Focus SO(2) Convolution (enabled for ALL lmax, including lmax=0)
-      │  ├─ `pre_focus_mix`: full-channel mixing on (N, D, C)
-      │  ├─ rotate/bmm in full width (E, D, C), then SO2 stack on strided (E, F, Dm, Cf)
+      │  ├─ `pre_focus_mix`: full-channel projection on (N, D, C)
+      │  ├─ rotate/bmm in hidden width (E, D, H), then SO2 stack on strided (E, F, Dm, Cf)
       │  ├─ optional SO(2) internal AttnRes over local layer history when `so2_attn_res != "none"`
-      │  └─ `post_focus_mix` on (N, 1, D, C)
+      │  └─ `post_focus_mix`: hidden width H -> channel width C
       ├─ FFN subblock sequence (ffn_blocks iterations, global C via view, no permute)
       │  ├─ optional full AttnRes before each FFN unit from `unit_history`
       │  ├─ optional block AttnRes before each FFN unit from `block_history + [partial_block]`
@@ -290,12 +290,16 @@ ______________________________________________________________________
 
 ### Multi-focus SO2 + global FFN
 
-- `channels` is split as `C = F * Cf`, where `F = n_focus` and `Cf = focus_dim`.
-- Backbone tensor stays in a single contiguous layout `(N, D, F, Cf)` across all blocks.
-- SO(2) pre/post norms operate directly on `(N, D, F, Cf)` (per-focus semantics unchanged).
+- The multi-focus SO(2) design is inspired by both MHA and dense MoE:
+  multiple focus streams process the same geometric context in parallel,
+  while `pre_focus_mix` / `post_focus_mix` provide dense channel projections
+  between the backbone width and the internal focus width.
+- Backbone tensor stays in a single contiguous layout `(N, D, 1, C)` across all blocks.
+- Real multi-focus structure is used only inside `SO2Convolution`, where the hidden width is `H = n_focus * focus_dim`.
+- SO(2) pre/post norms on the block boundary operate on `(N, D, 1, C)`.
 - Geometry cache (`edge_vec`, `edge_rbf`, `D_full`, `Dt_full`) is still built once per forward and shared across all focus streams.
-- Radial features keep `(E, L, C)` and are consumed by SO(2) without an explicit focus split.
-- FFN branch uses `view(N, D, C) <-> view(N, D, F, Cf)` only; no layout permute is required.
+- Radial features keep `(E, L, C)` at descriptor level; when `H != C`, the SO(2) branch applies an internal radial hidden projection.
+- FFN branch stays on the singleton-focus backbone `(N, D, 1, C)` with only view-based reshapes.
 
 ### 4. Full equivariant FFN
 
@@ -449,17 +453,18 @@ ______________________________________________________________________
 
 The backbone tensor is:
 
-- `x`: `torch.Tensor` with shape `(N, D, F, Cf)` (contiguous)
+- `x`: `torch.Tensor` with shape `(N, D, 1, C)` (contiguous)
   - `N = nf * nloc`
-  - `F = n_focus`
-  - `Cf = focus_dim`
-  - `C = channels = F * Cf`
+  - `C = channels`
   - `D = ebed_dim = (lmax + 1)^2 = sum_{l=0..lmax} (2l + 1)` is the SO(3) embedding dimension
+  - the singleton focus axis is kept only for module reuse
 
 View conventions used inside blocks:
 
 - `x.view(N, D, C)` for full-channel rotate/bmm and FFN mixing
-- `x.view(N, D, F, Cf)` for per-focus SO(2) pre/post norms
+- `x.view(N, D, 1, C)` at block boundaries
+- inside `SO2Convolution`, hidden features are reshaped to `(E, F, Dm, Cf)` with
+  `F = n_focus`, `Cf = focus_dim`, and `H = F * Cf`
 
 Packing convention:
 
@@ -618,13 +623,12 @@ ______________________________________________________________________
 The `SeZMInteractionBlock` implements a clean two-path residual structure:
 
 ```text
-SeZMInteractionBlock:  # x shape: (N, D, F, Cf)
-  C = F * Cf
+SeZMInteractionBlock:  # x shape: (N, D, 1, C)
 
   # === Path 1: SO(2) Convolution ===
-  x_pre = pre_so2_norm(x)                          # (N, D, F, Cf)
+  x_pre = pre_so2_norm(x)                          # (N, D, 1, C)
   y = so2_conv(view(x_pre, N, D, C), edge_cache, radial_feat)  # (N, D, C)
-  y = post_so2_norm(view(y, N, D, F, Cf))         # (N, D, F, Cf)
+  y = post_so2_norm(view(y, N, D, 1, C))          # (N, D, 1, C)
   x = x + y
 
   # === Path 2: FFN subblock sequence (ffn_blocks iterations) ===
@@ -639,7 +643,7 @@ SeZMInteractionBlock:  # x shape: (N, D, F, Cf)
           y = y * adam_ffn_layer_scales[i]   # per-channel, init 1e-3
       x_ffn = x_ffn + y
 
-  return view(x_ffn.squeeze(1), N, D, F, Cf)
+  return view(x_ffn.squeeze(1), N, D, 1, C)
 ```
 
 Descriptor-level wrapper around each block:
@@ -715,7 +719,8 @@ Key arguments:
 - `mmax: int | None` — Maximum SO(2) order (|m|), only used when `m_schedule` is None. If None, defaults to the per-block lmax
 - `m_schedule: list[int] | None` — Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored
 - `channels: int` — Total channels per (l,m) coefficient (default: 64)
-- `n_focus: int` — Number of parallel focus streams. Internal width is `focus_dim = channels // n_focus`; channels must be divisible by `n_focus` (default: 1)
+- `n_focus: int` — Number of parallel focus streams used only inside the SO(2) convolution (default: 1)
+- `focus_dim: int` — Hidden width per focus stream inside SO(2). `0` means using `channels` (default: 0)
 - Cross-focus softmax competition is enabled automatically when `n_focus > 1`. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
@@ -724,7 +729,7 @@ Key arguments:
 - `so2_attn_res: str` — SO(2)-internal depth-wise attention residual mode inside each interaction block. Allowed values: `none`, `independent`, `dependent` (default: `none`)
 - `ffn_neurons: int` — Hidden size for equivariant FFN (default: 96)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
-- `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the per-focus width `channels // n_focus` must be divisible by `n_atten_head`, and envelope-gated grouped softmax attention with output-side head gate is applied. Attention uses `w^2 * exp(logit)` in the numerator and `zeta + sum(w^2 * exp(logit))` in the denominator.
+- `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 0). When >0, the effective per-focus width (`focus_dim` or `channels` when `focus_dim=0`) must be divisible by `n_atten_head`, and envelope-gated grouped softmax attention with output-side head gate is applied. Attention uses `w^2 * exp(logit)` in the numerator and `zeta + sum(w^2 * exp(logit))` in the denominator.
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
