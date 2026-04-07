@@ -209,5 +209,39 @@ The fix significantly improves force error convergence (0.263 → 0.038 at 10k s
 | File | Changes |
 |------|---------|
 | `deepmd/pt/model/network/moe_ep_ops.py` | Added `result.backward()` in EP backward; sort-based expert dispatch (eliminate clone-per-expert); index_add for GPU-level aggregation |
-| `deepmd/pt/train/training.py` | Added `/= ep_size` for expert grads; batched gradient sync with flatten/unflatten |
+| `deepmd/pt/train/training.py` | Added `/= ep_size` for expert grads; batched gradient sync with flatten/unflatten; async overlapped all-reduce for EP+DP |
 | `deepmd/pt/model/network/moe.py` | Ghost terms → parameter sum; dispatch metadata → bincount (both methods); sort-based `_ep_local_experts` |
+
+---
+
+## EP+DP Correctness Verification (2026-04-06)
+
+### 8-GPU EP (ep_size=8, dp_size=1)
+- All parameter groups have correct non-zero gradients
+- Shared params identical across all ranks (max_diff=0.0)
+- Layer 5 angle params have no grad (expected: last layer angle output unused)
+
+### EP4+DP2 (ep_size=4, dp_size=2)
+- Training: 200 steps completed, 1.618 s/step, loss decreasing normally
+- Shared param grads identical across all 8 ranks (max_diff=0.0)
+- Expert param grads identical within DP group (max_diff=0.0)
+- Expert param grads differ across EP ranks (expected: different experts)
+
+### Multitask EP8
+- 2-task multitask with shared descriptor, 50 steps completed
+- Loss decreasing normally for both tasks
+
+### Speed Optimization: Async Gradient Sync
+Overlapped shared-param and expert-param all-reduce using `async_op=True`.
+
+| Config | Before async | After async | Improvement |
+|--------|-------------|-------------|-------------|
+| EP8 (dp=1) | 1.277 s/step | 1.261 s/step | 1.3% |
+| EP4+DP2 | 1.659 s/step | 1.618 s/step | 2.5% |
+
+### Overall Speed Summary
+
+| Config | Original | Final | Total Improvement |
+|--------|----------|-------|-------------------|
+| EP8 (dp=1) | 1.88 s/step | **1.26 s/step** | **33% faster** |
+| EP4+DP2 | — | 1.62 s/step | (baseline for EP4+DP2) |

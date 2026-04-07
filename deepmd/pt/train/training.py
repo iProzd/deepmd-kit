@@ -1040,6 +1040,7 @@ class Trainer:
           (gate, shared_experts, fitting_net, encoder, etc.)
 
         Gradients are batched into flat buffers to minimize all-reduce calls.
+        Shared and expert all-reduces are overlapped using async ops.
         """
         dp_size = dist.get_world_size(group=self.dp_group)
 
@@ -1054,33 +1055,59 @@ class Trainer:
             else:
                 shared_grads.append(p.grad)
 
-        # Batch all-reduce for shared params (global group)
+        # Launch async all-reduce for shared params (global group)
+        shared_flat = None
+        shared_handle = None
         if shared_grads:
-            flat = torch._utils._flatten_dense_tensors(shared_grads)
-            dist.all_reduce(flat)
-            flat /= self.world_size
+            shared_flat = torch._utils._flatten_dense_tensors(shared_grads)
+            shared_handle = dist.all_reduce(shared_flat, async_op=True)
+
+        # Launch async all-reduce for expert params (dp_group) if dp_size > 1
+        expert_flat = None
+        expert_handle = None
+        if expert_grads and dp_size > 1:
+            expert_flat = torch._utils._flatten_dense_tensors(expert_grads)
+            expert_handle = dist.all_reduce(
+                expert_flat, group=self.dp_group, async_op=True
+            )
+
+        # Wait for shared all-reduce and apply
+        if shared_handle is not None:
+            shared_handle.wait()
+            shared_flat /= self.world_size
             for g, synced in zip(
                 shared_grads,
-                torch._utils._unflatten_dense_tensors(flat, shared_grads),
+                torch._utils._unflatten_dense_tensors(shared_flat, shared_grads),
             ):
                 g.copy_(synced)
 
-        # Batch all-reduce for expert params (dp_group) + scale by ep_size
-        if expert_grads:
-            if dp_size > 1:
+        # Wait for expert all-reduce and apply
+        if expert_handle is not None:
+            expert_handle.wait()
+            # Fuse dp_size and ep_size scaling into one division on flat buffer
+            expert_flat /= dp_size
+            for g, synced in zip(
+                expert_grads,
+                torch._utils._unflatten_dense_tensors(expert_flat, expert_grads),
+            ):
+                g.copy_(synced)
+
+        # Scale expert grads by 1/ep_size (A2A backward accumulates a sum)
+        if expert_grads and self.ep_size > 1:
+            if expert_flat is not None and dp_size > 1:
+                # Already unflatten'd above; scale in-place per param
+                for g in expert_grads:
+                    g /= self.ep_size
+            else:
+                # dp_size == 1: no all-reduce was done, just scale
+                # Use flat buffer to avoid per-param loop overhead
                 flat = torch._utils._flatten_dense_tensors(expert_grads)
-                dist.all_reduce(flat, group=self.dp_group)
-                flat /= dp_size
+                flat /= self.ep_size
                 for g, synced in zip(
                     expert_grads,
                     torch._utils._unflatten_dense_tensors(flat, expert_grads),
                 ):
                     g.copy_(synced)
-            # Expert grads receive the raw SUM of contributions from all
-            # EP ranks through A2A backward. Divide by ep_size to average.
-            if self.ep_size > 1:
-                for g in expert_grads:
-                    g /= self.ep_size
 
     def run(self) -> None:
         fout = (
