@@ -406,10 +406,6 @@ def descrpt_se_zm_args() -> list[Argument]:
         "Number of parallel focus streams. Per-stream width is "
         "`focus_dim = channels // n_focus`; `channels` must be divisible by `n_focus`."
     )
-    doc_focus_compete = (
-        "If True, enable multi-focus softmax competition inside SO(2) convolution. "
-        "Competition logits are built from l=0 scalar channels and applied across focus streams."
-    )
     doc_n_atten_head = (
         "Number of attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
@@ -529,9 +525,6 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_so2_attn_res,
         ),
         Argument("n_focus", int, optional=True, default=1, doc=doc_n_focus),
-        Argument(
-            "focus_compete", bool, optional=True, default=True, doc=doc_focus_compete
-        ),
         Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
         Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
         Argument(

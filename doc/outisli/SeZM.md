@@ -543,8 +543,8 @@ For each edge `(src -> dst)`:
      - l=0: SiLU activation
      - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
    - LayerScale + Residual: `x_local = residual + scale * x_local` (scalar scale, init 1e-3 when `layer_scale=True`; bare residual otherwise)
-1. **Cross-focus competition (optional)**:
-   - Enabled only when `focus_compete=True and n_focus>1`
+1. **Cross-focus competition (automatic when multi-focus is enabled)**:
+   - Enabled only when `n_focus>1`
    - Use scalar-invariant source captured before SO(2) stack: `focus_gate_src = x_local_pre[:, :, 0, :]`
    - Compute logits with per-focus scalar projection and temperature:
      - `logits = focus_compete_proj(ScalarRMSNorm(focus_gate_src))`
@@ -716,7 +716,7 @@ Key arguments:
 - `m_schedule: list[int] | None` — Schedule of mmax per block. Must satisfy `m_schedule[i] <= l_schedule[i]`. If set, `mmax` will be ignored
 - `channels: int` — Total channels per (l,m) coefficient (default: 64)
 - `n_focus: int` — Number of parallel focus streams. Internal width is `focus_dim = channels // n_focus`; channels must be divisible by `n_focus` (default: 1)
-- `focus_compete: bool` — If True, enable cross-focus softmax competition in SO(2) convolution. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus (default: True)
+- Cross-focus softmax competition is enabled automatically when `n_focus > 1`. Logits are built from l=0 scalar channels and normalized across focus streams; weights are broadcast to all `(l, m)` components in each focus
 - `n_radial: int` — Number of radial basis functions (default: 10)
 - `radial_mlp: list[int]` — Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)\*channels is automatically appended (default: [64])
 - `so2_norm: bool` — If True, apply ReducedEquivariantRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers

@@ -180,10 +180,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     n_focus
         Number of parallel focus streams. The per-stream channel width is
         ``focus_dim = channels // n_focus``. Must divide ``channels`` exactly.
-    focus_compete
-        If True, enable cross-focus softmax competition inside SO(2) convolution.
-        Competition logits are built from l=0 scalar channels before SO(2) mixing
-        and applied after SO(2) stack to scale full irreps uniformly per focus.
+        Cross-focus softmax competition inside SO(2) convolution is enabled
+        automatically when ``n_focus > 1``.
     n_atten_head
         Number of attention heads when aggregating messages in SO(2) convolution.
         0 applies a plain envelope-weighted scatter-sum; >0 enables
@@ -284,7 +282,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         so2_layers: int = 4,
         so2_attn_res: str = "none",
         n_focus: int = 1,
-        focus_compete: bool = True,
         n_atten_head: int = 0,
         ffn_neurons: int = 96,
         ffn_blocks: int = 1,
@@ -335,7 +332,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 f"`channels` ({self.channels}) must be divisible by `n_focus` ({self.n_focus})"
             )
         self.focus_dim = self.channels // self.n_focus
-        self.focus_compete = bool(focus_compete)
         self.n_radial = int(n_radial)
         if radial_mlp is None:
             radial_mlp = [64]
@@ -566,7 +562,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     mmax=m_b,
                     channels=self.channels,
                     n_focus=self.n_focus,
-                    focus_compete=self.focus_compete,
                     so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
                     so2_attn_res=self.so2_attn_res_mode,
@@ -1427,7 +1422,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "so2_layers": self.so2_layers,
                 "so2_attn_res": self.so2_attn_res_mode,
                 "n_focus": self.n_focus,
-                "focus_compete": self.focus_compete,
                 "ffn_neurons": self.ffn_neurons,
                 "ffn_blocks": self.ffn_blocks,
                 "layer_scale": self.layer_scale,
