@@ -28,6 +28,18 @@ from .dpa3s_v2_rbf_norm import (
 from .dpa3s_v3_attn import (
     DescrptDPA3V3,
 )
+from .dpa3s_v4_bessel import (
+    DescrptDPA3V4,
+)
+from .dpa3s_v5_gated import (
+    DescrptDPA3V5,
+)
+from .dpa3s_v6_line_attn import (
+    DescrptDPA3V6,
+)
+from .dpa3s_v7_matris import (
+    DescrptDPA3V7,
+)
 from .env_mat import (
     prod_env_mat,
 )
@@ -69,6 +81,10 @@ __all__ = [
     "DescrptDPA3V1",
     "DescrptDPA3V2",
     "DescrptDPA3V3",
+    "DescrptDPA3V4",
+    "DescrptDPA3V5",
+    "DescrptDPA3V6",
+    "DescrptDPA3V7",
     "DescrptHybrid",
     "DescrptSeA",
     "DescrptSeAttenV2",

@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -425,4 +427,391 @@ class SwiGLUFFN(nn.Module):
         obj.w_gate = MLPLayer.deserialize(data["w_gate"])
         obj.w_up = MLPLayer.deserialize(data["w_up"])
         obj.w_down = MLPLayer.deserialize(data["w_down"])
+        return obj
+
+
+class BesselExpansion(nn.Module):
+    """Bessel radial basis with polynomial envelope (DimeNet-style).
+
+    phi_k(r) = sqrt(2/rcut) * sin(k*pi*r/rcut) / r * envelope(r)
+    envelope(r) = 1 + a*(r/rcut)^p + b*(r/rcut)^(p+1) + c*(r/rcut)^(p+2)
+
+    C-infinity smooth within (0, rcut). The envelope ensures smooth decay to 0
+    at the cutoff boundary.
+
+    Parameters
+    ----------
+    num_radial : int
+        Number of Bessel basis functions.
+    cutoff : float
+        Cutoff radius.
+    envelope_exponent : int
+        Polynomial envelope exponent p. Default 8.
+    learnable : bool
+        Whether the Bessel frequencies are trainable.
+    """
+
+    def __init__(
+        self,
+        num_radial: int = 7,
+        cutoff: float = 6.0,
+        envelope_exponent: int = 8,
+        learnable: bool = True,
+    ) -> None:
+        super().__init__()
+        self.num_radial = num_radial
+        self.cutoff = cutoff
+        self.envelope_exponent = envelope_exponent
+        self.learnable = learnable
+        inv_cutoff = 1.0 / cutoff
+        self.register_buffer("inv_cutoff", torch.tensor(inv_cutoff, device="cpu"))
+        self.register_buffer(
+            "norm_const", torch.tensor((2.0 * inv_cutoff) ** 0.5, device="cpu")
+        )
+
+        freqs = math.pi * torch.arange(1, num_radial + 1, dtype=torch.float64, device="cpu")
+        if learnable:
+            self.frequencies = nn.Parameter(freqs)
+        else:
+            self.register_buffer("frequencies", freqs)
+
+        # Polynomial envelope coefficients
+        p = float(envelope_exponent)
+        self.register_buffer("p", torch.tensor(p, device="cpu"))
+        self.register_buffer("a", torch.tensor(-(p + 1) * (p + 2) / 2, device="cpu"))
+        self.register_buffer("b", torch.tensor(p * (p + 2), device="cpu"))
+        self.register_buffer("c", torch.tensor(-p * (p + 1) / 2, device="cpu"))
+
+    def _envelope(self, r_scaled: torch.Tensor) -> torch.Tensor:
+        """Polynomial envelope that smoothly goes to 0 at r_scaled=1."""
+        p = self.p
+        env_val = (
+            1.0
+            + self.a * r_scaled.pow(p)
+            + self.b * r_scaled.pow(p + 1)
+            + self.c * r_scaled.pow(p + 2)
+        )
+        return torch.where(r_scaled < 1.0, env_val, torch.zeros_like(env_val))
+
+    def forward(self, dist: torch.Tensor) -> torch.Tensor:
+        """Expand distances to Bessel basis features.
+
+        Parameters
+        ----------
+        dist : torch.Tensor
+            Input distances. Shape: (...,).
+
+        Returns
+        -------
+        torch.Tensor
+            Bessel features. Shape: (..., num_radial).
+        """
+        dist = dist.unsqueeze(-1)  # (..., 1)
+        d_scaled = dist * self.inv_cutoff
+        rbf = self.norm_const * torch.sin(self.frequencies * d_scaled) / (
+            dist + 1e-8
+        )
+        envelope = self._envelope(d_scaled)
+        return rbf * envelope
+
+    def serialize(self) -> dict:
+        """Serialize the module to a dict."""
+        return {
+            "@class": "BesselExpansion",
+            "@version": 1,
+            "num_radial": self.num_radial,
+            "cutoff": self.cutoff,
+            "envelope_exponent": self.envelope_exponent,
+            "learnable": self.learnable,
+            "frequencies": self.frequencies.detach().cpu().numpy().tolist(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "BesselExpansion":
+        """Deserialize the module from a dict."""
+        obj = cls(
+            num_radial=data["num_radial"],
+            cutoff=data["cutoff"],
+            envelope_exponent=data["envelope_exponent"],
+            learnable=data["learnable"],
+        )
+        freq_tensor = torch.tensor(
+            data["frequencies"], dtype=obj.frequencies.dtype, device="cpu"
+        )
+        if data["learnable"]:
+            obj.frequencies.data.copy_(freq_tensor)
+        else:
+            obj.frequencies.copy_(freq_tensor)
+        return obj
+
+
+# PLACEHOLDER_FOURIER
+
+
+class FourierExpansion(nn.Module):
+    """Fourier expansion for angles.
+
+    Output: [1/sqrt(2), sin(1*theta), ..., sin(K*theta),
+             cos(1*theta), ..., cos(K*theta)] / sqrt(pi)
+    Total dimension: 1 + 2*max_f.
+
+    Parameters
+    ----------
+    max_f : int
+        Maximum frequency. Output dimension = 1 + 2*max_f.
+    learnable : bool
+        Whether the frequencies are trainable.
+    """
+
+    def __init__(self, max_f: int = 3, learnable: bool = True) -> None:
+        super().__init__()
+        self.max_f = max_f
+        self.learnable = learnable
+        self.register_buffer("scale", torch.tensor(math.pi**0.5, device="cpu"))
+        freqs = torch.arange(1, max_f + 1, dtype=torch.float64, device="cpu")
+        if learnable:
+            self.frequencies = nn.Parameter(freqs)
+        else:
+            self.register_buffer("frequencies", freqs)
+
+    @property
+    def num_output(self) -> int:
+        """Output dimension."""
+        return 1 + 2 * self.max_f
+
+    def forward(self, angle: torch.Tensor) -> torch.Tensor:
+        """Expand angles (radians) to Fourier features.
+
+        Parameters
+        ----------
+        angle : torch.Tensor
+            Input angles in radians. Shape: (...,).
+
+        Returns
+        -------
+        torch.Tensor
+            Fourier features. Shape: (..., 1 + 2*max_f).
+        """
+        result = angle.new_zeros(*angle.shape, 1 + 2 * self.max_f)
+        result[..., 0] = 1.0 / (2.0**0.5)
+        tmp = angle.unsqueeze(-1) * self.frequencies
+        result[..., 1 : self.max_f + 1] = torch.sin(tmp)
+        result[..., self.max_f + 1 :] = torch.cos(tmp)
+        return result / self.scale
+
+    def serialize(self) -> dict:
+        """Serialize the module to a dict."""
+        return {
+            "@class": "FourierExpansion",
+            "@version": 1,
+            "max_f": self.max_f,
+            "learnable": self.learnable,
+            "frequencies": self.frequencies.detach().cpu().numpy().tolist(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "FourierExpansion":
+        """Deserialize the module from a dict."""
+        obj = cls(max_f=data["max_f"], learnable=data["learnable"])
+        freq_tensor = torch.tensor(
+            data["frequencies"], dtype=obj.frequencies.dtype, device="cpu"
+        )
+        if data["learnable"]:
+            obj.frequencies.data.copy_(freq_tensor)
+        else:
+            obj.frequencies.copy_(freq_tensor)
+        return obj
+
+
+# PLACEHOLDER_DIMWISE
+
+
+def dimwise_softmax(
+    feas: torch.Tensor,
+    segment: torch.Tensor,
+    num_segment: int | None = None,
+) -> torch.Tensor:
+    """Per-dimension softmax over segments (MatRIS-style).
+
+    For each feature dimension independently, compute softmax-normalized
+    weights across all entries belonging to the same segment.
+
+    Parameters
+    ----------
+    feas : torch.Tensor
+        Input features. Shape: (N, D).
+    segment : torch.Tensor
+        Segment index for each row. Shape: (N,).
+    num_segment : int or None
+        Total number of segments. Inferred from segment if None.
+
+    Returns
+    -------
+    torch.Tensor
+        Normalized weights. Shape: (N, D).
+    """
+    N, D = feas.shape
+    if num_segment is None:
+        num_segment = int(segment.max().item()) + 1
+    seg_exp = segment.unsqueeze(1).expand(-1, D)
+
+    # Numerically stable softmax: subtract per-segment max
+    feas_max = feas.new_full((num_segment, D), float("-inf"))
+    feas_max = feas_max.scatter_reduce(
+        0, seg_exp, feas, reduce="amax", include_self=False
+    )
+    feas_max_gathered = feas_max[segment]
+
+    out = (feas - feas_max_gathered).exp()
+    out_sum = feas.new_zeros(num_segment, D)
+    out_sum = out_sum.scatter_reduce(
+        0, seg_exp, out, reduce="sum", include_self=False
+    )
+    out_sum_gathered = out_sum[segment]
+
+    return out / (out_sum_gathered + 1e-12)
+
+
+class GatedMLP(nn.Module):
+    """MatRIS-style GatedMLP: core * gate.
+
+    core = silu(RMSNorm(MLP_core(x)))
+    gate = sigmoid(RMSNorm(MLP_gate(x)))
+    output = core * gate
+
+    Each branch is a 2-hidden-layer MLP (input -> hidden -> hidden -> output).
+
+    Parameters
+    ----------
+    input_dim : int
+        Input dimension.
+    hidden_dim : int
+        Hidden layer dimension for both branches.
+    output_dim : int
+        Output dimension.
+    precision : str
+        Parameter precision.
+    seed : int or list[int] or None
+        Random seed for initialization.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        precision: str = "float32",
+        seed: int | list[int] | None = None,
+    ) -> None:
+        from deepmd.dpmodel.utils.seed import child_seed
+        from deepmd.pt.model.network.mlp import MLPLayer
+
+        super().__init__()
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
+        self.precision = precision
+
+        # Core branch: input -> hidden -> hidden -> output
+        self.core_l1 = MLPLayer(
+            input_dim, hidden_dim, bias=False, precision=precision,
+            seed=child_seed(seed, 0),
+        )
+        self.core_l2 = MLPLayer(
+            hidden_dim, hidden_dim, bias=False, precision=precision,
+            seed=child_seed(seed, 1),
+        )
+        self.core_l3 = MLPLayer(
+            hidden_dim, output_dim, bias=False, precision=precision,
+            seed=child_seed(seed, 2),
+        )
+        # Gate branch: input -> hidden -> hidden -> output
+        self.gate_l1 = MLPLayer(
+            input_dim, hidden_dim, bias=False, precision=precision,
+            seed=child_seed(seed, 3),
+        )
+        self.gate_l2 = MLPLayer(
+            hidden_dim, hidden_dim, bias=False, precision=precision,
+            seed=child_seed(seed, 4),
+        )
+        self.gate_l3 = MLPLayer(
+            hidden_dim, output_dim, bias=False, precision=precision,
+            seed=child_seed(seed, 5),
+        )
+        # Norms (create on same device as MLPLayer params)
+        from deepmd.pt.utils import env as _env
+        with torch.device(_env.DEVICE):
+            self.core_norm = RMSNorm(output_dim)
+            self.gate_norm = RMSNorm(output_dim)
+
+        from deepmd.pt.utils.utils import ActivationFn
+        self.act = ActivationFn("silu")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor. Shape: (..., input_dim).
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor. Shape: (..., output_dim).
+        """
+        # Core branch
+        core = self.act(self.core_l1(x))
+        core = self.act(self.core_l2(core))
+        core = self.core_l3(core)
+        core = torch.nn.functional.silu(self.core_norm(core))
+
+        # Gate branch
+        gate = self.act(self.gate_l1(x))
+        gate = self.act(self.gate_l2(gate))
+        gate = self.gate_l3(gate)
+        gate = torch.sigmoid(self.gate_norm(gate))
+
+        return core * gate
+
+    def serialize(self) -> dict:
+        """Serialize the module to a dict."""
+        return {
+            "@class": "GatedMLP",
+            "@version": 1,
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "output_dim": self.output_dim,
+            "precision": self.precision,
+            "core_l1": self.core_l1.serialize(),
+            "core_l2": self.core_l2.serialize(),
+            "core_l3": self.core_l3.serialize(),
+            "gate_l1": self.gate_l1.serialize(),
+            "gate_l2": self.gate_l2.serialize(),
+            "gate_l3": self.gate_l3.serialize(),
+            "core_norm": self.core_norm.serialize(),
+            "gate_norm": self.gate_norm.serialize(),
+        }
+
+    @classmethod
+    def deserialize(cls, data: dict) -> "GatedMLP":
+        """Deserialize the module from a dict."""
+        from deepmd.pt.model.network.mlp import MLPLayer
+        from deepmd.pt.utils import env as _env
+
+        obj = cls(
+            input_dim=data["input_dim"],
+            hidden_dim=data["hidden_dim"],
+            output_dim=data["output_dim"],
+            precision=data["precision"],
+        )
+        obj.core_l1 = MLPLayer.deserialize(data["core_l1"])
+        obj.core_l2 = MLPLayer.deserialize(data["core_l2"])
+        obj.core_l3 = MLPLayer.deserialize(data["core_l3"])
+        obj.gate_l1 = MLPLayer.deserialize(data["gate_l1"])
+        obj.gate_l2 = MLPLayer.deserialize(data["gate_l2"])
+        obj.gate_l3 = MLPLayer.deserialize(data["gate_l3"])
+        with torch.device(_env.DEVICE):
+            obj.core_norm = RMSNorm.deserialize(data["core_norm"])
+            obj.gate_norm = RMSNorm.deserialize(data["gate_norm"])
         return obj

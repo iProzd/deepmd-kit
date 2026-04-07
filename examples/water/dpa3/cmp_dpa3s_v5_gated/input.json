@@ -1,0 +1,78 @@
+{
+  "_comment": "dpa3s V5: V4 + GatedMLP on 3 key paths (symmetrization preserved)",
+  "model": {
+    "type_map": ["O", "H"],
+    "descriptor": {
+      "type": "dpa3s_v5_gated",
+      "n_dim": 256,
+      "e_dim": 128,
+      "a_dim": 64,
+      "nlayers": 3,
+      "e_rcut": 6.0,
+      "e_rcut_smth": 5.0,
+      "e_sel": 120,
+      "a_rcut": 4.0,
+      "a_rcut_smth": 3.5,
+      "a_sel": 40,
+      "axis_neuron": 4,
+      "sel_reduce_factor": 10.0,
+      "num_edge_basis": 7,
+      "num_angle_basis": 7,
+      "envelope_exponent": 8,
+      "learnable_basis": true,
+      "gated_hidden_dim": 128,
+      "activation_function": "silu",
+      "precision": "float32",
+      "seed": 1
+    },
+    "fitting_net": {
+      "neuron": [240, 240, 240],
+      "resnet_dt": true,
+      "precision": "float32",
+      "activation_function": "silu",
+      "seed": 1
+    }
+  },
+  "learning_rate": {
+    "type": "exp",
+    "decay_steps": 5000,
+    "start_lr": 0.001,
+    "stop_lr": 3e-5
+  },
+  "loss": {
+    "type": "ener",
+    "start_pref_e": 0.2,
+    "limit_pref_e": 20,
+    "start_pref_f": 100,
+    "limit_pref_f": 60,
+    "start_pref_v": 0.02,
+    "limit_pref_v": 1
+  },
+  "optimizer": {
+    "type": "AdamW",
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "weight_decay": 0.001
+  },
+  "training": {
+    "stat_file": "./stat.hdf5",
+    "training_data": {
+      "systems": [
+        "../data/data_0",
+        "../data/data_1",
+        "../data/data_2"
+      ],
+      "batch_size": 1
+    },
+    "validation_data": {
+      "systems": ["../data/data_3"],
+      "batch_size": 1
+    },
+    "numb_steps": 20,
+    "gradient_max_norm": 5.0,
+    "seed": 10,
+    "disp_file": "lcurve.out",
+    "disp_freq": 5,
+    "save_freq": 20
+  }
+}

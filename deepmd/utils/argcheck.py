@@ -2015,7 +2015,91 @@ def descrpt_dpa3s_v3_attn_args() -> list[Argument]:
     ]
 
 
-# repflow for dpa3
+def _dpa3s_v4_base_args() -> list[Argument]:
+    """Shared base arguments for V4-V7 variants."""
+    doc_n_dim = "The dimension of node representation."
+    doc_e_dim = "The dimension of edge representation."
+    doc_a_dim = "The dimension of angle representation."
+    doc_nlayers = "The number of repflow layers."
+    doc_e_rcut = "The edge cut-off radius."
+    doc_e_rcut_smth = "Where to start smoothing for edge."
+    doc_e_sel = "Maximally possible number of selected edge neighbors."
+    doc_a_rcut = "The angle cut-off radius."
+    doc_a_rcut_smth = "Where to start smoothing for angle."
+    doc_a_sel = "Maximally possible number of selected angle neighbors."
+    doc_axis_neuron = "The number of dimension of submatrix used for rot_mat computation."
+    doc_sel_reduce_factor = "Reduction factor applied to neighbor-scale normalization."
+    doc_num_edge_basis = "Number of Bessel radial basis functions for edge distance embedding."
+    doc_num_angle_basis = "Number of Fourier basis functions for angle embedding (must be odd)."
+    doc_envelope_exponent = "Polynomial envelope exponent for Bessel basis."
+    doc_learnable_basis = "Whether the basis function frequencies are trainable."
+    doc_concat_output_tebd = "Whether to concat type embedding at the output of the descriptor."
+    doc_add_chg_spin_ebd = "Whether to add charge and spin embedding to the descriptor."
+    doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_precision = f"The precision of the embedding net parameters, supported options are {list_to_doc(PRECISION_DICT.keys())} Default follows the interface precision."
+    doc_exclude_types = "The excluded pairs of types which have no interaction with each other."
+    doc_env_protection = "Protection parameter to prevent division by zero errors during environment matrix calculations."
+    doc_trainable = "If the parameters in the embedding net is trainable."
+    doc_seed = "Random seed for parameter initialization."
+    doc_use_econf_tebd = "Whether to use electronic configuration type embedding."
+    doc_use_tebd_bias = "Whether to use bias in the type embedding layer."
+    return [
+        Argument("n_dim", int, optional=True, default=128, doc=doc_n_dim),
+        Argument("e_dim", int, optional=True, default=64, doc=doc_e_dim),
+        Argument("a_dim", int, optional=True, default=32, doc=doc_a_dim),
+        Argument("nlayers", int, optional=True, default=6, doc=doc_nlayers),
+        Argument("e_rcut", float, optional=False, doc=doc_e_rcut),
+        Argument("e_rcut_smth", float, optional=False, doc=doc_e_rcut_smth),
+        Argument("e_sel", [int, str], optional=False, doc=doc_e_sel),
+        Argument("a_rcut", float, optional=False, doc=doc_a_rcut),
+        Argument("a_rcut_smth", float, optional=False, doc=doc_a_rcut_smth),
+        Argument("a_sel", [int, str], optional=False, doc=doc_a_sel),
+        Argument("axis_neuron", int, optional=True, default=4, doc=doc_axis_neuron),
+        Argument("sel_reduce_factor", float, optional=True, default=10.0, doc=doc_sel_reduce_factor),
+        Argument("num_edge_basis", int, optional=True, default=7, doc=doc_num_edge_basis),
+        Argument("num_angle_basis", int, optional=True, default=7, doc=doc_num_angle_basis),
+        Argument("envelope_exponent", int, optional=True, default=8, doc=doc_envelope_exponent),
+        Argument("learnable_basis", bool, optional=True, default=True, doc=doc_learnable_basis),
+        Argument("concat_output_tebd", bool, optional=True, default=False, doc=doc_concat_output_tebd),
+        Argument("add_chg_spin_ebd", bool, optional=True, default=False, doc=doc_add_chg_spin_ebd),
+        Argument("activation_function", str, optional=True, default="silu", doc=doc_activation_function),
+        Argument("precision", str, optional=True, default="default", doc=doc_precision),
+        Argument("exclude_types", list[list[int]], optional=True, default=[], doc=doc_exclude_types),
+        Argument("env_protection", float, optional=True, default=0.0, doc=doc_env_protection),
+        Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
+        Argument("seed", [int, None], optional=True, doc=doc_seed),
+        Argument("use_econf_tebd", bool, optional=True, default=False, doc=doc_use_econf_tebd),
+        Argument("use_tebd_bias", bool, optional=True, default=False, doc=doc_use_tebd_bias),
+    ]
+
+
+@descrpt_args_plugin.register("dpa3s_v4_bessel", doc=doc_only_pt_supported)
+def descrpt_dpa3s_v4_bessel_args() -> list[Argument]:
+    return _dpa3s_v4_base_args()
+
+
+@descrpt_args_plugin.register("dpa3s_v5_gated", doc=doc_only_pt_supported)
+def descrpt_dpa3s_v5_gated_args() -> list[Argument]:
+    return _dpa3s_v4_base_args() + [
+        Argument("gated_hidden_dim", int, optional=True, default=128,
+                 doc="Hidden dimension for GatedMLP branches."),
+    ]
+
+
+@descrpt_args_plugin.register("dpa3s_v6_line_attn", doc=doc_only_pt_supported)
+def descrpt_dpa3s_v6_line_attn_args() -> list[Argument]:
+    return _dpa3s_v4_base_args() + [
+        Argument("gated_hidden_dim", int, optional=True, default=128,
+                 doc="Hidden dimension for GatedMLP branches."),
+    ]
+
+
+@descrpt_args_plugin.register("dpa3s_v7_matris", doc=doc_only_pt_supported)
+def descrpt_dpa3s_v7_matris_args() -> list[Argument]:
+    return _dpa3s_v4_base_args() + [
+        Argument("gated_hidden_dim", int, optional=True, default=128,
+                 doc="Hidden dimension for GatedMLP branches."),
+    ]
 def dpa3_repflow_args() -> list[Argument]:
     # repflow args
     doc_n_dim = "The dimension of node representation."
