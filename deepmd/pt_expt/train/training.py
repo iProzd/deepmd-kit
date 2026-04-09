@@ -990,7 +990,8 @@ class Trainer:
                             learning_rate=None,
                         )
                     )
-                # Log gradient norm
+                # Compute average gradient norm for logging and lcurve
+                avg_grad_norm: float | None = None
                 if self.disp_grad_norm and self.grad_norm_count > 0:
                     avg_grad_norm = self.grad_norm_accu / self.grad_norm_count
                     log.info(
@@ -1005,10 +1006,15 @@ class Trainer:
 
                 # lcurve file
                 if self.lcurve_should_print_header:
-                    self.print_header(fout, train_results, valid_results)
+                    self.print_header(fout, train_results, valid_results, avg_grad_norm)
                     self.lcurve_should_print_header = False
                 self.print_on_training(
-                    fout, display_step_id, cur_lr, train_results, valid_results
+                    fout,
+                    display_step_id,
+                    cur_lr,
+                    train_results,
+                    valid_results,
+                    avg_grad_norm,
                 )
 
                 self.wrapper.train()
@@ -1032,6 +1038,7 @@ class Trainer:
         fout: Any,
         train_results: dict[str, Any],
         valid_results: dict[str, Any],
+        grad_norm: float | None = None,
     ) -> None:
         train_keys = sorted(train_results.keys())
         header = "# {:5s}".format("step")
@@ -1041,7 +1048,11 @@ class Trainer:
         else:
             for k in train_keys:
                 header += f"   {k + '_trn':>11s}"
-        header += "   {:8s}\n".format("lr")
+        header += "   {:8s}".format("lr")
+        # Add gradient norm column to header
+        if grad_norm is not None:
+            header += f"   {'grad_norm':>11s}"
+        header += "\n"
         fout.write(header)
         fout.flush()
 
@@ -1052,6 +1063,7 @@ class Trainer:
         cur_lr: float,
         train_results: dict,
         valid_results: dict,
+        grad_norm: float | None = None,
     ) -> None:
         train_keys = sorted(train_results.keys())
         line = f"{step_id:7d}"
@@ -1061,7 +1073,11 @@ class Trainer:
         else:
             for k in train_keys:
                 line += f"   {train_results[k]:11.2e}"
-        line += f"   {cur_lr:8.1e}\n"
+        line += f"   {cur_lr:8.1e}"
+        # Add gradient norm value
+        if grad_norm is not None:
+            line += f"   {grad_norm:11.2e}"
+        line += "\n"
         fout.write(line)
         fout.flush()
 

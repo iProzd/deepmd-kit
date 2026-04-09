@@ -1351,6 +1351,10 @@ class Trainer:
                 if not self.multi_task:
                     train_results = log_loss_train(loss, more_loss)
                     valid_results = log_loss_valid()
+                    # Compute average gradient norm for logging and lcurve
+                    avg_grad_norm: float | None = None
+                    if self.disp_grad_norm and self.grad_norm_count > 0:
+                        avg_grad_norm = self.grad_norm_accu / self.grad_norm_count
                     if self.rank == 0:
                         log.info(
                             format_training_message_per_task(
@@ -1370,8 +1374,7 @@ class Trainer:
                                 )
                             )
                         # Log gradient norm for single-task
-                        if self.disp_grad_norm and self.grad_norm_count > 0:
-                            avg_grad_norm = self.grad_norm_accu / self.grad_norm_count
+                        if avg_grad_norm is not None:
                             log.info(
                                 format_grad_norm_message(
                                     batch=display_step_id,
@@ -1425,8 +1428,9 @@ class Trainer:
                                             learning_rate=None,
                                         )
                                     )
-                    # Log gradient norms for multi-task (all tasks in one message)
-                    if self.disp_grad_norm and self.rank == 0:
+                    # Compute gradient norms for multi-task for logging and lcurve
+                    grad_norms_per_task: dict[str, float] | None = None
+                    if self.disp_grad_norm:
                         grad_norms_per_task = {}
                         for _key in self.model_keys:
                             if self.grad_norm_count_per_task.get(_key, 0) > 0:
@@ -1434,7 +1438,7 @@ class Trainer:
                                     self.grad_norm_accu_per_task[_key]
                                     / self.grad_norm_count_per_task[_key]
                                 )
-                        if grad_norms_per_task:
+                        if grad_norms_per_task and self.rank == 0:
                             log.info(
                                 format_grad_norm_message(
                                     batch=display_step_id,
@@ -1503,11 +1507,25 @@ class Trainer:
                         )
 
                 if fout:
+                    # Prepare gradient norm for lcurve output
+                    if not self.multi_task:
+                        grad_norm_for_lcurve: float | dict[str, float] | None = (
+                            avg_grad_norm
+                        )
+                    else:
+                        grad_norm_for_lcurve = grad_norms_per_task
                     if self.lcurve_should_print_header:
-                        self.print_header(fout, train_results, valid_results)
+                        self.print_header(
+                            fout, train_results, valid_results, grad_norm_for_lcurve
+                        )
                         self.lcurve_should_print_header = False
                     self.print_on_training(
-                        fout, display_step_id, cur_lr, train_results, valid_results
+                        fout,
+                        display_step_id,
+                        cur_lr,
+                        train_results,
+                        valid_results,
+                        grad_norm_for_lcurve,
                     )
 
             if (
@@ -1762,7 +1780,11 @@ class Trainer:
         return input_dict, label_dict, log_dict
 
     def print_header(
-        self, fout: Any, train_results: dict[str, Any], valid_results: dict[str, Any]
+        self,
+        fout: Any,
+        train_results: dict[str, Any],
+        valid_results: dict[str, Any],
+        grad_norm: float | dict[str, float] | None = None,
     ) -> None:
         train_keys = sorted(train_results.keys())
         print_str = ""
@@ -1789,7 +1811,17 @@ class Trainer:
                     prop_fmt = "   %11s"
                     for k in sorted(train_results[model_key].keys()):
                         print_str += prop_fmt % (k + f"_trn_{model_key}")
-        print_str += "   {:8s}\n".format("lr")
+        print_str += "   {:8s}".format("lr")
+        # Add gradient norm column(s) to header
+        if grad_norm is not None:
+            if isinstance(grad_norm, dict):
+                # Multi-task: add one column per task
+                for task_name in sorted(grad_norm.keys()):
+                    print_str += f"   {'gnorm_' + task_name:>11s}"
+            else:
+                # Single-task: add one column
+                print_str += f"   {'grad_norm':>11s}"
+        print_str += "\n"
         print_str += "# If there is no available reference data, rmse_*_{val,trn} will print nan\n"
         fout.write(print_str)
         fout.flush()
@@ -1801,6 +1833,7 @@ class Trainer:
         cur_lr: float,
         train_results: dict,
         valid_results: dict,
+        grad_norm: float | dict[str, float] | None = None,
     ) -> None:
         train_keys = sorted(train_results.keys())
         print_str = ""
@@ -1827,7 +1860,17 @@ class Trainer:
                     prop_fmt = "   %11.2e"
                     for k in sorted(train_results[model_key].keys()):
                         print_str += prop_fmt % (train_results[model_key][k])
-        print_str += f"   {cur_lr:8.1e}\n"
+        print_str += f"   {cur_lr:8.1e}"
+        # Add gradient norm value(s)
+        if grad_norm is not None:
+            if isinstance(grad_norm, dict):
+                # Multi-task: add one value per task
+                for task_name in sorted(grad_norm.keys()):
+                    print_str += f"   {grad_norm[task_name]:11.2e}"
+            else:
+                # Single-task: add one value
+                print_str += f"   {grad_norm:11.2e}"
+        print_str += "\n"
         fout.write(print_str)
         fout.flush()
 
