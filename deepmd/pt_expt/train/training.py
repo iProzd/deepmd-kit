@@ -34,6 +34,7 @@ from deepmd.dpmodel.utils.learning_rate import (
     LearningRateExp,
 )
 from deepmd.loggers.training import (
+    format_grad_norm_message,
     format_training_message,
     format_training_message_per_task,
 )
@@ -437,6 +438,7 @@ class Trainer:
         self.save_freq = training_params.get("save_freq", 1000)
         self.display_in_training = training_params.get("disp_training", True)
         self.timing_in_training = training_params.get("time_training", True)
+        self.disp_grad_norm = training_params.get("disp_grad_norm", False)
         self.lcurve_should_print_header = True
 
         # Model ---------------------------------------------------------------
@@ -857,6 +859,11 @@ class Trainer:
         wall_start = time.time()
         last_log_time = wall_start
 
+        # Initialize gradient norm accumulators for logging
+        if self.disp_grad_norm:
+            self.grad_norm_accu: float = 0.0
+            self.grad_norm_count: int = 0
+
         for step_id in range(self.start_step, self.num_steps):
             cur_lr = float(self.lr_schedule.value(step_id))
 
@@ -873,10 +880,24 @@ class Trainer:
             )
             loss.backward()
 
-            if self.gradient_max_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.wrapper.parameters(), self.gradient_max_norm
-                )
+            # Compute gradient norm for logging if enabled
+            total_norm: torch.Tensor | None = None
+            if self.disp_grad_norm or self.gradient_max_norm > 0.0:
+                if self.gradient_max_norm > 0.0:
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.wrapper.parameters(), self.gradient_max_norm
+                    )
+                else:
+                    # Compute total gradient norm without clipping
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.wrapper.parameters(),
+                        float("inf"),  # No clipping
+                    )
+
+                # Accumulate gradient norm for logging
+                if self.disp_grad_norm and total_norm is not None:
+                    self.grad_norm_accu += total_norm.item()
+                    self.grad_norm_count += 1
 
             self._optimizer_step()
 
@@ -969,13 +990,31 @@ class Trainer:
                             learning_rate=None,
                         )
                     )
+                # Compute average gradient norm for logging and lcurve
+                avg_grad_norm: float | None = None
+                if self.disp_grad_norm and self.grad_norm_count > 0:
+                    avg_grad_norm = self.grad_norm_accu / self.grad_norm_count
+                    log.info(
+                        format_grad_norm_message(
+                            batch=display_step_id,
+                            grad_norm=avg_grad_norm,
+                        )
+                    )
+                    # Reset gradient norm accumulators after display
+                    self.grad_norm_accu = 0.0
+                    self.grad_norm_count = 0
 
                 # lcurve file
                 if self.lcurve_should_print_header:
-                    self.print_header(fout, train_results, valid_results)
+                    self.print_header(fout, train_results, valid_results, avg_grad_norm)
                     self.lcurve_should_print_header = False
                 self.print_on_training(
-                    fout, display_step_id, cur_lr, train_results, valid_results
+                    fout,
+                    display_step_id,
+                    cur_lr,
+                    train_results,
+                    valid_results,
+                    avg_grad_norm,
                 )
 
                 self.wrapper.train()
@@ -999,6 +1038,7 @@ class Trainer:
         fout: Any,
         train_results: dict[str, Any],
         valid_results: dict[str, Any],
+        grad_norm: float | None = None,
     ) -> None:
         train_keys = sorted(train_results.keys())
         header = "# {:5s}".format("step")
@@ -1008,7 +1048,11 @@ class Trainer:
         else:
             for k in train_keys:
                 header += f"   {k + '_trn':>11s}"
-        header += "   {:8s}\n".format("lr")
+        header += "   {:8s}".format("lr")
+        # Add gradient norm column to header
+        if grad_norm is not None:
+            header += f"   {'grad_norm':>11s}"
+        header += "\n"
         fout.write(header)
         fout.flush()
 
@@ -1019,6 +1063,7 @@ class Trainer:
         cur_lr: float,
         train_results: dict,
         valid_results: dict,
+        grad_norm: float | None = None,
     ) -> None:
         train_keys = sorted(train_results.keys())
         line = f"{step_id:7d}"
@@ -1028,7 +1073,11 @@ class Trainer:
         else:
             for k in train_keys:
                 line += f"   {train_results[k]:11.2e}"
-        line += f"   {cur_lr:8.1e}\n"
+        line += f"   {cur_lr:8.1e}"
+        # Add gradient norm value
+        if grad_norm is not None:
+            line += f"   {grad_norm:11.2e}"
+        line += "\n"
         fout.write(line)
         fout.flush()
 

@@ -116,3 +116,50 @@ def format_training_message_per_task(
         )
         raise RuntimeError(err_msg)
     return msg
+
+
+def format_grad_norm_message(
+    batch: int,
+    grad_norm: float | dict[str, float],
+) -> str:
+    """Format gradient norm message for logging.
+
+    This function formats gradient norm information for display during training.
+    It supports both single-task training (single float value) and multitask
+    training (dictionary mapping task names to gradient norms).
+
+    Parameters
+    ----------
+    batch : int
+        The batch index.
+    grad_norm : float | dict[str, float]
+        The gradient norm value(s). For single-task training, this is a float.
+        For multitask training, this is a dictionary mapping task names to
+        their respective gradient norms.
+
+    Returns
+    -------
+    str
+        The formatted gradient norm message.
+
+    Examples
+    --------
+    Single-task training:
+    >>> format_grad_norm_message(100, 1.5e-3)
+    'Batch     100: grad_norm = 1.50e-03'
+
+    Multitask training:
+    >>> format_grad_norm_message(100, {"task1": 1.5e-3, "task2": 2.0e-3})
+    'Batch     100: grad_norm: task1 = 1.50e-03, task2 = 2.00e-03'
+    """
+    if isinstance(grad_norm, dict):
+        # Multitask: format as "grad_norm: task1 = X, task2 = Y, ..."
+        grad_norm = dict(sorted(grad_norm.items()))
+        norms_str = ", ".join(
+            [f"{task} = {norm:8.2e}" for task, norm in grad_norm.items()]
+        )
+        msg = f"Batch {batch:7d}: grad_norm: {norms_str}"
+    else:
+        # Single-task: format as "grad_norm = X"
+        msg = f"Batch {batch:7d}: grad_norm = {grad_norm:8.2e}"
+    return msg
