@@ -3916,6 +3916,10 @@ def training_args(
     )
     doc_disp_training = "Displaying verbose information during training."
     doc_time_training = "Timing during training."
+    doc_disp_grad_norm = (
+        "Display the gradient norm during training. This is useful for observing "
+        "gradient norm scale mismatch between tasks during multitask training."
+    )
     doc_disp_avg = (
         "Display the average loss over the display interval for training sets."
     )
@@ -4033,6 +4037,13 @@ def training_args(
         ),
         Argument(
             "time_training", bool, optional=True, default=True, doc=doc_time_training
+        ),
+        Argument(
+            "disp_grad_norm",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_disp_grad_norm,
         ),
         Argument(
             "disp_avg",

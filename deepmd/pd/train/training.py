@@ -40,6 +40,7 @@ from deepmd.dpmodel.utils.learning_rate import (
     BaseLR,
 )
 from deepmd.loggers.training import (
+    format_grad_norm_message,
     format_training_message,
     format_training_message_per_task,
 )
@@ -153,6 +154,7 @@ class Trainer:
         self.max_ckpt_keep = training_params.get("max_ckpt_keep", 5)
         self.display_in_training = training_params.get("disp_training", True)
         self.timing_in_training = training_params.get("time_training", True)
+        self.disp_grad_norm = training_params.get("disp_grad_norm", False)
         self.change_bias_after_training = training_params.get(
             "change_bias_after_training", False
         )
@@ -838,6 +840,22 @@ class Trainer:
                             list(self.wrapper.parameters()), None
                         )
 
+                    # Compute gradient norm for logging if enabled
+                    total_norm: paddle.Tensor | None = None
+                    if self.disp_grad_norm or self.gradient_max_norm > 0.0:
+                        # Compute total gradient norm (before clipping if clipping is enabled)
+                        grads = [
+                            p.grad
+                            for p in self.wrapper.parameters()
+                            if p.grad is not None
+                        ]
+                        if grads:
+                            total_norm = paddle.linalg.norm(
+                                paddle.stack(
+                                    [paddle.linalg.norm(g.flatten()) for g in grads]
+                                )
+                            )
+
                     if self.gradient_max_norm > 0.0:
                         with nvprof_context(enable_profiling, "Gradient clip"):
                             paddle.nn.utils.clip_grad_norm_(
@@ -850,6 +868,15 @@ class Trainer:
                         self.optimizer.step()
                     self.optimizer.clear_grad(set_to_zero=False)
                     self.scheduler.step()
+
+                    # Accumulate gradient norm for logging if enabled
+                    if self.disp_grad_norm and total_norm is not None:
+                        if not self.multi_task:
+                            self.grad_norm_accu += float(total_norm)
+                            self.grad_norm_count += 1
+                        else:
+                            self.grad_norm_accu_per_task[task_key] += float(total_norm)
+                            self.grad_norm_count_per_task[task_key] += 1
 
             else:
                 raise ValueError(f"Not supported optimizer type '{self.opt_type}'")
@@ -927,6 +954,15 @@ class Trainer:
                                     learning_rate=None,
                                 )
                             )
+                        # Log gradient norm for single-task
+                        if self.disp_grad_norm and self.grad_norm_count > 0:
+                            avg_grad_norm = self.grad_norm_accu / self.grad_norm_count
+                            log.info(
+                                format_grad_norm_message(
+                                    batch=display_step_id,
+                                    grad_norm=avg_grad_norm,
+                                )
+                            )
                 else:
                     train_results = {_key: {} for _key in self.model_keys}
                     valid_results = {_key: {} for _key in self.model_keys}
@@ -967,7 +1003,33 @@ class Trainer:
                                         learning_rate=None,
                                     )
                                 )
+                    # Log gradient norms for multi-task (all tasks in one message)
+                    if self.disp_grad_norm and self.rank == 0:
+                        grad_norms_per_task = {}
+                        for _key in self.model_keys:
+                            if self.grad_norm_count_per_task.get(_key, 0) > 0:
+                                grad_norms_per_task[_key] = (
+                                    self.grad_norm_accu_per_task[_key]
+                                    / self.grad_norm_count_per_task[_key]
+                                )
+                        if grad_norms_per_task:
+                            log.info(
+                                format_grad_norm_message(
+                                    batch=display_step_id,
+                                    grad_norm=grad_norms_per_task,
+                                )
+                            )
                 self.wrapper.train()
+
+                # Reset gradient norm accumulators after display
+                if self.disp_grad_norm:
+                    if not self.multi_task:
+                        self.grad_norm_accu = 0.0
+                        self.grad_norm_count = 0
+                    else:
+                        for task_key in self.model_keys:
+                            self.grad_norm_accu_per_task[task_key] = 0.0
+                            self.grad_norm_count_per_task[task_key] = 0
 
                 current_time = time.time()
                 train_time = current_time - self.t0
@@ -1033,6 +1095,20 @@ class Trainer:
         self.wrapper.train()
         self.t0 = time.time()
         self.total_train_time = 0.0
+
+        # Initialize gradient norm accumulators for logging
+        if self.disp_grad_norm:
+            if not self.multi_task:
+                self.grad_norm_accu: float = 0.0
+                self.grad_norm_count: int = 0
+            else:
+                self.grad_norm_accu_per_task: dict[str, float] = dict.fromkeys(
+                    self.model_keys, 0.0
+                )
+                self.grad_norm_count_per_task: dict[str, int] = dict.fromkeys(
+                    self.model_keys, 0
+                )
+
         for step_id in range(self.start_step, self.num_steps):
             step(step_id)
             if JIT:

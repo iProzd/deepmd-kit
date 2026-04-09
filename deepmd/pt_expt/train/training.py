@@ -34,6 +34,7 @@ from deepmd.dpmodel.utils.learning_rate import (
     LearningRateExp,
 )
 from deepmd.loggers.training import (
+    format_grad_norm_message,
     format_training_message,
     format_training_message_per_task,
 )
@@ -437,6 +438,7 @@ class Trainer:
         self.save_freq = training_params.get("save_freq", 1000)
         self.display_in_training = training_params.get("disp_training", True)
         self.timing_in_training = training_params.get("time_training", True)
+        self.disp_grad_norm = training_params.get("disp_grad_norm", False)
         self.lcurve_should_print_header = True
 
         # Model ---------------------------------------------------------------
@@ -857,6 +859,11 @@ class Trainer:
         wall_start = time.time()
         last_log_time = wall_start
 
+        # Initialize gradient norm accumulators for logging
+        if self.disp_grad_norm:
+            self.grad_norm_accu: float = 0.0
+            self.grad_norm_count: int = 0
+
         for step_id in range(self.start_step, self.num_steps):
             cur_lr = float(self.lr_schedule.value(step_id))
 
@@ -873,10 +880,24 @@ class Trainer:
             )
             loss.backward()
 
-            if self.gradient_max_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.wrapper.parameters(), self.gradient_max_norm
-                )
+            # Compute gradient norm for logging if enabled
+            total_norm: torch.Tensor | None = None
+            if self.disp_grad_norm or self.gradient_max_norm > 0.0:
+                if self.gradient_max_norm > 0.0:
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.wrapper.parameters(), self.gradient_max_norm
+                    )
+                else:
+                    # Compute total gradient norm without clipping
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.wrapper.parameters(),
+                        float("inf"),  # No clipping
+                    )
+
+                # Accumulate gradient norm for logging
+                if self.disp_grad_norm and total_norm is not None:
+                    self.grad_norm_accu += total_norm.item()
+                    self.grad_norm_count += 1
 
             self._optimizer_step()
 
@@ -969,6 +990,18 @@ class Trainer:
                             learning_rate=None,
                         )
                     )
+                # Log gradient norm
+                if self.disp_grad_norm and self.grad_norm_count > 0:
+                    avg_grad_norm = self.grad_norm_accu / self.grad_norm_count
+                    log.info(
+                        format_grad_norm_message(
+                            batch=display_step_id,
+                            grad_norm=avg_grad_norm,
+                        )
+                    )
+                    # Reset gradient norm accumulators after display
+                    self.grad_norm_accu = 0.0
+                    self.grad_norm_count = 0
 
                 # lcurve file
                 if self.lcurve_should_print_header:
