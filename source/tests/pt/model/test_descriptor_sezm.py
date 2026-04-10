@@ -79,6 +79,9 @@ def _descriptor_kwargs(**overrides) -> dict:
         "radial_mlp": [6],
         "ffn_neurons": 8,
         "ffn_blocks": 1,
+        "random_gamma": False,
+        "n_atten_head": 0,
+        "mlp_bias": True,
         "precision": "float32",
         "trainable": True,
     }

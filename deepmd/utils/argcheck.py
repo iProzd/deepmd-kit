@@ -498,7 +498,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             "random_gamma",
             bool,
             optional=True,
-            default=False,
+            default=True,
             doc=doc_only_pt_supported + doc_random_gamma,
         ),
         Argument("lmax", int, optional=True, default=2, doc=doc_lmax),
@@ -537,7 +537,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             extra_check_errmsg="must be >= 0",
             doc=doc_focus_dim,
         ),
-        Argument("n_atten_head", int, optional=True, default=0, doc=doc_n_atten_head),
+        Argument("n_atten_head", int, optional=True, default=1, doc=doc_n_atten_head),
         Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
         Argument(
             "ffn_blocks",
@@ -557,7 +557,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             "mlp_bias",
             bool,
             optional=True,
-            default=True,
+            default=False,
             doc=doc_only_pt_supported + doc_mlp_bias,
         ),
         Argument(

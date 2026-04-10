@@ -147,7 +147,7 @@ class SO2Linear(nn.Module):
         out_channels: int,
         n_focus: int = 1,
         dtype: torch.dtype,
-        mlp_bias: bool = True,
+        mlp_bias: bool = False,
         seed: int | list[int] | None,
         trainable: bool,
     ) -> None:
@@ -542,8 +542,8 @@ class SO2Convolution(nn.Module):
         so2_layers: int = 4,
         so2_attn_res: str = "none",
         layer_scale: bool = False,
-        n_atten_head: int = 0,
-        mlp_bias: bool = True,
+        n_atten_head: int = 1,
+        mlp_bias: bool = False,
         use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
@@ -666,7 +666,6 @@ class SO2Convolution(nn.Module):
                         channels=self.so2_focus_dim,
                         degree_index_m=self.degree_index_m,
                         n_focus=self.n_focus,
-                        centering=True,
                         dtype=self.compute_dtype,
                         trainable=trainable,
                     )

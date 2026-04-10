@@ -19,7 +19,7 @@
         64
       ],
       "use_env_seed": true,
-      "random_gamma": false,
+      "random_gamma": true,
       "l_schedule": [
         3,
         3,
@@ -31,7 +31,7 @@
       "so2_attn_res": "none",
       "n_focus": 1,
       "focus_dim": 0,
-      "n_atten_head": 0,
+      "n_atten_head": 1,
       "ffn_neurons": 96,
       "ffn_blocks": 1,
       "sandwich_norm": [
@@ -40,7 +40,7 @@
         true,
         false
       ],
-      "mlp_bias": true,
+      "mlp_bias": false,
       "layer_scale": false,
       "full_attn_res": "none",
       "block_attn_res": "none",

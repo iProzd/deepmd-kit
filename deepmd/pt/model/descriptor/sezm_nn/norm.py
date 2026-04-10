@@ -142,14 +142,14 @@ class EquivariantRMSNorm(nn.Module):
     """
     Degree-balanced equivariant RMS normalization on packed `(l, m)` layout.
 
-    The scalar slice `l=0` is optionally mean-centered across channels before the
-    shared RMS is evaluated. All coefficients, including the centered scalar
-    slice, contribute to the same per-sample and per-focus RMS. Degree balancing
+    The scalar slice `l=0` is mean-centered across channels before the shared
+    RMS is evaluated. All coefficients, including the centered scalar slice,
+    contribute to the same per-sample and per-focus RMS. Degree balancing
     assigns each coefficient from degree `l` the weight
     `1 / ((2 * l + 1) * (lmax + 1))`, so each degree contributes equally
     regardless of its multiplicity. A learnable per-focus, per-degree scale is
-    then expanded to all `m` coefficients, and an optional learnable bias is
-    added only to the scalar slice.
+    then expanded to all `m` coefficients, and a learnable bias is added only
+    to the scalar slice.
 
     Parameters
     ----------
@@ -159,9 +159,6 @@ class EquivariantRMSNorm(nn.Module):
         Channels per `(l, m)` coefficient in each focus stream.
     n_focus
         Number of focus streams. Affine parameters are independent per focus.
-    centering
-        Whether to mean-center the scalar slice `l=0` across channels before
-        RMS normalization.
     eps
         Small epsilon for numerical stability.
     dtype
@@ -176,7 +173,6 @@ class EquivariantRMSNorm(nn.Module):
         lmax: int,
         channels: int,
         n_focus: int = 1,
-        centering: bool = True,
         *,
         eps: float = 1e-5,
         dtype: torch.dtype,
@@ -186,32 +182,27 @@ class EquivariantRMSNorm(nn.Module):
         self.lmax = int(lmax)
         self.channels = int(channels)
         self.n_focus = int(n_focus)
-        self.centering = centering
         self.dtype = dtype
         self.device = env.DEVICE
         self.eps = float(eps)
 
         # === Step 1. Learnable Parameters ===
-        # Per-focus, per-l affine scales with shape (F, lmax+1, C)
+        # Store affine scales in degree-major layout (L, F, C). This matches the
+        # packed output layout after degree expansion
         # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
         self.adam_scale = nn.Parameter(
             torch.ones(
-                self.n_focus,
                 self.lmax + 1,
+                self.n_focus,
                 self.channels,
                 dtype=self.dtype,
                 device=self.device,
             )
         )
-        if self.centering:
-            # Bias only for l=0, independent per focus.
-            self.bias = nn.Parameter(
-                torch.zeros(
-                    self.n_focus, self.channels, dtype=self.dtype, device=self.device
-                )
-            )
-        else:
-            self.register_parameter("bias", None)
+        # Bias only for l=0, independent per focus.
+        self.bias = nn.Parameter(
+            torch.zeros(self.n_focus, self.channels, dtype=self.dtype, device=self.device)
+        )
 
         # === Step 2. Index and Weight Buffers ===
         expand_index = map_degree_idx(self.lmax, device=self.device)
@@ -254,8 +245,7 @@ class EquivariantRMSNorm(nn.Module):
         xt = x[:, 1:, :, :]  # (N, D-1, F, C)
 
         # === Step 1. Center the scalar slice ===
-        if self.centering:
-            x0 = x0 - x0.mean(dim=-1, keepdim=True)
+        x0 = x0 - x0.mean(dim=-1, keepdim=True)
 
         # === Step 2. Compute a shared degree-balanced RMS ===
         mean_variance = x0.square().sum(dim=(1, 3)) * self.balance_weight[0]
@@ -271,17 +261,16 @@ class EquivariantRMSNorm(nn.Module):
 
         # === Step 3. Apply per-degree affine parameters ===
         expanded_scale = torch.index_select(
-            self.adam_scale, dim=1, index=self.expand_index
+            self.adam_scale, dim=0, index=self.expand_index
         )
-        expanded_scale = expanded_scale.permute(1, 0, 2).unsqueeze(0)  # (1, D, F, C)
+        expanded_scale = expanded_scale.unsqueeze(0)  # (1, D, F, C)
         x0 = x0 * expanded_scale[:, :1, :, :]
         if xt.numel() > 0:
             xt = xt * expanded_scale[:, 1:, :, :]
 
         # === Step 4. Add scalar bias and restore layout ===
-        if self.centering:
-            bias0 = self.bias.reshape(1, 1, self.n_focus, -1)  # (1, 1, F, C)
-            x0 = x0 + bias0
+        bias0 = self.bias.reshape(1, 1, self.n_focus, -1)  # (1, 1, F, C)
+        x0 = x0 + bias0
 
         out = x0 if xt.numel() == 0 else torch.cat([x0, xt], dim=1)
         out = out.to(dtype=in_dtype)
@@ -297,7 +286,6 @@ class EquivariantRMSNorm(nn.Module):
                 "lmax": self.lmax,
                 "channels": self.channels,
                 "n_focus": self.n_focus,
-                "centering": self.centering,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,
@@ -334,15 +322,15 @@ class ReducedEquivariantRMSNorm(nn.Module):
     """
     Degree-balanced equivariant RMS normalization on reduced m-major layout.
 
-    The scalar slice `l=0` is optionally mean-centered across channels before the
-    shared RMS is evaluated. All retained coefficients, including the centered
-    scalar slice, contribute to the same per-edge and per-focus RMS. Degree
-    balancing assigns each retained coefficient from degree `l` the weight
+    The scalar slice `l=0` is mean-centered across channels before the shared
+    RMS is evaluated. All retained coefficients, including the centered scalar
+    slice, contribute to the same per-edge and per-focus RMS. Degree balancing
+    assigns each retained coefficient from degree `l` the weight
     `1 / (n_coeff_l * (lmax + 1))`, where
     `n_coeff_l = 2 * min(l, mmax) + 1` is the number of retained coefficients
     for that degree in the reduced layout. A learnable per-focus, per-degree
-    scale is expanded with `degree_index_m`, and an optional learnable bias is
-    added only to the scalar slice.
+    scale is expanded with `degree_index_m`, and a learnable bias is added only
+    to the scalar slice.
 
     Parameters
     ----------
@@ -357,9 +345,6 @@ class ReducedEquivariantRMSNorm(nn.Module):
         `(D_m_trunc,)`.
     n_focus
         Number of focus streams.
-    centering
-        Whether to mean-center scalar `l=0` features across channels before RMS
-        normalization.
     eps
         Epsilon for numerical stability.
     dtype
@@ -377,7 +362,6 @@ class ReducedEquivariantRMSNorm(nn.Module):
         channels: int,
         degree_index_m: torch.Tensor,
         n_focus: int = 1,
-        centering: bool = True,
         eps: float = 1e-5,
         dtype: torch.dtype,
         trainable: bool,
@@ -387,7 +371,6 @@ class ReducedEquivariantRMSNorm(nn.Module):
         self.mmax = int(mmax)
         self.channels = int(channels)
         self.n_focus = int(n_focus)
-        self.centering = bool(centering)
         self.eps = float(eps)
         self.dtype = dtype
         self.device = env.DEVICE
@@ -424,17 +407,14 @@ class ReducedEquivariantRMSNorm(nn.Module):
                 device=self.device,
             )
         )
-        if self.centering:
-            self.bias0 = nn.Parameter(
-                torch.zeros(
-                    self.n_focus,
-                    self.channels,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
+        self.bias0 = nn.Parameter(
+            torch.zeros(
+                self.n_focus,
+                self.channels,
+                dtype=self.dtype,
+                device=self.device,
             )
-        else:
-            self.register_parameter("bias0", None)
+        )
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -458,8 +438,7 @@ class ReducedEquivariantRMSNorm(nn.Module):
         xt = x[:, :, 1:, :]  # (E, F, D_m_trunc-1, C)
 
         # === Step 1. Center the scalar slice ===
-        if self.centering:
-            x0 = x0 - x0.mean(dim=-1, keepdim=True)
+        x0 = x0 - x0.mean(dim=-1, keepdim=True)
 
         # === Step 2. Compute a shared degree-balanced RMS ===
         mean_variance = x0.square().sum(dim=(2, 3)) * self.balance_weight[0]
@@ -483,9 +462,8 @@ class ReducedEquivariantRMSNorm(nn.Module):
             xt = xt * expanded_scale[:, :, 1:, :]
 
         # === Step 4. Add scalar bias and restore layout ===
-        if self.centering:
-            bias0 = self.bias0.reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
-            x0 = x0 + bias0
+        bias0 = self.bias0.reshape(1, self.n_focus, 1, -1)  # (1, F, 1, C)
+        x0 = x0 + bias0
 
         out = x0 if xt.numel() == 0 else torch.cat([x0, xt], dim=2)
         out = out.to(dtype=in_dtype)
@@ -501,8 +479,8 @@ class ReducedEquivariantRMSNorm(nn.Module):
                 "lmax": self.lmax,
                 "mmax": self.mmax,
                 "channels": self.channels,
+                "degree_index_m": np_safe(self.degree_index_m),
                 "n_focus": self.n_focus,
-                "centering": self.centering,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "trainable": trainable,
@@ -523,8 +501,14 @@ class ReducedEquivariantRMSNorm(nn.Module):
             )
         config = data.pop("config")
         variables = data.pop("@variables")
+        degree_index_m = safe_numpy_to_tensor(
+            config.pop("degree_index_m"),
+            device=env.DEVICE,
+            dtype=torch.long,
+        )
         precision = config.pop("precision")
         config["dtype"] = PRECISION_DICT[precision]
+        config["degree_index_m"] = degree_index_m
         obj = cls(**config)
         template = obj.state_dict()
         state = {

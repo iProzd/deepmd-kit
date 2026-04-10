@@ -159,7 +159,7 @@ class SeZMInteractionBlock(nn.Module):
         so2_norm: bool = False,
         so2_layers: int = 4,
         so2_attn_res: str = "none",
-        n_atten_head: int = 0,
+        n_atten_head: int = 1,
         so2_pre_norm: bool = True,
         so2_post_norm: bool = False,
         ffn_pre_norm: bool = True,
@@ -171,7 +171,7 @@ class SeZMInteractionBlock(nn.Module):
         block_attn_res: str = "none",
         activation_function: str,
         glu_activation: bool = True,
-        mlp_bias: bool = True,
+        mlp_bias: bool = False,
         use_triton: bool = False,
         eps: float = 1e-7,
         dtype: torch.dtype,
@@ -248,7 +248,6 @@ class SeZMInteractionBlock(nn.Module):
                 self.lmax,
                 self.channels,
                 n_focus=1,
-                centering=True,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
@@ -260,7 +259,6 @@ class SeZMInteractionBlock(nn.Module):
                 self.lmax,
                 self.channels,
                 n_focus=1,
-                centering=True,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
@@ -301,7 +299,6 @@ class SeZMInteractionBlock(nn.Module):
                         self.lmax,
                         self.channels,
                         n_focus=1,
-                        centering=True,
                         dtype=self.compute_dtype,
                         trainable=trainable,
                     )
@@ -315,7 +312,6 @@ class SeZMInteractionBlock(nn.Module):
                         self.lmax,
                         self.channels,
                         n_focus=1,
-                        centering=True,
                         dtype=self.compute_dtype,
                         trainable=trainable,
                     )

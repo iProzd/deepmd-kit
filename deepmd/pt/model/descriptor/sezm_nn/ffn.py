@@ -89,7 +89,7 @@ class EquivariantFFN(nn.Module):
         dtype: torch.dtype,
         activation_function: str = "silu",
         glu_activation: bool = True,
-        mlp_bias: bool = True,
+        mlp_bias: bool = False,
         trainable: bool,
         seed: int | list[int] | None = None,
     ) -> None:
