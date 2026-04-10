@@ -184,7 +184,7 @@ class SO2Linear(nn.Module):
         self.register_buffer(
             "m0_idx",
             torch.arange(m0_size, device=self.device, dtype=torch.long),
-            persistent=False,
+            persistent=True,
         )
 
         pos_indices_list: list[torch.Tensor] = []
@@ -213,22 +213,22 @@ class SO2Linear(nn.Module):
 
         if len(pos_indices_list) > 0:
             self.register_buffer(
-                "pos_indices", torch.cat(pos_indices_list), persistent=False
+                "pos_indices", torch.cat(pos_indices_list), persistent=True
             )
             self.register_buffer(
-                "neg_indices", torch.cat(neg_indices_list), persistent=False
+                "neg_indices", torch.cat(neg_indices_list), persistent=True
             )
             self._m_ranges = m_ranges
         else:
             self.register_buffer(
                 "pos_indices",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "neg_indices",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=False,
+                persistent=True,
             )
             self._m_ranges = []
 
@@ -634,10 +634,10 @@ class SO2Convolution(nn.Module):
             device=self.device,
             dtype=self.dtype,
         )
-        self.register_buffer("coeff_index_m", coeff_index_m, persistent=False)
-        self.register_buffer("degree_index_m", degree_index_m, persistent=False)
+        self.register_buffer("coeff_index_m", coeff_index_m, persistent=True)
+        self.register_buffer("degree_index_m", degree_index_m, persistent=True)
         self.register_buffer(
-            "rotate_inv_rescale_full", rotate_inv_rescale_full, persistent=False
+            "rotate_inv_rescale_full", rotate_inv_rescale_full, persistent=True
         )
         self.reduced_dim = int(coeff_index_m.numel())
         self.triton_rotation_mode = resolve_triton_rotation_mode(

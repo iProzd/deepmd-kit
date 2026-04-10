@@ -343,7 +343,7 @@ class SO3Linear(nn.Module):
         self.register_buffer(
             "expand_index",
             map_degree_idx(self.lmax, device=self.device),
-            persistent=False,
+            persistent=True,
         )
 
         for p in self.parameters():

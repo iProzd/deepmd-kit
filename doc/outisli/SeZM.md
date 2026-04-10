@@ -892,6 +892,9 @@ ______________________________________________________________________
 - top-level descriptor config, including `l_schedule`, `m_schedule`, `use_env_seed`,
   `full_attn_res`, `block_attn_res`, `so2_attn_res`, `sandwich_norm`, and inner-clamp settings
 - the full descriptor `state_dict()` payload under `@variables`
+- all SeZM `register_buffer()` tensors are persistent model state and therefore live inside
+  `@variables`, including precomputed index tables, S2 projection matrices, reduced-layout
+  maps, Wigner coefficient tables, and interface-compatibility buffers
 - an `env_mat` compatibility payload
 
 At the descriptor top level, serialization is flat: `DescrptSeZM.serialize()` does

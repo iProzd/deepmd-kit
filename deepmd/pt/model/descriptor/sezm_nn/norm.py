@@ -208,7 +208,7 @@ class EquivariantRMSNorm(nn.Module):
 
         # === Step 2. Index and Weight Buffers ===
         expand_index = map_degree_idx(self.lmax, device=self.device)
-        self.register_buffer("expand_index", expand_index, persistent=False)
+        self.register_buffer("expand_index", expand_index, persistent=True)
 
         # Pre-fuse degree balancing and channel averaging into a single weight:
         #   w_d = 1 / ((2l+1) * (lmax+1) * C)
@@ -224,7 +224,7 @@ class EquivariantRMSNorm(nn.Module):
         balance_weight = torch.tensor(
             weights_list, dtype=self.dtype, device=self.device
         )
-        self.register_buffer("balance_weight", balance_weight, persistent=False)
+        self.register_buffer("balance_weight", balance_weight, persistent=True)
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -379,7 +379,7 @@ class ReducedEquivariantRMSNorm(nn.Module):
 
         if degree_index_m.dtype != torch.long:
             degree_index_m = degree_index_m.to(dtype=torch.long)
-        self.register_buffer("degree_index_m", degree_index_m, persistent=False)
+        self.register_buffer("degree_index_m", degree_index_m, persistent=True)
 
         # Pre-fuse degree balancing and channel averaging into a single weight:
         #   w_d = 1 / (n_coeff_l * (lmax+1) * C)
@@ -397,7 +397,7 @@ class ReducedEquivariantRMSNorm(nn.Module):
             raise ValueError(
                 "ReducedEquivariantRMSNorm: balance_weight has zeros; degree_index_m may be invalid."
             )
-        self.register_buffer("balance_weight", weights, persistent=False)
+        self.register_buffer("balance_weight", weights, persistent=True)
 
         # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
         self.adam_scale = nn.Parameter(

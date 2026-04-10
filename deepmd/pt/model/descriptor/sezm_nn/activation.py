@@ -161,7 +161,7 @@ class GatedActivation(nn.Module):
         else:
             expand_index = torch.zeros(0, dtype=torch.long, device=self.device)
             self.gate_linear = nn.Identity()
-        self.register_buffer("expand_index", expand_index, persistent=False)
+        self.register_buffer("expand_index", expand_index, persistent=True)
 
         for p in self.parameters():
             p.requires_grad = trainable
@@ -328,8 +328,8 @@ class S2GridProjector(nn.Module):
         to_grid_mat, from_grid_mat = self._build_projection_mats(coeff_index)
         to_grid_mat = to_grid_mat.to(device=self.device, dtype=self.dtype)
         from_grid_mat = from_grid_mat.to(device=self.device, dtype=self.dtype)
-        self.register_buffer("to_grid_mat", to_grid_mat, persistent=False)
-        self.register_buffer("from_grid_mat", from_grid_mat, persistent=False)
+        self.register_buffer("to_grid_mat", to_grid_mat, persistent=True)
+        self.register_buffer("from_grid_mat", from_grid_mat, persistent=True)
 
     def _build_coefficient_index(self, device: torch.device) -> torch.Tensor:
         if self.coefficient_layout == "m_major":

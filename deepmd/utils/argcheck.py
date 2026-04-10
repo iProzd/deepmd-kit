@@ -635,7 +635,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             list[int],
             optional=True,
             default=None,
-            extra_check=lambda x: len(x) == 2 and all(v > 0 for v in x),
+            extra_check=lambda x: x is None or (len(x) == 2 and all(v > 0 for v in x)),
             extra_check_errmsg="must be a list of two positive integers",
             doc=doc_only_pt_supported + doc_s2_grid_resolution,
         ),
@@ -2777,7 +2777,7 @@ def sezm_model_args() -> Argument:
         "torch.compile in the SeZM model. "
         "Only supported in the PyTorch backend."
     )
-    doc_use_tf32 = (
+    doc_enable_tf32 = (
         "If True, enable TF32 matmul precision when use_compile=True. "
         "Only supported in the PyTorch backend."
     )
@@ -2804,11 +2804,11 @@ def sezm_model_args() -> Argument:
                 doc=doc_only_pt_supported + doc_use_compile,
             ),
             Argument(
-                "use_tf32",
+                "enable_tf32",
                 bool,
                 optional=True,
                 default=False,
-                doc=doc_only_pt_supported + doc_use_tf32,
+                doc=doc_only_pt_supported + doc_enable_tf32,
             ),
             Argument(
                 "model_branch_alias",

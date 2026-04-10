@@ -116,7 +116,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self,
         *args: Any,
         use_compile: bool = False,
-        use_tf32: bool = False,
+        enable_tf32: bool = False,
         bridging_method: str = "none",
         bridging_r_inner: float = 0.9,
         bridging_r_outer: float = 1.3,
@@ -126,7 +126,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         SeZMModel_.__init__(self, *args, **kwargs)
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         self.use_compile = bool(use_compile)
-        self.use_tf32 = bool(use_tf32)
+        self.enable_tf32 = bool(enable_tf32)
         self._compiled = False
         # Store compiled_compute outside the nn.Module tree so that
         # FSDP2 / DDP do not shard or sync its duplicated parameters.
@@ -1079,7 +1079,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "type": self.model_type,
             "atomic_model": self.atomic_model.serialize(),
             "use_compile": self.use_compile,
-            "use_tf32": self.use_tf32,
+            "enable_tf32": self.enable_tf32,
             "bridging_method": self.bridging_method,
             "bridging_r_inner": self.bridging_r_inner,
             "bridging_r_outer": self.bridging_r_outer,
@@ -1127,7 +1127,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             return
         prev_precision = torch.get_float32_matmul_precision()
         try:
-            if self.use_tf32:
+            if self.enable_tf32:
                 torch.set_float32_matmul_precision("medium")
             else:
                 torch.set_float32_matmul_precision("highest")

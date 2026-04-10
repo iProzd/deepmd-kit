@@ -187,33 +187,33 @@ class GeometricInitialEmbedding(nn.Module):
             )
             radial_slot_index_for_row = non_scalar_degree_by_row - 1
             self.register_buffer(
-                "non_scalar_row_index", non_scalar_row_index, persistent=False
+                "non_scalar_row_index", non_scalar_row_index, persistent=True
             )
             self.register_buffer(
                 "zonal_m0_col_index_for_row",
                 zonal_m0_col_index_for_row,
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "radial_slot_index_for_row",
                 radial_slot_index_for_row,
-                persistent=False,
+                persistent=True,
             )
         else:
             self.register_buffer(
                 "non_scalar_row_index",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "zonal_m0_col_index_for_row",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "radial_slot_index_for_row",
                 torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=False,
+                persistent=True,
             )
 
     def forward(

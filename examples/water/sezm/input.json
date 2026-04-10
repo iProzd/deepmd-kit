@@ -55,7 +55,7 @@
     },
     "fitting_net": {
       "neuron": [
-        96
+        0
       ],
       "activation_function": "silu",
       "precision": "float32",

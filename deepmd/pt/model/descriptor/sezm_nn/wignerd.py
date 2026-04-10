@@ -56,12 +56,12 @@ class CaseCoefficients(nn.Module):
         sign: torch.Tensor,
     ) -> None:
         super().__init__()
-        self.register_buffer("coeff", coeff, persistent=False)
-        self.register_buffer("horner", horner, persistent=False)
-        self.register_buffer("poly_len", poly_len, persistent=False)
-        self.register_buffer("ra_exp", ra_exp, persistent=False)
-        self.register_buffer("rb_exp", rb_exp, persistent=False)
-        self.register_buffer("sign", sign, persistent=False)
+        self.register_buffer("coeff", coeff, persistent=True)
+        self.register_buffer("horner", horner, persistent=True)
+        self.register_buffer("poly_len", poly_len, persistent=True)
+        self.register_buffer("ra_exp", ra_exp, persistent=True)
+        self.register_buffer("rb_exp", rb_exp, persistent=True)
+        self.register_buffer("sign", sign, persistent=True)
 
 
 class WignerPolynomialCoefficients(nn.Module):
@@ -109,22 +109,22 @@ class WignerPolynomialCoefficients(nn.Module):
         self.n_primary = int(n_primary)
         self.n_derived = int(n_derived)
 
-        self.register_buffer("primary_row", primary_row, persistent=False)
-        self.register_buffer("primary_col", primary_col, persistent=False)
+        self.register_buffer("primary_row", primary_row, persistent=True)
+        self.register_buffer("primary_col", primary_col, persistent=True)
         self.case1 = case1
         self.case2 = case2
-        self.register_buffer("mp_plus_m", mp_plus_m, persistent=False)
-        self.register_buffer("m_minus_mp", m_minus_mp, persistent=False)
-        self.register_buffer("diagonal_mask", diagonal_mask, persistent=False)
-        self.register_buffer("anti_diagonal_mask", anti_diagonal_mask, persistent=False)
-        self.register_buffer("special_2m", special_2m, persistent=False)
-        self.register_buffer("anti_diag_sign", anti_diag_sign, persistent=False)
-        self.register_buffer("derived_row", derived_row, persistent=False)
-        self.register_buffer("derived_col", derived_col, persistent=False)
+        self.register_buffer("mp_plus_m", mp_plus_m, persistent=True)
+        self.register_buffer("m_minus_mp", m_minus_mp, persistent=True)
+        self.register_buffer("diagonal_mask", diagonal_mask, persistent=True)
+        self.register_buffer("anti_diagonal_mask", anti_diagonal_mask, persistent=True)
+        self.register_buffer("special_2m", special_2m, persistent=True)
+        self.register_buffer("anti_diag_sign", anti_diag_sign, persistent=True)
+        self.register_buffer("derived_row", derived_row, persistent=True)
+        self.register_buffer("derived_col", derived_col, persistent=True)
         self.register_buffer(
-            "derived_primary_idx", derived_primary_idx, persistent=False
+            "derived_primary_idx", derived_primary_idx, persistent=True
         )
-        self.register_buffer("derived_sign", derived_sign, persistent=False)
+        self.register_buffer("derived_sign", derived_sign, persistent=True)
 
 
 class WignerSmallOrderCoefficients(nn.Module):
@@ -152,12 +152,12 @@ class WignerSmallOrderCoefficients(nn.Module):
         exp_l4: torch.Tensor,
     ) -> None:
         super().__init__()
-        self.register_buffer("C_l2", C_l2, persistent=False)
-        self.register_buffer("C_l3", C_l3, persistent=False)
-        self.register_buffer("C_l4", C_l4, persistent=False)
-        self.register_buffer("C_combined_l3l4", C_combined_l3l4, persistent=False)
-        self.register_buffer("exp_l3", exp_l3, persistent=False)
-        self.register_buffer("exp_l4", exp_l4, persistent=False)
+        self.register_buffer("C_l2", C_l2, persistent=True)
+        self.register_buffer("C_l3", C_l3, persistent=True)
+        self.register_buffer("C_l4", C_l4, persistent=True)
+        self.register_buffer("C_combined_l3l4", C_combined_l3l4, persistent=True)
+        self.register_buffer("exp_l3", exp_l3, persistent=True)
+        self.register_buffer("exp_l4", exp_l4, persistent=True)
 
 
 def _safe_norm_nd(x: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
@@ -398,13 +398,13 @@ class WignerDCalculator(nn.Module):
         self.register_buffer(
             "l1_perm",
             torch.tensor([1, 2, 0], dtype=torch.int64, device=self.device),
-            persistent=False,
+            persistent=True,
         )
         l1_sign = torch.tensor([-1.0, -1.0, 1.0], dtype=self.dtype, device=self.device)
         self.register_buffer(
             "l1_sign_outer",
             torch.outer(l1_sign, l1_sign),
-            persistent=False,
+            persistent=True,
         )
 
         if self.lmax >= 2:
@@ -433,22 +433,22 @@ class WignerDCalculator(nn.Module):
             self.register_buffer(
                 "poly_u_re",
                 U_re.to(device=self.device, dtype=self.dtype),
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "poly_u_im",
                 U_im.to(device=self.device, dtype=self.dtype),
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "poly_u_re_t",
                 U_re_t.to(device=self.device, dtype=self.dtype),
-                persistent=False,
+                persistent=True,
             )
             self.register_buffer(
                 "poly_u_im_t",
                 U_im_t.to(device=self.device, dtype=self.dtype),
-                persistent=False,
+                persistent=True,
             )
 
     def forward(
@@ -995,9 +995,9 @@ class WignerDCalculator(nn.Module):
                 dtype=torch.bool,
                 device=case.poly_len.device,
             )
-        case.register_buffer("valid_mask", case.poly_len > 0, persistent=False)
-        case.register_buffer("horner_step_mask", horner_step_mask, persistent=False)
-        case.register_buffer("signed_coeff", case.sign * case.coeff, persistent=False)
+        case.register_buffer("valid_mask", case.poly_len > 0, persistent=True)
+        case.register_buffer("horner_step_mask", horner_step_mask, persistent=True)
+        case.register_buffer("signed_coeff", case.sign * case.coeff, persistent=True)
 
     @staticmethod
     def _vectorized_horner(

@@ -673,7 +673,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.register_buffer(
             "_empty_tensor",
             torch.empty(0, device=env.DEVICE, dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            persistent=False,
+            persistent=True,
         )
 
         # === Statistics buffers (interface compatibility) ===
@@ -681,12 +681,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.register_buffer(
             "mean",
             torch.zeros(0, dtype=self.dtype, device=self.device),
-            persistent=False,
+            persistent=True,
         )
         self.register_buffer(
             "stddev",
             torch.ones(0, dtype=self.dtype, device=self.device),
-            persistent=False,
+            persistent=True,
         )
 
     def forward(
