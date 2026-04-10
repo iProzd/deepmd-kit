@@ -91,6 +91,7 @@ from .sezm_nn import (
     get_so3_dim_of_lmax,
     np_safe,
     nvtx_range,
+    resolve_s2_grid_resolution,
     safe_numpy_to_tensor,
 )
 
@@ -194,7 +195,14 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         When enabled, the SO(2)-internal per-focus width ``focus_dim`` must be
         divisible by ``n_atten_head``.
     ffn_neurons
-        Hidden sizes for the equivariant FFN in each block and the final scalar output FFN.
+        Hidden sizes for the equivariant FFN in each block and the final scalar
+        output FFN. If set to 0, it is resolved automatically from ``channels``:
+        ``4 * channels`` when ``glu_activation=False`` and
+        ``(8 / 3) * channels`` when ``glu_activation=True``; the result is then
+        rounded up to a multiple of 32.
+    grid_ffn
+        If True, use the optional grid-MLP structure for the block-internal FFN
+        units. The final scalar output head is unchanged.
     ffn_blocks
         Number of FFN subblocks per interaction block.
     sandwich_norm
@@ -231,6 +239,18 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         before the SO(2) unit, before each FFN unit, and before the final block
         aggregation. Must be one of ``"none"``, ``"independent"``, or
         ``"dependent"``. Cannot be enabled together with `full_attn_res`.
+    s2_activation
+        If True, replace the SO(2) intermediate gated activations and the
+        default block-internal FFN activation path with the merged scalar/grid
+        SwiGLU-S2 activation. The final ``l=0`` output head keeps the scalar
+        FFN path. When enabled, the
+        descriptor internally forces ``activation_function="silu"`` and
+        ``glu_activation=True``.
+    s2_grid_resolution
+        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
+        If omitted, it is resolved from the first block ``(lmax, mmax)`` after
+        schedule parsing as
+        ``[2 * mmax + 4, ceil_even(3 * lmax + 2)]``.
     activation_function
         Activation function used by deepmd EmbeddingNet.
     glu_activation
@@ -287,13 +307,16 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         n_focus: int = 1,
         focus_dim: int = 0,
         n_atten_head: int = 1,
-        ffn_neurons: int = 96,
+        ffn_neurons: int = 0,
+        grid_ffn: bool = False,
         ffn_blocks: int = 1,
         sandwich_norm: list[bool] | None = None,
         mlp_bias: bool = False,
         layer_scale: bool = False,
         full_attn_res: str = "none",
         block_attn_res: str = "none",
+        s2_activation: bool = False,
+        s2_grid_resolution: list[int] | None = None,
         activation_function: str = "silu",
         glu_activation: bool = True,
         use_amp: bool = True,
@@ -349,8 +372,11 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.so2_post_norm = self.sandwich_norm[1]
         self.ffn_pre_norm = self.sandwich_norm[2]
         self.ffn_post_norm = self.sandwich_norm[3]
-        self.activation_function = str(activation_function)
-        self.glu_activation = bool(glu_activation)
+        self.s2_activation = bool(s2_activation)
+        self.activation_function = (
+            "silu" if self.s2_activation else str(activation_function)
+        )
+        self.glu_activation = True if self.s2_activation else bool(glu_activation)
         self.precision = str(precision)
         self.dtype = PRECISION_DICT[self.precision]
         self.device = env.DEVICE
@@ -406,6 +432,11 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
+        self.s2_grid_resolution = resolve_s2_grid_resolution(
+            self.lmax,
+            self.mmax,
+            s2_grid_resolution,
+        )
         self.ebed_dims = [get_so3_dim_of_lmax(l) for l in self.l_schedule]
         self.rad_sizes_per_block = [l + 1 for l in self.l_schedule]
 
@@ -416,7 +447,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             raise ValueError(
                 "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
             )
-        self.ffn_neurons = int(ffn_neurons)
+        self.ffn_neurons = self._resolve_ffn_neurons(ffn_neurons)
+        self.grid_ffn = bool(grid_ffn)
         self.ffn_blocks = int(ffn_blocks)
         if self.ffn_blocks < 1:
             raise ValueError("`ffn_blocks` must be >= 1")
@@ -570,10 +602,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     so2_layers=self.so2_layers,
                     so2_attn_res=self.so2_attn_res_mode,
                     ffn_neurons=self.ffn_neurons,
+                    grid_ffn=self.grid_ffn,
                     ffn_blocks=self.ffn_blocks,
                     layer_scale=self.layer_scale,
                     full_attn_res=self.full_attn_res_mode,
                     block_attn_res=self.block_attn_res_mode,
+                    s2_activation=self.s2_activation,
+                    s2_grid_resolution=self.s2_grid_resolution,
                     n_atten_head=self.n_atten_head,
                     so2_pre_norm=self.so2_pre_norm,
                     so2_post_norm=self.so2_post_norm,
@@ -621,7 +656,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             lmax=0,
             channels=self.channels,
             hidden_channels=self.ffn_neurons,
+            grid_ffn=False,
             dtype=self.compute_dtype,
+            s2_activation=False,
             activation_function=self.activation_function,
             glu_activation=self.glu_activation,
             mlp_bias=self.mlp_bias,
@@ -1157,6 +1194,24 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         keep = type_mask.index_select(0, type_ij.to(dtype=torch.long))
         return keep.to(dtype=torch.bool)
 
+    def _resolve_ffn_neurons(self, ffn_neurons: int) -> int:
+        """
+        Resolve the effective FFN hidden width from the descriptor config.
+
+        ``ffn_neurons=0`` enables automatic width selection from ``channels``.
+        """
+        resolved = int(ffn_neurons)
+        if resolved < 0:
+            raise ValueError("`ffn_neurons` must be >= 0")
+        if resolved > 0:
+            return resolved
+        base_width = (
+            (8.0 * float(self.channels) / 3.0)
+            if self.glu_activation
+            else (4.0 * float(self.channels))
+        )
+        return int(32 * math.ceil(base_width / 32.0))
+
     def _init_lm_schedules(
         self,
         lmax: int,
@@ -1402,12 +1457,15 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "n_focus": self.n_focus,
                 "focus_dim": self.focus_dim,
                 "ffn_neurons": self.ffn_neurons,
+                "grid_ffn": self.grid_ffn,
                 "ffn_blocks": self.ffn_blocks,
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
                 "sandwich_norm": self.sandwich_norm,
                 "full_attn_res": self.full_attn_res_mode,
                 "block_attn_res": self.block_attn_res_mode,
+                "s2_activation": self.s2_activation,
+                "s2_grid_resolution": self.s2_grid_resolution,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],

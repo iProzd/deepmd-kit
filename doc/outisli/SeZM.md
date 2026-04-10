@@ -24,6 +24,8 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
   - packed `(l, m)` indexing, reduced-layout indexing, rotation projection helpers
 - `deepmd/pt/model/descriptor/sezm_nn/radial.py`
   - `C3CutoffEnvelope`, `InnerClamp`, `RadialBasis`, `RadialMLP`
+- `deepmd/pt/model/descriptor/sezm_nn/activation.py`
+  - `GatedActivation`, `SwiGLU`, `S2GridProjector`, `SwiGLUS2Activation`
 - `deepmd/pt/model/descriptor/sezm_nn/embedding.py`
   - `SeZMTypeEmbedding`, `GeometricInitialEmbedding`, `EnvironmentInitialEmbedding`
 - `deepmd/pt/model/descriptor/sezm_nn/norm.py`
@@ -33,7 +35,7 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
 - `deepmd/pt/model/descriptor/sezm_nn/attn_res.py`
   - `DepthAttnRes`
 - `deepmd/pt/model/descriptor/sezm_nn/so3.py`
-  - `FocusLinear`, `GatedActivation`, `SO3Linear`
+  - `ChannelLinear`, `FocusLinear`, `SO3Linear`
 - `deepmd/pt/model/descriptor/sezm_nn/so2.py`
   - `SO2Linear`, `SO2Convolution`
 - `deepmd/pt/model/descriptor/sezm_nn/ffn.py`
@@ -283,8 +285,12 @@ ______________________________________________________________________
 - Bias is applied only to the scalar slice after normalization.
 - Memory optimization: the weighted RMS is computed with fused einsum, and the reduced SO(2) layout uses retained-count weights `2 * min(l, mmax) + 1`.
 
-### 3. SO3Linear
+### 3. SO(3) Linear Layers
 
+- `ChannelLinear` applies a shared linear map on the last channel axis without
+  introducing a focus dimension.
+- `FocusLinear` applies per-focus linear mixing on `(B, F, C)` and stores weight
+  as `(Cin, F*Cout)` (focus folded on output side).
 - `SO3Linear` keeps per-focus independent mixing on `(N, D, F, C)` and stores
   weight as `(lmax+1, Cin, F*Cout)` (focus folded on output side).
 - Implemented as `index_select(expand_index)` + `einsum`; bias is applied only for `l=0`.
@@ -304,13 +310,26 @@ ______________________________________________________________________
 
 ### 4. Full equivariant FFN
 
-- `SO3Linear -> GatedActivation -> SO3Linear` with a residual connection.
-- Gates are derived from `l=0` scalars (one gate per `l`) and expanded across all `m`.
+- Default path: `SO3Linear -> GatedActivation -> SO3Linear` with a residual connection.
+  Gates are derived from `l=0` scalars (one gate per `l`) and expanded across all `m`.
+- When `s2_activation=true` and `grid_ffn=false`, the first projection outputs
+  `2 * hidden_channels`, then `SwiGLUS2Activation` uses the `l=0` slice to
+  build a scalar `SwiGLU` branch plus a sigmoid gate, applies point-wise
+  multiplication on the S2 grid, gates the reconstructed coefficients, and
+  merges the scalar branch back to `l=0`. In the SeZM block wrapper, the FFN
+  path uses a square grid resolution `[max(R_phi, R_theta), max(R_phi, R_theta)]`.
+- When `grid_ffn=true`, the block-internal FFN switches to
+  `SO3Linear(in -> hidden) -> scalar LinearSwiGLU(input l=0) + packed-grid point-wise MLP(hidden -> hidden) -> merge at l=0 -> SO3Linear(hidden -> out)`.
 
 ### 5. Multi-layer SO(2) convolution
 
 - Uses the edge-local m-major reduced layout controlled by `mmax`.
-- Stacks `SO2Linear` with optional `GatedActivation(mmax=...)` for `so2_layers`.
+- Stacks `SO2Linear` with an intermediate non-linearity for `so2_layers`.
+  - Default path uses `GatedActivation(mmax=...)`.
+  - When `s2_activation=true`, every intermediate layer outputs `2 * focus_dim`
+    channels and `SwiGLUS2Activation` uses the reduced-layout `l=0` slice to
+    build the scalar `SwiGLU` branch and sigmoid gate around the S2-grid
+    multiplicative path.
 - Each SO(2) layer uses **pre-norm + residual + LayerScale**:
   - `residual = x_local`
   - `x_local = inter_norm(x_local)` (pre-norm; Identity when `so2_norm=False`)
@@ -342,13 +361,17 @@ ______________________________________________________________________
 - SO2Linear weights use truncated normal init with std `1/sqrt(fan_in + fan_out)`, cut at +/-3\*std.
 - For |m|>0 blocks, an extra `1/sqrt(2)` scale is applied to preserve SO(2) coupling energy.
 - SO3Linear uses truncated normal init with std `1/sqrt(fan_in + fan_out)`, cut at +/-3\*std.
-- `FocusLinear`, `SO3Linear`, and `SO2Linear` all support an optional `init_std` parameter: when given, weights are initialized with `Normal(0, init_std)` instead of the default scheme. Use `init_std=0.0` for zero initialization (e.g., residual output projections).
+- `ChannelLinear`, `FocusLinear`, `SO3Linear`, and `SO2Linear` all support an optional `init_std` parameter: when given, weights are initialized with `Normal(0, init_std)` instead of the default scheme. Use `init_std=0.0` for zero initialization (e.g., residual output projections).
 
 ### 7. Unified weight layout convention
 
 All learnable weight matrices use **(in, out) convention** (rows = fan_in, cols = fan_out),
 and focus-aware modules fold the focus dimension `F` on the **output (cols) side**:
 
+- `ChannelLinear`
+  - stored weight: `(C_in, C_out)` — 2D, Muon
+  - stored bias: `(C_out,)` — 1D, Adam
+  - runtime contraction: `einsum("...i,io->...o")`
 - `FocusLinear`
   - stored weight: `(C_in, F * C_out)` — 2D, Muon
   - runtime view: `(C_in, F, C_out)` with `einsum("bfi,ifo->bfo")`
@@ -545,10 +568,18 @@ For each edge `(src -> dst)`:
    - Apply `SO2Linear` (group by `|m|`):
      - `m=0`: standard linear with additive bias (modulated by radial weights and cutoff to preserve strict smoothness on first layer); bias uses in-place add on preallocated output
      - `|m|>0`: 2x2 complex mixing on `(-m, +m)` pairs treated as `(Re, Im)`
-   - Apply `non_linear` (GatedActivation between layers, Identity for last layer):
-     - l=0: SiLU activation
-     - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
-   - LayerScale + Residual: `x_local = residual + scale * x_local` (scalar scale, init 1e-3 when `layer_scale=True`; bare residual otherwise)
+
+- Apply `non_linear` (between layers, Identity for last layer):
+  - default path: `GatedActivation`
+    - l=0: SiLU activation
+    - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
+  - `s2_activation=true`: `SwiGLUS2Activation`
+    - `l=0` slice -> scalar `SwiGLU` branch
+    - `l=0` slice -> sigmoid gate
+    - reduced coefficients -> flattened S2 grid -> point-wise multiplication -> reduced coefficients
+    - sigmoid gate modulates the reconstructed coefficients, then the scalar branch is added back to `l=0`
+- LayerScale + Residual: `x_local = residual + scale * x_local` (scalar scale, init 1e-3 when `layer_scale=True`; bare residual otherwise)
+
 1. **Cross-focus competition (automatic when multi-focus is enabled)**:
    - Enabled only when `n_focus>1`
    - Use scalar-invariant source captured before SO(2) stack: `focus_gate_src = x_local_pre[:, :, 0, :]`
@@ -609,6 +640,12 @@ h = torch.cat([h0, ht], dim=1)
 out = so3_linear_2(h)  # (N, D, hidden_channels) -> (N, D, C)
 ```
 
+With `grid_ffn=true`, the block-internal FFN instead keeps a hidden-width
+SO(3) projection, projects the packed SO(3) coefficients to the S2 grid,
+applies a point-wise grid MLP on the packed S2 grid, projects the grid features
+back to packed SO(3) coefficients, adds a separate scalar `LinearSwiGLU`
+branch back to `l=0`, and then applies the output SO(3) projection.
+
 Key properties:
 
 - Bias only on l=0 (scalar) components
@@ -660,7 +697,9 @@ Components:
 - `pre_so2_norm`: `EquivariantRMSNorm` applied before SO(2) convolution
 - `so2_conv`: `SO2Convolution` with pre-norm residual SO(2) mixing, optional per-focus-channel LayerScale, and final SO(3) channel mixing
 - `pre_ffn_norms[i]`: `EquivariantRMSNorm` applied before each FFN subblock
-- `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and gated activation
+- `ffns[i]`: `EquivariantFFN` with SO(3) linear projections and either
+  the direct `GatedActivation` path, S2-grid SwiGLU activation, or the optional
+  grid-MLP FFN path
 - `adam_ffn_layer_scales[i]`: optional per-channel learnable scale (init 1e-3) for training stability
 
 ______________________________________________________________________
@@ -728,12 +767,15 @@ Key arguments:
 - `so2_norm: bool` — If True, apply ReducedEquivariantRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 4)
 - `so2_attn_res: str` — SO(2)-internal depth-wise attention residual mode inside each interaction block. Allowed values: `none`, `independent`, `dependent` (default: `none`)
-- `ffn_neurons: int` — Hidden size for equivariant FFN (default: 96)
+- `ffn_neurons: int` — Hidden size for equivariant FFN. `0` enables automatic inference from `channels`: use `4 * channels` when `glu_activation=false`, or `(8 / 3) * channels` when `glu_activation=true`, then round up to a multiple of 32 (default: 0)
+- `grid_ffn: bool` — If True, use the optional grid-MLP structure for block-internal FFN units. The final `l=0` output head is unchanged (default: False)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
 - `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 1). When >0, the effective per-focus width (`focus_dim` or `channels` when `focus_dim=0`) must be divisible by `n_atten_head`, and envelope-gated grouped softmax attention with output-side head gate is applied. Attention uses `w^2 * exp(logit)` in the numerator and `zeta + sum(w^2 * exp(logit))` in the denominator.
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
+- `s2_activation: bool` — If True, enable the merged scalar/grid SwiGLU-S2 activation in the SO(2) branch and in the default block-internal FFN activation path. The final `l=0` output head keeps the scalar FFN path. When enabled, the descriptor internally forces `glu_activation=true` and `activation_function="silu"` (default: False)
+- `s2_grid_resolution: list[int]` — Two positive integers `[R_phi, R_theta]` used by the S2-grid activation. If omitted, SeZM resolves it from the first block `(lmax, mmax)` after schedule parsing as `[2 * mmax + 4, ceil_even(3 * lmax + 2)]`
 - `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, DepthAttnRes input-dependent query projection) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: False)
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
 - `full_attn_res: str` — Descriptor-level full AttnRes mode over unit history. `independent` uses learned query vectors; `dependent` derives the query from the current SeZM state before the SO(2) unit, before each FFN unit, and before the final aggregation. Allowed values: `none`, `independent`, `dependent` (default: `none`)
@@ -753,7 +795,7 @@ Optimizer routing note:
   - all other parameters follow shape-based routing (2D → Muon, otherwise → AdamW)
 - SeZM norm/layer-scale/frequency parameters use `adam_` prefixes (`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adam_freqs`) so HybridMuon routes them to Adam (no weight decay).
 - For HybridMuon with SeZM, recommended routing mode is `muon_mode = "slice"`:
-  - 2D weights (SO2Linear, FocusLinear): Muon (same as mode=2d)
+  - 2D weights (ChannelLinear, SO2Linear, FocusLinear): Muon (same as mode=2d)
   - 3D SO3Linear `(F*(lmax+1), C_out, C_in)`: per-(focus, l) independent Muon with correct rectangular scale
   - `adam_`/`bias` parameters: Adam (name-based routing takes priority)
 - HybridMuon supports optional Muon-path Magma-lite damping via `magma_muon` (default: `false`):
@@ -1053,7 +1095,7 @@ This section provides formulas for quick GPU memory estimation given known model
 | L      | Max angular momentum (max of l_schedule)         | config       |
 | D      | Spherical harmonics dimension = (L+1)²           | derived      |
 | C      | Channel width                                    | config       |
-| F      | FFN hidden dimension (ffn_neurons)               | config       |
+| F      | Effective FFN hidden dimension                   | config/auto  |
 | B      | Number of interaction blocks (len of l_schedule) | config       |
 | b      | Bytes per element (4 for FP32, 2 for FP16/BF16)  | dtype        |
 
@@ -1092,11 +1134,13 @@ M_cache   = M_wigner + M_radial      # small terms (edge_vectors, envelope, etc.
 
 ```
 M_so2conv = E × D × C × b           # SO2Conv intermediate (rotation + message)
-M_ffn     = E × D × 2F × b          # FFN up-projection (GLU doubles width)
+M_ffn     = E × D × 2F × b          # Default FFN up-projection (GLU doubles width)
 M_block   = max(M_so2conv, M_ffn)    # peak of the two stages (not simultaneous)
 ```
 
 > If 2F > C (typical: F=96, C=64 → 2F=192 > 64), FFN dominates the per-block peak.
+> When `grid_ffn=true`, the `2F` activation buffer is replaced by a hidden-width
+> SO(3) tensor plus transient S2-grid buffers from the point-wise grid MLP.
 
 #### 2.3 Total Inference VRAM
 

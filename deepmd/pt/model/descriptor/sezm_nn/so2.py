@@ -33,6 +33,11 @@ from deepmd.pt.utils.utils import (
     get_generator,
 )
 
+from .activation import (
+    GatedActivation,
+    SwiGLUS2Activation,
+    resolve_s2_grid_resolution,
+)
 from .attention import (
     segment_envelope_gated_softmax,
 )
@@ -53,8 +58,8 @@ from .norm import (
     ScalarRMSNorm,
 )
 from .so3 import (
+    ChannelLinear,
     FocusLinear,
-    GatedActivation,
     SO3Linear,
 )
 from .triton import (
@@ -513,6 +518,12 @@ class SO2Convolution(nn.Module):
           ``zeta + sum(w**2 * exp(logit))`` in the denominator.
         Requires the effective per-focus width to satisfy
         ``focus_dim % n_atten_head == 0``.
+    s2_activation
+        If True, replace each intermediate reduced-layout gate with S2-grid
+        SwiGLU. Intermediate ``SO2Linear`` layers then output ``2 * focus_dim``
+        channels before the activation folds them back to ``focus_dim``.
+    s2_grid_resolution
+        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
     mlp_bias
         Whether to use bias in SO2Linear (l=0 bias) and GatedActivation
         (gate linear bias).
@@ -543,6 +554,8 @@ class SO2Convolution(nn.Module):
         so2_attn_res: str = "none",
         layer_scale: bool = False,
         n_atten_head: int = 1,
+        s2_activation: bool = False,
+        s2_grid_resolution: list[int] | None = None,
         mlp_bias: bool = False,
         use_triton: bool = False,
         eps: float = 1e-7,
@@ -582,6 +595,10 @@ class SO2Convolution(nn.Module):
         self.use_so2_attn_res = self.so2_attn_res_mode != "none"
         self.layer_scale = bool(layer_scale)
         self.n_atten_head = int(n_atten_head)
+        self.s2_activation = bool(s2_activation)
+        self.s2_grid_resolution = resolve_s2_grid_resolution(
+            self.lmax, self.mmax, s2_grid_resolution
+        )
         if self.n_atten_head < 0:
             raise ValueError("`n_atten_head` must be non-negative")
         if self.n_atten_head > 0 and self.so2_focus_dim % self.n_atten_head != 0:
@@ -644,7 +661,11 @@ class SO2Convolution(nn.Module):
                     lmax=self.lmax,
                     mmax=self.mmax,
                     in_channels=self.so2_focus_dim,
-                    out_channels=self.so2_focus_dim,
+                    out_channels=(
+                        2 * self.so2_focus_dim
+                        if self.s2_activation and i < self.so2_layers - 1
+                        else self.so2_focus_dim
+                    ),
                     n_focus=self.n_focus,
                     dtype=self.dtype,
                     mlp_bias=self.mlp_bias,
@@ -679,19 +700,36 @@ class SO2Convolution(nn.Module):
         # === Step 5. Intermediate non-linearity ===
         non_linearities: list[nn.Module] = []
         for i in range(max(0, self.so2_layers - 1)):
-            non_linearities.append(
-                GatedActivation(
-                    lmax=self.lmax,
-                    mmax=self.mmax,
-                    channels=self.so2_focus_dim,
-                    n_focus=self.n_focus,
-                    dtype=self.dtype,
-                    mlp_bias=self.mlp_bias,
-                    layout="nfdc",
-                    trainable=trainable,
-                    seed=child_seed(seed_non_linearities, i),
+            if self.s2_activation:
+                non_linearities.append(
+                    SwiGLUS2Activation(
+                        lmax=self.lmax,
+                        mmax=self.mmax,
+                        channels=self.so2_focus_dim,
+                        dtype=self.dtype,
+                        n_focus=self.n_focus,
+                        layout="nfdc",
+                        grid_resolution_list=self.s2_grid_resolution,
+                        coefficient_layout="m_major",
+                        mlp_bias=self.mlp_bias,
+                        trainable=trainable,
+                        seed=child_seed(seed_non_linearities, i),
+                    )
                 )
-            )
+            else:
+                non_linearities.append(
+                    GatedActivation(
+                        lmax=self.lmax,
+                        mmax=self.mmax,
+                        channels=self.so2_focus_dim,
+                        n_focus=self.n_focus,
+                        dtype=self.dtype,
+                        mlp_bias=self.mlp_bias,
+                        layout="nfdc",
+                        trainable=trainable,
+                        seed=child_seed(seed_non_linearities, i),
+                    )
+                )
         non_linearities.append(nn.Identity())
         self.non_linearities = nn.ModuleList(non_linearities)
 
@@ -856,12 +894,11 @@ class SO2Convolution(nn.Module):
                 )
 
         # === Step 8. Optional radial hidden projection ===
-        self.radial_hidden_proj: FocusLinear | None = None
+        self.radial_hidden_proj: ChannelLinear | None = None
         if self.use_hidden_projection:
-            self.radial_hidden_proj = FocusLinear(
+            self.radial_hidden_proj = ChannelLinear(
                 in_channels=self.channels,
                 out_channels=self.hidden_channels,
-                n_focus=1,
                 dtype=self.dtype,
                 bias=False,
                 seed=seed_radial_hidden,
@@ -953,9 +990,7 @@ class SO2Convolution(nn.Module):
         with nvtx_range("SO2Conv/radial_fuse"):
             rad_feat = radial_feat[:, self.degree_index_m, :]  # (E, D_m, C)
             if self.radial_hidden_proj is not None:
-                rad_feat = self.radial_hidden_proj(
-                    rad_feat.reshape(n_edge * self.reduced_dim, 1, self.channels)
-                ).reshape(n_edge, self.reduced_dim, self.hidden_channels)
+                rad_feat = self.radial_hidden_proj(rad_feat)
             x_local.mul_(rad_feat)
             rad_feat_l0_focus = rad_feat[:, 0, :].reshape(
                 n_edge, self.n_focus, self.so2_focus_dim
@@ -976,6 +1011,31 @@ class SO2Convolution(nn.Module):
                 """Extract scalar features from SO(2) reduced layout."""
                 return v[:, :, 0, :].reshape(v.shape[0], self.hidden_channels)
 
+            def apply_bias_correction(
+                x_local: torch.Tensor,
+                so2_linear: SO2Linear,
+                layer_idx: int,
+            ) -> None:
+                if layer_idx != 0 or so2_linear.bias0 is None:
+                    return
+                bias0 = so2_linear.bias0.view(
+                    self.n_focus, so2_linear.out_channels
+                ).unsqueeze(0)
+                if so2_linear.out_channels == self.so2_focus_dim:
+                    radial_factor = rad_feat_l0_focus
+                elif so2_linear.out_channels == 2 * self.so2_focus_dim:
+                    radial_factor = torch.cat(
+                        [rad_feat_l0_focus, rad_feat_l0_focus], dim=-1
+                    )
+                else:
+                    raise RuntimeError(
+                        "Unexpected SO2Linear output width in bias correction"
+                    )
+                bias_correction = bias0 * (
+                    radial_factor * edge_cache.edge_env.reshape(-1, 1, 1) - 1.0
+                )
+                x_local[:, :, 0, :].add_(bias_correction)
+
             if self.use_so2_attn_res:
                 so2_depth_sources = [x_local]
                 for layer_idx, (so2_linear, inter_norm, non_linear) in enumerate(
@@ -989,17 +1049,7 @@ class SO2Convolution(nn.Module):
                     residual = x_local
                     x_local = inter_norm(x_local)
                     x_local = so2_linear(x_local)
-
-                    if layer_idx == 0 and so2_linear.bias0 is not None:
-                        # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
-                        bias0 = so2_linear.bias0.view(
-                            self.n_focus, self.so2_focus_dim
-                        ).unsqueeze(0)
-                        bias_correction = bias0 * (
-                            rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1)
-                            - 1.0
-                        )  # (E, F, Cf)
-                        x_local[:, :, 0, :].add_(bias_correction)
+                    apply_bias_correction(x_local, so2_linear, layer_idx)
 
                     x_local = non_linear(x_local)
 
@@ -1018,17 +1068,7 @@ class SO2Convolution(nn.Module):
                     residual = x_local
                     x_local = inter_norm(x_local)
                     x_local = so2_linear(x_local)
-
-                    if layer_idx == 0 and so2_linear.bias0 is not None:
-                        # bias0: (F*Cf,) → (1, F, Cf) for broadcasting with (E, F, Cf)
-                        bias0 = so2_linear.bias0.view(
-                            self.n_focus, self.so2_focus_dim
-                        ).unsqueeze(0)
-                        bias_correction = bias0 * (
-                            rad_feat_l0_focus * edge_cache.edge_env.reshape(-1, 1, 1)
-                            - 1.0
-                        )  # (E, F, Cf)
-                        x_local[:, :, 0, :].add_(bias_correction)
+                    apply_bias_correction(x_local, so2_linear, layer_idx)
 
                     x_local = non_linear(x_local)
 
@@ -1198,6 +1238,8 @@ class SO2Convolution(nn.Module):
                 "so2_attn_res": self.so2_attn_res_mode,
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
+                "s2_activation": self.s2_activation,
+                "s2_grid_resolution": self.s2_grid_resolution,
                 "mlp_bias": self.mlp_bias,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],

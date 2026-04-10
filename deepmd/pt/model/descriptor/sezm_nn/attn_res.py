@@ -30,7 +30,7 @@ from .norm import (
     ScalarRMSNorm,
 )
 from .so3 import (
-    FocusLinear,
+    ChannelLinear,
 )
 from .utils import (
     np_safe,
@@ -80,7 +80,7 @@ class DepthAttnRes(nn.Module):
     """
 
     if TYPE_CHECKING:
-        query_proj: FocusLinear
+        query_proj: ChannelLinear
         adamw_pseudo_query: torch.Tensor
 
     def __init__(
@@ -111,10 +111,9 @@ class DepthAttnRes(nn.Module):
             trainable=trainable,
         )
         if self.input_dependent:
-            self.query_proj = FocusLinear(
+            self.query_proj = ChannelLinear(
                 in_channels=self.channels,
                 out_channels=self.channels,
-                n_focus=1,
                 dtype=self.dtype,
                 bias=self.query_bias,
                 trainable=trainable,
@@ -165,9 +164,7 @@ class DepthAttnRes(nn.Module):
         # === Step 1. Build the query vector ===
         if self.input_dependent:
             current_x_scalar = scalar_extractor(current_x)
-            query = self.query_proj(
-                current_x_scalar.to(dtype=self.dtype).unsqueeze(1)
-            ).squeeze(1)
+            query = self.query_proj(current_x_scalar.to(dtype=self.dtype))
         else:
             query = self.adamw_pseudo_query.unsqueeze(0).expand(batch_size, -1)
 

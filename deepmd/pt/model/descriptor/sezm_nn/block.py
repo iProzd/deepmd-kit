@@ -30,6 +30,9 @@ from deepmd.pt.utils.env import (
     RESERVED_PRECISION_DICT,
 )
 
+from .activation import (
+    resolve_s2_grid_resolution,
+)
 from .attn_res import (
     DepthAttnRes,
 )
@@ -110,6 +113,9 @@ class SeZMInteractionBlock(nn.Module):
         If True, apply post-norm on each FFN subblock output before the residual add.
     ffn_neurons
         Hidden dimension for each FFN subblock.
+    grid_ffn
+        If True, use the optional grid-MLP structure for the block-internal FFN
+        units. The final descriptor output head is unaffected.
     ffn_blocks
         Number of FFN subblocks per block.
     layer_scale
@@ -125,6 +131,12 @@ class SeZMInteractionBlock(nn.Module):
         Descriptor-level block attention residual mode for this block wrapper.
         When enabled, the block uses external block history plus an intra-block
         partial sum to build the SO(2) input and the input of each FFN unit.
+    s2_activation
+        If True, enable the merged scalar/grid SwiGLU-S2 activation in the SO(2)
+        branch and in the default FFN activation path.
+    s2_grid_resolution
+        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation
+        modules.
     activation_function
         Activation function for l=0 components.
     glu_activation
@@ -165,10 +177,13 @@ class SeZMInteractionBlock(nn.Module):
         ffn_pre_norm: bool = True,
         ffn_post_norm: bool = False,
         ffn_neurons: int = 96,
+        grid_ffn: bool = False,
         ffn_blocks: int = 1,
         layer_scale: bool = False,
         full_attn_res: str = "none",
         block_attn_res: str = "none",
+        s2_activation: bool = False,
+        s2_grid_resolution: list[int] | None = None,
         activation_function: str,
         glu_activation: bool = True,
         mlp_bias: bool = False,
@@ -206,6 +221,7 @@ class SeZMInteractionBlock(nn.Module):
         self.ffn_pre_norm = bool(ffn_pre_norm)
         self.ffn_post_norm = bool(ffn_post_norm)
         self.ffn_neurons = int(ffn_neurons)
+        self.grid_ffn = bool(grid_ffn)
         self.ffn_blocks = int(ffn_blocks)
         if self.ffn_blocks < 1:
             raise ValueError("`ffn_blocks` must be >= 1")
@@ -226,6 +242,10 @@ class SeZMInteractionBlock(nn.Module):
             raise ValueError(
                 "`full_attn_res` and `block_attn_res` cannot both be enabled"
             )
+        self.s2_activation = bool(s2_activation)
+        self.s2_grid_resolution = resolve_s2_grid_resolution(
+            self.lmax, self.mmax, s2_grid_resolution
+        )
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
@@ -277,6 +297,8 @@ class SeZMInteractionBlock(nn.Module):
             so2_attn_res=self.so2_attn_res_mode,
             layer_scale=self.layer_scale,
             n_atten_head=n_atten_head,
+            s2_activation=self.s2_activation,
+            s2_grid_resolution=self.s2_grid_resolution,
             mlp_bias=self.mlp_bias,
             use_triton=self.use_triton,
             eps=self.eps,
@@ -324,7 +346,13 @@ class SeZMInteractionBlock(nn.Module):
                     lmax=self.lmax,
                     channels=self.channels,
                     hidden_channels=ffn_neurons,
+                    grid_ffn=self.grid_ffn,
                     dtype=dtype,
+                    s2_activation=self.s2_activation,
+                    s2_grid_resolution=[
+                        max(self.s2_grid_resolution),
+                        max(self.s2_grid_resolution),
+                    ],
                     activation_function=activation_function,
                     glu_activation=self.glu_activation,
                     mlp_bias=self.mlp_bias,
@@ -715,9 +743,12 @@ class SeZMInteractionBlock(nn.Module):
                 "ffn_pre_norm": self.ffn_pre_norm,
                 "ffn_post_norm": self.ffn_post_norm,
                 "ffn_neurons": self.ffn_neurons,
+                "grid_ffn": self.grid_ffn,
                 "ffn_blocks": self.ffn_blocks,
                 "full_attn_res": self.full_attn_res_mode,
                 "block_attn_res": self.block_attn_res_mode,
+                "s2_activation": self.s2_activation,
+                "s2_grid_resolution": self.s2_grid_resolution,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,

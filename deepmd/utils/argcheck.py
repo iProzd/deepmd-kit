@@ -418,7 +418,12 @@ def descrpt_se_zm_args() -> list[Argument]:
         "`w**2 * exp(logit)` in the numerator and "
         "`zeta + sum(w**2 * exp(logit))` in the denominator."
     )
-    doc_ffn_neurons = "Hidden sizes for equivariant FFN in each block and the final scalar output FFN."
+    doc_ffn_neurons = (
+        "Hidden size for the equivariant FFN in each block and the final scalar "
+        "output FFN. `0` enables automatic inference from `channels`: "
+        "`4 * channels` when `glu_activation=false`, or `(8 / 3) * channels` "
+        "when `glu_activation=true`, then rounded up to a multiple of 32."
+    )
     doc_ffn_blocks = "Number of FFN sublayers per interaction block."
     doc_sandwich_norm = (
         "Pre/post-norm switches for residual branches. Use [so2_pre, so2_post, ffn_pre, ffn_post] to "
@@ -449,6 +454,24 @@ def descrpt_se_zm_args() -> list[Argument]:
         "each FFN unit, and before the final aggregation. Must be one of "
         "`none`, `independent`, or `dependent`. Cannot be enabled together "
         "with `block_attn_res`."
+    )
+    doc_s2_activation = (
+        "If True, replace the intermediate gated activations in both "
+        "SO(2) convolution and the default block-internal equivariant FFN path "
+        "with the merged scalar/grid SwiGLU-S2 activation. The final `l=0` "
+        "output head keeps the scalar FFN path. "
+        "When enabled, the descriptor internally forces "
+        '`glu_activation=true` and `activation_function="silu"`.'
+    )
+    doc_grid_ffn = (
+        "If True, use the optional grid-MLP structure for the block-internal "
+        "equivariant FFN. This does not change the final `l=0` output head."
+    )
+    doc_s2_grid_resolution = (
+        "Two positive integers `[R_phi, R_theta]` used by the S2-grid "
+        "activation. If omitted, the resolution is resolved automatically from "
+        "the first block `(lmax, mmax)` after schedule parsing as "
+        "`[2 * mmax + 4, ceil_even(3 * lmax + 2)]`."
     )
     doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
     doc_glu_activation = (
@@ -538,7 +561,22 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_focus_dim,
         ),
         Argument("n_atten_head", int, optional=True, default=1, doc=doc_n_atten_head),
-        Argument("ffn_neurons", int, optional=True, default=96, doc=doc_ffn_neurons),
+        Argument(
+            "ffn_neurons",
+            int,
+            optional=True,
+            default=0,
+            extra_check=lambda x: x >= 0,
+            extra_check_errmsg="must be >= 0",
+            doc=doc_ffn_neurons,
+        ),
+        Argument(
+            "grid_ffn",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_grid_ffn,
+        ),
         Argument(
             "ffn_blocks",
             int,
@@ -584,6 +622,22 @@ def descrpt_se_zm_args() -> list[Argument]:
             extra_check=lambda x: x in attn_res_modes,
             extra_check_errmsg="must be one of 'none', 'independent', or 'dependent'",
             doc=doc_only_pt_supported + doc_block_attn_res,
+        ),
+        Argument(
+            "s2_activation",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_s2_activation,
+        ),
+        Argument(
+            "s2_grid_resolution",
+            list[int],
+            optional=True,
+            default=None,
+            extra_check=lambda x: len(x) == 2 and all(v > 0 for v in x),
+            extra_check_errmsg="must be a list of two positive integers",
+            doc=doc_only_pt_supported + doc_s2_grid_resolution,
         ),
         Argument(
             "activation_function",

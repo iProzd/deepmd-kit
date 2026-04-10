@@ -172,6 +172,14 @@ class TestDescrptSeZM(_SeZMTestCase):
                 focus_dim=3,
                 so2_layers=2,
             ),
+            "focus_dim_zero_s2": _descriptor_kwargs(
+                channels=4,
+                n_focus=2,
+                focus_dim=0,
+                so2_layers=2,
+                s2_activation=True,
+                s2_grid_resolution=[8, 12],
+            ),
         }
         for name, model_kwargs in cases.items():
             with self.subTest(mode=name):
@@ -189,6 +197,12 @@ class TestDescrptSeZM(_SeZMTestCase):
                 seed=123,
                 full_attn_res="none",
                 block_attn_res="dependent",
+            ),
+            "full_attention_s2": _attention_descriptor_kwargs(
+                precision="float32",
+                seed=123,
+                s2_activation=True,
+                s2_grid_resolution=[8, 12],
             ),
         }
         for name, model_kwargs in cases.items():
@@ -289,48 +303,61 @@ class TestDescrptSeZM(_SeZMTestCase):
 
     def test_serialization_deserialization(self) -> None:
         """Test serialization and deserialization preserves model state."""
-        focus_dim_cases = (0, 3)
+        cases = {
+            "focus_dim_zero": _attention_descriptor_kwargs(
+                precision="float32",
+                focus_dim=0,
+            ),
+            "focus_dim_explicit": _descriptor_kwargs(
+                precision="float32",
+                channels=4,
+                n_focus=2,
+                focus_dim=3,
+                so2_layers=2,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neurons=8,
+            ),
+            "focus_dim_zero_s2": _descriptor_kwargs(
+                precision="float32",
+                channels=4,
+                n_focus=2,
+                focus_dim=0,
+                so2_layers=2,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neurons=8,
+                s2_activation=True,
+                s2_grid_resolution=[8, 12],
+            ),
+        }
         dtype = PRECISION_DICT["float32"]
-        for focus_dim in focus_dim_cases:
+        for case_name, model_kwargs in cases.items():
             coord, atype, nlist = _tiny_two_atom_system(self.device, dtype=dtype)
             extended_coord = coord.reshape(1, -1)
+            with self.subTest(mode=case_name):
+                model = DescrptSeZM(**model_kwargs)
 
-            model_kwargs = (
-                _attention_descriptor_kwargs(precision="float32", focus_dim=focus_dim)
-                if focus_dim == 0
-                else _descriptor_kwargs(
-                    precision="float32",
-                    channels=4,
-                    n_focus=2,
-                    focus_dim=focus_dim,
-                    so2_layers=2,
-                    n_radial=3,
-                    radial_mlp=[6],
-                    ffn_neurons=8,
+                desc1, _, _, _, sw1 = model(extended_coord, atype, nlist)
+                data = model.serialize()
+                model_restored = DescrptSeZM.deserialize(data)
+                desc2, _, _, _, sw2 = model_restored(extended_coord, atype, nlist)
+                atol, rtol = _forward_tols(dtype)
+
+                torch.testing.assert_close(
+                    desc1,
+                    desc2,
+                    atol=atol,
+                    rtol=rtol,
+                    msg="Descriptor mismatch after deserialization",
                 )
-            )
-            model = DescrptSeZM(**model_kwargs)
-
-            desc1, _, _, _, sw1 = model(extended_coord, atype, nlist)
-            data = model.serialize()
-            model_restored = DescrptSeZM.deserialize(data)
-            desc2, _, _, _, sw2 = model_restored(extended_coord, atype, nlist)
-            atol, rtol = _forward_tols(dtype)
-
-            torch.testing.assert_close(
-                desc1,
-                desc2,
-                atol=atol,
-                rtol=rtol,
-                msg="Descriptor mismatch after deserialization",
-            )
-            torch.testing.assert_close(
-                sw1,
-                sw2,
-                atol=atol,
-                rtol=rtol,
-                msg="Smooth weight mismatch after deserialization",
-            )
+                torch.testing.assert_close(
+                    sw1,
+                    sw2,
+                    atol=atol,
+                    rtol=rtol,
+                    msg="Smooth weight mismatch after deserialization",
+                )
 
     def test_seed_reproducibility(self) -> None:
         """Test that fixed seed produces identical model initialization."""

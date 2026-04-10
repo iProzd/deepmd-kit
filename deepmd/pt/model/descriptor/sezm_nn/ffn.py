@@ -28,8 +28,15 @@ from deepmd.pt.utils.env import (
     RESERVED_PRECISION_DICT,
 )
 
-from .so3 import (
+from .activation import (
     GatedActivation,
+    S2GridProjector,
+    SwiGLU,
+    SwiGLUS2Activation,
+    resolve_s2_grid_resolution,
+)
+from .so3 import (
+    ChannelLinear,
     SO3Linear,
 )
 from .utils import (
@@ -42,11 +49,19 @@ class EquivariantFFN(nn.Module):
     """
     Full equivariant FFN operating on all spherical harmonic degrees.
 
-    Structure (glu_activation=False):
+    Default structure (glu_activation=False):
         SO3 linear (in -> hidden) -> GatedActivation -> SO3 linear (hidden -> out)
 
-    Structure (glu_activation=True):
+    Default structure (glu_activation=True):
         SO3 linear (in -> 2*hidden) -> split -> GatedActivation(val, gate) -> SO3 linear (hidden -> out)
+
+    Optional grid-FFN structure (grid_ffn=True):
+        SO3 linear (in -> hidden)
+        -> project packed SO(3) coefficients to the S2 grid
+        -> packed S2-grid point-wise MLP on hidden features
+        -> project grid features back to packed SO(3) coefficients
+        -> add scalar LinearSwiGLU branch to l=0
+        -> SO3 linear (hidden -> out)
 
     GatedActivation serves as the unified "activation" for equivariant networks,
     analogous to SiLU in standard MLPs, but respecting SO(3) equivariance:
@@ -65,15 +80,25 @@ class EquivariantFFN(nn.Module):
         Number of channels per (l, m) coefficient.
     hidden_channels
         Hidden dimension for the FFN.
+    grid_ffn
+        If True, use the optional grid-MLP FFN structure on the block-internal
+        FFN path. This path takes precedence over the simpler activation-only
+        path inside this module.
     dtype
         Parameter dtype.
+    s2_activation
+        If True and ``grid_ffn=False``, replace the default GatedActivation path
+        with the merged scalar/grid SwiGLU-S2 activation.
+    s2_grid_resolution
+        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
     activation_function
         Activation function for l=0 components (e.g., "silu", "tanh", "gelu").
     glu_activation
         If True, use GLU-style gating (e.g., silu -> swiglu, gelu -> geglu).
     mlp_bias
-        Whether to use bias in SO3Linear (l=0 bias) and GatedActivation
-        (gate linear bias).
+        Whether to use bias in SO3Linear (l=0 bias), GatedActivation
+        (gate linear bias), and the scalar point-wise projection when
+        ``grid_ffn=True``.
     trainable
         Whether parameters are trainable.
     seed
@@ -86,7 +111,10 @@ class EquivariantFFN(nn.Module):
         lmax: int,
         channels: int,
         hidden_channels: int,
+        grid_ffn: bool = False,
         dtype: torch.dtype,
+        s2_activation: bool = False,
+        s2_grid_resolution: list[int] | None = None,
         activation_function: str = "silu",
         glu_activation: bool = True,
         mlp_bias: bool = False,
@@ -97,6 +125,11 @@ class EquivariantFFN(nn.Module):
         self.lmax = int(lmax)
         self.channels = int(channels)
         self.hidden_channels = int(hidden_channels)
+        self.grid_ffn = bool(grid_ffn)
+        self.s2_activation = bool(s2_activation)
+        self.s2_grid_resolution = resolve_s2_grid_resolution(
+            self.lmax, self.lmax, s2_grid_resolution
+        )
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
@@ -110,10 +143,15 @@ class EquivariantFFN(nn.Module):
         seed_so3_out = child_seed(seed, 2)
 
         # === First SO3Linear for channel mixing ===
-        # When glu_activation=True, output 2*hidden_channels for split
-        linear1_out_channels = (
-            2 * self.hidden_channels if self.glu_activation else self.hidden_channels
-        )
+        # Grid-FFN keeps the hidden width and performs the nonlinear expansion
+        # inside the scalar/grid point-wise MLPs.
+        linear1_out_channels = self.hidden_channels
+        if not self.grid_ffn:
+            linear1_out_channels = (
+                2 * self.hidden_channels
+                if self.glu_activation
+                else self.hidden_channels
+            )
         self.so3_linear_1 = SO3Linear(
             lmax=self.lmax,
             in_channels=self.channels,
@@ -125,17 +163,60 @@ class EquivariantFFN(nn.Module):
             seed=seed_so3_in,
         )
 
-        # === Equivariant activation ===
-        self.act = GatedActivation(
-            lmax=self.lmax,
-            channels=self.hidden_channels,
-            dtype=dtype,
-            activation_function=activation_function,
-            mlp_bias=self.mlp_bias,
-            layout="ndfc",
-            trainable=trainable,
-            seed=seed_act,
-        )
+        # === Equivariant nonlinearity path ===
+        self.scalar_mlp: nn.Module | None = None
+        self.grid_projector: S2GridProjector | None = None
+        self.grid_mlp: nn.Module | None = None
+        if self.grid_ffn:
+            self.scalar_mlp = nn.Sequential(
+                ChannelLinear(
+                    in_channels=self.channels,
+                    out_channels=2 * self.hidden_channels,
+                    dtype=dtype,
+                    bias=self.mlp_bias,
+                    trainable=trainable,
+                    seed=child_seed(seed_act, 0),
+                ),
+                SwiGLU(),
+            )
+            self.grid_projector = S2GridProjector(
+                lmax=self.lmax,
+                mmax=self.lmax,
+                dtype=dtype,
+                grid_resolution_list=self.s2_grid_resolution,
+                coefficient_layout="packed",
+            )
+            self.grid_mlp = PointwiseGridMLP(
+                channels=self.hidden_channels,
+                dtype=dtype,
+                trainable=trainable,
+                seed=child_seed(seed_act, 1),
+            )
+            self.act = nn.Identity()
+        elif self.s2_activation:
+            self.act = SwiGLUS2Activation(
+                lmax=self.lmax,
+                channels=self.hidden_channels,
+                dtype=dtype,
+                n_focus=1,
+                layout="ndfc",
+                grid_resolution_list=self.s2_grid_resolution,
+                coefficient_layout="packed",
+                mlp_bias=self.mlp_bias,
+                trainable=trainable,
+                seed=seed_act,
+            )
+        else:
+            self.act = GatedActivation(
+                lmax=self.lmax,
+                channels=self.hidden_channels,
+                dtype=dtype,
+                activation_function=activation_function,
+                mlp_bias=self.mlp_bias,
+                layout="ndfc",
+                trainable=trainable,
+                seed=seed_act,
+            )
 
         # === Second SO3Linear for channel mixing ===
         # Zero-initialized so residual path starts near-identity.
@@ -167,10 +248,22 @@ class EquivariantFFN(nn.Module):
             Output with shape (N, D, F, C).
         """
         # === Step 1. Input up projection ===
+        x_input = x
         x = self.so3_linear_1(x)
 
-        # === Step 2. Equivariant activation (with optional GLU) ===
-        if self.glu_activation:
+        # === Step 2. Equivariant nonlinearity ===
+        if self.grid_ffn:
+            scalar_outputs = self.scalar_mlp(x_input.select(dim=1, index=0))
+            x_flat, shape_info = self._flatten_grid_inputs(x)
+            x_grid = self.grid_projector.to_grid(x_flat.to(dtype=self.dtype))
+            x_grid = self.grid_mlp(x_grid)
+            x = self._restore_grid_outputs(
+                self.grid_projector.from_grid(x_grid), shape_info
+            )
+            x[:, 0, :, :].add_(scalar_outputs)
+        elif self.s2_activation:
+            x = self.act(x)
+        elif self.glu_activation:
             # Split into value and gate branches along channel dimension
             x_val, x_gate = x.chunk(2, dim=-1)
             # Pass gate to GatedActivation for GLU-style gating
@@ -183,6 +276,23 @@ class EquivariantFFN(nn.Module):
 
         return x
 
+    def _flatten_grid_inputs(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, tuple[int, int, int]]:
+        n_batch, coeff_dim, n_focus, _ = x.shape
+        return (
+            x.permute(0, 2, 1, 3).reshape(n_batch * n_focus, coeff_dim, x.shape[-1]),
+            (n_batch, coeff_dim, n_focus),
+        )
+
+    def _restore_grid_outputs(
+        self, x: torch.Tensor, shape_info: tuple[int, int, int]
+    ) -> torch.Tensor:
+        n_batch, coeff_dim, n_focus = shape_info
+        return x.reshape(n_batch, n_focus, coeff_dim, self.hidden_channels).permute(
+            0, 2, 1, 3
+        )
+
     def serialize(self) -> dict[str, Any]:
         trainable = all(p.requires_grad for p in self.parameters())
         state = self.state_dict()
@@ -193,7 +303,10 @@ class EquivariantFFN(nn.Module):
                 "lmax": self.lmax,
                 "channels": self.channels,
                 "hidden_channels": self.hidden_channels,
+                "grid_ffn": self.grid_ffn,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
+                "s2_activation": self.s2_activation,
+                "s2_grid_resolution": self.s2_grid_resolution,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,
@@ -226,3 +339,53 @@ class EquivariantFFN(nn.Module):
         }
         obj.load_state_dict(state)
         return obj
+
+
+class PointwiseGridMLP(nn.Module):
+    """
+    Apply a two-layer point-wise MLP on flattened S2 grid features.
+
+    Parameters
+    ----------
+    channels
+        Hidden feature dimension on the grid.
+    dtype
+        Parameter dtype.
+    trainable
+        Whether parameters are trainable.
+    seed
+        Random seed for weight initialization.
+    """
+
+    def __init__(
+        self,
+        *,
+        channels: int,
+        dtype: torch.dtype,
+        trainable: bool,
+        seed: int | list[int] | None = None,
+    ) -> None:
+        super().__init__()
+        self.channels = int(channels)
+        self.linear_1 = ChannelLinear(
+            in_channels=self.channels,
+            out_channels=2 * self.channels,
+            dtype=dtype,
+            bias=False,
+            trainable=trainable,
+            seed=child_seed(seed, 0),
+        )
+        self.act = SwiGLU()
+        self.linear_2 = ChannelLinear(
+            in_channels=self.channels,
+            out_channels=self.channels,
+            dtype=dtype,
+            bias=False,
+            trainable=trainable,
+            seed=child_seed(seed, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply the point-wise grid MLP."""
+        x = self.act(self.linear_1(x))
+        return self.linear_2(x)

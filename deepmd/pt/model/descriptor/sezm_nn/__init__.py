@@ -6,6 +6,13 @@ This package re-exports the helper functions, embeddings, equivariant layers,
 and quaternion-based Wigner-D utilities used by the SeZM descriptor and model.
 """
 
+from .activation import (
+    GatedActivation,
+    S2GridProjector,
+    SwiGLU,
+    SwiGLUS2Activation,
+    resolve_s2_grid_resolution,
+)
 from .attention import (
     segment_envelope_gated_softmax,
 )
@@ -58,8 +65,8 @@ from .so2 import (
     SO2Linear,
 )
 from .so3 import (
+    ChannelLinear,
     FocusLinear,
-    GatedActivation,
     SO3Linear,
 )
 from .utils import (
@@ -84,6 +91,7 @@ from .wignerd import (
 __all__ = [
     "ATTN_RES_MODES",
     "C3CutoffEnvelope",
+    "ChannelLinear",
     "DepthAttnRes",
     "EdgeFeatureCache",
     "EnvironmentInitialEmbedding",
@@ -97,12 +105,15 @@ __all__ = [
     "RadialBasis",
     "RadialMLP",
     "ReducedEquivariantRMSNorm",
+    "S2GridProjector",
     "SO2Convolution",
     "SO2Linear",
     "SO3Linear",
     "ScalarRMSNorm",
     "SeZMInteractionBlock",
     "SeZMTypeEmbedding",
+    "SwiGLU",
+    "SwiGLUS2Activation",
     "WignerDCalculator",
     "build_edge_cache",
     "build_edge_cache_from_edges",
@@ -126,6 +137,7 @@ __all__ = [
     "quaternion_normalize",
     "quaternion_to_rotation_matrix",
     "quaternion_z_rotation",
+    "resolve_s2_grid_resolution",
     "safe_norm",
     "safe_numpy_to_tensor",
     "segment_envelope_gated_softmax",

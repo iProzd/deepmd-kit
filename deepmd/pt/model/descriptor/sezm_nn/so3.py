@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """
-SO(3)-equivariant linear and gating layers for SeZM.
+SO(3)-equivariant linear layers for SeZM.
 
-This module defines the focus-aware linear maps and gated nonlinearities
-used by SeZM SO(3) feature transformations.
+This module defines the channel-only and focus-aware linear maps used by SeZM
+SO(3) feature transformations.
 """
 
 from __future__ import (
@@ -29,12 +29,10 @@ from deepmd.pt.utils.env import (
     RESERVED_PRECISION_DICT,
 )
 from deepmd.pt.utils.utils import (
-    ActivationFn,
     get_generator,
 )
 
 from .indexing import (
-    build_m_major_l_index,
     get_so3_dim_of_lmax,
     map_degree_idx,
 )
@@ -143,245 +141,96 @@ class FocusLinear(nn.Module):
         return out
 
 
-class GatedActivation(nn.Module):
+class ChannelLinear(nn.Module):
     """
-    Gated activation for SO(3) equivariant features with per-l independent gates.
+    Channel-only linear projection on the last feature axis.
 
-    Standard mode (gate=None in forward):
-        - l=0: Uses the specified activation function
-        - l>0: Each degree l has an independent gate derived from the l=0 scalar features.
-               The gate for each l is expanded to all m components within that l-block.
-
-    GLU mode (gate provided in forward, e.g., from split linear output):
-        - l=0: x0 * act(g0) (SwiGLU-style when act=silu, GeGLU when act=gelu, etc.)
-        - l>0: Uses gate's scalar (g0) to generate sigmoid gates for x's vector components.
-               This preserves SO(3) equivariance (scalar gates vector, not vector gates vector).
-
-    This module also supports the m-major reduced layout used inside SO(2) blocks.
-    If `mmax` is provided, the coefficient axis is assumed to follow the truncated
-    m-major order built by `build_m_major_index(lmax, mmax)`; otherwise, it is assumed
-    to be the full packed (l, m) layout with D=(lmax+1)^2.
+    Notes
+    -----
+    Parameters are stored in (in, out) convention to match Muon's rectangular
+    correction assumption (rows=fan_in, cols=fan_out):
+    - weight: (in_channels, out_channels)
+    - bias: (out_channels,)
 
     Parameters
     ----------
-    lmax
-        Maximum spherical harmonic degree.
-    mmax
-        Maximum order (|m|) for the m-major reduced layout. If None, use the full
-        packed layout with D=(lmax+1)^2.
-    channels
-        Number of channels per focus stream.
-    n_focus
-        Number of focus streams.
+    in_channels
+        Input feature dimension.
+    out_channels
+        Output feature dimension.
     dtype
         Parameter dtype.
-    activation_function
-        Activation function for l=0 components (e.g., "silu", "tanh", "gelu").
-    mlp_bias
-        Whether to use bias in the gate linear layer.
-    layout
-        Tensor layout convention. ``"nfdc"`` means input shape (N, F, D, C);
-        ``"ndfc"`` means input shape (N, D, F, C).
+    bias
+        Whether to use bias.
     trainable
         Whether parameters are trainable.
     seed
-        Random seed for weight initialization.
+        Random seed for initialization.
+    init_std
+        If given, use normal(0, init_std) instead of default uniform init.
+        Useful for gate projections where small initial logits are desired.
     """
 
     def __init__(
         self,
         *,
-        lmax: int,
-        mmax: int | None = None,
-        channels: int,
-        n_focus: int = 1,
+        in_channels: int,
+        out_channels: int,
         dtype: torch.dtype,
-        activation_function: str = "silu",
-        mlp_bias: bool = False,
-        layout: str = "nfdc",
+        bias: bool = True,
         trainable: bool,
         seed: int | list[int] | None = None,
+        init_std: float | None = None,
     ) -> None:
         super().__init__()
-        self.lmax = int(lmax)
-        self.mmax = None if mmax is None else int(mmax)
-        if self.mmax is not None:
-            if self.mmax < 0:
-                raise ValueError("`mmax` must be non-negative")
-            if self.mmax > self.lmax:
-                raise ValueError("`mmax` must be <= `lmax`")
-        self.channels = int(channels)
-        self.n_focus = int(n_focus)
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
         self.dtype = dtype
         self.device = env.DEVICE
-        self.precision = RESERVED_PRECISION_DICT[dtype]
-        self.mlp_bias = bool(mlp_bias)
-        self.layout = str(layout).lower()
-        if self.layout not in {"nfdc", "ndfc"}:
-            raise ValueError("`layout` must be either 'nfdc' or 'ndfc'")
-
-        self.scalar_act = ActivationFn(activation_function)
-
-        # === Build expand_index for mapping per-l gates to all m components ===
-        if self.lmax > 0:
-            # expand_index[k] = l-1 for the k-th component in the non-scalar (l>0) portion.
-            # This maps each coefficient position to its corresponding gate index.
-            if self.mmax is None:
-                expand_index = map_degree_idx(self.lmax, device=self.device)[1:] - 1
-            else:
-                degree_index = build_m_major_l_index(
-                    self.lmax, self.mmax, device=self.device
-                )
-                expand_index = degree_index[1:] - 1
-            self.register_buffer("expand_index", expand_index, persistent=False)
-
-            # Linear to generate lmax independent gates from scalar features
-            self.gate_linear: nn.Module = FocusLinear(
-                in_channels=self.channels,
-                out_channels=self.lmax * self.channels,
-                n_focus=self.n_focus,
+        self.use_bias = bool(bias)
+        self.weight = nn.Parameter(
+            torch.empty(
+                self.in_channels,
+                self.out_channels,
+                device=self.device,
                 dtype=self.dtype,
-                bias=self.mlp_bias,
-                seed=seed,
-                trainable=trainable,
             )
-
-            # === Optimized Init: Gate output ~0 => Sigmoid => 0.5 ===
-            # Ensures maximum gradient flow (sigmoid'(0) = 0.25 is maximal, sigmoid(0) = 0.5) and unbiased
-            # feature scaling at initialization. All high-order features start with
-            # equal gating weight (0.5), allowing the model to learn which to suppress
-            # or amplify based on the loss signal.
-            # Use small std (0.01) to keep gate logits near zero at init.
-            gen_gate = get_generator(child_seed(seed, 1))
-            nn.init.normal_(
-                self.gate_linear.weight, mean=0.0, std=0.01, generator=gen_gate
-            )
-            if self.gate_linear.bias is not None:
-                nn.init.zeros_(self.gate_linear.bias)
+        )
+        gen = get_generator(seed)
+        if init_std is not None:
+            nn.init.normal_(self.weight, mean=0.0, std=init_std, generator=gen)
         else:
-            self.register_buffer(
-                "expand_index",
-                torch.zeros(0, dtype=torch.long, device=self.device),
-                persistent=False,
+            bound = 1.0 / math.sqrt(self.in_channels)
+            nn.init.uniform_(self.weight, -bound, bound, generator=gen)
+        if self.use_bias:
+            self.bias: nn.Parameter | None = nn.Parameter(
+                torch.zeros(
+                    self.out_channels,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
             )
-            self.gate_linear = nn.Identity()
-
+        else:
+            self.bias = None
         for p in self.parameters():
             p.requires_grad = trainable
 
-    def forward(
-        self, x: torch.Tensor, gate: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
         ----------
         x
-            Value features. Shape is (N, F, D, C) when ``layout='nfdc'``,
-            or (N, D, F, C) when ``layout='ndfc'``.
-        gate
-            Optional gate features with the same layout as ``x``.
-            When provided, enables GLU mode:
-            - l=0: x0 * act(g0) (e.g., SwiGLU when act=silu)
-            - l>0: sigmoid(Linear(g0)) gates x's vector components
-            When None (default), uses standard mode where gates are derived from x itself.
+            Input tensor with shape ``(..., C_in)``.
 
         Returns
         -------
         torch.Tensor
-            Gated features with the same layout as ``x``.
+            Projected tensor with shape ``(..., C_out)``.
         """
-        if self.layout == "nfdc":
-            focus_axis = 1
-            degree_axis = 2
-        else:
-            focus_axis = 2
-            degree_axis = 1
-
-        # === Determine gate source ===
-        # GLU mode: use external gate's scalar; Standard mode: use x's scalar
-        if gate is not None:
-            gate_scalar_source = gate.select(dim=degree_axis, index=0)  # (N, F, C)
-        else:
-            gate_scalar_source = x.select(dim=degree_axis, index=0)  # (N, F, C)
-
-        # === Step 1. l=0 activation ===
-        if gate is not None:
-            # GLU mode: x0 * act(g0) (e.g., SwiGLU, GeGLU)
-            x0 = x.narrow(degree_axis, 0, 1) * self.scalar_act(
-                gate.narrow(degree_axis, 0, 1)
-            )
-        else:
-            # Standard mode: act(x0)
-            x0 = self.scalar_act(x.narrow(degree_axis, 0, 1))
-
-        if self.lmax == 0:
-            return x0
-
-        # === Step 2. Generate per-l gates from scalar features ===
-        # gate_scalar_source has shape (N, F, C)
-        # gate_linear outputs (N, F, lmax * C)
-        gating_scalars = torch.sigmoid(self.gate_linear(gate_scalar_source))
-
-        # Reshape to (N, F, lmax, C) then expand to (N, F, D-1, C)
-        gating_scalars = gating_scalars.reshape(
-            x.shape[0], gate_scalar_source.shape[1], self.lmax, self.channels
-        )
-        gates = gating_scalars.index_select(dim=2, index=self.expand_index)
-        if self.layout == "ndfc":
-            gates = gates.transpose(1, 2)  # (N, D-1, F, C)
-
-        # === Step 3. Apply gates to l>0 components ===
-        out = x.new_empty(x.shape)
-        out.narrow(degree_axis, 0, 1).copy_(x0)
-        out.narrow(degree_axis, 1, x.shape[degree_axis] - 1).copy_(
-            x.narrow(degree_axis, 1, x.shape[degree_axis] - 1) * gates
-        )
+        out = torch.einsum("...i,io->...o", x, self.weight)
+        if self.use_bias:
+            out = out + self.bias
         return out
-
-    def serialize(self) -> dict[str, Any]:
-        trainable = all(p.requires_grad for p in self.parameters())
-        state = self.state_dict()
-        return {
-            "@class": "GatedActivation",
-            "@version": 1,
-            "config": {
-                "lmax": self.lmax,
-                "mmax": self.mmax,
-                "channels": self.channels,
-                "n_focus": self.n_focus,
-                "precision": RESERVED_PRECISION_DICT[self.dtype],
-                "activation_function": self.scalar_act.activation,
-                "mlp_bias": self.mlp_bias,
-                "layout": self.layout,
-                "trainable": trainable,
-                "seed": None,
-            },
-            "@variables": {key: np_safe(value) for key, value in state.items()},
-        }
-
-    @classmethod
-    def deserialize(cls, data: dict[str, Any]) -> GatedActivation:
-        data = data.copy()
-        data_cls = data.pop("@class")
-        if data_cls != "GatedActivation":
-            raise ValueError(f"Invalid class for GatedActivation: {data_cls}")
-        version = int(data.pop("@version"))
-        if version != 1:
-            raise ValueError(f"Unsupported GatedActivation version: {version}")
-        config = data.pop("config")
-        variables = data.pop("@variables")
-        precision = config.pop("precision")
-        config["dtype"] = PRECISION_DICT[precision]
-        obj = cls(**config)
-        template = obj.state_dict()
-        state = {
-            key: safe_numpy_to_tensor(
-                value, device=template[key].device, dtype=template[key].dtype
-            )
-            for key, value in variables.items()
-        }
-        obj.load_state_dict(state)
-        return obj
 
 
 class SO3Linear(nn.Module):
