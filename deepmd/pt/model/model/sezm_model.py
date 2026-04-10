@@ -151,93 +151,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
     # Forward Methods
     # =========================================================================
 
-    def forward_common_lower(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor | None = None,
-        fparam: torch.Tensor | None = None,
-        aparam: torch.Tensor | None = None,
-        do_atomic_virial: bool = False,
-        comm_dict: dict[str, torch.Tensor] | None = None,
-        extra_nlist_sort: bool = False,
-        extended_coord_corr: torch.Tensor | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Override to inject analytical pair potential before autograd.
-
-        When ``bridging_method`` is active, the pair energy is added to the
-        atomic energy between ``forward_common_atomic`` and
-        ``fit_output_to_model_output``, so that autograd naturally produces
-        forces and virial that include the analytical potential contribution.
-
-        Parameters
-        ----------
-        extended_coord
-            Coordinates in extended region with shape (nf, nall*3) or (nf, nall, 3) in Å.
-        extended_atype
-            Atom types in extended region with shape (nf, nall).
-        nlist
-            Neighbor list with shape (nf, nloc, nsel).
-        mapping
-            Maps extended indices to local indices with shape (nf, nall).
-        fparam
-            Frame parameters with shape (nf, ndf) or None.
-        aparam
-            Atomic parameters with shape (nf, nloc, nda) or None.
-        do_atomic_virial
-            Whether to compute atomic virial.
-        comm_dict
-            Communication data for parallel inference.
-        extra_nlist_sort
-            Whether to forcibly sort the nlist.
-        extended_coord_corr
-            Coordinates correction for virial with shape (nf, nall*3) or None.
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Model predictions on the extended region.
-        """
-        nframes, nall = extended_atype.shape[:2]
-        extended_coord = extended_coord.view(nframes, -1, 3)
-        nlist = self.format_nlist(
-            extended_coord, extended_atype, nlist, extra_nlist_sort=extra_nlist_sort
-        )
-        cc_ext, _, fp, ap, input_prec = self._input_type_cast(
-            extended_coord, fparam=fparam, aparam=aparam
-        )
-        del extended_coord, fparam, aparam
-        atomic_ret = self.atomic_model.forward_common_atomic(
-            cc_ext,
-            extended_atype,
-            nlist,
-            mapping=mapping,
-            fparam=fp,
-            aparam=ap,
-            comm_dict=comm_dict,
-        )
-
-        # === Inject analytical pair potential ===
-        if self.inter_potential is not None:
-            nloc = nlist.shape[1]
-            atomic_ret["energy"] = atomic_ret["energy"] + self.inter_potential(
-                cc_ext, extended_atype, nlist, nloc
-            )  # (nf, nloc, 1)
-
-        model_predict = fit_output_to_model_output(
-            atomic_ret,
-            self.atomic_output_def(),
-            cc_ext,
-            do_atomic_virial=do_atomic_virial,
-            create_graph=self.training,
-            mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
-            extended_coord_corr=extended_coord_corr,
-        )
-        model_predict = self._output_type_cast(model_predict, input_prec)
-        return model_predict
-
     def forward(
         self,
         coord: Float[Tensor, "nf nloc 3"] | Float[Tensor, "nf nloc_x3"],
@@ -493,6 +406,196 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             with nvtx_range("SeZM/output_type_cast"):
                 model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
+
+    def forward_common_lower(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+        extra_nlist_sort: bool = False,
+        extended_coord_corr: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Override to inject analytical pair potential before autograd.
+
+        When ``bridging_method`` is active, the pair energy is added to the
+        atomic energy between ``forward_common_atomic`` and
+        ``fit_output_to_model_output``, so that autograd naturally produces
+        forces and virial that include the analytical potential contribution.
+
+        Parameters
+        ----------
+        extended_coord
+            Coordinates in extended region with shape (nf, nall*3) or (nf, nall, 3) in Å.
+        extended_atype
+            Atom types in extended region with shape (nf, nall).
+        nlist
+            Neighbor list with shape (nf, nloc, nsel).
+        mapping
+            Maps extended indices to local indices with shape (nf, nall).
+        fparam
+            Frame parameters with shape (nf, ndf) or None.
+        aparam
+            Atomic parameters with shape (nf, nloc, nda) or None.
+        do_atomic_virial
+            Whether to compute atomic virial.
+        comm_dict
+            Communication data for parallel inference.
+        extra_nlist_sort
+            Whether to forcibly sort the nlist.
+        extended_coord_corr
+            Coordinates correction for virial with shape (nf, nall*3) or None.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Model predictions on the extended region.
+        """
+        nframes, nall = extended_atype.shape[:2]
+        extended_coord = extended_coord.view(nframes, -1, 3)
+        nlist = self.format_nlist(
+            extended_coord, extended_atype, nlist, extra_nlist_sort=extra_nlist_sort
+        )
+        cc_ext, _, fp, ap, input_prec = self._input_type_cast(
+            extended_coord, fparam=fparam, aparam=aparam
+        )
+        del extended_coord, fparam, aparam
+        atomic_ret = self.compute_atomic_outputs_with_compact_edges(
+            cc_ext,
+            extended_atype,
+            nlist,
+            mapping=mapping,
+            fparam=fp,
+            aparam=ap,
+            comm_dict=comm_dict,
+        )
+
+        # === Inject analytical pair potential ===
+        if self.inter_potential is not None:
+            nloc = nlist.shape[1]
+            atomic_ret["energy"] = atomic_ret["energy"] + self.inter_potential(
+                cc_ext, extended_atype, nlist, nloc
+            )  # (nf, nloc, 1)
+
+        model_predict = fit_output_to_model_output(
+            atomic_ret,
+            self.atomic_output_def(),
+            cc_ext,
+            do_atomic_virial=do_atomic_virial,
+            create_graph=self.training,
+            mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
+            extended_coord_corr=extended_coord_corr,
+        )
+        model_predict = self._output_type_cast(model_predict, input_prec)
+        return model_predict
+
+    def compute_atomic_outputs_with_compact_edges(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Run the SeZM atomic path through `forward_with_edges()`.
+
+        This keeps the non-compile SeZM model on the same descriptor entry as the
+        sparse-edge compile path while preserving the standard DeePMD outer API
+        (`fit_output_to_model_output()` + `communicate_extended_output()`).
+
+        Parameters
+        ----------
+        extended_coord
+            Extended coordinates with shape `(nf, nall, 3)` in Å.
+        extended_atype
+            Extended atom types with shape `(nf, nall)`.
+        nlist
+            DeePMD neighbor list with shape `(nf, nloc, nsel)`.
+        mapping
+            Extended-to-local mapping with shape `(nf, nall)`, or `None`.
+        fparam
+            Frame parameters with shape `(nf, ndf)`, or `None`.
+        aparam
+            Atomic parameters with shape `(nf, nloc, nda)`, or `None`.
+        comm_dict
+            Communication dict kept for interface compatibility. Unused here.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Atomic outputs in the same format as `forward_common_atomic()`.
+        """
+        del comm_dict
+        _, nloc, _ = nlist.shape
+        atype = extended_atype[:, :nloc]
+        descriptor_model = self.atomic_model.descriptor
+
+        # === Step 1. Enable coordinate gradients on the extended coordinates ===
+        if self.do_grad_r() or self.do_grad_c():
+            extended_coord.requires_grad_(True)
+
+        # === Step 2. Build compact sparse edges from the DeePMD nlist ===
+        edge_index, edge_vec, edge_mask = self.build_fixed_edge_list_from_nlist(
+            extended_coord=extended_coord,
+            nlist=nlist,
+            mapping=mapping,
+        )
+
+        # === Step 3. Descriptor forward through the sparse-edge entry ===
+        descriptor, rot_mat, g2, h2, _ = descriptor_model.forward_with_edges(
+            extended_coord=extended_coord[:, :nloc, :],
+            extended_atype=atype,
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            edge_mask=edge_mask,
+        )
+        assert descriptor is not None
+        if self.atomic_model.enable_eval_descriptor_hook:
+            self.atomic_model.eval_descriptor_list.append(descriptor.detach())
+
+        # === Step 4. Fitting net + output statistics ===
+        fit_ret = self.atomic_model.fitting_net(
+            descriptor,
+            atype,
+            gr=rot_mat,
+            g2=g2,
+            h2=h2,
+            fparam=fparam,
+            aparam=aparam,
+        )
+        if self.atomic_model.enable_eval_fitting_last_layer_hook:
+            assert "middle_output" in fit_ret, (
+                "eval_fitting_last_layer not supported for this fitting net!"
+            )
+            self.atomic_model.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
+            )
+        fit_ret = self.atomic_model.apply_out_stat(fit_ret, atype)
+
+        # === Step 5. Apply the same atom masking contract as BaseAtomicModel ===
+        ext_atom_mask = self.atomic_model.make_atom_mask(extended_atype)
+        atom_mask = ext_atom_mask[:, :nloc].to(torch.int32)
+        if self.atomic_model.atom_excl is not None:
+            atom_mask *= self.atomic_model.atom_excl(atype)
+        for key in fit_ret.keys():
+            out_shape = fit_ret[key].shape
+            flat_dim = 1
+            for axis_size in out_shape[2:]:
+                flat_dim *= axis_size
+            fit_ret[key] = (
+                fit_ret[key].reshape([out_shape[0], out_shape[1], flat_dim])
+                * atom_mask[:, :, None]
+            ).view(out_shape)
+        fit_ret["mask"] = atom_mask
+        return fit_ret
 
     def trace_and_compile(
         self,
@@ -953,15 +1056,20 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         n_actual = nf * nloc
         device = extended_coord.device
         nall = extended_coord.shape[1]
+        descriptor_model = self.atomic_model.descriptor
+        coord_for_diff = extended_coord.to(dtype=descriptor_model.compute_dtype)
 
-        # === Step 1. Build per-edge geometry ===
+        # === Step 1. Build per-edge geometry in descriptor compute dtype ===
+        # Match the eager descriptor path:
+        #   cast extended coordinates to `descriptor.compute_dtype`
+        #   before any gather/subtract for edge geometry.
         valid_nlist = nlist >= 0
         gather_index = torch.where(valid_nlist, nlist, torch.zeros_like(nlist))
         index = rearrange(gather_index, "nf nloc nnei -> nf (nloc nnei) 1").expand(
             -1, -1, 3
         )
-        nei_pos = torch.gather(extended_coord, 1, index).view(nf, nloc, nsel, 3)
-        atom_pos = extended_coord[:, :nloc].unsqueeze(2)
+        nei_pos = torch.gather(coord_for_diff, 1, index).view(nf, nloc, nsel, 3)
+        atom_pos = coord_for_diff[:, :nloc].unsqueeze(2)
         diff = nei_pos - atom_pos
         edge_len2 = torch.sum(diff * diff, dim=-1).reshape(-1)  # (n_actual * nsel,)
         edge_vec_actual = diff.reshape(n_actual * nsel, 3)

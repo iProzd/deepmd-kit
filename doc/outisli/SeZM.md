@@ -97,7 +97,11 @@ the standard DeePMD neighbor list behavior:
   even when `use_compile=true`.
 - Set `DP_COMPILE_INFER=1` before model construction to make `eval()/inference` use the compile path
   by default without changing any Python call sites. The environment variable is read at model init time.
-- When `use_compile=false` (default), the normal DeePMD neighbor list path is used in all modes.
+- `SeZMModel` always starts from the standard DeePMD neighbor list, then converts it to the same
+  sparse edge representation `(src, dst, edge_vec, edge_mask)` before entering the SeZM descriptor.
+  This keeps the eager and compile descriptor math aligned while leaving the descriptor's ordinary
+  `forward(extended_coord, extended_atype, nlist, mapping, ...)` entry available for other DeePMD
+  models that want to reuse SeZM without going through `SeZMModel`.
 
 This path is designed for second-order derivatives during training; all geometry (edge vectors,
 Wigner-D, radial basis) remains differentiable, and no global node/edge padding is introduced.
@@ -198,7 +202,18 @@ ______________________________________________________________________
 Text diagram (single forward pass):
 
 ```
-Standard DeePMD nlist path:
+SeZMModel runtime path:
+  Inputs: extended_coord, extended_atype, nlist, mapping
+    └─ compact sparse edges `(src, dst, edge_vec, edge_mask)` built from DeePMD nlist
+       └─ EdgeFeatureCache (built once via build_edge_cache_from_edges)
+       ├─ edges: (src, dst) global indices, edge_vec
+       ├─ edge_type_feat: per-edge type embedding (src+dst)
+       ├─ edge_rbf: Bessel radial basis via sinc × C² envelope
+       ├─ edge_env: C³ cutoff envelope weights (flattened to valid edges)
+       ├─ D_full, Dt_full: block-diagonal Wigner-D matrices
+       └─ inv_sqrt_deg: inverse sqrt smooth degree (`sum(edge_env²)`) for normalization
+
+Descriptor compatibility path for other models:
   Inputs: extended_coord, extended_atype, nlist, mapping
     └─ EdgeFeatureCache (built once via build_edge_cache)
        ├─ standard-path geometry/RBF chain (`not training` on supported CUDA+dtypes):

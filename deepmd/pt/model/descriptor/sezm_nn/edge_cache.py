@@ -96,6 +96,7 @@ class EdgeFeatureCache(NamedTuple):
     Dt_from_m_cache: dict[str, torch.Tensor] | None = None
 
 
+@torch.amp.autocast("cuda", enabled=False)
 def build_edge_cache(
     *,
     type_ebed: torch.Tensor,
@@ -280,6 +281,7 @@ def build_edge_cache(
     )
 
 
+@torch.amp.autocast("cuda", enabled=False)
 def build_edge_cache_from_edges(
     *,
     type_ebed: torch.Tensor,

@@ -20,6 +20,10 @@ if torch_set_num_interop_threads is not None:
 if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
+from deepmd.pt.model.descriptor.sezm_nn import (
+    build_edge_cache,
+    build_edge_cache_from_edges,
+)
 from deepmd.pt.model.model import (
     get_sezm_model,
 )
@@ -251,6 +255,76 @@ class TestSeZMModelCompile(unittest.TestCase):
         torch.testing.assert_close(
             out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
         )
+
+    def test_fixed_edge_geometry_matches_standard_cache(self) -> None:
+        """Sparse edge geometry should match the standard descriptor cache."""
+        coord, atype, box, _, _, _ = self._load_water_frame()
+        model = get_sezm_model(self._build_model_params(use_compile=False))
+        model.train()
+        descriptor = model.atomic_model.descriptor
+
+        cc, bb, fp, ap, _ = model._input_type_cast(
+            coord, box=box, fparam=None, aparam=None
+        )
+        del fp, ap
+        if cc.ndim == 2:
+            cc = cc.view(coord.shape[0], atype.shape[1], 3)
+        extended_coord, extended_atype, mapping, nlist = model.build_neighbor_list(
+            cc, atype, bb
+        )
+        atype_loc = extended_atype[:, : nlist.shape[1]]
+        type_ebed = descriptor.type_embedding(atype_loc).reshape(
+            -1, descriptor.channels
+        )
+        pair_keep_mask = torch.ones_like(
+            nlist, dtype=torch.bool, device=extended_coord.device
+        )
+
+        cache_std = build_edge_cache(
+            type_ebed=type_ebed,
+            extended_coord=extended_coord.to(descriptor.compute_dtype),
+            nlist=nlist,
+            mapping=mapping,
+            pair_keep_mask=pair_keep_mask,
+            eps=descriptor.eps,
+            inner_clamp=descriptor.inner_clamp,
+            edge_envelope=descriptor.edge_envelope,
+            radial_basis=descriptor.radial_basis,
+            n_radial=descriptor.radial_basis.n_radial,
+            random_gamma=False,
+            wigner_calc=descriptor.wigner_calc,
+            use_geometry_rbf_triton=False,
+        )
+
+        edge_index, edge_vec, edge_mask = model.build_fixed_edge_list_from_nlist(
+            extended_coord=extended_coord,
+            nlist=nlist,
+            mapping=mapping,
+        )
+        cache_sparse = build_edge_cache_from_edges(
+            type_ebed=type_ebed,
+            atype_flat=atype_loc.reshape(-1),
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            edge_mask=edge_mask,
+            compute_dtype=descriptor.compute_dtype,
+            eps=descriptor.eps,
+            inner_clamp=descriptor.inner_clamp,
+            edge_envelope=descriptor.edge_envelope,
+            radial_basis=descriptor.radial_basis,
+            has_exclude_types=False,
+            edge_type_keep_mask=descriptor._edge_type_keep_mask,
+            random_gamma=False,
+            wigner_calc=descriptor.wigner_calc,
+        )
+
+        self.assertTrue(torch.equal(cache_std.src, cache_sparse.src))
+        self.assertTrue(torch.equal(cache_std.dst, cache_sparse.dst))
+        torch.testing.assert_close(cache_std.edge_vec, cache_sparse.edge_vec)
+        torch.testing.assert_close(cache_std.edge_rbf, cache_sparse.edge_rbf)
+        torch.testing.assert_close(cache_std.edge_env, cache_sparse.edge_env)
+        torch.testing.assert_close(cache_std.D_full, cache_sparse.D_full)
+        torch.testing.assert_close(cache_std.Dt_full, cache_sparse.Dt_full)
 
     def test_eval_defaults_to_eager_without_env_override(self) -> None:
         """Evaluation defaults to eager when `DP_COMPILE_INFER` is unset."""

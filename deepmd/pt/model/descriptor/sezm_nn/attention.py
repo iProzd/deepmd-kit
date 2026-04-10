@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 
+@torch.amp.autocast("cuda", enabled=False)
 def segment_envelope_gated_softmax(
     logits: torch.Tensor,
     edge_env: torch.Tensor,

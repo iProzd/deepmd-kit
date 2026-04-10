@@ -78,6 +78,7 @@ class RMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -229,6 +230,7 @@ class EquivariantRMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -421,6 +423,7 @@ class ReducedEquivariantRMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
@@ -576,6 +579,7 @@ class ScalarRMSNorm(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
+    @torch.amp.autocast("cuda", enabled=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Parameters
