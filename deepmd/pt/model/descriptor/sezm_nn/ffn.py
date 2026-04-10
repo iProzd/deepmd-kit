@@ -55,7 +55,7 @@ class EquivariantFFN(nn.Module):
     Default structure (glu_activation=True):
         SO3 linear (in -> 2*hidden) -> split -> GatedActivation(val, gate) -> SO3 linear (hidden -> out)
 
-    Optional grid-FFN structure (grid_ffn=True):
+    Optional grid-FFN structure (grid_mlp=True):
         SO3 linear (in -> hidden)
         -> project packed SO(3) coefficients to the S2 grid
         -> packed S2-grid point-wise MLP on hidden features
@@ -80,14 +80,14 @@ class EquivariantFFN(nn.Module):
         Number of channels per (l, m) coefficient.
     hidden_channels
         Hidden dimension for the FFN.
-    grid_ffn
+    grid_mlp
         If True, use the optional grid-MLP FFN structure on the block-internal
         FFN path. This path takes precedence over the simpler activation-only
         path inside this module.
     dtype
         Parameter dtype.
     s2_activation
-        If True and ``grid_ffn=False``, replace the default GatedActivation path
+        If True and ``grid_mlp=False``, replace the default GatedActivation path
         with the merged scalar/grid SwiGLU-S2 activation.
     s2_grid_resolution
         Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
@@ -98,7 +98,7 @@ class EquivariantFFN(nn.Module):
     mlp_bias
         Whether to use bias in SO3Linear (l=0 bias), GatedActivation
         (gate linear bias), and the scalar point-wise projection when
-        ``grid_ffn=True``.
+        ``grid_mlp=True``.
     trainable
         Whether parameters are trainable.
     seed
@@ -111,7 +111,7 @@ class EquivariantFFN(nn.Module):
         lmax: int,
         channels: int,
         hidden_channels: int,
-        grid_ffn: bool = False,
+        grid_mlp: bool = False,
         dtype: torch.dtype,
         s2_activation: bool = False,
         s2_grid_resolution: list[int] | None = None,
@@ -125,7 +125,7 @@ class EquivariantFFN(nn.Module):
         self.lmax = int(lmax)
         self.channels = int(channels)
         self.hidden_channels = int(hidden_channels)
-        self.grid_ffn = bool(grid_ffn)
+        self.use_grid_mlp = bool(grid_mlp)
         self.s2_activation = bool(s2_activation)
         self.s2_grid_resolution = resolve_s2_grid_resolution(
             self.lmax, self.lmax, s2_grid_resolution
@@ -146,7 +146,7 @@ class EquivariantFFN(nn.Module):
         # Grid-FFN keeps the hidden width and performs the nonlinear expansion
         # inside the scalar/grid point-wise MLPs.
         linear1_out_channels = self.hidden_channels
-        if not self.grid_ffn:
+        if not self.use_grid_mlp:
             linear1_out_channels = (
                 2 * self.hidden_channels
                 if self.glu_activation
@@ -166,8 +166,8 @@ class EquivariantFFN(nn.Module):
         # === Equivariant nonlinearity path ===
         self.scalar_mlp: nn.Module | None = None
         self.grid_projector: S2GridProjector | None = None
-        self.grid_mlp: nn.Module | None = None
-        if self.grid_ffn:
+        self.pointwise_grid_mlp: nn.Module | None = None
+        if self.use_grid_mlp:
             self.scalar_mlp = nn.Sequential(
                 ChannelLinear(
                     in_channels=self.channels,
@@ -186,7 +186,7 @@ class EquivariantFFN(nn.Module):
                 grid_resolution_list=self.s2_grid_resolution,
                 coefficient_layout="packed",
             )
-            self.grid_mlp = PointwiseGridMLP(
+            self.pointwise_grid_mlp = PointwiseGridMLP(
                 channels=self.hidden_channels,
                 dtype=dtype,
                 trainable=trainable,
@@ -252,11 +252,11 @@ class EquivariantFFN(nn.Module):
         x = self.so3_linear_1(x)
 
         # === Step 2. Equivariant nonlinearity ===
-        if self.grid_ffn:
+        if self.use_grid_mlp:
             scalar_outputs = self.scalar_mlp(x_input.select(dim=1, index=0))
             x_flat, shape_info = self._flatten_grid_inputs(x)
             x_grid = self.grid_projector.to_grid(x_flat.to(dtype=self.dtype))
-            x_grid = self.grid_mlp(x_grid)
+            x_grid = self.pointwise_grid_mlp(x_grid)
             x = self._restore_grid_outputs(
                 self.grid_projector.from_grid(x_grid), shape_info
             )
@@ -303,7 +303,7 @@ class EquivariantFFN(nn.Module):
                 "lmax": self.lmax,
                 "channels": self.channels,
                 "hidden_channels": self.hidden_channels,
-                "grid_ffn": self.grid_ffn,
+                "grid_mlp": self.use_grid_mlp,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "s2_activation": self.s2_activation,
                 "s2_grid_resolution": self.s2_grid_resolution,

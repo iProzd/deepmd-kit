@@ -177,7 +177,7 @@ class TestDescrptSeZM(_SeZMTestCase):
                 n_focus=2,
                 focus_dim=0,
                 so2_layers=2,
-                s2_activation=True,
+                s2_activation=[False, True],
                 s2_grid_resolution=[8, 12],
             ),
         }
@@ -201,7 +201,7 @@ class TestDescrptSeZM(_SeZMTestCase):
             "full_attention_s2": _attention_descriptor_kwargs(
                 precision="float32",
                 seed=123,
-                s2_activation=True,
+                s2_activation=[False, True],
                 s2_grid_resolution=[8, 12],
             ),
         }
@@ -327,7 +327,7 @@ class TestDescrptSeZM(_SeZMTestCase):
                 n_radial=3,
                 radial_mlp=[6],
                 ffn_neurons=8,
-                s2_activation=True,
+                s2_activation=[False, True],
                 s2_grid_resolution=[8, 12],
             ),
         }

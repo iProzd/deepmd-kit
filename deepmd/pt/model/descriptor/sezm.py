@@ -195,12 +195,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         When enabled, the SO(2)-internal per-focus width ``focus_dim`` must be
         divisible by ``n_atten_head``.
     ffn_neurons
-        Hidden sizes for the equivariant FFN in each block and the final scalar
-        output FFN. If set to 0, it is resolved automatically from ``channels``:
-        ``4 * channels`` when ``glu_activation=False`` and
-        ``(8 / 3) * channels`` when ``glu_activation=True``; the result is then
-        rounded up to a multiple of 32.
-    grid_ffn
+        Hidden width for block FFNs and the final scalar output FFN.
+        If ``>0``, both paths use this width.
+        If ``=0``, each path resolves its own width from ``channels`` and its
+        effective GLU setting: ``4 * channels`` without GLU, ``(8 / 3) * channels``
+        with GLU, then round up to a multiple of 32.
+    grid_mlp
         If True, use the optional grid-MLP structure for the block-internal FFN
         units. The final scalar output head is unchanged.
     ffn_blocks
@@ -240,21 +240,26 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         aggregation. Must be one of ``"none"``, ``"independent"``, or
         ``"dependent"``. Cannot be enabled together with `full_attn_res`.
     s2_activation
-        If True, replace the SO(2) intermediate gated activations and the
-        default block-internal FFN activation path with the merged scalar/grid
-        SwiGLU-S2 activation. The final ``l=0`` output head keeps the scalar
-        FFN path. When enabled, the
-        descriptor internally forces ``activation_function="silu"`` and
-        ``glu_activation=True``.
+        Two booleans ``[so2_enabled, ffn_enabled]``.
+        ``so2_enabled=True`` makes the SO(2) gated activation path use
+        ``activation_function="silu"``.
+        ``ffn_enabled=True`` makes the block-internal FFN path use
+        ``activation_function="silu"`` and ``glu_activation=True``.
+        The final ``l=0`` output FFN is unchanged.
     s2_grid_resolution
         Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
         If omitted, it is resolved from the first block ``(lmax, mmax)`` after
         schedule parsing as
         ``[2 * mmax + 4, ceil_even(3 * lmax + 2)]``.
     activation_function
-        Activation function used by deepmd EmbeddingNet.
+        Base activation function for helper MLPs, the SO(2) gated activation
+        path, and the final ``l=0`` output FFN.
+        It is overridden to ``"silu"`` only on paths whose ``s2_activation``
+        switch is enabled.
     glu_activation
-        If True, use GLU-style gating in FFN (e.g., silu -> swiglu, gelu -> geglu).
+        Base GLU switch for FFN. The block-internal FFN path overrides it to
+        ``True`` only when ``s2_activation[1]=True``. The final ``l=0`` output
+        FFN always keeps this user-provided value.
     use_amp
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
@@ -308,14 +313,14 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         focus_dim: int = 0,
         n_atten_head: int = 1,
         ffn_neurons: int = 0,
-        grid_ffn: bool = False,
+        grid_mlp: bool = False,
         ffn_blocks: int = 1,
         sandwich_norm: list[bool] | None = None,
         mlp_bias: bool = False,
         layer_scale: bool = False,
         full_attn_res: str = "none",
         block_attn_res: str = "none",
-        s2_activation: bool = False,
+        s2_activation: list[bool] | None = None,
         s2_grid_resolution: list[int] | None = None,
         activation_function: str = "silu",
         glu_activation: bool = True,
@@ -372,11 +377,34 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.so2_post_norm = self.sandwich_norm[1]
         self.ffn_pre_norm = self.sandwich_norm[2]
         self.ffn_post_norm = self.sandwich_norm[3]
-        self.s2_activation = bool(s2_activation)
-        self.activation_function = (
-            "silu" if self.s2_activation else str(activation_function)
+        if s2_activation is None:
+            s2_activation = [False, False]
+        if not isinstance(s2_activation, list) or len(s2_activation) != 2:
+            raise ValueError(
+                "`s2_activation` must be a list[bool] of length 2: [so2_activation, ffn_activation]"
+            )
+        if any(not isinstance(flag, bool) for flag in s2_activation):
+            raise ValueError(
+                "`s2_activation` must be a list[bool] of length 2: [so2_activation, ffn_activation]"
+            )
+        self.s2_activation = list(s2_activation)
+        self.activation_function = str(activation_function)
+        self.glu_activation = bool(glu_activation)
+
+        # === Split effective activation config by branch ===
+        self.so2_s2_activation = self.s2_activation[0]
+        self.ffn_s2_activation = self.s2_activation[1]
+        self.so2_activation_function = (
+            "silu" if self.so2_s2_activation else self.activation_function
         )
-        self.glu_activation = True if self.s2_activation else bool(glu_activation)
+        self.ffn_activation_function = (
+            "silu" if self.ffn_s2_activation else self.activation_function
+        )
+        self.ffn_glu_activation = (
+            True if self.ffn_s2_activation else self.glu_activation
+        )
+        self.out_activation_function = self.activation_function
+        self.out_glu_activation = self.glu_activation
         self.precision = str(precision)
         self.dtype = PRECISION_DICT[self.precision]
         self.device = env.DEVICE
@@ -447,8 +475,16 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             raise ValueError(
                 "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
             )
-        self.ffn_neurons = self._resolve_ffn_neurons(ffn_neurons)
-        self.grid_ffn = bool(grid_ffn)
+        self.ffn_neurons = int(ffn_neurons)
+        self.block_ffn_neurons = self._resolve_ffn_neurons(
+            self.ffn_neurons,
+            glu_activation=self.ffn_glu_activation,
+        )
+        self.out_ffn_neurons = self._resolve_ffn_neurons(
+            self.ffn_neurons,
+            glu_activation=self.out_glu_activation,
+        )
+        self.grid_mlp = bool(grid_mlp)
         self.ffn_blocks = int(ffn_blocks)
         if self.ffn_blocks < 1:
             raise ValueError("`ffn_blocks` must be >= 1")
@@ -601,21 +637,23 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     so2_norm=self.so2_norm,
                     so2_layers=self.so2_layers,
                     so2_attn_res=self.so2_attn_res_mode,
-                    ffn_neurons=self.ffn_neurons,
-                    grid_ffn=self.grid_ffn,
+                    ffn_neurons=self.block_ffn_neurons,
+                    grid_mlp=self.grid_mlp,
                     ffn_blocks=self.ffn_blocks,
                     layer_scale=self.layer_scale,
                     full_attn_res=self.full_attn_res_mode,
                     block_attn_res=self.block_attn_res_mode,
-                    s2_activation=self.s2_activation,
+                    so2_s2_activation=self.so2_s2_activation,
+                    ffn_s2_activation=self.ffn_s2_activation,
                     s2_grid_resolution=self.s2_grid_resolution,
                     n_atten_head=self.n_atten_head,
                     so2_pre_norm=self.so2_pre_norm,
                     so2_post_norm=self.so2_post_norm,
+                    so2_activation_function=self.so2_activation_function,
                     ffn_pre_norm=self.ffn_pre_norm,
                     ffn_post_norm=self.ffn_post_norm,
-                    activation_function=self.activation_function,
-                    glu_activation=self.glu_activation,
+                    ffn_activation_function=self.ffn_activation_function,
+                    ffn_glu_activation=self.ffn_glu_activation,
                     mlp_bias=self.mlp_bias,
                     use_triton=self.use_triton,
                     eps=self.eps,
@@ -655,12 +693,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.output_ffn = EquivariantFFN(
             lmax=0,
             channels=self.channels,
-            hidden_channels=self.ffn_neurons,
-            grid_ffn=False,
+            hidden_channels=self.out_ffn_neurons,
+            grid_mlp=False,
             dtype=self.compute_dtype,
             s2_activation=False,
-            activation_function=self.activation_function,
-            glu_activation=self.glu_activation,
+            activation_function=self.out_activation_function,
+            glu_activation=self.out_glu_activation,
             mlp_bias=self.mlp_bias,
             trainable=self.trainable,
             seed=seed_out,
@@ -1194,12 +1232,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         keep = type_mask.index_select(0, type_ij.to(dtype=torch.long))
         return keep.to(dtype=torch.bool)
 
-    def _resolve_ffn_neurons(self, ffn_neurons: int) -> int:
-        """
-        Resolve the effective FFN hidden width from the descriptor config.
-
-        ``ffn_neurons=0`` enables automatic width selection from ``channels``.
-        """
+    def _resolve_ffn_neurons(
+        self,
+        ffn_neurons: int,
+        *,
+        glu_activation: bool,
+    ) -> int:
+        """Resolve one FFN hidden width from the descriptor config."""
         resolved = int(ffn_neurons)
         if resolved < 0:
             raise ValueError("`ffn_neurons` must be >= 0")
@@ -1207,7 +1246,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             return resolved
         base_width = (
             (8.0 * float(self.channels) / 3.0)
-            if self.glu_activation
+            if glu_activation
             else (4.0 * float(self.channels))
         )
         return int(32 * math.ceil(base_width / 32.0))
@@ -1457,7 +1496,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "n_focus": self.n_focus,
                 "focus_dim": self.focus_dim,
                 "ffn_neurons": self.ffn_neurons,
-                "grid_ffn": self.grid_ffn,
+                "grid_mlp": self.grid_mlp,
                 "ffn_blocks": self.ffn_blocks,
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,

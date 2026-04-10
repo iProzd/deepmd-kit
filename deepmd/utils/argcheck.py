@@ -405,10 +405,7 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_n_focus = (
         "Number of parallel focus streams used only inside the SO(2) convolution."
     )
-    doc_focus_dim = (
-        "Hidden width per focus stream inside the SO(2) convolution. "
-        "`0` means using `channels`."
-    )
+    doc_focus_dim = "Hidden width per focus stream inside the SO(2) convolution. `0` means using `channels`."
     doc_n_atten_head = (
         "Number of attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
@@ -419,10 +416,11 @@ def descrpt_se_zm_args() -> list[Argument]:
         "`zeta + sum(w**2 * exp(logit))` in the denominator."
     )
     doc_ffn_neurons = (
-        "Hidden size for the equivariant FFN in each block and the final scalar "
-        "output FFN. `0` enables automatic inference from `channels`: "
-        "`4 * channels` when `glu_activation=false`, or `(8 / 3) * channels` "
-        "when `glu_activation=true`, then rounded up to a multiple of 32."
+        "Hidden width for block FFNs and the final scalar output FFN. "
+        "`>0` uses the same explicit width for both. "
+        "`0` lets each path resolve its own width from `channels`: "
+        "`4 * channels` without GLU, `(8 / 3) * channels` with GLU, "
+        "then round up to a multiple of 32."
     )
     doc_ffn_blocks = "Number of FFN sublayers per interaction block."
     doc_sandwich_norm = (
@@ -456,12 +454,12 @@ def descrpt_se_zm_args() -> list[Argument]:
         "with `block_attn_res`."
     )
     doc_s2_activation = (
-        "If True, replace the intermediate gated activations in both "
-        "SO(2) convolution and the default block-internal equivariant FFN path "
-        "with the merged scalar/grid SwiGLU-S2 activation. The final `l=0` "
-        "output head keeps the scalar FFN path. "
-        "When enabled, the descriptor internally forces "
-        '`glu_activation=true` and `activation_function="silu"`.'
+        "Two booleans `[so2_enabled, ffn_enabled]`. "
+        "`so2_enabled=true` makes the SO(2) gated activation path use "
+        '`activation_function="silu"`. '
+        "`ffn_enabled=true` makes the block-internal FFN path use "
+        '`activation_function="silu"` and `glu_activation=true`. '
+        "The final scalar output FFN is unchanged."
     )
     doc_grid_ffn = (
         "If True, use the optional grid-MLP structure for the block-internal "
@@ -473,10 +471,17 @@ def descrpt_se_zm_args() -> list[Argument]:
         "the first block `(lmax, mmax)` after schedule parsing as "
         "`[2 * mmax + 4, ceil_even(3 * lmax + 2)]`."
     )
-    doc_activation_function = f"The activation function in the embedding net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_activation_function = (
+        f"Base activation function for helper MLPs, the SO(2) gated activation "
+        f"path, and the final scalar output FFN. Supported activation functions "
+        f"are {list_to_doc(ACTIVATION_FN_DICT.keys())}. "
+        f'It is overridden to `"silu"` only on paths whose `s2_activation` '
+        f"switch is enabled."
+    )
     doc_glu_activation = (
-        "If True, use GLU-style gating in FFN (e.g., silu -> swiglu, gelu -> geglu). "
-        "This can improve model expressiveness with slightly increased parameters."
+        "Base GLU switch for FFN (e.g., silu -> swiglu, gelu -> geglu). "
+        "The block-internal FFN overrides this to `true` when `s2_activation[1]=true`, "
+        "while the final scalar output FFN keeps the user-provided value."
     )
     doc_use_amp = (
         "If True, use automatic mixed precision (AMP) with bfloat16 on CUDA. "
@@ -571,7 +576,7 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_ffn_neurons,
         ),
         Argument(
-            "grid_ffn",
+            "grid_mlp",
             bool,
             optional=True,
             default=False,
@@ -625,9 +630,11 @@ def descrpt_se_zm_args() -> list[Argument]:
         ),
         Argument(
             "s2_activation",
-            bool,
+            list[bool],
             optional=True,
-            default=False,
+            default=[False, False],
+            extra_check=lambda x: len(x) == 2,
+            extra_check_errmsg="must be a list of two booleans: [so2_activation, ffn_activation]",
             doc=doc_only_pt_supported + doc_s2_activation,
         ),
         Argument(
@@ -2758,10 +2765,7 @@ def sezm_model_args() -> Argument:
     doc_descrpt = (
         "The descriptor of atomic environment. User-provided (SeZM is recommended)."
     )
-    doc_fitting = (
-        "The fitting of physical properties. The `type` field is ignored; "
-        "SeZM always uses sezm_ener (GLU fitting)."
-    )
+    doc_fitting = "The fitting of physical properties. The `type` field is ignored; SeZM always uses sezm_ener (GLU fitting)."
     doc_model_branch_alias = (
         "List of aliases for this model branch. "
         "Multiple aliases can be defined, and any alias can reference this branch throughout the model usage. "
@@ -2777,10 +2781,7 @@ def sezm_model_args() -> Argument:
         "torch.compile in the SeZM model. "
         "Only supported in the PyTorch backend."
     )
-    doc_enable_tf32 = (
-        "If True, enable TF32 matmul precision when use_compile=True. "
-        "Only supported in the PyTorch backend."
-    )
+    doc_enable_tf32 = "If True, enable TF32 matmul precision when use_compile=True. Only supported in the PyTorch backend."
 
     ca = Argument(
         "SeZM",
@@ -3093,9 +3094,7 @@ def _check_wsd_args(data: dict[str, Any]) -> bool:
         "linear",
     ):
         raise ValueError(
-            "decay_type must be one of "
-            f"{('inverse_linear', 'cosine', 'linear')}. "
-            f"Got decay_type={decay_type}."
+            f"decay_type must be one of {('inverse_linear', 'cosine', 'linear')}. Got decay_type={decay_type}."
         )
     return True
 
@@ -3165,10 +3164,7 @@ def learning_rate_wsd() -> list[Argument]:
         "The remaining post-warmup steps are used as the stable phase. "
         "Default is 0.1."
     )
-    doc_decay_type = (
-        "The decay rule used in the decay phase. "
-        "Supported values are `inverse_linear` (default), `cosine`, and `linear`."
-    )
+    doc_decay_type = "The decay rule used in the decay phase. Supported values are `inverse_linear` (default), `cosine`, and `linear`."
     return [
         Argument(
             "decay_phase_ratio",
@@ -3203,14 +3199,8 @@ def learning_rate_args(fold_subdoc: bool = False) -> Argument:
     doc_scale_by_worker = "When parallel training or batch size scaled, how to alter learning rate. Valid values are `linear`(default), `sqrt` or `none`."
     doc_lr = "The definition of learning rate"
     doc_start_lr = "The learning rate at the start of the training (after warmup)."
-    doc_stop_lr = (
-        "The desired learning rate at the end of training. "
-        "Mutually exclusive with stop_lr_ratio."
-    )
-    doc_stop_lr_ratio = (
-        "The ratio of stop_lr to start_lr. stop_lr = start_lr * stop_lr_ratio. "
-        "Mutually exclusive with stop_lr."
-    )
+    doc_stop_lr = "The desired learning rate at the end of training. Mutually exclusive with stop_lr_ratio."
+    doc_stop_lr_ratio = "The ratio of stop_lr to start_lr. stop_lr = start_lr * stop_lr_ratio. Mutually exclusive with stop_lr."
     doc_warmup_steps = (
         "The number of steps for learning rate warmup. "
         "During warmup, the learning rate increases linearly from "
@@ -4739,10 +4729,7 @@ def validating_args() -> Argument:
     doc_validation_freq = (
         "The frequency, in training steps, of running the full validation pass."
     )
-    doc_save_best = (
-        "Whether to save an extra checkpoint when the selected full validation "
-        "metric reaches a new best value."
-    )
+    doc_save_best = "Whether to save an extra checkpoint when the selected full validation metric reaches a new best value."
     doc_ema_full_validation = (
         "Whether to additionally run the same full validation flow on the "
         "EMA-smoothed model when `validating.full_validation=true`. This reuses "
@@ -4763,10 +4750,7 @@ def validating_args() -> Argument:
         "`E` and `V` are per-atom metrics; `F` uses component-wise force errors, "
         "matching `dp test`. The corresponding loss prefactors must not both be 0."
     )
-    doc_full_val_file = (
-        "The file for writing full validation results only. This file is "
-        "independent from `training.disp_file`."
-    )
+    doc_full_val_file = "The file for writing full validation results only. This file is independent from `training.disp_file`."
     doc_full_val_start = (
         "The starting point of full validation. `0` means the feature is active "
         "from the beginning and will trigger at every `validation_freq` steps. "
@@ -4876,14 +4860,12 @@ def validate_full_validation_config(
     if not is_valid_full_validation_metric(metric):
         valid_metrics = ", ".join(item.upper() for item in FULL_VALIDATION_METRIC_PREFS)
         raise ValueError(
-            "validating.validation_metric must be one of "
-            f"{valid_metrics}, got {metric!r}."
+            f"validating.validation_metric must be one of {valid_metrics}, got {metric!r}."
         )
 
     if multi_task:
         raise ValueError(
-            "validating.full_validation only supports single-task energy "
-            "training; multi-task training is not supported."
+            "validating.full_validation only supports single-task energy training; multi-task training is not supported."
         )
 
     loss_params = data.get("loss", {})
@@ -4901,8 +4883,7 @@ def validate_full_validation_config(
 
     if not training_params.get("validation_data"):
         raise ValueError(
-            "full validation requires `training.validation_data`. It is only "
-            "supported for single-task energy training."
+            "full validation requires `training.validation_data`. It is only supported for single-task energy training."
         )
 
     zero_stage = int(training_params.get("zero_stage", 0))

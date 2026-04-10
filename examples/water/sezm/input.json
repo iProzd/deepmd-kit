@@ -33,7 +33,7 @@
       "focus_dim": 0,
       "n_atten_head": 1,
       "ffn_neurons": 0,
-      "grid_ffn": false,
+      "grid_mlp": false,
       "ffn_blocks": 1,
       "sandwich_norm": [
         true,
@@ -45,7 +45,10 @@
       "layer_scale": false,
       "full_attn_res": "none",
       "block_attn_res": "none",
-      "s2_activation": false,
+      "s2_activation": [
+        false,
+        false
+      ],
       "activation_function": "silu",
       "glu_activation": true,
       "use_amp": true,

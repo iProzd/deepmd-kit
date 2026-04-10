@@ -117,7 +117,7 @@ where `r` is the true interatomic distance and `r̃` is the clamped distance see
 
 ### Design Principles
 
-1. **Pure additive**: ZBL energy is added to the atomic energy *before* autograd, so forces and
+1. **Pure additive**: ZBL energy is added to the atomic energy _before_ autograd, so forces and
    virials naturally include ZBL contributions with no extra code.
 1. **Descriptor-level inner clamping**: When bridging is active, the descriptor sees clamped
    distances — both scalar and vectorial — so its output is completely frozen below `r_inner`.
@@ -167,7 +167,7 @@ The polynomial satisfies `h(0)=0`, `h(1)=1`, `h'(0)=0`, `h'(1)=1`,
 `h''(0)=0`, `h''(1)=0`, `h'''(0)=0`, and `h'''(1)=0`, so the frozen zone,
 transition zone, and identity zone match with C3 continuity.
 
-This ensures the descriptor receives *no information* about the true distance when `r < r_inner`.
+This ensures the descriptor receives _no information_ about the true distance when `r < r_inner`.
 All downstream modules — radial basis, envelope, edge quaternion construction,
 `EnvironmentInitialEmbedding` — see clamped values uniformly. No raw distance is preserved anywhere.
 
@@ -312,13 +312,13 @@ ______________________________________________________________________
 
 - Default path: `SO3Linear -> GatedActivation -> SO3Linear` with a residual connection.
   Gates are derived from `l=0` scalars (one gate per `l`) and expanded across all `m`.
-- When `s2_activation=true` and `grid_ffn=false`, the first projection outputs
+- When `s2_activation[1]=true` and `grid_mlp=false`, the first projection outputs
   `2 * hidden_channels`, then `SwiGLUS2Activation` uses the `l=0` slice to
   build a scalar `SwiGLU` branch plus a sigmoid gate, applies point-wise
   multiplication on the S2 grid, gates the reconstructed coefficients, and
   merges the scalar branch back to `l=0`. In the SeZM block wrapper, the FFN
   path uses a square grid resolution `[max(R_phi, R_theta), max(R_phi, R_theta)]`.
-- When `grid_ffn=true`, the block-internal FFN switches to
+- When `grid_mlp=true`, the block-internal FFN switches to
   `SO3Linear(in -> hidden) -> scalar LinearSwiGLU(input l=0) + packed-grid point-wise MLP(hidden -> hidden) -> merge at l=0 -> SO3Linear(hidden -> out)`.
 
 ### 5. Multi-layer SO(2) convolution
@@ -326,7 +326,7 @@ ______________________________________________________________________
 - Uses the edge-local m-major reduced layout controlled by `mmax`.
 - Stacks `SO2Linear` with an intermediate non-linearity for `so2_layers`.
   - Default path uses `GatedActivation(mmax=...)`.
-  - When `s2_activation=true`, every intermediate layer outputs `2 * focus_dim`
+  - When `s2_activation[0]=true`, every intermediate layer outputs `2 * focus_dim`
     channels and `SwiGLUS2Activation` uses the reduced-layout `l=0` slice to
     build the scalar `SwiGLU` branch and sigmoid gate around the S2-grid
     multiplicative path.
@@ -571,9 +571,9 @@ For each edge `(src -> dst)`:
 
 - Apply `non_linear` (between layers, Identity for last layer):
   - default path: `GatedActivation`
-    - l=0: SiLU activation
+    - l=0: uses the configured base `activation_function`
     - l>0: sigmoid(l=0) gate; implementation uses preallocated output instead of cat
-  - `s2_activation=true`: `SwiGLUS2Activation`
+  - `s2_activation[0]=true`: `SwiGLUS2Activation`
     - `l=0` slice -> scalar `SwiGLU` branch
     - `l=0` slice -> sigmoid gate
     - reduced coefficients -> flattened S2 grid -> point-wise multiplication -> reduced coefficients
@@ -640,7 +640,7 @@ h = torch.cat([h0, ht], dim=1)
 out = so3_linear_2(h)  # (N, D, hidden_channels) -> (N, D, C)
 ```
 
-With `grid_ffn=true`, the block-internal FFN instead keeps a hidden-width
+With `grid_mlp=true`, the block-internal FFN instead keeps a hidden-width
 SO(3) projection, projects the packed SO(3) coefficients to the S2 grid,
 applies a point-wise grid MLP on the packed S2 grid, projects the grid features
 back to packed SO(3) coefficients, adds a separate scalar `LinearSwiGLU`
@@ -767,14 +767,14 @@ Key arguments:
 - `so2_norm: bool` — If True, apply ReducedEquivariantRMSNorm as pre-norm before each SO(2) mixing layer (except the last, which uses Identity). When False (default), pre-norm is Identity for all layers
 - `so2_layers: int` — Number of SO2Linear layers per convolution (default: 4)
 - `so2_attn_res: str` — SO(2)-internal depth-wise attention residual mode inside each interaction block. Allowed values: `none`, `independent`, `dependent` (default: `none`)
-- `ffn_neurons: int` — Hidden size for equivariant FFN. `0` enables automatic inference from `channels`: use `4 * channels` when `glu_activation=false`, or `(8 / 3) * channels` when `glu_activation=true`, then round up to a multiple of 32 (default: 0)
-- `grid_ffn: bool` — If True, use the optional grid-MLP structure for block-internal FFN units. The final `l=0` output head is unchanged (default: False)
+- `ffn_neurons: int` — Hidden width for block FFNs and the final scalar output FFN. `>0` uses the same explicit width for both. `0` lets each path resolve its own width from `channels`: `4 * channels` without GLU, `(8 / 3) * channels` with GLU, then round up to a multiple of 32 (default: 0)
+- `grid_mlp: bool` — If True, use the optional grid-MLP structure for block-internal FFN units. The final `l=0` output head is unchanged (default: False)
 - `ffn_blocks: int` — Number of FFN subblocks per interaction block (default: 1)
 - `n_atten_head: int` — Number of attention heads when aggregating messages in SO(2) convolution. 0 applies a plain envelope-weighted scatter-sum (default: 1). When >0, the effective per-focus width (`focus_dim` or `channels` when `focus_dim=0`) must be divisible by `n_atten_head`, and envelope-gated grouped softmax attention with output-side head gate is applied. Attention uses `w^2 * exp(logit)` in the numerator and `zeta + sum(w^2 * exp(logit))` in the denominator.
 - `sandwich_norm: list[bool]` — Pre/post-norm switches for residual branches: `[so2_pre, so2_post, ffn_pre, ffn_post]` (default: [True, False, True, False])
 - `exclude_types: list[tuple[int, int]]` — Excluded type pairs
 - `precision: str` — `float64` / `float32`
-- `s2_activation: bool` — If True, enable the merged scalar/grid SwiGLU-S2 activation in the SO(2) branch and in the default block-internal FFN activation path. The final `l=0` output head keeps the scalar FFN path. When enabled, the descriptor internally forces `glu_activation=true` and `activation_function="silu"` (default: False)
+- `s2_activation: list[bool]` — Two booleans `[so2_enabled, ffn_enabled]`. `so2_enabled=true` makes the SO(2) gated activation path use `activation_function="silu"`. `ffn_enabled=true` makes the block-internal FFN path use `activation_function="silu"` and `glu_activation=true`. The final `l=0` output FFN is unchanged (default: `[False, False]`)
 - `s2_grid_resolution: list[int]` — Two positive integers `[R_phi, R_theta]` used by the S2-grid activation. If omitted, SeZM resolves it from the first block `(lmax, mmax)` after schedule parsing as `[2 * mmax + 4, ceil_even(3 * lmax + 2)]`
 - `mlp_bias: bool` — Whether to use bias in equivariant layers (SO3Linear l=0 bias, SO2Linear l=0 bias, GatedActivation gate linear bias, DepthAttnRes input-dependent query projection) and EnvironmentInitialEmbedding MLPs (`rbf_proj_layer1/2`, `g_layer1/2`) (default: False)
 - `layer_scale: bool` — If True, apply learnable LayerScale on residual branches for training stability: per-focus-channel scales (init 1e-3) on each SO(2) mixing layer, and per-channel vector (init 1e-3) on each FFN subblock (default: False)
@@ -1142,7 +1142,7 @@ M_block   = max(M_so2conv, M_ffn)    # peak of the two stages (not simultaneous)
 ```
 
 > If 2F > C (typical: F=96, C=64 → 2F=192 > 64), FFN dominates the per-block peak.
-> When `grid_ffn=true`, the `2F` activation buffer is replaced by a hidden-width
+> When `grid_mlp=true`, the `2F` activation buffer is replaced by a hidden-width
 > SO(3) tensor plus transient S2-grid buffers from the point-wise grid MLP.
 
 #### 2.3 Total Inference VRAM

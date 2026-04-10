@@ -524,6 +524,9 @@ class SO2Convolution(nn.Module):
         channels before the activation folds them back to ``focus_dim``.
     s2_grid_resolution
         Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
+    activation_function
+        Activation function for the gated activation path when
+        ``s2_activation=False``.
     mlp_bias
         Whether to use bias in SO2Linear (l=0 bias) and GatedActivation
         (gate linear bias).
@@ -556,6 +559,7 @@ class SO2Convolution(nn.Module):
         n_atten_head: int = 1,
         s2_activation: bool = False,
         s2_grid_resolution: list[int] | None = None,
+        activation_function: str = "silu",
         mlp_bias: bool = False,
         use_triton: bool = False,
         eps: float = 1e-7,
@@ -599,6 +603,7 @@ class SO2Convolution(nn.Module):
         self.s2_grid_resolution = resolve_s2_grid_resolution(
             self.lmax, self.mmax, s2_grid_resolution
         )
+        self.activation_function = str(activation_function)
         if self.n_atten_head < 0:
             raise ValueError("`n_atten_head` must be non-negative")
         if self.n_atten_head > 0 and self.so2_focus_dim % self.n_atten_head != 0:
@@ -724,6 +729,7 @@ class SO2Convolution(nn.Module):
                         channels=self.so2_focus_dim,
                         n_focus=self.n_focus,
                         dtype=self.dtype,
+                        activation_function=self.activation_function,
                         mlp_bias=self.mlp_bias,
                         layout="nfdc",
                         trainable=trainable,
@@ -1240,6 +1246,7 @@ class SO2Convolution(nn.Module):
                 "n_atten_head": self.n_atten_head,
                 "s2_activation": self.s2_activation,
                 "s2_grid_resolution": self.s2_grid_resolution,
+                "activation_function": self.activation_function,
                 "mlp_bias": self.mlp_bias,
                 "eps": self.eps,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
