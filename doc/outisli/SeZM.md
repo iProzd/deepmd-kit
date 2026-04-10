@@ -79,25 +79,26 @@ ______________________________________________________________________
 - `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is ignored; SeZM always uses `sezm_ener`.
 - Internally it is built as `make_model(SeZMAtomicModel)`.
 
-### Optional compile path (fixed-shape sparse edges)
+### Optional compile path (compact sparse edges)
 
-SeZM supports an optional **fixed-shape edge** path that enables `torch.compile` while preserving
+SeZM supports an optional **compact sparse edge** path that enables `torch.compile` while preserving
 the standard DeePMD neighbor list behavior:
 
 - Enable with `model.use_compile = true`.
-- Set `model.n_node` to the fixed node count used for padding (must satisfy `n_node >= nf * nloc`).
-- Optional: set `model.n_edge` to cap the fixed edge count. `n_edge=0` means
-  `n_node * nsel` (default). When `n_edge>0`, valid edges are **globally sorted
-  by distance** and only the shortest `n_edge` are kept; extra edges are dropped
-  (padding is added if fewer are available).
-- The model still builds the DeePMD neighbor list, then **packs it into a fixed-shape edge list**
-  `(src, dst, edge_vec, edge_mask)` with size `n_edge` (or `n_node * nsel` when `n_edge=0`).
-- The descriptor accepts the fixed edge list directly and runs a **pure tensor graph**.
-- When `use_compile=false` (default), the normal DeePMD neighbor list path is used.
-- `use_compile` / `n_node` are model-level flags; the descriptor config remains unchanged.
+- The model still builds the DeePMD neighbor list eagerly, then **compacts it into a sparse edge list**
+  `(src, dst, edge_vec, edge_mask)` containing only valid local edges.
+- The descriptor accepts the sparse edge list directly and traces a **pure tensor graph**
+  with `make_fx(tracing_mode="symbolic")`, then runs `torch.compile(..., backend="inductor", dynamic=True)`.
+- The compiled graph keeps **dynamic total node / edge counts** while preserving second-order derivatives
+  needed by force training.
+- Training follows `model.use_compile`, but `eval()/inference/full_validation` default to the eager path
+  even when `use_compile=true`.
+- Set `DP_COMPILE_INFER=1` before model construction to make `eval()/inference` use the compile path
+  by default without changing any Python call sites. The environment variable is read at model init time.
+- When `use_compile=false` (default), the normal DeePMD neighbor list path is used in all modes.
 
 This path is designed for second-order derivatives during training; all geometry (edge vectors,
-Wigner-D, radial basis) remains differentiable, and padded edges are fully masked.
+Wigner-D, radial basis) remains differentiable, and no global node/edge padding is introduced.
 
 ______________________________________________________________________
 

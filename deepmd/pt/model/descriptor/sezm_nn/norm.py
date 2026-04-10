@@ -201,7 +201,9 @@ class EquivariantRMSNorm(nn.Module):
         )
         # Bias only for l=0, independent per focus.
         self.bias = nn.Parameter(
-            torch.zeros(self.n_focus, self.channels, dtype=self.dtype, device=self.device)
+            torch.zeros(
+                self.n_focus, self.channels, dtype=self.dtype, device=self.device
+            )
         )
 
         # === Step 2. Index and Weight Buffers ===
@@ -579,19 +581,24 @@ class ScalarRMSNorm(nn.Module):
         Parameters
         ----------
         x
-            Input tensor with shape (B, F, C).
+            Input tensor with shape (B, F, C) or (B, C) when `n_focus=1`.
 
         Returns
         -------
         torch.Tensor
-            Normalized tensor with shape (B, F, C), same dtype as input.
+            Normalized tensor with the same shape as input and same dtype.
         """
         in_dtype = x.dtype
         x = x.to(dtype=self.dtype)
 
-        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        x = x * inv_rms
+        if x.ndim == 2:
+            inv_rms = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
+            x = x * inv_rms
+            x = x * self.adam_scale[0]
+            return x.to(dtype=in_dtype)
 
+        inv_rms = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
+        x = x * inv_rms
         x = x * self.adam_scale.unsqueeze(0)
         return x.to(dtype=in_dtype)
 

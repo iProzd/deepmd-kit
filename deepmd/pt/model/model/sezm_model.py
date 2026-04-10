@@ -5,6 +5,7 @@ from __future__ import (
     annotations,
 )
 
+import os
 from contextlib import (
     contextmanager,
 )
@@ -14,7 +15,6 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 from einops import (
     rearrange,
 )
@@ -56,6 +56,42 @@ from deepmd.pt.utils.nlist import (
 
 SeZMModel_ = make_model(SeZMAtomicModel)
 
+# Keep compile-time autotune candidate dumps out of logs by default.
+os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_REPORT_CHOICES_STATS", "0")
+os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "0")
+
+
+def _parse_optional_env_bool(var_name: str) -> bool | None:
+    """
+    Parse an optional boolean environment variable.
+
+    Parameters
+    ----------
+    var_name
+        Environment variable name.
+
+    Returns
+    -------
+    bool | None
+        Parsed boolean value, or ``None`` when the variable is unset.
+
+    Raises
+    ------
+    ValueError
+        If the environment variable value is not a supported boolean token.
+    """
+    raw_value = os.environ.get(var_name)
+    if raw_value is None:
+        return None
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{var_name} must be one of 1/0/true/false/yes/no/on/off, got {raw_value!r}"
+    )
+
 
 @BaseModel.register("SeZM")
 @BaseModel.register("se_zm")
@@ -63,13 +99,15 @@ SeZMModel_ = make_model(SeZMAtomicModel)
 @BaseModel.register("SeZM-Net")
 class SeZMModel(DPModelCommon, SeZMModel_):
     """
-    SeZM energy model with optional fixed-shape compile path.
+    SeZM energy model with an optional compiled sparse-edge path.
 
     By default it uses the traditional DeePMD neighbor list path with ghost atoms
     and padded neighbor matrix, compatible with LAMMPS and other MD engines.
-    When `use_compile=True`, it builds fixed-shape sparse edges from the standard
-    neighbor list and routes the descriptor through a pure-tensor graph for
-    torch.compile.
+    When `use_compile=True`, it builds a compact sparse edge list from the
+    standard neighbor list and traces the local graph with ``make_fx`` for
+    higher-order force training. Evaluation/inference compile usage is
+    controlled by the `DP_COMPILE_INFER` environment variable read at model
+    initialization time.
     """
 
     model_type = "SeZM"
@@ -79,8 +117,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         *args: Any,
         use_compile: bool = False,
         use_tf32: bool = False,
-        n_node: int | None = None,
-        n_edge: int = 0,
         bridging_method: str = "none",
         bridging_r_inner: float = 0.9,
         bridging_r_outer: float = 1.3,
@@ -91,19 +127,15 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         self.use_compile = bool(use_compile)
         self.use_tf32 = bool(use_tf32)
-        self.n_node = int(n_node) if n_node is not None else None
-        self.n_edge = int(n_edge)
         self._compiled = False
         # Store compiled_compute outside the nn.Module tree so that
         # FSDP2 / DDP do not shard or sync its duplicated parameters.
         object.__setattr__(self, "compiled_compute", None)
-        if self.use_compile:
-            if self.n_node is None or self.n_node <= 0:
-                raise ValueError("n_node must be positive when use_compile=True")
-            if self.n_edge < 0:
-                raise ValueError("n_edge must be non-negative")
-            if self.n_edge > 0 and self.n_edge > self.n_node * self.get_nsel():
-                raise ValueError("n_edge must be <= n_node * nsel when set")
+        # Training follows `use_compile`. Evaluation/inference reads
+        # `DP_COMPILE_INFER` at init time and falls back to eager when unset.
+        self._env_use_compile_infer: bool | None = _parse_optional_env_bool(
+            "DP_COMPILE_INFER"
+        )
 
         # === Bridging (optional short-range zone bridging) ===
         self.bridging_method: str = str(bridging_method).upper()
@@ -318,7 +350,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Model predictions including energy, forces, etc.
         """
         with nvtx_range("SeZM/forward_common"):
-            if self.use_compile:
+            if self._should_use_compile():
                 return self.forward_common_compile(
                     coord,
                     atype,
@@ -377,9 +409,9 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         do_atomic_virial: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
-        Forward pass using fixed-shape sparse edges and torch.compile.
+        Forward pass using compact sparse edges and symbolic ``make_fx`` tracing.
 
-        This path uses DeePMD neighbor list to build fixed-shape edges,
+        This path uses DeePMD neighbor list to build a compact edge list,
         then traces/compiles the compute graph.
         """
         with nvtx_range("SeZM/forward_common_compile"):
@@ -406,95 +438,58 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 device=cc.device,
             )
 
-            # === Step 3. Enable gradient early ===
-            need_grad = self.do_grad_r() or self.do_grad_c()
-            if need_grad:
-                cc.requires_grad_(True)
-
-            # === Step 4. Build neighbor list (standard DeePMD path) ===
+            # === Step 3. Build neighbor list (standard DeePMD path) ===
             with nvtx_range("SeZM/build_neighbor_list"):
                 extended_coord, extended_atype, mapping, nlist = (
-                    self.build_neighbor_list(cc, atype, bb)
+                    self.build_neighbor_list(cc.detach(), atype, bb)
                 )
 
-            # === Step 5. Flatten and pad to fixed n_node ===
-            n_actual = nf * nloc
-            if self.n_node is None:
-                raise ValueError("n_node must be set when use_compile=True")
-            n_node = self.n_node
-            if n_actual > n_node:
-                raise ValueError(
-                    f"Actual atoms ({n_actual} = {nf}x{nloc}) exceed n_node ({n_node})"
-                )
-            cc_flat = cc.view(n_actual, 3)
-            atype_flat = atype.view(n_actual)
+            # === Step 4. Re-enable gradients on local coordinates ===
+            need_grad = self.do_grad_r() or self.do_grad_c()
+            if need_grad:
+                cc = cc.detach().requires_grad_(True)
+            cc_flat = cc.reshape(-1, 3)
+            atype_flat = atype.reshape(-1)
 
-            pad_size = n_node - n_actual
-            if pad_size > 0:
-                cc_flat = F.pad(
-                    cc_flat, (0, 0, 0, pad_size), mode="constant", value=0.0
-                )
-                atype_flat = torch.cat(
-                    [
-                        atype_flat,
-                        torch.full(
-                            (pad_size,),
-                            -1,
-                            dtype=atype_flat.dtype,
-                            device=atype_flat.device,
-                        ),
-                    ],
-                    dim=0,
-                )
-
-            atom_mask = torch.zeros(n_node, dtype=cc_flat.dtype, device=cc_flat.device)
-            atom_mask[:n_actual] = 1.0
-
-            atype_valid = torch.where(atype_flat >= 0, atype_flat, 0)
-
-            # === Step 6. Build fixed-shape edges from nlist ===
+            # === Step 5. Build compact edges from nlist ===
             edge_index, edge_vec, edge_mask = self.build_fixed_edge_list_from_nlist(
                 extended_coord=extended_coord,
                 nlist=nlist,
                 mapping=mapping,
-                n_node=n_node,
-                n_edge=self.n_edge,
             )
 
-            # === Step 7. Trace and compile on first forward ===
+            # === Step 6. Trace and compile on first forward ===
             with self.tf32_precision_ctx():
                 if not self._compiled:
                     self.trace_and_compile(
                         cc_flat,
-                        atype_valid,
+                        atype_flat,
                         edge_index,
                         edge_vec,
                         edge_mask,
-                        atom_mask,
                         fp,
                         ap,
                     )
 
-                # === Step 8. Forward through compiled compute path ===
+                # === Step 7. Forward through compiled compute path ===
                 with nvtx_range("SeZM/forward_compute"):
                     compute_ret = self.compiled_compute(
                         cc_flat,
-                        atype_valid,
+                        atype_flat,
                         edge_index,
                         edge_vec,
                         edge_mask,
-                        atom_mask,
                         fp,
                         ap,
                     )
 
-            # === Step 9. Post-process outputs ===
+            # === Step 8. Post-process outputs ===
             with nvtx_range("SeZM/post_process"):
                 model_predict = self.post_process_output(
-                    compute_ret, atype, nf, nloc, do_atomic_virial
+                    compute_ret, atype, do_atomic_virial
                 )
 
-            # === Step 10. Output type cast ===
+            # === Step 9. Output type cast ===
             with nvtx_range("SeZM/output_type_cast"):
                 model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
@@ -502,111 +497,91 @@ class SeZMModel(DPModelCommon, SeZMModel_):
     def trace_and_compile(
         self,
         cc_flat: torch.Tensor,
-        atype_valid: torch.Tensor,
+        atype_flat: torch.Tensor,
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
-        atom_mask: torch.Tensor,
         fp: torch.Tensor,
         ap: torch.Tensor,
     ) -> None:
         """Trace computation graph with make_fx and compile."""
+        from torch._inductor import config as inductor_config
+
+        inductor_config.max_autotune_report_choices_stats = False
+        inductor_config.autotune_num_choices_displayed = 0
 
         def compute_fn(
             cc_flat: torch.Tensor,
-            atype_valid: torch.Tensor,
+            atype_flat: torch.Tensor,
             edge_index: torch.Tensor,
             edge_vec: torch.Tensor,
             edge_mask: torch.Tensor,
-            atom_mask: torch.Tensor,
             fp: torch.Tensor,
             ap: torch.Tensor,
         ) -> torch.Tensor:
             return self.compile_compute_func(
                 cc_flat,
-                atype_valid,
+                atype_flat,
                 edge_index,
                 edge_vec,
                 edge_mask,
-                atom_mask,
                 fp,
                 ap,
             )
 
         traced = make_fx(
             compute_fn,
-            tracing_mode="real",
+            tracing_mode="symbolic",
             _allow_non_fake_inputs=True,
         )(
             cc_flat,
-            atype_valid,
+            atype_flat,
             edge_index,
             edge_vec,
             edge_mask,
-            atom_mask,
             fp,
             ap,
         )
 
-        if not torch.cuda.is_available():
-            # CPU fallback: use aot_eager for compatibility
-            object.__setattr__(
-                self, "compiled_compute", torch.compile(traced, backend="aot_eager")
-            )
-        else:
-            # GPU: use inductor with full performance options
-            # These options enable aggressive optimizations:
-            # - max_autotune: profile to pick best matmul config
-            # - epilogue_fusion: fuse pointwise ops into templates (requires max_autotune)
-            # - triton.cudagraphs: reduce CPU overhead via CUDA graphs
-            # - shape_padding: pad matrices for better GPU alignment (tensor cores)
-            # - max_fusion_size: limit fusion size limit for complex graphs
-            import torch.distributed as dist
-
-            is_multi_gpu = (
-                dist.is_available()
-                and dist.is_initialized()
-                and dist.get_world_size() > 1
-            )
-            # Single-GPU: enable all optimizations
-            # Multi-GPU: disable autotune/cudagraphs to avoid DDP sync issues
-            compile_options = {
-                "max_autotune": not is_multi_gpu,
-                "epilogue_fusion": not is_multi_gpu,
-                "triton.cudagraphs": not is_multi_gpu,
-                "shape_padding": not is_multi_gpu,
-                "max_fusion_size": 16,
-            }
-            object.__setattr__(
-                self, "compiled_compute", torch.compile(traced, options=compile_options)
-            )
+        object.__setattr__(
+            self,
+            "compiled_compute",
+            torch.compile(
+                traced,
+                backend="inductor",
+                dynamic=True,
+                options={
+                    "max_autotune": False,
+                    "epilogue_fusion": False,
+                    "triton.cudagraphs": False,
+                    "shape_padding": True,
+                    "max_fusion_size": 8,
+                },
+            ),
+        )
         self._compiled = True
 
     def compile_compute_func(
         self,
         cc_flat: torch.Tensor,
-        atype_valid: torch.Tensor,
+        atype_flat: torch.Tensor,
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
-        atom_mask: torch.Tensor,
         fp: torch.Tensor,
         ap: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute-only forward pass (make_fx compatible) with fixed shapes.
+        Compute-only forward pass (make_fx compatible) with compact dynamic shapes.
 
         Returns a single concatenated tensor.
 
-        Layout along last dim (always padded to ``n_node``):
+        Layout along last dim:
             - ``[:, :, 0:1]``  — atom_energy  (always present)
             - ``[:, :, 1:4]``  — minus_force  (zeros when force is off)
             - ``[:, :, 4:13]`` — atom_virial  (zeros when virial is off)
         """
-        if self.n_node is None:
-            raise ValueError("n_node must be set when use_compile=True")
-
-        n_node = self.n_node
+        n_node = atype_flat.shape[0]
 
         # === Step 1. Attach coord gradients to edge vectors ===
         edge_vec = self.attach_edge_vec_grad(cc_flat, edge_index, edge_vec)
@@ -616,24 +591,18 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             descriptor_model = self.atomic_model.descriptor
             descriptor, rot_mat, g2, h2, _ = descriptor_model.forward_with_edges(
                 extended_coord=cc_flat.view(1, n_node, 3),
-                extended_atype=atype_valid.view(1, n_node),
+                extended_atype=atype_flat.view(1, n_node),
                 edge_index=edge_index,
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
             )
         assert descriptor is not None
 
-        if descriptor.ndim == 2:
-            descriptor_for_fit = descriptor.unsqueeze(0)
-        else:
-            descriptor_for_fit = descriptor
-        atype_for_fit = atype_valid.unsqueeze(0)
-
         # === Step 3. Fitting net ===
         with nvtx_range("SeZM/fitting_net"):
             fit_ret = self.atomic_model.fitting_net(
-                descriptor_for_fit,
-                atype_for_fit,
+                descriptor,
+                atype_flat.view(1, n_node),
                 gr=rot_mat,
                 g2=g2,
                 h2=h2,
@@ -642,30 +611,28 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             )
 
         with nvtx_range("SeZM/apply_out_stat"):
-            fit_ret = self.atomic_model.apply_out_stat(fit_ret, atype_for_fit)
+            fit_ret = self.atomic_model.apply_out_stat(
+                fit_ret, atype_flat.view(1, n_node)
+            )
 
         atom_energy = fit_ret["energy"]  # (1, n_node, 1)
 
         # === Step 3b. Inject zone bridging potential (compile path) ===
         if self.inter_potential is not None:
             pair_energy = self.inter_potential.forward_from_edges(
-                edge_vec, edge_index, atype_valid, edge_mask, n_node
-            )  # (1, n_node, 1)
+                edge_vec, edge_index, atype_flat, edge_mask, n_node
+            )
             atom_energy = atom_energy + pair_energy
 
         redu_prec = self.redu_prec
-        atom_mask_view = atom_mask.to(dtype=redu_prec).view(1, n_node, 1)
-        atom_energy_masked = atom_energy * atom_mask_view
-        energy_sum = torch.sum(atom_energy_masked.to(redu_prec))
+        energy_sum = torch.sum(atom_energy.to(redu_prec))
 
         do_grad_r = self.do_grad_r("energy")
         do_grad_c = self.do_grad_c("energy")
 
         # === Step 4. Force / virial via autograd ===
         # Always use create_graph=True for compile path compatibility.
-        force_flat = torch.zeros(
-            n_node, 3, dtype=atom_energy.dtype, device=atom_energy.device
-        )
+        minus_force = torch.zeros_like(cc_flat)
         virial_flat = torch.zeros(
             n_node, 9, dtype=atom_energy.dtype, device=atom_energy.device
         )
@@ -678,7 +645,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 create_graph=True,
                 retain_graph=True,
             )
-            force_flat = minus_force_flat
+            minus_force = minus_force_flat
 
             edge_keep = edge_mask.to(dtype=edge_grad.dtype).unsqueeze(-1)
             edge_grad = edge_grad * edge_keep
@@ -702,7 +669,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 create_graph=True,
                 retain_graph=True,
             )
-            force_flat = minus_force_flat
+            minus_force = minus_force_flat
         # Virial only
         elif do_grad_c:
             (edge_grad,) = torch.autograd.grad(
@@ -730,8 +697,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # Layout: [energy(1) | force(3) | virial(9)] along last dim.
         return torch.cat(
             [
-                atom_energy_masked.view(1, n_node, 1),
-                force_flat.view(1, n_node, 3),
+                atom_energy,
+                minus_force.view(1, n_node, 3),
                 virial_flat.view(1, n_node, 9),
             ],
             dim=-1,
@@ -776,8 +743,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self,
         compute_ret: torch.Tensor,
         atype: torch.Tensor,
-        nf: int,
-        nloc: int,
         do_atomic_virial: bool = False,
     ) -> dict[str, torch.Tensor]:
         """
@@ -790,10 +755,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Layout: [energy(1) | force(3) | virial(9)].
         atype : torch.Tensor
             Atom types with shape (nf, nloc).
-        nf : int
-            Number of frames.
-        nloc : int
-            Number of local atoms per frame.
         do_atomic_virial : bool
             Whether to output per-atom virial.
 
@@ -802,9 +763,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         dict[str, torch.Tensor]
             Standard DeePMD model predictions.
         """
-        if self.n_node is None:
-            raise ValueError("n_node must be set when use_compile=True")
-
+        nf = atype.shape[0]
+        nloc = atype.shape[1]
         n_actual = nf * nloc
         redu_prec = self.redu_prec
 
@@ -814,9 +774,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         atom_virial_flat = compute_ret[:, :, 4:13]  # (1, n_node, 9)
 
         # === Step 2. Energy ===
-        # atom_energy is already masked in compile_compute_func.
-        # The compile path flattens all frames into one graph, so we must slice to
-        # actual atoms and reshape back to (nf, nloc, 1) before reducing frame energies.
         atom_energy = atom_energy_masked[:, :n_actual, :].view(nf, nloc, 1)
         energy = torch.sum(atom_energy.to(redu_prec), dim=1)
 
@@ -979,20 +936,18 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         extended_coord: torch.Tensor,
         nlist: torch.Tensor,
         mapping: torch.Tensor | None,
-        n_node: int,
-        n_edge: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Build fixed-shape edge list from DeePMD padded neighbor list.
+        Build a compact edge list from DeePMD padded neighbor list.
 
         Returns
         -------
         edge_index
-            Edge indices with shape (2, n_edge).
+            Edge indices with shape (2, E).
         edge_vec
-            Edge vectors with shape (n_edge, 3).
+            Edge vectors with shape (E, 3).
         edge_mask
-            Boolean mask with shape (n_edge,).
+            Boolean mask with shape (E,).
         """
         nf, nloc, nsel = nlist.shape
         n_actual = nf * nloc
@@ -1011,7 +966,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         edge_len2 = torch.sum(diff * diff, dim=-1).reshape(-1)  # (n_actual * nsel,)
         edge_vec_actual = diff.reshape(n_actual * nsel, 3)
 
-        # === Step 2. Build fixed-shape src/dst ===
+        # === Step 2. Build compact src/dst ===
         dst_actual = torch.arange(
             n_actual, device=device, dtype=torch.long
         ).repeat_interleave(nsel)
@@ -1036,56 +991,21 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         len_positive = edge_len2 > 1e-10
         edge_mask_actual = valid_flat & src_local_valid & len_positive
 
-        n_edge = n_node * nsel if n_edge == 0 else n_edge
-        src_full = torch.zeros(n_edge, dtype=torch.long, device=device)
-        dst_full = torch.zeros(n_edge, dtype=torch.long, device=device)
-        edge_mask_full = torch.zeros(n_edge, dtype=torch.bool, device=device)
-        edge_vec_full = torch.zeros(
-            n_edge, 3, dtype=edge_vec_actual.dtype, device=device
-        )
+        valid_idx = torch.nonzero(edge_mask_actual).squeeze(-1)
+        if valid_idx.numel() == 0:
+            edge_index = torch.zeros((2, 1), dtype=torch.long, device=device)
+            edge_vec = torch.tensor(
+                [[0.0, 0.0, 1.0]], dtype=edge_vec_actual.dtype, device=device
+            )
+            edge_mask = torch.zeros(1, dtype=torch.bool, device=device)
+            return edge_index, edge_vec, edge_mask
 
-        fill_count = n_actual * nsel
-        if n_edge == n_node * nsel:
-            dst_full = torch.arange(
-                n_node, device=device, dtype=torch.long
-            ).repeat_interleave(nsel)
-            src_full[:fill_count] = src_actual
-            dst_full[:fill_count] = dst_actual
-            edge_mask_full[:fill_count] = edge_mask_actual
-            edge_vec_full[:fill_count] = edge_vec_actual
-        else:
-            # === Step 3. Global edge compaction by distance ===
-            valid_idx = torch.nonzero(edge_mask_actual).squeeze(-1)
-            num_valid = int(valid_idx.numel())
-            if num_valid > 0:
-                if n_edge >= num_valid:
-                    # Preserve original nlist traversal order when all valid
-                    # edges fit in the fixed buffer. Reordering can create
-                    # accumulation drift under AMP/bfloat16.
-                    sel_idx = valid_idx
-                else:
-                    edge_len2_valid = edge_len2.index_select(0, valid_idx)
-                    _, topk_rel = torch.topk(
-                        edge_len2_valid,
-                        n_edge,
-                        largest=False,
-                        sorted=False,
-                    )
-                    sel_idx = valid_idx.index_select(0, topk_rel)
-
-                src_sel = src_actual.index_select(0, sel_idx)
-                dst_sel = dst_actual.index_select(0, sel_idx)
-                edge_mask_sel = edge_mask_actual.index_select(0, sel_idx)
-                edge_vec_sel = edge_vec_actual.index_select(0, sel_idx)
-                fill_count = int(src_sel.numel())
-
-                src_full[:fill_count] = src_sel
-                dst_full[:fill_count] = dst_sel
-                edge_mask_full[:fill_count] = edge_mask_sel
-                edge_vec_full[:fill_count] = edge_vec_sel
-
-        edge_index = torch.stack([src_full, dst_full], dim=0)
-        return edge_index, edge_vec_full, edge_mask_full
+        src_sel = src_actual.index_select(0, valid_idx)
+        dst_sel = dst_actual.index_select(0, valid_idx)
+        edge_vec_sel = edge_vec_actual.index_select(0, valid_idx)
+        edge_index = torch.stack([src_sel, dst_sel], dim=0)
+        edge_mask = torch.ones(valid_idx.shape[0], dtype=torch.bool, device=device)
+        return edge_index, edge_vec_sel, edge_mask
 
     # =========================================================================
     # Output Definitions
@@ -1160,8 +1080,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "atomic_model": self.atomic_model.serialize(),
             "use_compile": self.use_compile,
             "use_tf32": self.use_tf32,
-            "n_node": self.n_node,
-            "n_edge": self.n_edge,
             "bridging_method": self.bridging_method,
             "bridging_r_inner": self.bridging_r_inner,
             "bridging_r_outer": self.bridging_r_outer,
@@ -1195,10 +1113,16 @@ class SeZMModel(DPModelCommon, SeZMModel_):
     # Context Managers
     # =========================================================================
 
+    def _should_use_compile(self) -> bool:
+        """Return whether the current forward should use the compile path."""
+        if self.training:
+            return self.use_compile
+        return bool(self._env_use_compile_infer)
+
     @contextmanager
     def tf32_precision_ctx(self) -> Generator[None, None, None]:
         """Context manager to temporarily set TF32 matmul precision."""
-        if not self.use_compile or not torch.cuda.is_available():
+        if not self._should_use_compile() or not torch.cuda.is_available():
             yield
             return
         prev_precision = torch.get_float32_matmul_precision()
@@ -1447,7 +1371,7 @@ class InterPotential(torch.nn.Module):
         edge_mask
             Boolean mask with shape (E,). True means valid edge.
         n_node : int
-            Padded number of nodes.
+            Number of flattened local nodes.
 
         Returns
         -------

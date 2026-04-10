@@ -331,8 +331,6 @@ def get_sezm_model(model_params: dict) -> BaseModel:
     data_stat_protect = model_params.get("data_stat_protect", 1e-2)
     use_compile = bool(model_params.get("use_compile", False))
     use_tf32 = bool(model_params.get("use_tf32", False))
-    n_node = model_params.get("n_node")
-    n_edge = model_params.get("n_edge", 0)
 
     model = SeZMModel(
         descriptor=descriptor,
@@ -344,8 +342,6 @@ def get_sezm_model(model_params: dict) -> BaseModel:
         data_stat_protect=data_stat_protect,
         use_compile=use_compile,
         use_tf32=use_tf32,
-        n_node=n_node,
-        n_edge=n_edge,
         bridging_method=bridging_method,
         bridging_r_inner=bridging_r_inner,
         bridging_r_outer=bridging_r_outer,

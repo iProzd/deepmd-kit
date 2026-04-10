@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import os
 import unittest
 from pathlib import (
     Path,
+)
+from unittest import (
+    mock,
 )
 
 import numpy as np
@@ -34,7 +38,9 @@ class TestSeZMModelCompile(unittest.TestCase):
         self.device = env.DEVICE
         torch.manual_seed(2024)
 
-    def _build_model_params(self, *, use_compile: bool, n_node: int) -> dict:
+    def _build_model_params(
+        self, *, use_compile: bool, use_env_seed: bool = False
+    ) -> dict:
         return {
             "type": "SeZM",
             "type_map": ["A", "B"],
@@ -47,7 +53,7 @@ class TestSeZMModelCompile(unittest.TestCase):
                 "focus_compete": False,
                 "n_radial": 3,
                 "radial_mlp": [6],
-                "use_env_seed": False,
+                "use_env_seed": use_env_seed,
                 "l_schedule": [1, 0],
                 "mmax": 1,
                 "so2_norm": False,
@@ -71,7 +77,6 @@ class TestSeZMModelCompile(unittest.TestCase):
                 "seed": 7,
             },
             "use_compile": use_compile,
-            "n_node": n_node,
         }
 
     def _load_water_frame(
@@ -185,12 +190,8 @@ class TestSeZMModelCompile(unittest.TestCase):
         coord, atype, box, energy, force, _virial = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(
-            self._build_model_params(use_compile=False, n_node=512)
-        )
-        model_cmp = get_sezm_model(
-            self._build_model_params(use_compile=True, n_node=512)
-        )
+        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
         model_dyn.train()
         model_cmp.train()
@@ -216,12 +217,9 @@ class TestSeZMModelCompile(unittest.TestCase):
         coord, atype, box, _, _, _ = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(
-            self._build_model_params(use_compile=False, n_node=512)
-        )
-        model_cmp = get_sezm_model(
-            self._build_model_params(use_compile=True, n_node=512)
-        )
+        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
         model_dyn.eval()
         model_cmp.eval()
@@ -233,19 +231,52 @@ class TestSeZMModelCompile(unittest.TestCase):
             out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
         )
 
+    def test_force_matches_compile_with_env_seed(self) -> None:
+        """Compile path should remain aligned when Env FiLM is enabled."""
+        coord, atype, box, _, _, _ = self._load_water_frame()
+
+        model_dyn = get_sezm_model(
+            self._build_model_params(use_compile=False, use_env_seed=True)
+        )
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model_cmp = get_sezm_model(
+                self._build_model_params(use_compile=True, use_env_seed=True)
+            )
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.eval()
+        model_cmp.eval()
+
+        out_dyn = model_dyn(coord, atype, box=box)
+        out_cmp = model_cmp(coord, atype, box=box)
+        torch.testing.assert_close(
+            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+
+    def test_eval_defaults_to_eager_without_env_override(self) -> None:
+        """Evaluation defaults to eager when `DP_COMPILE_INFER` is unset."""
+        model = get_sezm_model(self._build_model_params(use_compile=True))
+        self.assertTrue(model.use_compile)
+
+        model.train()
+        self.assertTrue(model._should_use_compile())
+
+        model.eval()
+        self.assertFalse(model._should_use_compile())
+
+    def test_eval_env_override_enables_compile(self) -> None:
+        """`DP_COMPILE_INFER` should enable eval compile at model init."""
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model = get_sezm_model(self._build_model_params(use_compile=True))
+        model.eval()
+        self.assertTrue(model._should_use_compile())
+
     def test_multi_frame_energy_matches_compile(self) -> None:
         """Energy output must remain per-frame in compile path."""
         nframe = 2
         coord, atype, box, _, _, _ = self._load_water_frame(nframe=nframe)
-        n_node = int(coord.shape[0] * coord.shape[1] + 64)
-
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(
-            self._build_model_params(use_compile=False, n_node=n_node)
-        )
-        model_cmp = get_sezm_model(
-            self._build_model_params(use_compile=True, n_node=n_node)
-        )
+        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
         model_dyn.train()
         model_cmp.train()
@@ -265,12 +296,9 @@ class TestSeZMModelCompile(unittest.TestCase):
         coord, atype, box, _, _, _ = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(
-            self._build_model_params(use_compile=False, n_node=512)
-        )
-        model_cmp = get_sezm_model(
-            self._build_model_params(use_compile=True, n_node=512)
-        )
+        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
         model_dyn.eval()
         model_cmp.eval()
@@ -299,12 +327,8 @@ class TestSeZMModelCompile(unittest.TestCase):
         coord, atype, box, _, _, _ = self._load_water_frame()
 
         # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(
-            self._build_model_params(use_compile=False, n_node=512)
-        )
-        model_cmp = get_sezm_model(
-            self._build_model_params(use_compile=True, n_node=512)
-        )
+        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
         model_dyn.train()
         model_cmp.train()
@@ -374,6 +398,33 @@ class TestSeZMModelCompile(unittest.TestCase):
             torch.testing.assert_close(
                 grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
+
+    def test_shape_change_after_first_compile_matches_dynamic(self) -> None:
+        """A compiled model should handle a larger compact graph after first trace."""
+        coord_1, atype_1, box_1, _, _, _ = self._load_water_frame(nframe=1)
+        coord_2, atype_2, box_2, _, _, _ = self._load_water_frame(nframe=2)
+
+        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.eval()
+        model_cmp.eval()
+
+        # First forward builds the traced graph on a smaller compact graph.
+        _ = model_cmp(coord_1, atype_1, box=box_1)
+
+        out_dyn = model_dyn(coord_2, atype_2, box=box_2)
+        out_cmp = model_cmp(coord_2, atype_2, box=box_2)
+        torch.testing.assert_close(
+            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn["virial"], out_cmp["virial"], atol=1.0e-5, rtol=1.0e-5
+        )
 
 
 class TestInterPotential(unittest.TestCase):
@@ -544,7 +595,6 @@ class TestSeZMModelBridging(unittest.TestCase):
                 "seed": 7,
             },
             "use_compile": False,
-            "n_node": 256,
             "bridging_method": bridging_method,
             "bridging_r_inner": 0.9,
             "bridging_r_outer": 1.3,

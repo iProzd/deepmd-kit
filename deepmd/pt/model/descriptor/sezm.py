@@ -792,15 +792,10 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     atype_flat=atype_flat,
                     n_nodes=n_nodes,
                 )  # (N, 2*C)
-                scale_logits, shift_logits = film.chunk(2, dim=-1)  # (N, C), (N, C)
-                # ScalarRMSNorm is unified to focus-aware layout (B, F, C).
-                # Env FiLM remains a single scalar stream, so F=1 here.
-                scale_hat = self.film_scale_norm(scale_logits.unsqueeze(1)).squeeze(
-                    1
-                )  # (N, C)
-                shift_hat = self.film_shift_norm(shift_logits.unsqueeze(1)).squeeze(
-                    1
-                )  # (N, C)
+                scale_logits = film[:, : self.channels]  # (N, C)
+                shift_logits = film[:, self.channels :]  # (N, C)
+                scale_hat = self.film_scale_norm(scale_logits)  # (N, C)
+                shift_hat = self.film_shift_norm(shift_logits)  # (N, C)
                 scale_strength = torch.exp(self.film_scale_strength_log)
                 shift_strength = torch.exp(self.film_shift_strength_log)
                 scale = 1.0 + scale_strength * torch.tanh(scale_hat)  # (N, C)
@@ -881,7 +876,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         torch.Tensor,
     ]:
         """
-        Compute the descriptor from a fixed-shape edge list.
+        Compute the descriptor from a sparse edge list.
 
         Parameters
         ----------
@@ -918,16 +913,16 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "extended_coord must have shape (nf, nloc*3) or (nf, nloc, 3)"
             )
         nf, nloc = extended_atype.shape[:2]
-        n_nodes = int(nf * nloc)
 
         # === Step 2. Type embedding (l=0) ===
         with nvtx_range("type_embedding"):
             atype_loc = extended_atype[:, :nloc]  # (nf, nloc)
             type_ebed = self.type_embedding(atype_loc).reshape(
-                n_nodes, self.channels
+                -1, self.channels
             )  # (N, C)
+            n_nodes = type_ebed.shape[0]
 
-        # === Step 3. Build edge cache once (fixed-shape edges) ===
+        # === Step 3. Build edge cache once (sparse edges) ===
         with nvtx_range("build_edge_cache"):
             edge_cache = build_edge_cache_from_edges(
                 type_ebed=type_ebed,
@@ -952,34 +947,25 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         x0_out = x0  # (N, C)
 
         # === Step 4. Compute radial features once (fp32+) ===
-        radial_feat = None
         with nvtx_range("radial_embedding"):
-            if edge_cache.src.numel() > 0:
-                radial_feat = rearrange(
-                    self.radial_embedding(edge_cache.edge_rbf),
-                    "E (L C) -> E L C",
-                    L=self.lmax + 1,
-                    C=self.channels,
-                )  # (E, lmax+1, C)
+            radial_feat_flat = self.radial_embedding(edge_cache.edge_rbf)
+            radial_feat = radial_feat_flat.reshape(
+                radial_feat_flat.shape[0], self.lmax + 1, self.channels
+            )  # (E, lmax+1, C)
 
         # === Step 5. Env FiLM conditioning (optional, fp32+) ===
         with nvtx_range("env_film"):
-            if self.use_env_seed and edge_cache.src.numel() > 0:
+            if self.use_env_seed:
                 atype_flat = atype_loc.reshape(-1)  # (N,)
                 film = self.env_seed_embedding(
                     edge_cache=edge_cache,
                     atype_flat=atype_flat,
                     n_nodes=n_nodes,
                 )  # (N, 2*C)
-                scale_logits, shift_logits = film.chunk(2, dim=-1)  # (N, C), (N, C)
-                # ScalarRMSNorm is unified to focus-aware layout (B, F, C).
-                # Env FiLM remains a single scalar stream, so F=1 here.
-                scale_hat = self.film_scale_norm(scale_logits.unsqueeze(1)).squeeze(
-                    1
-                )  # (N, C)
-                shift_hat = self.film_shift_norm(shift_logits.unsqueeze(1)).squeeze(
-                    1
-                )  # (N, C)
+                scale_logits = film[:, : self.channels]  # (N, C)
+                shift_logits = film[:, self.channels :]  # (N, C)
+                scale_hat = self.film_scale_norm(scale_logits)  # (N, C)
+                shift_hat = self.film_shift_norm(shift_logits)  # (N, C)
                 scale_strength = torch.exp(self.film_scale_strength_log)
                 shift_strength = torch.exp(self.film_shift_strength_log)
                 scale = 1.0 + scale_strength * torch.tanh(scale_hat)  # (N, C)
@@ -992,7 +978,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === Step 7. Geometric Initial Embedding (fp32+) ===
         with nvtx_range("gie"):
-            if self.use_gie and radial_feat is not None:
+            if self.use_gie:
                 x = x + self.gie(
                     n_nodes=n_nodes,
                     edge_cache=edge_cache,
@@ -1001,26 +987,20 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === Step 8. Fuse edge type features into radial features (fp32+) ===
         with nvtx_range("radial_fuse"):
-            if radial_feat is not None:
-                radial_feat = radial_feat + rearrange(
-                    edge_cache.edge_type_feat, "E C -> E 1 C"
-                )
-
-        if radial_feat is not None:
             radial_feat = radial_feat.to(dtype=self.dtype)
+            radial_feat = radial_feat + rearrange(
+                edge_cache.edge_type_feat.to(dtype=self.dtype), "E C -> E 1 C"
+            )
             rad_feat_per_block = [
                 radial_feat[:, :rad_len, :] for rad_len in self.rad_sizes_per_block
             ]
-        else:
-            rad_feat_per_block = []
 
         # === Step 9. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
             x = x.to(dtype=self.dtype)  # (N, D, 1, C)
-            if edge_cache.src.numel() > 0:
-                edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
-                with self._compute_mode_ctx(extended_coord.device):
-                    x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
+            edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
+            with self._compute_mode_ctx(extended_coord.device):
+                x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
 
         # === Step 10. Final l=0 output mixing ===
         with nvtx_range("output_ffn"):
@@ -1032,9 +1012,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             x_scalar = x_scalar + self.output_ffn(x_scalar)
 
         # === Step 11. Reshape to (nf, nloc, channels) and return ===
-        descriptor = rearrange(
-            x_scalar, "(nf nloc) 1 1 C -> nf nloc C", nf=nf, nloc=nloc
-        )  # (nf, nloc, C)
+        descriptor = x_scalar.reshape(nf, nloc, self.channels)  # (nf, nloc, C)
         return (
             descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
             self._empty_tensor,

@@ -20,7 +20,6 @@ from typing import (
 )
 
 import torch
-import torch.nn.functional as F
 from einops import (
     rearrange,
 )
@@ -265,9 +264,7 @@ def build_edge_cache(
             wigner_calc=wigner_calc,
         )  # (E, D, D), (E, D, D)
 
-    edge_type_feat = build_edge_type_feat(
-        type_ebed, src, dst, num_edges=int(src.numel())
-    )  # (E, C)
+    edge_type_feat = build_edge_type_feat(type_ebed, src, dst)  # (E, C)
 
     return _finalize_edge_cache(
         n_nodes=n_nodes,
@@ -301,7 +298,7 @@ def build_edge_cache_from_edges(
     wigner_calc: WignerCalculatorFn,
 ) -> EdgeFeatureCache:
     """
-    Build the global edge cache from a fixed-shape edge list.
+    Build the global edge cache from a sparse edge list.
 
     Parameters
     ----------
@@ -341,7 +338,7 @@ def build_edge_cache_from_edges(
     EdgeFeatureCache
         Per-edge cache.
     """
-    n_nodes = int(type_ebed.shape[0])
+    n_nodes = type_ebed.shape[0]
     src = edge_index[0].to(dtype=torch.long)
     dst = edge_index[1].to(dtype=torch.long)
 
@@ -379,9 +376,7 @@ def build_edge_cache_from_edges(
         )  # (E, D, D), (E, D, D)
 
     # === Step 5. Edge type features ===
-    edge_type_feat = build_edge_type_feat(
-        type_ebed, src, dst, num_edges=int(src.numel())
-    )
+    edge_type_feat = build_edge_type_feat(type_ebed, src, dst)
     edge_type_feat = edge_type_feat * edge_keep_f.to(dtype=edge_type_feat.dtype)
 
     return _finalize_edge_cache(
@@ -664,7 +659,6 @@ def build_edge_type_feat(
     type_ebed: torch.Tensor,
     src: torch.Tensor,
     dst: torch.Tensor,
-    num_edges: int | None = None,
 ) -> torch.Tensor:
     """
     Build per-edge type features by summing src/dst embeddings.
@@ -677,39 +671,20 @@ def build_edge_type_feat(
         Source node indices with shape (E,).
     dst
         Destination node indices with shape (E,).
-    num_edges
-        Number of edges. When provided, avoids calling `numel()` on GPU tensors.
 
     Returns
     -------
     torch.Tensor
         Per-edge type features with shape (E, C).
     """
-    if num_edges is None:
-        num_edges = int(src.numel())
-    if num_edges == 0:
-        return type_ebed.new_empty((0, type_ebed.shape[1]))
-
     # === Step 1. Normalize index dtypes ===
     if src.dtype != torch.long:
         src = src.to(dtype=torch.long)
     if dst.dtype != torch.long:
         dst = dst.to(dtype=torch.long)
 
-    # === Step 2. Pack edge indices as a 2-item bag ===
-    pair_index = torch.stack((src, dst), dim=1).reshape(-1)
-
-    # === Step 3. Reduce with a single embedding_bag ===
-    offsets = torch.arange(
-        0, 2 * num_edges, step=2, device=src.device, dtype=torch.long
-    )
-    return F.embedding_bag(
-        pair_index,
-        type_ebed,
-        offsets,
-        mode="sum",
-        include_last_offset=False,
-    )
+    # === Step 2. Sum source and destination embeddings ===
+    return type_ebed.index_select(0, src) + type_ebed.index_select(0, dst)
 
 
 def edge_cache_to_dtype(

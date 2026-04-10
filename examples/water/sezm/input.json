@@ -61,8 +61,6 @@
       "_comment": "that's all"
     },
     "use_compile": false,
-    "n_node": 256,
-    "n_edge": 0,
     "bridging_method": "none",
     "bridging_r_inner": 0.9,
     "bridging_r_outer": 1.3,

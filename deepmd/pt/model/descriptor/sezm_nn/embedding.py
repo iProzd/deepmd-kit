@@ -238,17 +238,7 @@ class GeometricInitialEmbedding(nn.Module):
         torch.Tensor
             Initial features to add with shape (N, D, C). l=0 is guaranteed zero.
         """
-        # === Step 1. Early exit ===
-        num_edges = edge_cache.src.size(0)
-        if num_edges == 0:
-            return torch.zeros(
-                n_nodes,
-                self.ebed_dim,
-                self.channels,
-                device=edge_cache.edge_vec.device,
-                dtype=edge_cache.edge_vec.dtype,
-            )
-
+        # === Step 1. Initialize output ===
         device = edge_cache.edge_vec.device
         dtype = edge_cache.edge_vec.dtype
         out = torch.zeros(
@@ -496,12 +486,6 @@ class EnvironmentInitialEmbedding(nn.Module):
         torch.Tensor
             FiLM logits with shape (N, 2*channels).
         """
-        num_edges = edge_cache.src.numel()
-        if num_edges == 0:
-            return torch.zeros(
-                n_nodes, 2 * self.channels, dtype=self.dtype, device=self.device
-            )
-
         src, dst = edge_cache.src, edge_cache.dst
         edge_vec = edge_cache.edge_vec  # (E, 3)
         edge_rbf = edge_cache.edge_rbf  # (E, n_radial)
@@ -534,7 +518,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         # === Step 3. Aggregate outer product by destination node ===
         # outer = r_tilde[:, :, None] * g[:, None, :]  # (E, 4, embed_dim)
         outer = torch.einsum("ei,ej->eij", r_tilde, g)  # (E, 4, embed_dim)
-        outer_flat = outer.reshape(num_edges, 4 * self.embed_dim)  # (E, 4*embed_dim)
+        outer_flat = outer.reshape(-1, 4 * self.embed_dim)  # (E, 4*embed_dim)
         env_agg = outer_flat.new_zeros(n_nodes, 4 * self.embed_dim)  # (N, 4*embed_dim)
         env_agg.index_add_(0, dst, outer_flat)
         env_agg = env_agg.reshape(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)
