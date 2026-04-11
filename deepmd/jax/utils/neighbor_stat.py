@@ -74,37 +74,6 @@ class NeighborStat(BaseNeighborStat):
                 )
                 yield np.max(max_nnei, axis=0), np.min(minrr2), jj
 
-    def iterator_with_edge(
-        self, data: DeepmdDataSystem
-    ) -> Iterator[tuple[np.ndarray, float, int, str]]:
-        """Iterator method producing neighbor statistics with edge counts.
-
-        Yields
-        ------
-        np.ndarray
-            The maximal number of neighbors
-        float
-            The squared minimal distance between two atoms
-        int
-            The maximal number of valid edges per frame
-        str
-            The directory of the data system
-        """
-        for ii in range(len(data.system_dirs)):
-            for jj in data.data_systems[ii].dirs:
-                data_set = data.data_systems[ii]
-                data_set_data = data_set._load_set(jj)
-                minrr2, max_nnei, edge_per_frame = self.auto_batch_size.execute_all(
-                    self._execute_with_edge,
-                    data_set_data["coord"].shape[0],
-                    data_set.get_natoms(),
-                    data_set_data["coord"],
-                    data_set_data["type"],
-                    data_set_data["box"] if data_set.pbc else None,
-                )
-                max_edge = int(np.max(edge_per_frame))
-                yield np.max(max_nnei, axis=0), np.min(minrr2), max_edge, jj
-
     def _execute(
         self,
         coord: np.ndarray,
@@ -130,30 +99,3 @@ class NeighborStat(BaseNeighborStat):
         minrr2 = to_numpy_array(minrr2)
         max_nnei = to_numpy_array(max_nnei)
         return minrr2, max_nnei
-
-    def _execute_with_edge(
-        self,
-        coord: np.ndarray,
-        atype: np.ndarray,
-        cell: np.ndarray | None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Execute the operation and return edge counts.
-
-        Parameters
-        ----------
-        coord
-            The coordinates of atoms.
-        atype
-            The atom types.
-        cell
-            The cell.
-        """
-        minrr2, max_nnei, edge_per_frame = self.op.call_with_edge_stats(
-            to_jax_array(coord),
-            to_jax_array(atype),
-            to_jax_array(cell),
-        )
-        minrr2 = to_numpy_array(minrr2)
-        max_nnei = to_numpy_array(max_nnei)
-        edge_per_frame = to_numpy_array(edge_per_frame)
-        return minrr2, max_nnei, edge_per_frame

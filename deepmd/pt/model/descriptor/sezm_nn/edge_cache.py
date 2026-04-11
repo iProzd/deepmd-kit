@@ -493,7 +493,8 @@ def _finalize_edge_cache(
     with nvtx_range("degree"):
         deg = torch.zeros(n_nodes, dtype=edge_vec.dtype, device=edge_vec.device)  # (N,)
         deg.index_add_(0, dst, edge_env.squeeze(-1).to(dtype=edge_vec.dtype).square())
-        inv_sqrt_deg = rearrange(torch.rsqrt(deg + eps), "N -> N 1 1")  # (N, 1, 1)
+        eps_tensor = deg.new_tensor(eps)
+        inv_sqrt_deg = rearrange(torch.rsqrt(deg + eps_tensor), "N -> N 1 1")  # (N, 1, 1)
 
     return EdgeFeatureCache(
         src=src,

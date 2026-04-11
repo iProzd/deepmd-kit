@@ -115,10 +115,10 @@ def _extract_envelope_params(
     """Extract the polynomial envelope parameters from one SeZM module."""
     return (
         float(envelope.rcut),
-        float(envelope.a),
-        float(envelope.b),
-        float(envelope.c),
-        float(envelope.d),
+        float(envelope.coeff_a),
+        float(envelope.coeff_b),
+        float(envelope.coeff_c),
+        float(envelope.coeff_d),
         int(envelope.p),
     )
 

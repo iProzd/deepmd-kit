@@ -227,22 +227,57 @@ class C3CutoffEnvelope(torch.nn.Module):
         Cubic coefficient for x^(p+3) term.
     """
 
-    def __init__(self, rcut: float, exponent: int = 5) -> None:
+    def __init__(
+        self,
+        rcut: float,
+        exponent: int = 5,
+        *,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
         super().__init__()
         if exponent <= 0:
             raise ValueError("`exponent` must be positive")
         self.rcut = float(rcut)
-        self.p: float = float(exponent)
-        self.a: float = -((self.p + 1) * (self.p + 2) * (self.p + 3)) / 6.0
-        self.b: float = (self.p * (self.p + 2) * (self.p + 3)) / 2.0
-        self.c: float = -(self.p * (self.p + 1) * (self.p + 3)) / 2.0
-        self.d: float = (self.p * (self.p + 1) * (self.p + 2)) / 6.0
+        self.p = int(exponent)
+        self.dtype = dtype
+        self.device = env.DEVICE
+        coeff_a = -((self.p + 1) * (self.p + 2) * (self.p + 3)) / 6.0
+        coeff_b = (self.p * (self.p + 2) * (self.p + 3)) / 2.0
+        coeff_c = -(self.p * (self.p + 1) * (self.p + 3)) / 2.0
+        coeff_d = (self.p * (self.p + 1) * (self.p + 2)) / 6.0
+        self.register_buffer(
+            "rcut_tensor",
+            torch.tensor(self.rcut, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "coeff_a",
+            torch.tensor(coeff_a, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "coeff_b",
+            torch.tensor(coeff_b, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "coeff_c",
+            torch.tensor(coeff_c, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "coeff_d",
+            torch.tensor(coeff_d, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
     def forward(self, dst: torch.Tensor) -> torch.Tensor:
         """Compute the envelope value for given distances."""
-        d_scaled = (dst / self.rcut).clamp(min=0.0, max=1.0)
-        poly = self.a + d_scaled * (self.b + d_scaled * (self.c + d_scaled * self.d))
-        env_val = 1 + (d_scaled**self.p) * poly
+        d_scaled = (dst / self.rcut_tensor).clamp(min=0.0, max=1.0)
+        poly = self.coeff_a + d_scaled * (
+            self.coeff_b + d_scaled * (self.coeff_c + d_scaled * self.coeff_d)
+        )
+        env_val = 1 + d_scaled.pow(self.p) * poly
         return env_val * ((d_scaled < 1.0).to(dst.dtype))
 
 
@@ -379,6 +414,11 @@ class RadialBasis(nn.Module):
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[self.dtype]
         self.exponent = int(exponent)
+        self.register_buffer(
+            "pi_tensor",
+            torch.tensor(math.pi, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
         # === Frequencies: n*π/rcut, n=1..n_radial ===
         # Shape: (1, n_radial), stored as trainable nn.Parameter
@@ -392,7 +432,11 @@ class RadialBasis(nn.Module):
             rearrange(freqs, "n_radial -> 1 n_radial"), requires_grad=True
         )
 
-        self.envelope = C3CutoffEnvelope(rcut=self.rcut, exponent=self.exponent)
+        self.envelope = C3CutoffEnvelope(
+            rcut=self.rcut,
+            exponent=self.exponent,
+            dtype=self.dtype,
+        )
 
     def forward(self, r: torch.Tensor) -> torch.Tensor:
         """
@@ -413,7 +457,7 @@ class RadialBasis(nn.Module):
         # phi_n(r) = w_n * sinc(w_n * r / π)
         # Shape: (N, 1) * (1, n_radial) -> (N, n_radial)
         x = r * self.adam_freqs  # (N, n_rbf)
-        raw = self.adam_freqs * torch.sinc(x / math.pi)  # (N, n_rbf)
+        raw = self.adam_freqs * torch.sinc(x / self.pi_tensor)  # (N, n_rbf)
 
         # === Step 2. Apply C^3 envelope for smooth cutoff ===
         envelope = self.envelope(r)  # (N, 1)

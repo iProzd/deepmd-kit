@@ -69,6 +69,11 @@ class RMSNorm(nn.Module):
         self.dtype = dtype
         self.device = env.DEVICE
         self.eps = float(eps)
+        self.register_buffer(
+            "eps_tensor",
+            torch.tensor(self.eps, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
         # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
         self.adam_scale = nn.Parameter(
@@ -93,8 +98,7 @@ class RMSNorm(nn.Module):
         """
         in_dtype = x.dtype
         x = x.to(dtype=self.dtype)
-
-        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+        inv_rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps_tensor)
         scale = self.adam_scale.view(*([1] * (x.ndim - 1)), self.channels)
         x = x * inv_rms * scale
         return x.to(dtype=in_dtype)
@@ -186,6 +190,11 @@ class EquivariantRMSNorm(nn.Module):
         self.dtype = dtype
         self.device = env.DEVICE
         self.eps = float(eps)
+        self.register_buffer(
+            "eps_tensor",
+            torch.tensor(self.eps, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
         # === Step 1. Learnable Parameters ===
         # Store affine scales in degree-major layout (L, F, C). This matches the
@@ -257,7 +266,7 @@ class EquivariantRMSNorm(nn.Module):
             mean_variance = mean_variance + torch.einsum(
                 "ndfc,d->nf", xt * xt, self.balance_weight[1:]
             )
-        inv_rms = torch.rsqrt(mean_variance + self.eps).unsqueeze(1).unsqueeze(-1)
+        inv_rms = torch.rsqrt(mean_variance + self.eps_tensor).unsqueeze(1).unsqueeze(-1)
 
         x0 = x0 * inv_rms
         if xt.numel() > 0:
@@ -378,6 +387,11 @@ class ReducedEquivariantRMSNorm(nn.Module):
         self.eps = float(eps)
         self.dtype = dtype
         self.device = env.DEVICE
+        self.register_buffer(
+            "eps_tensor",
+            torch.tensor(self.eps, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
         if degree_index_m.dtype != torch.long:
             degree_index_m = degree_index_m.to(dtype=torch.long)
@@ -451,7 +465,7 @@ class ReducedEquivariantRMSNorm(nn.Module):
             mean_variance = mean_variance + torch.einsum(
                 "efdc,d->ef", xt * xt, self.balance_weight[1:]
             )
-        inv_rms = torch.rsqrt(mean_variance + self.eps).unsqueeze(-1).unsqueeze(-1)
+        inv_rms = torch.rsqrt(mean_variance + self.eps_tensor).unsqueeze(-1).unsqueeze(-1)
 
         x0 = x0 * inv_rms
         if xt.numel() > 0:
@@ -565,6 +579,11 @@ class ScalarRMSNorm(nn.Module):
         self.dtype = dtype
         self.device = env.DEVICE
         self.eps = float(eps)
+        self.register_buffer(
+            "eps_tensor",
+            torch.tensor(self.eps, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
         # adam_ prefix routes this to Adam (no weight decay) in HybridMuon.
         self.adam_scale = nn.Parameter(
@@ -596,12 +615,16 @@ class ScalarRMSNorm(nn.Module):
         x = x.to(dtype=self.dtype)
 
         if x.ndim == 2:
-            inv_rms = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
+            inv_rms = torch.rsqrt(
+                x.square().mean(dim=-1, keepdim=True) + self.eps_tensor
+            )
             x = x * inv_rms
             x = x * self.adam_scale[0]
             return x.to(dtype=in_dtype)
 
-        inv_rms = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + self.eps)
+        inv_rms = torch.rsqrt(
+            x.square().mean(dim=-1, keepdim=True) + self.eps_tensor
+        )
         x = x * inv_rms
         x = x * self.adam_scale.unsqueeze(0)
         return x.to(dtype=in_dtype)

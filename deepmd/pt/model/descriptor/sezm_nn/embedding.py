@@ -391,6 +391,16 @@ class EnvironmentInitialEmbedding(nn.Module):
         self.dtype = dtype
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
+        self.register_buffer(
+            "eps_tensor",
+            torch.tensor(self.eps, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
+        self.register_buffer(
+            "eps_sq_tensor",
+            torch.tensor(self.eps * self.eps, dtype=self.dtype, device=self.device),
+            persistent=False,
+        )
 
         # === RBF projection: n_radial -> rbf_out_dim (two-layer MLP) ===
         # rbf_out_dim = max(32, embed_dim - 2*type_dim) to align G-network width to embed_dim
@@ -494,7 +504,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         # === Step 1. Construct r_tilde = [s, s*r_hat] ===
         # s = edge_env * (1/r), r_hat = edge_vec / r
         r_sq = (edge_vec * edge_vec).sum(dim=-1, keepdim=True)  # (E, 1)
-        inv_r = torch.rsqrt(r_sq + self.eps * self.eps)  # (E, 1)
+        inv_r = torch.rsqrt(r_sq + self.eps_sq_tensor)  # (E, 1)
         s = edge_env * inv_r  # (E, 1)
         r_hat = edge_vec * inv_r  # (E, 3)
         r_tilde = torch.cat([s, s * r_hat], dim=-1)  # (E, 4)
@@ -524,7 +534,7 @@ class EnvironmentInitialEmbedding(nn.Module):
         env_agg = env_agg.reshape(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)
 
         # === Step 4. Smooth normalization by envelope-squared degree ===
-        deg_scale = torch.rsqrt(edge_cache.deg + self.eps).reshape(
+        deg_scale = torch.rsqrt(edge_cache.deg + self.eps_tensor).reshape(
             -1, 1, 1
         )  # (N, 1, 1)
         env_agg = env_agg * deg_scale

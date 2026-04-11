@@ -23,7 +23,6 @@ def neighbor_stat(
     rcut: float,
     type_map: list[str] | None,
     mixed_type: bool = False,
-    gnn: bool = False,
     backend: str = "tensorflow",
     **kwargs: Any,
 ) -> None:
@@ -39,8 +38,6 @@ def neighbor_stat(
         type map
     mixed_type : bool, optional, default=False
         treat all types as a single type
-    gnn : bool, optional, default=False
-        also calculate the maximal number of valid edges per frame
     backend : str, optional, default="tensorflow"
         backend to use
     **kwargs
@@ -95,11 +92,6 @@ def neighbor_stat(
         log.info(f"type_map: {data.get_type_map()}")
     data.get_batch()
     nei = NeighborStat(data.get_ntypes(), rcut, mixed_type=mixed_type)
-    if gnn:
-        if not hasattr(nei, "get_stat_with_edge"):
-            raise RuntimeError("NeighborStat does not support edge statistics")
-        return nei.get_stat_with_edge(data)
-
     min_nbor_dist, max_nbor_size = nei.get_stat(data)
     log.info(f"min_nbor_dist: {min_nbor_dist:f}")
     log.info(f"max_nbor_size: {max_nbor_size!s}")
