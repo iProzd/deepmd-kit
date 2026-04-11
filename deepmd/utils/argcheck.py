@@ -2100,6 +2100,58 @@ def descrpt_dpa3s_v7_matris_args() -> list[Argument]:
         Argument("gated_hidden_dim", int, optional=True, default=128,
                  doc="Hidden dimension for GatedMLP branches."),
     ]
+
+
+@descrpt_args_plugin.register("dpa3s_v8_next", doc=doc_only_pt_supported)
+def descrpt_dpa3s_v8_next_args() -> list[Argument]:
+    doc_n_dim = "The dimension of node representation."
+    doc_e_dim = "The dimension of edge representation."
+    doc_a_dim = "The dimension of angle representation."
+    doc_nlayers = "The number of interaction layers."
+    doc_e_rcut = "The edge cut-off radius."
+    doc_e_rcut_smth = "Where to start smoothing for edge."
+    doc_e_sel = "Maximally possible number of selected edge neighbors."
+    doc_a_rcut = "The angle cut-off radius."
+    doc_a_rcut_smth = "Where to start smoothing for angle."
+    doc_a_sel = "Maximally possible number of selected angle neighbors."
+    doc_num_radial = "Number of Bessel radial basis functions for edge embedding."
+    doc_num_angular = "Number of Chebyshev basis functions for angle embedding."
+    doc_sel_reduce_factor = "Reduction factor for neighbor normalization."
+    doc_activation_function = f"The activation function. Supported: {list_to_doc(ACTIVATION_FN_DICT.keys())}."
+    doc_precision = f"Parameter precision. Supported: {list_to_doc(PRECISION_DICT.keys())}."
+    doc_exclude_types = "Excluded type pairs."
+    doc_env_protection = "Environment matrix protection parameter."
+    doc_trainable = "Whether parameters are trainable."
+    doc_seed = "Random seed."
+    doc_use_econf_tebd = "Whether to use electronic configuration type embedding."
+    doc_use_tebd_bias = "Whether to use bias in type embedding."
+    doc_concat_output_tebd = "Whether to concat type embedding at output."
+    return [
+        Argument("n_dim", int, optional=True, default=128, doc=doc_n_dim),
+        Argument("e_dim", int, optional=True, default=128, doc=doc_e_dim),
+        Argument("a_dim", int, optional=True, default=64, doc=doc_a_dim),
+        Argument("nlayers", int, optional=True, default=6, doc=doc_nlayers),
+        Argument("e_rcut", float, optional=False, doc=doc_e_rcut),
+        Argument("e_rcut_smth", float, optional=False, doc=doc_e_rcut_smth),
+        Argument("e_sel", [int, str], optional=False, doc=doc_e_sel),
+        Argument("a_rcut", float, optional=False, doc=doc_a_rcut),
+        Argument("a_rcut_smth", float, optional=False, doc=doc_a_rcut_smth),
+        Argument("a_sel", [int, str], optional=False, doc=doc_a_sel),
+        Argument("num_radial", int, optional=True, default=12, doc=doc_num_radial),
+        Argument("num_angular", int, optional=True, default=8, doc=doc_num_angular),
+        Argument("sel_reduce_factor", float, optional=True, default=10.0, doc=doc_sel_reduce_factor),
+        Argument("activation_function", str, optional=True, default="silu", doc=doc_activation_function),
+        Argument("precision", str, optional=True, default="default", doc=doc_precision),
+        Argument("exclude_types", list[list[int]], optional=True, default=[], doc=doc_exclude_types),
+        Argument("env_protection", float, optional=True, default=0.0, doc=doc_env_protection),
+        Argument("trainable", bool, optional=True, default=True, doc=doc_trainable),
+        Argument("seed", [int, None], optional=True, doc=doc_seed),
+        Argument("use_econf_tebd", bool, optional=True, default=False, doc=doc_use_econf_tebd),
+        Argument("use_tebd_bias", bool, optional=True, default=False, doc=doc_use_tebd_bias),
+        Argument("concat_output_tebd", bool, optional=True, default=False, doc=doc_concat_output_tebd),
+    ]
+
+
 def dpa3_repflow_args() -> list[Argument]:
     # repflow args
     doc_n_dim = "The dimension of node representation."

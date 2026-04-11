@@ -40,6 +40,9 @@ from .dpa3s_v6_line_attn import (
 from .dpa3s_v7_matris import (
     DescrptDPA3V7,
 )
+from .dpa3s_v8_next import (
+    DescrptDPA3Next,
+)
 from .env_mat import (
     prod_env_mat,
 )
@@ -85,6 +88,7 @@ __all__ = [
     "DescrptDPA3V5",
     "DescrptDPA3V6",
     "DescrptDPA3V7",
+    "DescrptDPA3Next",
     "DescrptHybrid",
     "DescrptSeA",
     "DescrptSeAttenV2",
