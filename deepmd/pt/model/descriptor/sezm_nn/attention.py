@@ -56,6 +56,7 @@ def segment_envelope_gated_softmax(
     logits_2d = logits.reshape(n_edge, n_channel)
     edge_env_1d = edge_env.squeeze(-1).to(dtype=logits.dtype).clamp_min(0.0)
     zeta = F.softplus(z_bias_raw).reshape(1, n_channel).to(dtype=logits.dtype)
+    dst_index = dst.reshape(n_edge, 1).expand(n_edge, n_channel)
     has_weight = edge_env_1d > 0.0
     logits_for_max = torch.where(
         has_weight.reshape(n_edge, 1),
@@ -70,7 +71,14 @@ def segment_envelope_gated_softmax(
         dtype=logits.dtype,
         device=logits.device,
     )
-    group_max.index_reduce_(0, dst, logits_for_max, reduce="amax", include_self=True)
+    group_max = torch.scatter_reduce(
+        group_max,
+        0,
+        dst_index,
+        logits_for_max,
+        reduce="amax",
+        include_self=True,
+    )
     edge_max = group_max.index_select(0, dst)
     edge_max = torch.where(
         torch.isfinite(edge_max), edge_max, torch.zeros_like(edge_max)
@@ -90,7 +98,7 @@ def segment_envelope_gated_softmax(
         dtype=logits.dtype,
         device=logits.device,
     )
-    denom_sum.index_add_(0, dst, edge_weighted_exp)
+    denom_sum = torch.scatter_add(denom_sum, 0, dst_index, edge_weighted_exp)
     denom = denom_sum + zeta * torch.exp(-group_max_safe)
 
     alpha = edge_weighted_exp / (denom.index_select(0, dst) + eps_f)
