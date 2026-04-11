@@ -550,14 +550,13 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         )
 
         # === Step 3. Descriptor forward through the sparse-edge entry ===
-        descriptor, rot_mat, g2, h2, _ = descriptor_model.forward_with_edges(
+        descriptor = descriptor_model.forward_with_edges(
             extended_coord=extended_coord[:, :nloc, :],
             extended_atype=atype,
             edge_index=edge_index,
             edge_vec=edge_vec,
             edge_mask=edge_mask,
         )
-        assert descriptor is not None
         if self.atomic_model.enable_eval_descriptor_hook:
             self.atomic_model.eval_descriptor_list.append(descriptor.detach())
 
@@ -565,9 +564,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         fit_ret = self.atomic_model.fitting_net(
             descriptor,
             atype,
-            gr=rot_mat,
-            g2=g2,
-            h2=h2,
             fparam=fparam,
             aparam=aparam,
         )
@@ -692,23 +688,19 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # === Step 2. Descriptor (edge path only) ===
         with nvtx_range("SeZM/descriptor"):
             descriptor_model = self.atomic_model.descriptor
-            descriptor, rot_mat, g2, h2, _ = descriptor_model.forward_with_edges(
+            descriptor = descriptor_model.forward_with_edges(
                 extended_coord=cc_flat.view(1, n_node, 3),
                 extended_atype=atype_flat.view(1, n_node),
                 edge_index=edge_index,
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
             )
-        assert descriptor is not None
 
         # === Step 3. Fitting net ===
         with nvtx_range("SeZM/fitting_net"):
             fit_ret = self.atomic_model.fitting_net(
                 descriptor,
                 atype_flat.view(1, n_node),
-                gr=rot_mat,
-                g2=g2,
-                h2=h2,
                 fparam=fp,
                 aparam=ap,
             )

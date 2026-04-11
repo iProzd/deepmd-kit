@@ -787,12 +787,19 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             Empty tensor (not used).
         """
         if edge_index is not None:
-            return self.forward_with_edges(
+            descriptor = self.forward_with_edges(
                 extended_coord=extended_coord,
                 extended_atype=extended_atype,
                 edge_index=edge_index,
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
+            )
+            return (
+                descriptor,
+                self._empty_tensor,
+                self._empty_tensor,
+                self._empty_tensor,
+                self._empty_tensor,
             )
 
         # === Step 1. Setup dimensions ===
@@ -943,13 +950,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
+    ) -> torch.Tensor:
         """
         Compute the descriptor from a sparse edge list.
 
@@ -968,16 +969,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         Returns
         -------
-        descriptor
+        torch.Tensor
             Descriptor with shape (nf, nloc, channels). Only l=0 is returned.
-        rot_mat
-            Empty tensor (not used).
-        g2
-            Empty tensor (not used).
-        h2
-            Empty tensor (not used).
-        sw
-            Empty tensor (not used).
         """
         # === Step 1. Setup dimensions ===
         extended_coord = extended_coord.to(self.compute_dtype)
@@ -1088,13 +1081,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === Step 11. Reshape to (nf, nloc, channels) and return ===
         descriptor = x_scalar.reshape(nf, nloc, self.channels)  # (nf, nloc, C)
-        return (
-            descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION),
-            self._empty_tensor,
-            self._empty_tensor,
-            self._empty_tensor,
-            self._empty_tensor,
-        )
+        return descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
 
     def _forward_blocks(
         self,
