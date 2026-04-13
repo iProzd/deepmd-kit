@@ -300,6 +300,9 @@ class DPAtomicModel(BaseAtomicModel):
         if self.enable_eval_descriptor_hook:
             self.eval_descriptor_list.append(descriptor.detach())
         # energy, force
+        additional_input: dict[str, torch.Tensor | None] = {}
+        if self.fitting_net.need_additional_input():
+            additional_input = self.descriptor.get_additional_output_for_fitting()
         fit_ret = self.fitting_net(
             descriptor,
             atype,
@@ -308,6 +311,8 @@ class DPAtomicModel(BaseAtomicModel):
             h2=h2,
             fparam=fparam,
             aparam=aparam,
+            sw=sw,
+            edge_index=additional_input.get("edge_index", None),
         )
         if self.enable_eval_fitting_last_layer_hook:
             assert "middle_output" in fit_ret, (

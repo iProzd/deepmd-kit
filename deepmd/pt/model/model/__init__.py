@@ -93,6 +93,10 @@ def _get_standard_model_components(model_params: dict, ntypes: int) -> tuple:
     if fitting_net["type"] in ["dipole", "polar"]:
         fitting_net["embedding_width"] = descriptor.get_dim_emb()
     fitting_net["dim_descrpt"] = descriptor.get_dim_out()
+    # edge readout: pass embedding_width and norm_fact from descriptor
+    if fitting_net.get("add_edge_readout", False):
+        fitting_net["embedding_width"] = descriptor.get_dim_emb()
+        fitting_net["norm_fact"] = descriptor.get_norm_fact()
     grad_force = "direct" not in fitting_net["type"]
     if not grad_force:
         fitting_net["out_dim"] = descriptor.get_dim_emb()

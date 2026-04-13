@@ -511,6 +511,14 @@ class DescrptDPA3(NativeOP, BaseDescriptor):
         """Returns the embedding dimension of this descriptor."""
         return self.repflows.dim_emb
 
+    def get_norm_fact(self) -> list[float]:
+        """Returns the norm factor."""
+        return self.repflows.get_norm_fact()
+
+    def get_additional_output_for_fitting(self) -> dict:
+        """Returns additional output from descriptor for fitting."""
+        return {}
+
     def mixed_types(self) -> bool:
         """If true, the descriptor
         1. assumes total number of atoms aligned across frames;

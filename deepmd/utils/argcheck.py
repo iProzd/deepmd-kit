@@ -1846,6 +1846,21 @@ def fitting_ener() -> list[Argument]:
             default=False,
             doc=doc_use_aparam_as_mask,
         ),
+        Argument(
+            "add_edge_readout",
+            bool,
+            optional=True,
+            default=False,
+            doc="Whether to add edge readout fitting net. Only supported with DPA3 descriptor.",
+        ),
+        Argument(
+            "edge_readout_neuron",
+            list[int],
+            optional=True,
+            default=None,
+            doc="Number of neurons in each hidden layer of the edge readout fitting net. "
+            "Default is the same as the main fitting neuron.",
+        ),
     ]
 
 

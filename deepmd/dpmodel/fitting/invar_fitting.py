@@ -223,6 +223,8 @@ class InvarFitting(GeneralFitting):
         h2: Array | None = None,
         fparam: Array | None = None,
         aparam: Array | None = None,
+        sw: Array | None = None,
+        edge_index: Array | None = None,
     ) -> dict[str, Array]:
         """Calculate the fitting.
 

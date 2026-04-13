@@ -396,6 +396,16 @@ class DescrptBlockRepflows(NativeOP, DescriptorBlock):
         """Returns the embedding dimension e_dim."""
         return self.e_dim
 
+    def get_norm_fact(self) -> list[float]:
+        """Returns the norm factor."""
+        return [
+            float(self.dynamic_e_sel if self.use_dynamic_sel else self.nnei),
+        ]
+
+    def get_additional_output_for_fitting(self) -> dict:
+        """Returns additional output from descriptor for fitting."""
+        return {}
+
     def __setitem__(self, key: str, value: Array) -> None:
         if key in ("avg", "data_avg", "davg"):
             self.mean = value

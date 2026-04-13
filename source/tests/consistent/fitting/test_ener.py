@@ -804,3 +804,136 @@ class TestEnerStat(CommonTest, FittingTest, unittest.TestCase):
             return 1e-4
         else:
             raise ValueError(f"Unknown precision: {precision}")
+
+
+@parameterized(
+    (True,),  # resnet_dt
+    ("float64",),  # precision
+    (True,),  # mixed_types
+)
+class TestEnerEdgeReadout(CommonTest, FittingTest, unittest.TestCase):
+    """Test backend consistency for ener fitting with edge readout enabled."""
+
+    @property
+    def data(self) -> dict:
+        (
+            resnet_dt,
+            precision,
+            mixed_types,
+        ) = self.param
+        return {
+            "neuron": [5, 5, 5],
+            "resnet_dt": resnet_dt,
+            "precision": precision,
+            "numb_fparam": 0,
+            "numb_aparam": 0,
+            "seed": 20240217,
+            "atom_ener": [],
+            "use_aparam_as_mask": False,
+            "activation_function": "tanh",
+            "add_edge_readout": True,
+            "edge_readout_neuron": [5, 5],
+        }
+
+    @property
+    def skip_pt(self) -> bool:
+        return CommonTest.skip_pt
+
+    skip_tf = True
+    skip_jax = True
+    skip_pd = True
+    skip_array_api_strict = True
+    skip_pt_expt = True
+
+    tf_class = EnerFittingTF
+    dp_class = EnerFittingDP
+    pt_class = EnerFittingPT
+    args = fitting_ener()
+
+    def setUp(self) -> None:
+        CommonTest.setUp(self)
+        self.ntypes = 2
+        self.natoms = np.array([6, 6, 2, 4], dtype=np.int32)
+        self.inputs = np.ones((1, 6, 20), dtype=GLOBAL_NP_FLOAT_PRECISION)
+        self.atype = np.array([0, 1, 1, 0, 1, 1], dtype=np.int32)
+        self.atype.sort()
+        # g2: nf x nloc x nnei x e_dim (embedding_width=8, nnei=10)
+        self.g2 = (
+            np.random.RandomState(42)
+            .randn(1, 6, 10, 8)
+            .astype(GLOBAL_NP_FLOAT_PRECISION)
+        )
+        # sw: nf x nloc x nnei
+        self.sw = (
+            np.random.RandomState(43).rand(1, 6, 10).astype(GLOBAL_NP_FLOAT_PRECISION)
+        )
+
+    @property
+    def additional_data(self) -> dict:
+        (
+            resnet_dt,
+            precision,
+            mixed_types,
+        ) = self.param
+        return {
+            "ntypes": self.ntypes,
+            "dim_descrpt": self.inputs.shape[-1],
+            "mixed_types": mixed_types,
+            "embedding_width": 8,
+            "norm_fact": [20.0],
+        }
+
+    def build_tf(self, obj: Any, suffix: str) -> tuple[list, dict]:
+        raise unittest.SkipTest("TF not supported for edge readout")
+
+    def eval_pt(self, pt_obj: Any) -> Any:
+        return (
+            pt_obj(
+                torch.from_numpy(self.inputs).to(device=PT_DEVICE),
+                torch.from_numpy(self.atype.reshape(1, -1)).to(device=PT_DEVICE),
+                g2=torch.from_numpy(self.g2).to(device=PT_DEVICE),
+                sw=torch.from_numpy(self.sw).to(device=PT_DEVICE),
+            )["energy"]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+
+    def eval_dp(self, dp_obj: Any) -> Any:
+        return dp_obj(
+            self.inputs,
+            self.atype.reshape(1, -1),
+            g2=self.g2,
+            sw=self.sw,
+        )["energy"]
+
+    def extract_ret(self, ret: Any, backend) -> tuple[np.ndarray, ...]:
+        return (ret,)
+
+    @property
+    def rtol(self) -> float:
+        (
+            resnet_dt,
+            precision,
+            mixed_types,
+        ) = self.param
+        if precision == "float64":
+            return 1e-10
+        elif precision == "float32":
+            return 1e-4
+        else:
+            raise ValueError(f"Unknown precision: {precision}")
+
+    @property
+    def atol(self) -> float:
+        (
+            resnet_dt,
+            precision,
+            mixed_types,
+        ) = self.param
+        if precision == "float64":
+            return 1e-10
+        elif precision == "float32":
+            return 1e-4
+        else:
+            raise ValueError(f"Unknown precision: {precision}")
