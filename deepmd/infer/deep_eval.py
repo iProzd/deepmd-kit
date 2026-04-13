@@ -710,6 +710,16 @@ class DeepEval(ABC):
         """Check if the model has hessian."""
         return self.deep_eval.get_has_hessian()
 
+    @property
+    def has_chg_spin_ebd(self) -> bool:
+        """Check if the model has charge spin embedding."""
+        return getattr(self.deep_eval, "get_has_chg_spin_ebd", lambda: False)()
+
+    @property
+    def has_default_chg_spin(self) -> bool:
+        """Check if the model has default charge_spin values."""
+        return getattr(self.deep_eval, "get_has_default_chg_spin", lambda: False)()
+
     def get_ntypes_spin(self) -> int:
         """Get the number of spin atom types of this model. Only used in old implement."""
         return self.deep_eval.get_ntypes_spin()

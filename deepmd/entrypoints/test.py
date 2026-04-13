@@ -417,6 +417,14 @@ def test_ener(
         data.add("force_mag", 3, atomic=True, must=False, high_prec=False)
     if dp.has_hessian:
         data.add("hessian", 1, atomic=True, must=True, high_prec=False)
+    if dp.has_chg_spin_ebd:
+        data.add(
+            "charge_spin",
+            2,
+            atomic=False,
+            must=not dp.has_default_chg_spin,
+            high_prec=False,
+        )
 
     test_data = data.get_test()
     find_energy = test_data.get("find_energy")
@@ -453,6 +461,10 @@ def test_ener(
         aparam = test_data["aparam"][:numb_test]
     else:
         aparam = None
+    if dp.has_chg_spin_ebd and test_data.get("find_charge_spin", 0.0) != 0.0:
+        charge_spin = test_data["charge_spin"][:numb_test]
+    else:
+        charge_spin = None
 
     ret = dp.eval(
         coord,
@@ -464,6 +476,7 @@ def test_ener(
         efield=efield,
         mixed_type=mixed_type,
         spin=spin,
+        charge_spin=charge_spin,
     )
     energy = ret[0]
     force = ret[1]

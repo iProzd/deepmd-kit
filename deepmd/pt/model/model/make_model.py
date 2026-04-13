@@ -139,6 +139,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             aparam: torch.Tensor | None = None,
             do_atomic_virial: bool = False,
             coord_corr_for_virial: torch.Tensor | None = None,
+            charge_spin: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             """Return model prediction.
 
@@ -204,6 +205,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 fparam=fp,
                 aparam=ap,
                 extended_coord_corr=extended_coord_corr,
+                charge_spin=charge_spin,
             )
             model_predict = communicate_extended_output(
                 model_predict_lower,
@@ -259,6 +261,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             comm_dict: dict[str, torch.Tensor] | None = None,
             extra_nlist_sort: bool = False,
             extended_coord_corr: torch.Tensor | None = None,
+            charge_spin: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             """Return model prediction. Lower interface that takes
             extended atomic coordinates and types, nlist, and mapping
@@ -311,6 +314,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 fparam=fp,
                 aparam=ap,
                 comm_dict=comm_dict,
+                charge_spin=charge_spin,
             )
             model_predict = fit_output_to_model_output(
                 atomic_ret,
@@ -552,6 +556,21 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             return self.atomic_model.get_default_fparam()
 
         @torch.jit.export
+        def has_chg_spin_ebd(self) -> bool:
+            """Check if the model has charge spin embedding."""
+            return getattr(self.atomic_model, "has_chg_spin_ebd", lambda: False)()
+
+        @torch.jit.export
+        def has_default_chg_spin(self) -> bool:
+            """Check if the model has default charge_spin values."""
+            return getattr(self.atomic_model, "has_default_chg_spin", lambda: False)()
+
+        def get_default_chg_spin(self) -> torch.Tensor | None:
+            if hasattr(self.atomic_model, "get_default_chg_spin"):
+                return self.atomic_model.get_default_chg_spin()
+            return None
+
+        @torch.jit.export
         def get_dim_aparam(self) -> int:
             """Get the number (dimension) of atomic parameters of this atomic model."""
             return self.atomic_model.get_dim_aparam()
@@ -670,6 +689,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
             fparam: torch.Tensor | None = None,
             aparam: torch.Tensor | None = None,
             do_atomic_virial: bool = False,
+            charge_spin: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             # directly call the forward_common method when no specific transform rule
             return self.forward_common(
@@ -679,6 +699,7 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
                 fparam=fparam,
                 aparam=aparam,
                 do_atomic_virial=do_atomic_virial,
+                charge_spin=charge_spin,
             )
 
     return CM

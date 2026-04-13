@@ -2016,30 +2016,25 @@ class TestEnerComputeOrLoadStat(unittest.TestCase):
 
 
 @parameterized(
-    ("no_fparam", "explicit_fparam", "default_fparam"),  # fparam_mode
+    ("no_chg_spin", "explicit_chg_spin"),  # chg_spin_mode
 )
 @unittest.skipUnless(INSTALLED_PT and INSTALLED_PT_EXPT, "PT and PT_EXPT are required")
 class TestEnerChgSpinEbdFparam(unittest.TestCase):
-    """Test dp/pt/pt_expt model forward consistency for add_chg_spin_ebd with three fparam modes.
+    """Test dp/pt/pt_expt model forward consistency for add_chg_spin_ebd with charge_spin modes.
 
-    - no_fparam: numb_fparam=0, add_chg_spin_ebd=False (baseline)
-    - explicit_fparam: numb_fparam=2, add_chg_spin_ebd=True, fparam provided
-    - default_fparam: numb_fparam=2, default_fparam set, add_chg_spin_ebd=True, fparam=None
+    - no_chg_spin: add_chg_spin_ebd=False (baseline)
+    - explicit_chg_spin: add_chg_spin_ebd=True, charge_spin provided
     """
 
     def setUp(self) -> None:
-        (self.fparam_mode,) = self.param
+        (self.chg_spin_mode,) = self.param
 
-        add_chg_spin_ebd = self.fparam_mode != "no_fparam"
+        add_chg_spin_ebd = self.chg_spin_mode != "no_chg_spin"
         fitting_cfg: dict[str, Any] = {
             "neuron": [10, 10],
             "precision": "float64",
             "seed": 1,
         }
-        if self.fparam_mode != "no_fparam":
-            fitting_cfg["numb_fparam"] = 2
-        if self.fparam_mode == "default_fparam":
-            fitting_cfg["default_fparam"] = [5, 1]
 
         data = model_args().normalize_value(
             {
@@ -2106,15 +2101,15 @@ class TestEnerChgSpinEbdFparam(unittest.TestCase):
             dtype=GLOBAL_NP_FLOAT_PRECISION,
         ).reshape(1, 9)
 
-        # fparam: charge=5, spin=1
-        if self.fparam_mode == "explicit_fparam":
-            self.fparam_np = np.array([[5, 1]], dtype=GLOBAL_NP_FLOAT_PRECISION)
+        # charge_spin: charge=5, spin=1
+        if self.chg_spin_mode == "explicit_chg_spin":
+            self.charge_spin_np = np.array([[5, 1]], dtype=GLOBAL_NP_FLOAT_PRECISION)
         else:
-            self.fparam_np = None
+            self.charge_spin_np = None
 
     def test_forward_consistency(self) -> None:
         dp_ret = self.dp_model(
-            self.coords, self.atype, box=self.box, fparam=self.fparam_np
+            self.coords, self.atype, box=self.box, charge_spin=self.charge_spin_np
         )
         pt_ret = {
             kk: torch_to_numpy(vv)
@@ -2122,7 +2117,7 @@ class TestEnerChgSpinEbdFparam(unittest.TestCase):
                 numpy_to_torch(self.coords),
                 numpy_to_torch(self.atype),
                 box=numpy_to_torch(self.box),
-                fparam=numpy_to_torch(self.fparam_np),
+                charge_spin=numpy_to_torch(self.charge_spin_np),
                 do_atomic_virial=True,
             ).items()
         }
@@ -2134,7 +2129,7 @@ class TestEnerChgSpinEbdFparam(unittest.TestCase):
                 coord_t,
                 pt_expt_numpy_to_torch(self.atype),
                 box=pt_expt_numpy_to_torch(self.box),
-                fparam=pt_expt_numpy_to_torch(self.fparam_np),
+                charge_spin=pt_expt_numpy_to_torch(self.charge_spin_np),
                 do_atomic_virial=True,
             ).items()
         }
@@ -2144,12 +2139,12 @@ class TestEnerChgSpinEbdFparam(unittest.TestCase):
                 pt_ret[key],
                 rtol=1e-10,
                 atol=1e-10,
-                err_msg=f"dp vs pt mismatch in {key} (mode={self.fparam_mode})",
+                err_msg=f"dp vs pt mismatch in {key} (mode={self.chg_spin_mode})",
             )
             np.testing.assert_allclose(
                 dp_ret[key],
                 pe_ret[key],
                 rtol=1e-10,
                 atol=1e-10,
-                err_msg=f"dp vs pt_expt mismatch in {key} (mode={self.fparam_mode})",
+                err_msg=f"dp vs pt_expt mismatch in {key} (mode={self.chg_spin_mode})",
             )
