@@ -19,6 +19,10 @@ from deepmd.pt.model.descriptor.base_descriptor import (
 from deepmd.pt.model.task.base_fitting import (
     BaseFitting,
 )
+from deepmd.pt.utils.env import (
+    DEVICE,
+    GLOBAL_PT_FLOAT_PRECISION,
+)
 from deepmd.utils.path import (
     DPPath,
 )
@@ -76,6 +80,30 @@ class DPAtomicModel(BaseAtomicModel):
 
     eval_descriptor_list: list[torch.Tensor]
     eval_fitting_last_layer_list: list[torch.Tensor]
+
+    def has_chg_spin_ebd(self) -> bool:
+        """Check if the model has charge spin embedding."""
+        return self.add_chg_spin_ebd
+
+    def get_dim_chg_spin(self) -> int:
+        """Get the dimension of charge_spin input."""
+        if self.add_chg_spin_ebd:
+            return self.descriptor.get_dim_chg_spin()
+        return 0
+
+    def has_default_chg_spin(self) -> bool:
+        """Check if the model has default charge_spin values."""
+        if self.add_chg_spin_ebd:
+            return self.descriptor.has_default_chg_spin()
+        return False
+
+    def get_default_chg_spin(self) -> torch.Tensor | None:
+        """Get the default charge_spin values as a tensor."""
+        if self.add_chg_spin_ebd and self.descriptor.has_default_chg_spin():
+            cs = self.descriptor.get_default_chg_spin()
+            if cs is not None:
+                return torch.tensor(cs, dtype=GLOBAL_PT_FLOAT_PRECISION, device=DEVICE)
+        return None
 
     def set_eval_descriptor_hook(self, enable: bool) -> None:
         """Set the hook for evaluating descriptor and clear the cache for descriptor list."""
@@ -244,6 +272,7 @@ class DPAtomicModel(BaseAtomicModel):
         fparam: torch.Tensor | None = None,
         aparam: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return atomic prediction.
 
@@ -261,6 +290,8 @@ class DPAtomicModel(BaseAtomicModel):
             frame parameter. nf x ndf
         aparam
             atomic parameter. nf x nloc x nda
+        charge_spin
+            charge and spin parameter for descriptor. nf x 2
 
         Returns
         -------
@@ -273,20 +304,19 @@ class DPAtomicModel(BaseAtomicModel):
         if self.do_grad_r() or self.do_grad_c():
             extended_coord.requires_grad_(True)
 
-        # Handle default fparam if fitting net supports it
-        if (
-            hasattr(self.fitting_net, "get_dim_fparam")
-            and self.fitting_net.get_dim_fparam() > 0
-            and fparam is None
-        ):
-            # use default fparam
-            default_fparam_tensor = self.fitting_net.get_default_fparam()
-            assert default_fparam_tensor is not None
-            fparam_input_for_des = torch.tile(
-                default_fparam_tensor.unsqueeze(0), [nframes, 1]
-            )
-        else:
-            fparam_input_for_des = fparam
+        # Handle default charge_spin if descriptor supports it
+        if self.add_chg_spin_ebd and charge_spin is None:
+            default_cs = self.descriptor.get_default_chg_spin()
+            if default_cs is not None:
+                charge_spin = (
+                    torch.tensor(
+                        default_cs,
+                        dtype=extended_coord.dtype,
+                        device=extended_coord.device,
+                    )
+                    .unsqueeze(0)
+                    .expand(nframes, -1)
+                )
 
         descriptor, rot_mat, g2, h2, sw = self.descriptor(
             extended_coord,
@@ -294,7 +324,7 @@ class DPAtomicModel(BaseAtomicModel):
             nlist,
             mapping=mapping,
             comm_dict=comm_dict,
-            fparam=fparam_input_for_des if self.add_chg_spin_ebd else None,
+            charge_spin=charge_spin if self.add_chg_spin_ebd else None,
         )
         assert descriptor is not None
         if self.enable_eval_descriptor_hook:

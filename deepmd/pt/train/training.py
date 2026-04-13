@@ -1672,13 +1672,20 @@ class Trainer:
             "box",
             "fparam",
             "aparam",
+            "charge_spin",
         ]
         input_dict = dict.fromkeys(input_keys)
         label_dict = {}
         for item_key in batch_data:
             if item_key in input_keys:
-                if item_key != "fparam" or batch_data["find_fparam"] != 0.0:
-                    input_dict[item_key] = batch_data[item_key]
+                if item_key == "fparam" and batch_data.get("find_fparam", 0.0) == 0.0:
+                    continue
+                if (
+                    item_key == "charge_spin"
+                    and batch_data.get("find_charge_spin", 0.0) == 0.0
+                ):
+                    continue
+                input_dict[item_key] = batch_data[item_key]
             else:
                 if item_key not in ["sid", "fid"]:
                     label_dict[item_key] = batch_data[item_key]
@@ -1792,6 +1799,27 @@ def get_additional_data_requirement(_model: Any) -> list[DataRequirementItem]:
             DataRequirementItem("spin", ndof=3, atomic=True, must=True)
         ]
         additional_data_requirement += spin_requirement_items
+    # charge_spin for descriptor
+    has_chg_spin = getattr(_model, "has_chg_spin_ebd", False)
+    if callable(has_chg_spin):
+        has_chg_spin = has_chg_spin()
+    if has_chg_spin:
+        _has_default_cs = _model.has_default_chg_spin()
+        if _has_default_cs:
+            _cs_default = _model.get_default_chg_spin()
+            if hasattr(_cs_default, "cpu"):
+                _cs_default = _cs_default.cpu().numpy()
+        else:
+            _cs_default = 0.0
+        additional_data_requirement.append(
+            DataRequirementItem(
+                "charge_spin",
+                2,
+                atomic=False,
+                must=not _has_default_cs,
+                default=_cs_default,
+            )
+        )
     return additional_data_requirement
 
 

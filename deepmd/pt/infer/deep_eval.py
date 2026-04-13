@@ -325,6 +325,20 @@ class DeepEval(DeepEvalBackend):
         """Check if the model has hessian."""
         return self._has_hessian
 
+    def get_has_chg_spin_ebd(self) -> bool:
+        """Check if the model has charge spin embedding."""
+        model = self.dp.model["Default"]
+        if hasattr(model, "has_chg_spin_ebd"):
+            return model.has_chg_spin_ebd()
+        return False
+
+    def get_has_default_chg_spin(self) -> bool:
+        """Check if the model has default charge_spin values."""
+        model = self.dp.model["Default"]
+        if hasattr(model, "has_default_chg_spin"):
+            return model.has_default_chg_spin()
+        return False
+
     def get_model_branch(self) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
         """Get the model branch information."""
         if "model_dict" in self.model_def_script:
@@ -391,6 +405,7 @@ class DeepEval(DeepEvalBackend):
             coords, atom_types, len(atom_types.shape) > 1
         )
         request_defs = self._get_request_defs(atomic)
+        self._charge_spin = kwargs.pop("charge_spin", None)
         if "spin" not in kwargs or kwargs["spin"] is None:
             out = self._eval_func(self._eval_model, numb_test, natoms)(
                 coords, cells, atom_types, fparam, aparam, request_defs
@@ -546,6 +561,15 @@ class DeepEval(DeepEvalBackend):
             )
         else:
             aparam_input = None
+        # Handle charge_spin
+        charge_spin_input = None
+        if self._charge_spin is not None:
+            cs = np.array(self._charge_spin)
+            if cs.size == nframes * 2:
+                cs = cs.reshape(nframes, 2)
+            elif cs.size == 2:
+                cs = np.tile(cs.reshape(1, 2), (nframes, 1))
+            charge_spin_input = to_torch_tensor(cs)
         do_atomic_virial = any(
             x.category == OutputVariableCategory.DERV_C for x in request_defs
         )
@@ -556,6 +580,7 @@ class DeepEval(DeepEvalBackend):
             do_atomic_virial=do_atomic_virial,
             fparam=fparam_input,
             aparam=aparam_input,
+            charge_spin=charge_spin_input,
         )
         if isinstance(batch_output, tuple):
             batch_output = batch_output[0]
@@ -625,6 +650,16 @@ class DeepEval(DeepEvalBackend):
         else:
             aparam_input = None
 
+        # Handle charge_spin
+        charge_spin_input = None
+        if self._charge_spin is not None:
+            cs = np.array(self._charge_spin)
+            if cs.size == nframes * 2:
+                cs = cs.reshape(nframes, 2)
+            elif cs.size == 2:
+                cs = np.tile(cs.reshape(1, 2), (nframes, 1))
+            charge_spin_input = to_torch_tensor(cs)
+
         do_atomic_virial = any(
             x.category == OutputVariableCategory.DERV_C_REDU for x in request_defs
         )
@@ -636,6 +671,7 @@ class DeepEval(DeepEvalBackend):
             do_atomic_virial=do_atomic_virial,
             fparam=fparam_input,
             aparam=aparam_input,
+            charge_spin=charge_spin_input,
         )
         if isinstance(batch_output, tuple):
             batch_output = batch_output[0]

@@ -305,6 +305,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         fparam: torch.Tensor | None = None,
         aparam: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Common interface for atomic inference.
 
@@ -356,6 +357,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             fparam=fparam,
             aparam=aparam,
             comm_dict=comm_dict,
+            charge_spin=charge_spin,
         )
         ret_dict = self.apply_out_stat(ret_dict, atype)
 
@@ -386,6 +388,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         fparam: torch.Tensor | None = None,
         aparam: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         return self.forward_common_atomic(
             extended_coord,
@@ -395,6 +398,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             fparam=fparam,
             aparam=aparam,
             comm_dict=comm_dict,
+            charge_spin=charge_spin,
         )
 
     def change_type_map(

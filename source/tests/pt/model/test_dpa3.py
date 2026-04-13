@@ -111,21 +111,21 @@ class TestDescrptDPA3(unittest.TestCase, TestCaseSingleFrameWithNlist):
             dd0.repflows.mean = torch.tensor(davg, dtype=dtype, device=env.DEVICE)
             dd0.repflows.stddev = torch.tensor(dstd, dtype=dtype, device=env.DEVICE)
 
-            # Prepare fparam if needed
-            fparam = None
-            fparam_np = None
+            # Prepare charge_spin if needed
+            charge_spin = None
+            charge_spin_np = None
             if add_chg_spin:
-                fparam = torch.tensor([[5, 1]], dtype=dtype, device=env.DEVICE).expand(
-                    nf, -1
-                )
-                fparam_np = np.array([[5, 1]], dtype=np.float64).repeat(nf, axis=0)
+                charge_spin = torch.tensor(
+                    [[5, 1]], dtype=dtype, device=env.DEVICE
+                ).expand(nf, -1)
+                charge_spin_np = np.array([[5, 1]], dtype=np.float64).repeat(nf, axis=0)
 
             rd0, _, _, _, _ = dd0(
                 torch.tensor(self.coord_ext, dtype=dtype, device=env.DEVICE),
                 torch.tensor(self.atype_ext, dtype=int, device=env.DEVICE),
                 torch.tensor(self.nlist, dtype=int, device=env.DEVICE),
                 torch.tensor(self.mapping, dtype=int, device=env.DEVICE),
-                fparam=fparam,
+                charge_spin=charge_spin,
             )
             # serialization
             dd1 = DescrptDPA3.deserialize(dd0.serialize())
@@ -134,7 +134,7 @@ class TestDescrptDPA3(unittest.TestCase, TestCaseSingleFrameWithNlist):
                 torch.tensor(self.atype_ext, dtype=int, device=env.DEVICE),
                 torch.tensor(self.nlist, dtype=int, device=env.DEVICE),
                 torch.tensor(self.mapping, dtype=int, device=env.DEVICE),
-                fparam=fparam,
+                charge_spin=charge_spin,
             )
             np.testing.assert_allclose(
                 rd0.detach().cpu().numpy(),
@@ -149,7 +149,7 @@ class TestDescrptDPA3(unittest.TestCase, TestCaseSingleFrameWithNlist):
                 self.atype_ext,
                 self.nlist,
                 self.mapping,
-                fparam=fparam_np,
+                charge_spin=charge_spin_np,
             )
             np.testing.assert_allclose(
                 rd0.detach().cpu().numpy(),
