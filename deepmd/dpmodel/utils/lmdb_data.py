@@ -143,6 +143,11 @@ def _remap_keys(frame: dict[str, Any]) -> dict[str, Any]:
     out = {}
     for k, v in frame.items():
         out[_KEY_REMAP.get(k, k)] = v
+    # If the dataset has fparam but no charge_spin, synthesize charge_spin from
+    # fparam so that models with add_chg_spin_ebd can be trained directly on
+    # legacy LMDB datasets without copying/modifying the data files.
+    if "fparam" in out and "charge_spin" not in out:
+        out["charge_spin"] = out["fparam"]
     return out
 
 
