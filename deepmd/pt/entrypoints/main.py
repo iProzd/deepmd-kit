@@ -516,10 +516,11 @@ def change_bias(
 def grad_probe(FLAGS) -> None:
     """Compute per-task descriptor gradient vectors for multitask conflict analysis."""
     import numpy as np
+
     from deepmd.common import j_loader
-    from deepmd.utils.compat import update_deepmd_input
     from deepmd.pt.utils.multi_task import preprocess_shared_params
     from deepmd.utils.argcheck import normalize
+    from deepmd.utils.compat import update_deepmd_input
 
     config = j_loader(FLAGS.INPUT)
     config = update_deepmd_input(config, warning=True, dump="input_v2_compat.json")
@@ -546,52 +547,132 @@ def grad_probe(FLAGS) -> None:
     param_names: list | None = None
     param_shapes: list | None = None
 
-    for task_key in trainer.model_keys:
-        trainer.optimizer.zero_grad(set_to_none=True)
+    # Initialize trackers
+    task_batch_norms = {k: [] for k in trainer.model_keys}
+    task_accum_grads = {k: None for k in trainer.model_keys}
+    pairwise_sims = {
+        (k1, k2): []
+        for i, k1 in enumerate(trainer.model_keys)
+        for j, k2 in enumerate(trainer.model_keys)
+        if i < j
+    }
 
-        for _ in range(FLAGS.nbatches):
+    cur_lr = config["learning_rate"]["start_lr"]
+
+    for b in range(FLAGS.nbatches):
+        batch_grads = {}
+        for task_key in trainer.model_keys:
+            trainer.optimizer.zero_grad(set_to_none=True)
             input_dict, label_dict, _ = trainer.get_data(
                 is_train=True, task_key=task_key
             )
-            cur_lr = config["learning_rate"]["start_lr"]
             _, loss, _ = trainer.wrapper(
                 **input_dict, cur_lr=cur_lr, label=label_dict, task_key=task_key
             )
             loss.backward()
 
-        model = module.model[task_key]
-        descriptor = model.get_descriptor()
-        grads, names, shapes = [], [], []
-        for name, param in descriptor.named_parameters():
-            if param.grad is not None:
-                g = param.grad.detach().cpu().float().numpy().ravel()
-            else:
-                g = np.zeros(param.numel(), dtype=np.float32)
-            grads.append(g)
-            names.append(name)
-            shapes.append(list(param.shape))
+            model = module.model[task_key]
+            descriptor = model.get_descriptor()
 
-        grad_vec = np.concatenate(grads) if grads else np.array([], dtype=np.float32)
-        if FLAGS.nbatches > 1:
-            grad_vec /= FLAGS.nbatches
+            # Extract current batch gradient
+            current_grads = []
+            for name, param in descriptor.named_parameters():
+                if param.grad is not None:
+                    current_grads.append(
+                        param.grad.detach().cpu().float().numpy().ravel()
+                    )
 
-        grads_per_task[task_key] = grad_vec
-        if param_names is None:
-            param_names = names
-            param_shapes = shapes
+            if current_grads:
+                grad_vec = np.concatenate(current_grads)
+                task_batch_norms[task_key].append(np.linalg.norm(grad_vec))
+                if task_accum_grads[task_key] is None:
+                    task_accum_grads[task_key] = grad_vec
+                else:
+                    task_accum_grads[task_key] += grad_vec
+                batch_grads[task_key] = grad_vec
 
-        trainer.optimizer.zero_grad(set_to_none=True)
+                if param_names is None:
+                    # get names and shapes from descriptor parameters
+                    param_names = [
+                        n for n, p in descriptor.named_parameters() if p.requires_grad
+                    ]
+                    param_shapes = [
+                        list(p.shape)
+                        for n, p in descriptor.named_parameters()
+                        if p.requires_grad
+                    ]
+
+        # Compute pairwise similarity for this batch
+        for k1, k2 in pairwise_sims.keys():
+            if k1 in batch_grads and k2 in batch_grads:
+                g1 = batch_grads[k1]
+                g2 = batch_grads[k2]
+                norm1 = np.linalg.norm(g1)
+                norm2 = np.linalg.norm(g2)
+                if norm1 > 1e-10 and norm2 > 1e-10:
+                    sim = np.dot(g1, g2) / (norm1 * norm2)
+                    pairwise_sims[(k1, k2)].append(sim)
+
+    # Compute final statistics and log for each task
+    for task_key in trainer.model_keys:
+        accumulated_grads = task_accum_grads[task_key]
+        norms = task_batch_norms[task_key]
+        if accumulated_grads is not None:
+            avg_grad_vec = accumulated_grads / FLAGS.nbatches
+            norm_mean = np.mean(norms)
+            norm_std = np.std(norms)
+        else:
+            avg_grad_vec = np.array([], dtype=np.float32)
+            norm_mean = 0.0
+            norm_std = 0.0
+
+        grads_per_task[task_key] = avg_grad_vec
+        grads_per_task[f"{task_key}_norm_mean"] = norm_mean
+        grads_per_task[f"{task_key}_norm_std"] = norm_std
+
         log.info(
-            "Task '%s': descriptor gradient collected, norm=%.4e",
+            "Task '%s': collected %d batches. Avg Grad Norm=%.4e, Mean(Batch Norms)=%.4e, Std(Batch Norms)=%.4e",
             task_key,
-            float(np.linalg.norm(grad_vec)),
+            len(norms),
+            float(np.linalg.norm(avg_grad_vec)),
+            float(norm_mean),
+            float(norm_std),
         )
+
+    # Compute pairwise similarity statistics
+    for (k1, k2), sims in pairwise_sims.items():
+        if sims:
+            sim_mean = np.mean(sims)
+            sim_std = np.std(sims)
+
+            # Compute similarity of accumulated gradients (reproducible from avg_grad_vec)
+            g1_avg = grads_per_task[k1]
+            g2_avg = grads_per_task[k2]
+            norm1_avg = np.linalg.norm(g1_avg)
+            norm2_avg = np.linalg.norm(g2_avg)
+            if norm1_avg > 1e-10 and norm2_avg > 1e-10:
+                sim_accum = np.dot(g1_avg, g2_avg) / (norm1_avg * norm2_avg)
+            else:
+                sim_accum = 0.0
+
+            grads_per_task[f"sim_{k1}_{k2}_mean"] = sim_mean
+            grads_per_task[f"sim_{k1}_{k2}_std"] = sim_std
+            grads_per_task[f"sim_{k1}_{k2}_accum"] = sim_accum
+
+            log.info(
+                "Similarity '%s' vs '%s': Mean=%.4f, Std=%.4f, Accum=%.4f",
+                k1,
+                k2,
+                float(sim_mean),
+                float(sim_std),
+                float(sim_accum),
+            )
 
     save_dict = {f"grads_{k}": v for k, v in grads_per_task.items()}
     save_dict["param_names"] = np.array(param_names, dtype=object)
     save_dict["param_shapes"] = np.array(param_shapes, dtype=object)
     np.savez(FLAGS.output, **save_dict)
-    log.info("Descriptor gradient vectors saved to: %s", FLAGS.output)
+    log.info("Descriptor gradient vectors and similarity stats saved to: %s", FLAGS.output)
 
 
 
