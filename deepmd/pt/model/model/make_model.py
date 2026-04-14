@@ -558,17 +558,15 @@ def make_model(T_AtomicModel: type[BaseAtomicModel]) -> type:
         @torch.jit.export
         def has_chg_spin_ebd(self) -> bool:
             """Check if the model has charge spin embedding."""
-            return getattr(self.atomic_model, "has_chg_spin_ebd", lambda: False)()
+            return self.atomic_model.has_chg_spin_ebd()
 
         @torch.jit.export
         def has_default_chg_spin(self) -> bool:
             """Check if the model has default charge_spin values."""
-            return getattr(self.atomic_model, "has_default_chg_spin", lambda: False)()
+            return self.atomic_model.has_default_chg_spin()
 
         def get_default_chg_spin(self) -> torch.Tensor | None:
-            if hasattr(self.atomic_model, "get_default_chg_spin"):
-                return self.atomic_model.get_default_chg_spin()
-            return None
+            return self.atomic_model.get_default_chg_spin()
 
         @torch.jit.export
         def get_dim_aparam(self) -> int:

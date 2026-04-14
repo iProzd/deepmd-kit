@@ -688,6 +688,18 @@ def make_model(
             """Get the default frame parameters."""
             return self.atomic_model.get_default_fparam()
 
+        def has_chg_spin_ebd(self) -> bool:
+            """Check if the model has charge spin embedding."""
+            return self.atomic_model.has_chg_spin_ebd()
+
+        def has_default_chg_spin(self) -> bool:
+            """Check if the model has default charge_spin values."""
+            return self.atomic_model.has_default_chg_spin()
+
+        def get_default_chg_spin(self) -> list[float] | None:
+            """Get the default charge_spin values."""
+            return self.atomic_model.get_default_chg_spin()
+
         def get_sel_type(self) -> list[int]:
             """Get the selected atom types of this model.
 

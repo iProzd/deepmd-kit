@@ -189,6 +189,18 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         """Get the default frame parameters."""
         return None
 
+    def has_chg_spin_ebd(self) -> bool:
+        """Check if the model has charge spin embedding."""
+        return False
+
+    def has_default_chg_spin(self) -> bool:
+        """Check if the model has default charge_spin values."""
+        return False
+
+    def get_default_chg_spin(self) -> torch.Tensor | None:
+        """Get the default charge_spin values as a tensor."""
+        return None
+
     def _make_wrapped_sampler(
         self,
         sampled_func: Callable[[], list[dict]],

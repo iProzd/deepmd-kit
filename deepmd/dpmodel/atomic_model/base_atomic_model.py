@@ -156,6 +156,18 @@ class BaseAtomicModel(BaseAtomicModel_, NativeOP):
         """Get the default frame parameters."""
         return None
 
+    def has_chg_spin_ebd(self) -> bool:
+        """Check if the model has charge spin embedding."""
+        return False
+
+    def has_default_chg_spin(self) -> bool:
+        """Check if the model has default charge_spin values."""
+        return False
+
+    def get_default_chg_spin(self) -> list[float] | None:
+        """Get the default charge_spin values."""
+        return None
+
     def reinit_atom_exclude(
         self,
         exclude_types: list[int] = [],
