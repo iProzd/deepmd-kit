@@ -87,8 +87,12 @@ SeZM supports an optional **compact sparse edge** path that enables `torch.compi
 the standard DeePMD neighbor list behavior:
 
 - Enable with `model.use_compile = true`.
-- The model still builds the DeePMD neighbor list eagerly, then **compacts it into a sparse edge list**
-  `(src, dst, edge_vec, edge_mask)` containing only valid local edges.
+- The model still builds the DeePMD neighbor list eagerly, formats it outside the compiled graph,
+  then **compacts it into a sparse edge list** `(src, dst, edge_vec, edge_mask)` containing only
+  valid local edges.
+- The main SeZM graph takes **local** `(coord, atype)` together with that sparse edge list as input.
+  `edge_vec` enters the graph directly, and the force gradient path is reattached cleanly from
+  local coordinates before descriptor evaluation.
 - The descriptor accepts the sparse edge list directly and traces a **pure tensor graph**
   with `make_fx(tracing_mode="symbolic")`, then runs `torch.compile(..., backend="inductor", dynamic=True)`.
 - The compiled graph keeps **dynamic total node / edge counts** while preserving second-order derivatives
@@ -99,9 +103,10 @@ the standard DeePMD neighbor list behavior:
   by default without changing any Python call sites. The environment variable is read at model init time.
 - `SeZMModel` always starts from the standard DeePMD neighbor list, then converts it to the same
   sparse edge representation `(src, dst, edge_vec, edge_mask)` before entering the SeZM descriptor.
-  This keeps the eager and compile descriptor math aligned while leaving the descriptor's ordinary
-  `forward(extended_coord, extended_atype, nlist, mapping, ...)` entry available for other DeePMD
-  models that want to reuse SeZM without going through `SeZMModel`.
+  Eager and compile share the same sparse-edge `core_compute` kernel and the same hand-written
+  local energy / force / virial post-process, while the descriptor's ordinary
+  `forward(extended_coord, extended_atype, nlist, mapping, ...)` entry remains available for other
+  DeePMD models that want to reuse SeZM without going through `SeZMModel`.
 
 This path is designed for second-order derivatives during training; all geometry (edge vectors,
 Wigner-D, radial basis) remains differentiable, and no global node/edge padding is introduced.
@@ -190,10 +195,10 @@ Each pair `(i, j)` contributes `V_ZBL / 2` to atom `i` (symmetric neighbor list,
 
 Energy injection points:
 
-- **Standard path** (`forward_common_lower`): injected into `atomic_ret["energy"]` before
-  `fit_output_to_model_output`.
-- **Compile path** (`compile_compute_func`): injected into `atom_energy` before autograd
+- **Main sparse-edge path** (`core_compute`): injected into `atom_energy` before autograd
   computes forces/virials.
+- **Lower extended-coordinate path** (`forward_common_lower`): injected into `fit_ret["energy"]`
+  before `fit_output_to_model_output`.
 
 ______________________________________________________________________
 
@@ -202,10 +207,13 @@ ______________________________________________________________________
 Text diagram (single forward pass):
 
 ```
-SeZMModel runtime path:
-  Inputs: extended_coord, extended_atype, nlist, mapping
-    └─ compact sparse edges `(src, dst, edge_vec, edge_mask)` built from DeePMD nlist
-       └─ EdgeFeatureCache (built once via build_edge_cache_from_edges)
+SeZMModel main forward path:
+  Inputs: coord, atype, box
+    ├─ build DeePMD neighbor list -> extended_coord, extended_atype, mapping, nlist
+    ├─ format_nlist outside the compiled graph
+    ├─ build compact sparse edges `(src, dst, edge_vec, edge_mask)` from DeePMD nlist
+    ├─ graph inputs: local `(coord, atype)` + sparse edges
+    └─ EdgeFeatureCache (built once via build_edge_cache_from_edges)
        ├─ edges: (src, dst) global indices, edge_vec
        ├─ edge_type_feat: per-edge type embedding (src+dst)
        ├─ edge_rbf: Bessel radial basis via sinc × C² envelope
@@ -266,6 +274,12 @@ Descriptor compatibility path for other models:
     └─ Scalar FFN (lmax=0) for channel mixing
        └─ Residual: x0 + FFN(x0)
        └─ (nf, nloc, channels)
+
+  Post-process in SeZMModel:
+    ├─ fitting + output statistics + atom mask
+    ├─ optional ZBL energy added on the sparse-edge path
+    ├─ hand-written autograd for force / virial on the sparse-edge graph
+    └─ local DeePMD-style outputs `(energy, energy_redu, energy_derv_r, energy_derv_c[_redu], mask)`
 ```
 
 ______________________________________________________________________

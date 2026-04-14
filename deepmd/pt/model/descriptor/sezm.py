@@ -786,6 +786,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         sw
             Empty tensor (not used).
         """
+        if extended_coord.ndim == 2:
+            extended_coord = rearrange(extended_coord, "nf (nall c) -> nf nall c", c=3)
+        elif extended_coord.ndim != 3:
+            raise ValueError(
+                "extended_coord must have shape (nf, nall*3) or (nf, nall, 3)"
+            )
+
         if edge_index is not None:
             descriptor = self.forward_with_edges(
                 extended_coord=extended_coord,
@@ -805,12 +812,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         # === Step 1. Setup dimensions ===
         extended_coord = extended_coord.to(self.compute_dtype)
         nf, nloc, nnei = nlist.shape
-        if extended_coord.ndim == 2:
-            extended_coord = rearrange(extended_coord, "nf (nall c) -> nf nall c", c=3)
-        elif extended_coord.ndim != 3:
-            raise ValueError(
-                "extended_coord must have shape (nf, nall*3) or (nf, nall, 3)"
-            )
         nall = extended_coord.shape[1]
         n_nodes = int(nf * nloc)
 
@@ -974,12 +975,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         """
         # === Step 1. Setup dimensions ===
         extended_coord = extended_coord.to(self.compute_dtype)
-        if extended_coord.ndim == 2:
-            extended_coord = rearrange(extended_coord, "nf (nloc c) -> nf nloc c", c=3)
-        elif extended_coord.ndim != 3:
-            raise ValueError(
-                "extended_coord must have shape (nf, nloc*3) or (nf, nloc, 3)"
-            )
         nf, nloc = extended_atype.shape[:2]
 
         # === Step 2. Type embedding (l=0) ===

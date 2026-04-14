@@ -350,9 +350,8 @@ def build_edge_cache_from_edges(
         edge_keep = edge_keep & edge_type_keep_mask(atype_flat, src, dst)
 
     # === Step 2. Promote geometry dtype ===
-    geom_dtype = compute_dtype
-    edge_vec = edge_vec.to(dtype=geom_dtype)
-    edge_keep_f = edge_keep.to(dtype=geom_dtype).unsqueeze(-1)
+    edge_vec = edge_vec.to(dtype=compute_dtype)
+    edge_keep_f = edge_keep.to(dtype=compute_dtype).unsqueeze(-1)
     edge_vec = edge_vec * edge_keep_f
     edge_vec = edge_vec + (1.0 - edge_keep_f) * edge_vec.new_tensor([0.0, 0.0, 1.0])
 
@@ -494,7 +493,9 @@ def _finalize_edge_cache(
         deg = torch.zeros(n_nodes, dtype=edge_vec.dtype, device=edge_vec.device)  # (N,)
         deg.index_add_(0, dst, edge_env.squeeze(-1).to(dtype=edge_vec.dtype).square())
         eps_tensor = deg.new_tensor(eps)
-        inv_sqrt_deg = rearrange(torch.rsqrt(deg + eps_tensor), "N -> N 1 1")  # (N, 1, 1)
+        inv_sqrt_deg = rearrange(
+            torch.rsqrt(deg + eps_tensor), "N -> N 1 1"
+        )  # (N, 1, 1)
 
     return EdgeFeatureCache(
         src=src,

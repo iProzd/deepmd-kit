@@ -44,7 +44,6 @@ from deepmd.pt.model.model.model import (
     BaseModel,
 )
 from deepmd.pt.model.model.transform_output import (
-    communicate_extended_output,
     fit_output_to_model_output,
 )
 from deepmd.pt.utils import (
@@ -127,10 +126,11 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         self.use_compile = bool(use_compile)
         self.enable_tf32 = bool(enable_tf32)
-        self._compiled = False
-        # Store compiled_compute outside the nn.Module tree so that
+        self._core_compute_compiled_train: bool | None = None
+        self._core_compute_compiled_atomic_virial: bool | None = None
+        # Store core_compute_compiled outside the nn.Module tree so that
         # FSDP2 / DDP do not shard or sync its duplicated parameters.
-        object.__setattr__(self, "compiled_compute", None)
+        object.__setattr__(self, "core_compute_compiled", None)
         # Training follows `use_compile`. Evaluation/inference reads
         # `DP_COMPILE_INFER` at init time and falls back to eager when unset.
         self._env_use_compile_infer: bool | None = _parse_optional_env_bool(
@@ -263,22 +263,15 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Model predictions including energy, forces, etc.
         """
         with nvtx_range("SeZM/forward_common"):
-            if self._should_use_compile():
-                return self.forward_common_compile(
-                    coord,
-                    atype,
-                    box,
-                    fparam=fparam,
-                    aparam=aparam,
-                    do_atomic_virial=do_atomic_virial,
-                )
-
             # === Step 1. Cast inputs to correct dtype ===
             with nvtx_range("SeZM/input_type_cast"):
                 cc, bb, fp, ap, input_prec = self._input_type_cast(
                     coord, box=box, fparam=fparam, aparam=aparam
                 )
                 del coord, box, fparam, aparam
+                nf, nloc = atype.shape[:2]
+                if cc.ndim == 2:
+                    cc = cc.view(nf, nloc, 3)
 
             # === Step 2. Build neighbor list ===
             with nvtx_range("SeZM/build_neighbor_list"):
@@ -288,124 +281,355 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                     self.build_neighbor_list(cc, atype, bb)
                 )
 
-            # === Step 3. Lower Forward + Communication ===
-            with nvtx_range("SeZM/forward_lower"):
-                model_predict_lower = self.forward_common_lower(
+            # === Step 3. Format nlist and build sparse edges ===
+            with nvtx_range("SeZM/prepare_sparse_edges"):
+                nlist = self.format_nlist(
                     extended_coord,
                     extended_atype,
                     nlist,
-                    mapping,
-                    do_atomic_virial=do_atomic_virial,
-                    fparam=fp,
-                    aparam=ap,
+                    extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+                )
+                edge_index, edge_vec, edge_mask = self.build_edge_list_from_nlist(
+                    extended_coord=extended_coord,
+                    nlist=nlist,
+                    mapping=mapping,
                 )
 
-            with nvtx_range("SeZM/communicate_output"):
-                model_predict = communicate_extended_output(
-                    model_predict_lower,
-                    self.model_output_def(),
-                    mapping,
-                    do_atomic_virial=do_atomic_virial,
-                )
-
-            with nvtx_range("SeZM/output_type_cast"):
-                model_predict = self._output_type_cast(model_predict, input_prec)
-                return model_predict
-
-    def forward_common_compile(
-        self,
-        coord: Float[Tensor, "nf nloc 3"] | Float[Tensor, "nf nloc_x3"],
-        atype: Int[Tensor, "nf nloc"],
-        box: Float[Tensor, "nf 9"] | None = None,
-        fparam: Float[Tensor, "nf ndf"] | None = None,
-        aparam: Float[Tensor, "nf nloc nda"] | None = None,
-        do_atomic_virial: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Forward pass using compact sparse edges and symbolic ``make_fx`` tracing.
-
-        This path uses DeePMD neighbor list to build a compact edge list,
-        then traces/compiles the compute graph.
-        """
-        with nvtx_range("SeZM/forward_common_compile"):
-            # === Step 1. Cast inputs to correct dtype ===
-            with nvtx_range("SeZM/input_type_cast"):
-                cc, bb, fp, ap, input_prec = self._input_type_cast(
-                    coord, box=box, fparam=fparam, aparam=aparam
-                )
-                del coord, box, fparam, aparam
-
-                nf, nloc = atype.shape[:2]
-                if cc.ndim == 2:
-                    cc = cc.view(nf, nloc, 3)
-
-            # === Step 2. Prepare compile fitting inputs ===
-            # Make compile inputs tensor-only to keep inductor/DDP runtime
-            # on a single stable calling convention.
-            fp, ap = self.prepare_compile_fitting_inputs(
-                fp,
-                ap,
-                nf=nf,
-                nloc=nloc,
-                dtype=cc.dtype,
-                device=cc.device,
-            )
-
-            # === Step 3. Build neighbor list (standard DeePMD path) ===
-            with nvtx_range("SeZM/build_neighbor_list"):
-                extended_coord, extended_atype, mapping, nlist = (
-                    self.build_neighbor_list(cc.detach(), atype, bb)
-                )
-
-            # === Step 4. Re-enable gradients on local coordinates ===
-            need_grad = self.do_grad_r() or self.do_grad_c()
-            if need_grad:
+            need_coord_grad = self.do_grad_r() or self.do_grad_c()
+            if need_coord_grad:
                 cc = cc.detach().requires_grad_(True)
-            cc_flat = cc.reshape(-1, 3)
-            atype_flat = atype.reshape(-1)
+            else:
+                cc = cc.detach()
 
-            # === Step 5. Build compact edges from nlist ===
-            edge_index, edge_vec, edge_mask = self.build_fixed_edge_list_from_nlist(
-                extended_coord=extended_coord,
-                nlist=nlist,
-                mapping=mapping,
-            )
-
-            # === Step 6. Trace and compile on first forward ===
-            with self.tf32_precision_ctx():
-                if not self._compiled:
-                    self.trace_and_compile(
-                        cc_flat,
-                        atype_flat,
+            # === Step 4. Eager / compile dispatch ===
+            if self.should_use_compile():
+                fp, ap = self.convert_fp_ap(
+                    fp,
+                    ap,
+                    nf=nf,
+                    nloc=nloc,
+                    dtype=cc.dtype,
+                    device=cc.device,
+                )
+                with self.tf32_precision_ctx():
+                    if (
+                        self.core_compute_compiled is None
+                        or self._core_compute_compiled_train != self.training
+                        or self._core_compute_compiled_atomic_virial != do_atomic_virial
+                    ):
+                        self.trace_and_compile(
+                            cc,
+                            atype,
+                            edge_index,
+                            edge_vec,
+                            edge_mask,
+                            fp,
+                            ap,
+                            do_atomic_virial,
+                        )
+                    with nvtx_range("SeZM/core_compute"):
+                        compute_ret = self.core_compute_compiled(
+                            cc,
+                            atype,
+                            edge_index,
+                            edge_vec,
+                            edge_mask,
+                            fp,
+                            ap,
+                        )
+            else:
+                with nvtx_range("SeZM/core_compute"):
+                    compute_ret = self.core_compute(
+                        cc,
+                        atype,
                         edge_index,
                         edge_vec,
                         edge_mask,
-                        fp,
-                        ap,
+                        fparam=fp,
+                        aparam=ap,
                     )
 
-                # === Step 7. Forward through compiled compute path ===
-                with nvtx_range("SeZM/forward_compute"):
-                    compute_ret = self.compiled_compute(
-                        cc_flat,
-                        atype_flat,
-                        edge_index,
-                        edge_vec,
-                        edge_mask,
-                        fp,
-                        ap,
-                    )
-
-            # === Step 8. Post-process outputs ===
+            # === Step 5. Post-process local outputs ===
             with nvtx_range("SeZM/post_process"):
                 model_predict = self.post_process_output(
-                    compute_ret, atype, do_atomic_virial
+                    compute_ret,
+                    atype,
+                    do_atomic_virial=do_atomic_virial,
                 )
 
-            # === Step 9. Output type cast ===
+            # === Step 6. Type cast output ===
             with nvtx_range("SeZM/output_type_cast"):
                 model_predict = self._output_type_cast(model_predict, input_prec)
                 return model_predict
+
+    def core_compute(
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute SeZM energy/force/virial tensors from sparse edges.
+
+        Parameters
+        ----------
+        coord
+            Local coordinates with shape (nf, nloc, 3) in Å.
+        atype
+            Local atom types with shape (nf, nloc).
+        edge_index
+            Edge source/destination indices with shape (2, E).
+        edge_vec
+            Edge vectors with shape (E, 3) in Å.
+        edge_mask
+            Edge validity mask with shape (E,).
+        fparam
+            Frame parameters with shape (nf, ndf), or None.
+        aparam
+            Atomic parameters with shape (nf, nloc, nda), or None.
+
+        Returns
+        -------
+        torch.Tensor
+            Concatenated local tensor with shape (nf, nloc, 13):
+            `[atom_energy | minus_force | atom_virial]`.
+        """
+        # === Step 1. Setup dimensions ===
+        nf, nloc = atype.shape[:2]
+        n_node = nf * nloc
+        coord_flat = coord.reshape(n_node, 3)
+
+        # === Step 2. Attach coordinate gradients to edge vectors ===
+        edge_vec = self.attach_edge_vec_grad(coord_flat, edge_index, edge_vec)
+
+        # === Step 3. Descriptor forward through the sparse-edge entry ===
+        with nvtx_range("SeZM/descriptor"):
+            descriptor_model = self.atomic_model.descriptor
+            descriptor = descriptor_model.forward_with_edges(
+                extended_coord=coord,
+                extended_atype=atype,
+                edge_index=edge_index,
+                edge_vec=edge_vec,
+                edge_mask=edge_mask,
+            )
+        if self.atomic_model.enable_eval_descriptor_hook:
+            self.atomic_model.eval_descriptor_list.append(descriptor.detach())
+
+        # === Step 4. Fitting net + output statistics ===
+        with nvtx_range("SeZM/fitting_net"):
+            fit_ret = self.atomic_model.fitting_net(
+                descriptor,
+                atype,
+                fparam=fparam,
+                aparam=aparam,
+            )
+        if self.atomic_model.enable_eval_fitting_last_layer_hook:
+            assert "middle_output" in fit_ret, (
+                "eval_fitting_last_layer not supported for this fitting net!"
+            )
+            self.atomic_model.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
+            )
+        with nvtx_range("SeZM/apply_out_stat"):
+            fit_ret = self.atomic_model.apply_out_stat(fit_ret, atype)
+
+        # === Step 5. Apply the local atom mask ===
+        atom_mask = self.atomic_model.make_atom_mask(atype).to(torch.int32)
+        if self.atomic_model.atom_excl is not None:
+            atom_mask *= self.atomic_model.atom_excl(atype)
+        for key in fit_ret.keys():
+            out_shape = fit_ret[key].shape
+            flat_dim = 1
+            for axis_size in out_shape[2:]:
+                flat_dim *= axis_size
+            fit_ret[key] = (
+                fit_ret[key].reshape([out_shape[0], out_shape[1], flat_dim])
+                * atom_mask[:, :, None]
+            ).view(out_shape)
+
+        atom_energy = fit_ret["energy"]
+        if self.inter_potential is not None:
+            atom_energy = atom_energy + self.inter_potential.forward_from_edges(
+                edge_vec,
+                edge_index,
+                atype.reshape(-1),
+                edge_mask,
+                n_node,
+            ).view(nf, nloc, 1)
+
+        # === Step 6. Differentiate energy for force / virial ===
+        energy_sum = torch.sum(atom_energy.to(self.redu_prec))
+        do_grad_r = self.do_grad_r("energy")
+        do_grad_c = self.do_grad_c("energy")
+        create_graph = self.training
+
+        minus_force = torch.zeros_like(coord)
+        atom_virial_flat = torch.zeros(
+            n_node,
+            9,
+            dtype=atom_energy.dtype,
+            device=atom_energy.device,
+        )
+
+        if do_grad_r and do_grad_c:
+            minus_force, edge_grad = torch.autograd.grad(
+                outputs=[energy_sum],
+                inputs=[coord, edge_vec],
+                create_graph=create_graph,
+                retain_graph=True,
+            )
+            edge_keep = edge_mask.to(dtype=edge_grad.dtype).unsqueeze(-1)
+            edge_grad = edge_grad * edge_keep
+            edge_vec_val = edge_vec.detach()
+            edge_virial = -torch.einsum("Ei,Ej->Eij", edge_grad, edge_vec_val)
+            edge_virial = edge_virial * edge_keep.unsqueeze(-1)
+            edge_virial_flat = edge_virial.view(-1, 9)
+            dst = edge_index[1].to(dtype=torch.long)
+            atom_virial_flat = torch.zeros(
+                n_node,
+                9,
+                dtype=edge_virial_flat.dtype,
+                device=edge_virial_flat.device,
+            ).index_add(0, dst, edge_virial_flat)
+        elif do_grad_r:
+            (minus_force,) = torch.autograd.grad(
+                outputs=[energy_sum],
+                inputs=[coord],
+                create_graph=create_graph,
+                retain_graph=True,
+            )
+        elif do_grad_c:
+            (edge_grad,) = torch.autograd.grad(
+                outputs=[energy_sum],
+                inputs=[edge_vec],
+                create_graph=create_graph,
+                retain_graph=True,
+            )
+            edge_keep = edge_mask.to(dtype=edge_grad.dtype).unsqueeze(-1)
+            edge_grad = edge_grad * edge_keep
+            edge_vec_val = edge_vec.detach()
+            edge_virial = -torch.einsum("Ei,Ej->Eij", edge_grad, edge_vec_val)
+            edge_virial = edge_virial * edge_keep.unsqueeze(-1)
+            edge_virial_flat = edge_virial.view(-1, 9)
+            dst = edge_index[1].to(dtype=torch.long)
+            atom_virial_flat = torch.zeros(
+                n_node,
+                9,
+                dtype=edge_virial_flat.dtype,
+                device=edge_virial_flat.device,
+            ).index_add(0, dst, edge_virial_flat)
+
+        # === Step 7. Concatenate local outputs ===
+        return torch.cat(
+            [
+                atom_energy,
+                minus_force,
+                atom_virial_flat.view(nf, nloc, 9),
+            ],
+            dim=-1,
+        )
+
+    @torch.jit.export
+    def forward_lower(
+        self,
+        extended_coord: Float[Tensor, "nf nall_x3"] | Float[Tensor, "nf nall 3"],
+        extended_atype: Int[Tensor, "nf nall"],
+        nlist: Int[Tensor, "nf nloc nsel"],
+        mapping: Int[Tensor, "nf nall"] | None = None,
+        fparam: Float[Tensor, "nf ndf"] | None = None,
+        aparam: Float[Tensor, "nf nall nda"] | None = None,
+        do_atomic_virial: bool = False,
+        comm_dict: dict[str, torch.Tensor] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Lower-level public forward using the DeePMD lower-interface contract.
+
+        Parameters
+        ----------
+        extended_coord
+            Extended coordinates with shape (nf, nall*3) or (nf, nall, 3) in Å.
+        extended_atype
+            Extended atom types with shape (nf, nall).
+        nlist
+            Neighbor list with shape (nf, nloc, nsel).
+        mapping
+            Mapping indices with shape (nf, nall), or None.
+        fparam
+            Frame parameters with shape (nf, ndf) or None.
+        aparam
+            Atomic parameters with shape (nf, nall, nda) or None.
+        do_atomic_virial
+            Whether to compute atomic virial.
+        comm_dict
+            Communication dict forwarded to `forward_common_lower()`.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Lower-interface outputs.
+            When a fitting net is present, this always includes:
+            - `atom_energy`: atomic energy on local atoms with shape (nf, nloc, 1)
+            - `energy`: reduced energy with shape (nf, 1)
+            It additionally includes:
+            - `extended_force`: force on extended coordinates with shape (nf, nall, 3)
+              when `self.do_grad_r("energy")` is true
+            - `dforce`: fitting-net direct force output when energy is not coordinate differentiable
+            - `virial`: reduced virial with shape (nf, 9) when `self.do_grad_c("energy")` is true
+            - `extended_virial`: per-extended-atom virial with shape (nf, nall, 9)
+              only when both `self.do_grad_c("energy")` and `do_atomic_virial` are true
+            If no fitting net is present, the raw result of `forward_common_lower()` is returned.
+        """
+        cc_ext, _, fp, ap, input_prec = self._input_type_cast(
+            extended_coord, fparam=fparam, aparam=aparam
+        )
+        model_ret = self.forward_common_lower(
+            cc_ext,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam=fp,
+            aparam=ap,
+            do_atomic_virial=do_atomic_virial,
+            comm_dict=comm_dict,
+            extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+        )
+        model_ret = self._output_type_cast(model_ret, input_prec)
+        if self.get_fitting_net() is not None:
+            model_predict: dict[str, torch.Tensor] = {}
+
+            # === Step 1. Energy ===
+            model_predict["atom_energy"] = model_ret["energy"]
+            model_predict["energy"] = model_ret["energy_redu"]
+
+            # === Step 2. Force (independent branch) ===
+            if self.do_grad_r("energy"):
+                model_predict["extended_force"] = rearrange(
+                    model_ret["energy_derv_r"],
+                    "nf nall 1 three -> nf nall three",
+                    three=3,
+                )
+            else:
+                assert model_ret["dforce"] is not None
+                model_predict["dforce"] = model_ret["dforce"]
+
+            # === Step 3. Virial ===
+            if self.do_grad_c("energy"):
+                model_predict["virial"] = rearrange(
+                    model_ret["energy_derv_c_redu"], "nf 1 nine -> nf nine", nine=9
+                )
+                if do_atomic_virial:
+                    model_predict["extended_virial"] = rearrange(
+                        model_ret["energy_derv_c"],
+                        "nf nall 1 nine -> nf nall nine",
+                        nine=9,
+                    )
+        else:
+            model_predict = model_ret
+        return model_predict
 
     def forward_common_lower(
         self,
@@ -421,31 +645,26 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         extended_coord_corr: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
-        Override to inject analytical pair potential before autograd.
-
-        When ``bridging_method`` is active, the pair energy is added to the
-        atomic energy between ``forward_common_atomic`` and
-        ``fit_output_to_model_output``, so that autograd naturally produces
-        forces and virial that include the analytical potential contribution.
+        Common lower forward on extended inputs before `forward_lower()` renames outputs.
 
         Parameters
         ----------
         extended_coord
-            Coordinates in extended region with shape (nf, nall*3) or (nf, nall, 3) in Å.
+            Extended coordinates with shape (nf, nall*3) or (nf, nall, 3) in Å.
         extended_atype
-            Atom types in extended region with shape (nf, nall).
+            Extended atom types with shape (nf, nall).
         nlist
             Neighbor list with shape (nf, nloc, nsel).
         mapping
-            Maps extended indices to local indices with shape (nf, nall).
+            Maps extended indices to local indices with shape (nf, nall), or None.
         fparam
-            Frame parameters with shape (nf, ndf) or None.
+            Frame parameters with shape (nf, ndf), or None.
         aparam
-            Atomic parameters with shape (nf, nloc, nda) or None.
+            Atomic parameters with shape (nf, nall, nda), or None.
         do_atomic_virial
             Whether to compute atomic virial.
         comm_dict
-            Communication data for parallel inference.
+            Communication data for parallel inference. Currently unused in SeZM.
         extra_nlist_sort
             Whether to forcibly sort the nlist.
         extended_coord_corr
@@ -454,104 +673,50 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         Returns
         -------
         dict[str, torch.Tensor]
-            Model predictions on the extended region.
+            DeePMD lower-style outputs before the `forward_lower()` key translation.
+            For the energy task this includes:
+            - `energy`: atomic energy on local atoms with shape (nf, nloc, 1)
+            - `energy_redu`: reduced energy with shape (nf, 1)
+            - `energy_derv_r`: derivative with respect to extended coordinates with shape
+              (nf, nall, 1, 3) when enabled
+            - `energy_derv_c`: per-extended-atom virial contribution with shape
+              (nf, nall, 1, 9) when enabled and `do_atomic_virial=True`
+            - `energy_derv_c_redu`: reduced virial with shape (nf, 1, 9) when enabled
+            - `mask`: local-atom mask with shape (nf, nloc)
         """
-        nframes, nall = extended_atype.shape[:2]
-        extended_coord = extended_coord.view(nframes, -1, 3)
-        nlist = self.format_nlist(
-            extended_coord, extended_atype, nlist, extra_nlist_sort=extra_nlist_sort
-        )
         cc_ext, _, fp, ap, input_prec = self._input_type_cast(
             extended_coord, fparam=fparam, aparam=aparam
         )
-        del extended_coord, fparam, aparam
-        atomic_ret = self.compute_atomic_outputs_with_compact_edges(
+        cc_ext = cc_ext.reshape(extended_atype.shape[0], -1, 3)
+        if extended_coord_corr is not None and extended_coord_corr.ndim == 2:
+            extended_coord_corr = extended_coord_corr.reshape(
+                extended_atype.shape[0], -1, 3
+            )
+        del comm_dict
+        nlist = self.format_nlist(
             cc_ext,
             extended_atype,
             nlist,
-            mapping=mapping,
-            fparam=fp,
-            aparam=ap,
-            comm_dict=comm_dict,
+            extra_nlist_sort=extra_nlist_sort,
         )
-
-        # === Inject analytical pair potential ===
-        if self.inter_potential is not None:
-            nloc = nlist.shape[1]
-            atomic_ret["energy"] = atomic_ret["energy"] + self.inter_potential(
-                cc_ext, extended_atype, nlist, nloc
-            )  # (nf, nloc, 1)
-
-        model_predict = fit_output_to_model_output(
-            atomic_ret,
-            self.atomic_output_def(),
-            cc_ext,
-            do_atomic_virial=do_atomic_virial,
-            create_graph=self.training,
-            mask=atomic_ret["mask"] if "mask" in atomic_ret else None,
-            extended_coord_corr=extended_coord_corr,
-        )
-        model_predict = self._output_type_cast(model_predict, input_prec)
-        return model_predict
-
-    def compute_atomic_outputs_with_compact_edges(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor | None = None,
-        fparam: torch.Tensor | None = None,
-        aparam: torch.Tensor | None = None,
-        comm_dict: dict[str, torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Run the SeZM atomic path through `forward_with_edges()`.
-
-        This keeps the non-compile SeZM model on the same descriptor entry as the
-        sparse-edge compile path while preserving the standard DeePMD outer API
-        (`fit_output_to_model_output()` + `communicate_extended_output()`).
-
-        Parameters
-        ----------
-        extended_coord
-            Extended coordinates with shape `(nf, nall, 3)` in Å.
-        extended_atype
-            Extended atom types with shape `(nf, nall)`.
-        nlist
-            DeePMD neighbor list with shape `(nf, nloc, nsel)`.
-        mapping
-            Extended-to-local mapping with shape `(nf, nall)`, or `None`.
-        fparam
-            Frame parameters with shape `(nf, ndf)`, or `None`.
-        aparam
-            Atomic parameters with shape `(nf, nloc, nda)`, or `None`.
-        comm_dict
-            Communication dict kept for interface compatibility. Unused here.
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Atomic outputs in the same format as `forward_common_atomic()`.
-        """
-        del comm_dict
         _, nloc, _ = nlist.shape
         atype = extended_atype[:, :nloc]
         descriptor_model = self.atomic_model.descriptor
 
         # === Step 1. Enable coordinate gradients on the extended coordinates ===
         if self.do_grad_r() or self.do_grad_c():
-            extended_coord.requires_grad_(True)
+            cc_ext.requires_grad_(True)
 
         # === Step 2. Build compact sparse edges from the DeePMD nlist ===
-        edge_index, edge_vec, edge_mask = self.build_fixed_edge_list_from_nlist(
-            extended_coord=extended_coord,
+        edge_index, edge_vec, edge_mask = self.build_edge_list_from_nlist(
+            extended_coord=cc_ext,
             nlist=nlist,
             mapping=mapping,
         )
 
         # === Step 3. Descriptor forward through the sparse-edge entry ===
         descriptor = descriptor_model.forward_with_edges(
-            extended_coord=extended_coord[:, :nloc, :],
+            extended_coord=cc_ext[:, :nloc, :],
             extended_atype=atype,
             edge_index=edge_index,
             edge_vec=edge_vec,
@@ -591,60 +756,107 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 * atom_mask[:, :, None]
             ).view(out_shape)
         fit_ret["mask"] = atom_mask
-        return fit_ret
+
+        if self.inter_potential is not None:
+            fit_ret["energy"] = fit_ret["energy"] + self.inter_potential(
+                cc_ext,
+                extended_atype,
+                nlist,
+                nloc,
+            )
+
+        model_predict = fit_output_to_model_output(
+            fit_ret,
+            self.atomic_output_def(),
+            cc_ext,
+            do_atomic_virial=do_atomic_virial,
+            create_graph=self.training,
+            mask=fit_ret["mask"] if "mask" in fit_ret else None,
+            extended_coord_corr=extended_coord_corr,
+        )
+        return self._output_type_cast(model_predict, input_prec)
+
+    # =========================================================================
+    # Compile Utilities
+    # =========================================================================
 
     def trace_and_compile(
         self,
-        cc_flat: torch.Tensor,
-        atype_flat: torch.Tensor,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
         fp: torch.Tensor,
         ap: torch.Tensor,
+        do_atomic_virial: bool,
     ) -> None:
-        """Trace computation graph with make_fx and compile."""
+        """Trace the sparse-edge `core_compute()` and cache the compiled callable."""
         from torch._inductor import config as inductor_config
 
         inductor_config.max_autotune_report_choices_stats = False
         inductor_config.autotune_num_choices_displayed = 0
 
         def compute_fn(
-            cc_flat: torch.Tensor,
-            atype_flat: torch.Tensor,
+            coord: torch.Tensor,
+            atype: torch.Tensor,
             edge_index: torch.Tensor,
             edge_vec: torch.Tensor,
             edge_mask: torch.Tensor,
             fp: torch.Tensor,
             ap: torch.Tensor,
         ) -> torch.Tensor:
-            return self.compile_compute_func(
-                cc_flat,
-                atype_flat,
+            return self.core_compute(
+                coord,
+                atype,
                 edge_index,
                 edge_vec,
                 edge_mask,
-                fp,
-                ap,
+                fparam=fp,
+                aparam=ap,
             )
+
+        trace_coord = coord
+        trace_atype = atype
+        trace_edge_index = edge_index
+        trace_edge_vec = edge_vec
+        trace_edge_mask = edge_mask
+        trace_fp = fp
+        trace_ap = ap
+        # Avoid specializing the traced batch dimension to the concrete value 1,
+        # although it is not necessary for the current implementation,
+        # it is a good practice to avoid specializing the traced batch dimension to 1.
+        if coord.shape[0] == 1:
+            trace_coord = torch.cat([trace_coord, trace_coord], dim=0)
+            trace_atype = torch.cat([trace_atype, trace_atype], dim=0)
+            trace_edge_index = torch.cat(
+                [trace_edge_index, trace_edge_index + coord.shape[1]],
+                dim=1,
+            )
+            trace_edge_vec = torch.cat([trace_edge_vec, trace_edge_vec], dim=0)
+            trace_edge_mask = torch.cat([trace_edge_mask, trace_edge_mask], dim=0)
+            if trace_fp is not None:
+                trace_fp = torch.cat([trace_fp, trace_fp], dim=0)
+            if trace_ap is not None:
+                trace_ap = torch.cat([trace_ap, trace_ap], dim=0)
 
         traced = make_fx(
             compute_fn,
             tracing_mode="symbolic",
             _allow_non_fake_inputs=True,
         )(
-            cc_flat,
-            atype_flat,
-            edge_index,
-            edge_vec,
-            edge_mask,
-            fp,
-            ap,
+            trace_coord,
+            trace_atype,
+            trace_edge_index,
+            trace_edge_vec,
+            trace_edge_mask,
+            trace_fp,
+            trace_ap,
         )
 
         object.__setattr__(
             self,
-            "compiled_compute",
+            "core_compute_compiled",
             torch.compile(
                 traced,
                 backend="inductor",
@@ -658,163 +870,25 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 },
             ),
         )
-        self._compiled = True
-
-    def compile_compute_func(
-        self,
-        cc_flat: torch.Tensor,
-        atype_flat: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_vec: torch.Tensor,
-        edge_mask: torch.Tensor,
-        fp: torch.Tensor,
-        ap: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Compute-only forward pass (make_fx compatible) with compact dynamic shapes.
-
-        Returns a single concatenated tensor.
-
-        Layout along last dim:
-            - ``[:, :, 0:1]``  — atom_energy  (always present)
-            - ``[:, :, 1:4]``  — minus_force  (zeros when force is off)
-            - ``[:, :, 4:13]`` — atom_virial  (zeros when virial is off)
-        """
-        n_node = atype_flat.shape[0]
-
-        # === Step 1. Attach coord gradients to edge vectors ===
-        edge_vec = self.attach_edge_vec_grad(cc_flat, edge_index, edge_vec)
-
-        # === Step 2. Descriptor (edge path only) ===
-        with nvtx_range("SeZM/descriptor"):
-            descriptor_model = self.atomic_model.descriptor
-            descriptor = descriptor_model.forward_with_edges(
-                extended_coord=cc_flat.view(1, n_node, 3),
-                extended_atype=atype_flat.view(1, n_node),
-                edge_index=edge_index,
-                edge_vec=edge_vec,
-                edge_mask=edge_mask,
-            )
-
-        # === Step 3. Fitting net ===
-        with nvtx_range("SeZM/fitting_net"):
-            fit_ret = self.atomic_model.fitting_net(
-                descriptor,
-                atype_flat.view(1, n_node),
-                fparam=fp,
-                aparam=ap,
-            )
-
-        with nvtx_range("SeZM/apply_out_stat"):
-            fit_ret = self.atomic_model.apply_out_stat(
-                fit_ret, atype_flat.view(1, n_node)
-            )
-
-        atom_energy = fit_ret["energy"]  # (1, n_node, 1)
-
-        # === Step 3b. Inject zone bridging potential (compile path) ===
-        if self.inter_potential is not None:
-            pair_energy = self.inter_potential.forward_from_edges(
-                edge_vec, edge_index, atype_flat, edge_mask, n_node
-            )
-            atom_energy = atom_energy + pair_energy
-
-        redu_prec = self.redu_prec
-        energy_sum = torch.sum(atom_energy.to(redu_prec))
-
-        do_grad_r = self.do_grad_r("energy")
-        do_grad_c = self.do_grad_c("energy")
-
-        # === Step 4. Force / virial via autograd ===
-        # Always use create_graph=True for compile path compatibility.
-        minus_force = torch.zeros_like(cc_flat)
-        virial_flat = torch.zeros(
-            n_node, 9, dtype=atom_energy.dtype, device=atom_energy.device
-        )
-
-        # Force and virial
-        if do_grad_r and do_grad_c:
-            minus_force_flat, edge_grad = torch.autograd.grad(
-                outputs=[energy_sum],
-                inputs=[cc_flat, edge_vec],
-                create_graph=True,
-                retain_graph=True,
-            )
-            minus_force = minus_force_flat
-
-            edge_keep = edge_mask.to(dtype=edge_grad.dtype).unsqueeze(-1)
-            edge_grad = edge_grad * edge_keep
-            edge_vec_val = edge_vec.detach()
-            edge_virial = -torch.einsum("Ei,Ej->Eij", edge_grad, edge_vec_val)
-            edge_virial = edge_virial * edge_keep.unsqueeze(-1)
-            edge_virial_flat = edge_virial.view(-1, 9)
-            dst = edge_index[1].to(dtype=torch.long)
-            atom_virial = torch.zeros(
-                n_node,
-                9,
-                dtype=edge_virial_flat.dtype,
-                device=edge_virial_flat.device,
-            )
-            virial_flat = atom_virial.index_add(0, dst, edge_virial_flat)
-        # Force only
-        elif do_grad_r:
-            (minus_force_flat,) = torch.autograd.grad(
-                outputs=[energy_sum],
-                inputs=[cc_flat],
-                create_graph=True,
-                retain_graph=True,
-            )
-            minus_force = minus_force_flat
-        # Virial only
-        elif do_grad_c:
-            (edge_grad,) = torch.autograd.grad(
-                outputs=[energy_sum],
-                inputs=[edge_vec],
-                create_graph=True,
-                retain_graph=True,
-            )
-            edge_keep = edge_mask.to(dtype=edge_grad.dtype).unsqueeze(-1)
-            edge_grad = edge_grad * edge_keep
-            edge_vec_val = edge_vec.detach()
-            edge_virial = -torch.einsum("Ei,Ej->Eij", edge_grad, edge_vec_val)
-            edge_virial = edge_virial * edge_keep.unsqueeze(-1)
-            edge_virial_flat = edge_virial.view(-1, 9)
-            dst = edge_index[1].to(dtype=torch.long)
-            atom_virial = torch.zeros(
-                n_node,
-                9,
-                dtype=edge_virial_flat.dtype,
-                device=edge_virial_flat.device,
-            )
-            virial_flat = atom_virial.index_add(0, dst, edge_virial_flat)
-
-        # === Step 5. Concatenate into single output tensor ===
-        # Layout: [energy(1) | force(3) | virial(9)] along last dim.
-        return torch.cat(
-            [
-                atom_energy,
-                minus_force.view(1, n_node, 3),
-                virial_flat.view(1, n_node, 9),
-            ],
-            dim=-1,
-        )  # (1, n_node, 13)
+        self._core_compute_compiled_train = self.training
+        self._core_compute_compiled_atomic_virial = do_atomic_virial
 
     def attach_edge_vec_grad(
         self,
-        cc_flat: torch.Tensor,
+        coord_flat: torch.Tensor,
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Attach coordinate gradients to edge vectors without changing values.
+        Attach local-coordinate gradients to edge vectors without changing values.
 
         Parameters
         ----------
-        cc_flat : torch.Tensor
-            Flattened coordinates with shape (N, 3) in Å.
-        edge_index : torch.Tensor
-            Edge indices with shape (2, E).
-        edge_vec : torch.Tensor
+        coord_flat
+            Flattened local coordinates with shape (N, 3) in Å.
+        edge_index
+            Edge source/destination indices with shape (2, E).
+        edge_vec
             Edge vectors with shape (E, 3) in Å.
 
         Returns
@@ -822,167 +896,30 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         torch.Tensor
             Edge vectors with attached gradient path and shape (E, 3).
         """
-        # === Step 1. Detach values to avoid duplicate gradient paths ===
+        # === Step 1. Detach the geometric values at the gradient boundary ===
+        # This helper treats the incoming edge vectors as pure numeric values,
+        # cuts any existing history, and then reattaches the clean
+        # local-coordinate gradient path used by force / virial.
         edge_vec = edge_vec.detach()
 
-        # === Step 2. Gather src/dst coordinates ===
+        # === Step 2. Gather source and destination coordinates ===
         src = edge_index[0].to(dtype=torch.long)
         dst = edge_index[1].to(dtype=torch.long)
-        cc_src = cc_flat.index_select(0, src)
-        cc_dst = cc_flat.index_select(0, dst)
+        coord_src = coord_flat.index_select(0, src)
+        coord_dst = coord_flat.index_select(0, dst)
 
-        # === Step 3. Inject gradient path via stop-gradient trick ===
-        return edge_vec + (cc_src - cc_src.detach()) - (cc_dst - cc_dst.detach())
-
-    def post_process_output(
-        self,
-        compute_ret: torch.Tensor,
-        atype: torch.Tensor,
-        do_atomic_virial: bool = False,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Post-process the single concatenated tensor from compile_compute_func.
-
-        Parameters
-        ----------
-        compute_ret : torch.Tensor
-            Concatenated output with shape (1, n_node, 13).
-            Layout: [energy(1) | force(3) | virial(9)].
-        atype : torch.Tensor
-            Atom types with shape (nf, nloc).
-        do_atomic_virial : bool
-            Whether to output per-atom virial.
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Standard DeePMD model predictions.
-        """
-        nf = atype.shape[0]
-        nloc = atype.shape[1]
-        n_actual = nf * nloc
-        redu_prec = self.redu_prec
-
-        # === Step 1. Split concatenated tensor ===
-        atom_energy_masked = compute_ret[:, :, 0:1]  # (1, n_node, 1)
-        minus_force_flat = compute_ret[:, :, 1:4]  # (1, n_node, 3)
-        atom_virial_flat = compute_ret[:, :, 4:13]  # (1, n_node, 9)
-
-        # === Step 2. Energy ===
-        atom_energy = atom_energy_masked[:, :n_actual, :].view(nf, nloc, 1)
-        energy = torch.sum(atom_energy.to(redu_prec), dim=1)
-
-        model_predict: dict[str, torch.Tensor] = {
-            "energy": atom_energy,
-            "energy_redu": energy,
-        }
-
-        # === Step 3. Force ===
-        if self.do_grad_r("energy"):
-            force = -minus_force_flat[0, :n_actual, :].view(nf, nloc, 3)
-            model_predict["energy_derv_r"] = force.unsqueeze(-2)
-
-        # === Step 4. Virial ===
-        if self.do_grad_c("energy"):
-            atom_virial = atom_virial_flat[0, :n_actual, :].view(nf, nloc, 9)
-            if do_atomic_virial:
-                model_predict["energy_derv_c"] = atom_virial.unsqueeze(-2)
-            model_predict["energy_derv_c_redu"] = torch.sum(
-                atom_virial.to(redu_prec), dim=1, keepdim=True
-            )
-
-        # === Step 5. Atom mask ===
-        ext_atom_mask = self.atomic_model.make_atom_mask(atype)
-        atom_mask_out = ext_atom_mask.to(torch.int32)
-        if self.atomic_model.atom_excl is not None:
-            atom_mask_out = atom_mask_out * self.atomic_model.atom_excl(atype)
-        model_predict["mask"] = atom_mask_out
-
-        return model_predict
-
-    @torch.jit.export
-    def forward_lower(
-        self,
-        extended_coord: Float[Tensor, "nf nall_x3"] | Float[Tensor, "nf nall 3"],
-        extended_atype: Int[Tensor, "nf nall"],
-        nlist: Int[Tensor, "nf nloc nsel"],
-        mapping: Int[Tensor, "nf nall"] | None = None,
-        fparam: Float[Tensor, "nf ndf"] | None = None,
-        aparam: Float[Tensor, "nf nall nda"] | None = None,
-        do_atomic_virial: bool = False,
-        comm_dict: dict[str, torch.Tensor] | None = None,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Lower-level forward using traditional neighbor list (LAMMPS compatible).
-
-        Parameters
-        ----------
-        extended_coord
-            Extended coordinates with shape (nf, nall*3) in Å.
-        extended_atype
-            Extended atom types with shape (nf, nall).
-        nlist
-            Neighbor list with shape (nf, nloc, nsel).
-        mapping
-            Mapping indices with shape (nf, nall), or None.
-        fparam
-            Frame parameters with shape (nf, ndf) or None.
-        aparam
-            Atomic parameters with shape (nf, nall, nda) or None.
-        do_atomic_virial
-            Whether to compute atomic virial.
-        comm_dict
-            Communication dict (unused).
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Model predictions including atom_energy, energy, extended_force,
-            virial, extended_virial, and dforce.
-        """
-        model_ret = self.forward_common_lower(
-            extended_coord,
-            extended_atype,
-            nlist,
-            mapping,
-            fparam=fparam,
-            aparam=aparam,
-            do_atomic_virial=do_atomic_virial,
-            comm_dict=comm_dict,
-            extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+        # === Step 3. Inject the clean coordinate gradient path ===
+        return (
+            edge_vec
+            + (coord_src - coord_src.detach())
+            - (coord_dst - coord_dst.detach())
         )
-        if self.get_fitting_net() is not None:
-            model_predict: dict[str, torch.Tensor] = {}
 
-            # === Step 1. Energy ===
-            model_predict["atom_energy"] = model_ret["energy"]
-            model_predict["energy"] = model_ret["energy_redu"]
-
-            # === Step 2. Force (independent branch) ===
-            if self.do_grad_r("energy"):
-                model_predict["extended_force"] = rearrange(
-                    model_ret["energy_derv_r"],
-                    "nf nall 1 three -> nf nall three",
-                    three=3,
-                )
-            else:
-                assert model_ret["dforce"] is not None
-                model_predict["dforce"] = model_ret["dforce"]
-
-            # === Step 3. Virial ===
-            if self.do_grad_c("energy"):
-                model_predict["virial"] = rearrange(
-                    model_ret["energy_derv_c_redu"], "nf 1 nine -> nf nine", nine=9
-                )
-                if do_atomic_virial:
-                    model_predict["extended_virial"] = rearrange(
-                        model_ret["energy_derv_c"],
-                        "nf nall 1 nine -> nf nall nine",
-                        nine=9,
-                    )
-        else:
-            model_predict = model_ret
-        return model_predict
+    def should_use_compile(self) -> bool:
+        """Return whether the current forward should use the compile path."""
+        if self.training:
+            return self.use_compile
+        return bool(self._env_use_compile_infer)
 
     # =========================================================================
     # Neighbor List Construction
@@ -1025,7 +962,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             box=box,
         )
 
-    def build_fixed_edge_list_from_nlist(
+    def build_edge_list_from_nlist(
         self,
         *,
         extended_coord: torch.Tensor,
@@ -1034,6 +971,15 @@ class SeZMModel(DPModelCommon, SeZMModel_):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Build a compact edge list from DeePMD padded neighbor list.
+
+        Parameters
+        ----------
+        extended_coord
+            Extended coordinates with shape (nf, nall, 3).
+        nlist
+            DeePMD padded neighbor list with shape (nf, nloc, nsel).
+        mapping
+            Extended-to-local mapping with shape (nf, nall), or `None`.
 
         Returns
         -------
@@ -1052,31 +998,25 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         coord_for_diff = extended_coord.to(dtype=descriptor_model.compute_dtype)
 
         # === Step 1. Build per-edge geometry in descriptor compute dtype ===
-        # Match the eager descriptor path:
-        #   cast extended coordinates to `descriptor.compute_dtype`
-        #   before any gather/subtract for edge geometry.
         valid_nlist = nlist >= 0
-        gather_index = torch.where(valid_nlist, nlist, torch.zeros_like(nlist))
-        index = rearrange(gather_index, "nf nloc nnei -> nf (nloc nnei) 1").expand(
-            -1, -1, 3
-        )
-        nei_pos = torch.gather(coord_for_diff, 1, index).view(nf, nloc, nsel, 3)
-        atom_pos = coord_for_diff[:, :nloc].unsqueeze(2)
-        diff = nei_pos - atom_pos
-        edge_len2 = torch.sum(diff * diff, dim=-1).reshape(-1)  # (n_actual * nsel,)
-        edge_vec_actual = diff.reshape(n_actual * nsel, 3)
-
-        # === Step 2. Build compact src/dst ===
         dst_actual = torch.arange(
             n_actual, device=device, dtype=torch.long
         ).repeat_interleave(nsel)
         f_idx = dst_actual // nloc
+        dst_local = dst_actual % nloc
         neighbor_flat = nlist.reshape(-1)
         valid_flat = neighbor_flat >= 0
         neighbor_safe = torch.where(
             valid_flat, neighbor_flat, torch.zeros_like(neighbor_flat)
         )
+        coord_flat = coord_for_diff.flatten(0, 1)
+        dst_ext = f_idx * nall + dst_local
+        src_ext = f_idx * nall + neighbor_safe.to(dtype=torch.long)
+        diff = coord_flat.index_select(0, src_ext) - coord_flat.index_select(0, dst_ext)
+        edge_len2 = torch.sum(diff * diff, dim=-1)  # (n_actual * nsel,)
+        edge_vec_actual = diff
 
+        # === Step 2. Build compact src/dst ===
         if mapping is None:
             src_local = neighbor_safe.to(dtype=torch.long)
         else:
@@ -1091,7 +1031,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         len_positive = edge_len2 > 1e-10
         edge_mask_actual = valid_flat & src_local_valid & len_positive
 
-        valid_idx = torch.nonzero(edge_mask_actual).squeeze(-1)
+        valid_idx = torch.nonzero(edge_mask_actual, as_tuple=False).flatten()
+
         if valid_idx.numel() == 0:
             edge_index = torch.zeros((2, 1), dtype=torch.long, device=device)
             edge_vec = torch.tensor(
@@ -1139,6 +1080,100 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             if m:
                 result.append(t)
         return result
+
+    def post_process_output(
+        self,
+        compute_ret: torch.Tensor,
+        atype: torch.Tensor,
+        do_atomic_virial: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Convert the concatenated sparse-edge output to DeePMD model outputs.
+
+        Parameters
+        ----------
+        compute_ret
+            Concatenated tensor with shape (nf, nloc, 13).
+        atype
+            Local atom types with shape (nf, nloc).
+        do_atomic_virial
+            Whether to output per-atom virial.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Standard DeePMD model predictions.
+        """
+        # === Step 1. Split concatenated tensor ===
+        atom_energy = compute_ret[:, :, 0:1]
+        minus_force = compute_ret[:, :, 1:4]
+        atom_virial = compute_ret[:, :, 4:13]
+
+        # === Step 2. Energy ===
+        model_predict: dict[str, torch.Tensor] = {
+            "energy": atom_energy,
+            "energy_redu": torch.sum(atom_energy.to(self.redu_prec), dim=1),
+        }
+
+        # === Step 3. Force ===
+        if self.do_grad_r("energy"):
+            model_predict["energy_derv_r"] = (-minus_force).unsqueeze(-2)
+
+        # === Step 4. Virial ===
+        if self.do_grad_c("energy"):
+            if do_atomic_virial:
+                model_predict["energy_derv_c"] = atom_virial.unsqueeze(-2)
+            model_predict["energy_derv_c_redu"] = torch.sum(
+                atom_virial.to(self.redu_prec),
+                dim=1,
+                keepdim=True,
+            )
+
+        # === Step 5. Atom mask ===
+        atom_mask = self.atomic_model.make_atom_mask(atype).to(torch.int32)
+        if self.atomic_model.atom_excl is not None:
+            atom_mask *= self.atomic_model.atom_excl(atype)
+        model_predict["mask"] = atom_mask
+        return model_predict
+
+    def convert_fp_ap(
+        self,
+        fp: torch.Tensor | None,
+        ap: torch.Tensor | None,
+        nf: int,
+        nloc: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Convert optional fitting inputs to tensor-only compile inputs."""
+        dim_fparam = self.get_dim_fparam()
+        dim_aparam = self.get_dim_aparam()
+
+        # === Step 1. Canonicalize frame parameters ===
+        if fp is None:
+            if dim_fparam > 0:
+                raise ValueError(
+                    "fparam is required because fitting net dim_fparam > 0"
+                )
+            fp = torch.empty((nf, 0), dtype=dtype, device=device)
+        elif fp.shape[-1] != dim_fparam:
+            raise ValueError(
+                f"fparam last dim ({fp.shape[-1]}) != dim_fparam ({dim_fparam})"
+            )
+
+        # === Step 2. Canonicalize atomic parameters ===
+        if ap is None:
+            if dim_aparam > 0:
+                raise ValueError(
+                    "aparam is required because fitting net dim_aparam > 0"
+                )
+            ap = torch.empty((nf, nloc, 0), dtype=dtype, device=device)
+        elif ap.shape[-1] != dim_aparam:
+            raise ValueError(
+                f"aparam last dim ({ap.shape[-1]}) != dim_aparam ({dim_aparam})"
+            )
+
+        return fp, ap
 
     def translated_output_def(self) -> dict[str, Any]:
         """
@@ -1213,77 +1248,21 @@ class SeZMModel(DPModelCommon, SeZMModel_):
     # Context Managers
     # =========================================================================
 
-    def _should_use_compile(self) -> bool:
-        """Return whether the current forward should use the compile path."""
-        if self.training:
-            return self.use_compile
-        return bool(self._env_use_compile_infer)
-
     @contextmanager
     def tf32_precision_ctx(self) -> Generator[None, None, None]:
         """Context manager to temporarily set TF32 matmul precision."""
-        if not self._should_use_compile() or not torch.cuda.is_available():
+        if not self.should_use_compile() or not torch.cuda.is_available():
             yield
             return
         prev_precision = torch.get_float32_matmul_precision()
         try:
             if self.enable_tf32:
-                torch.set_float32_matmul_precision("medium")
+                torch.set_float32_matmul_precision("high")
             else:
                 torch.set_float32_matmul_precision("highest")
             yield
         finally:
             torch.set_float32_matmul_precision(prev_precision)
-
-    # =========================================================================
-    # Compile Input Helpers
-    # =========================================================================
-
-    def prepare_compile_fitting_inputs(
-        self,
-        fp: torch.Tensor | None,
-        ap: torch.Tensor | None,
-        nf: int,
-        nloc: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Convert optional fitting inputs to tensor-only compile inputs.
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor]
-            Tensor-only frame/atomic parameters for compiled runtime.
-        """
-        dim_fparam = self.get_dim_fparam()
-        dim_aparam = self.get_dim_aparam()
-
-        # === Step 1. Canonicalize frame parameters ===
-        if fp is None:
-            if dim_fparam > 0:
-                raise ValueError(
-                    "fparam is required because fitting net dim_fparam > 0"
-                )
-            fp = torch.empty((nf, 0), dtype=dtype, device=device)
-        elif fp.shape[-1] != dim_fparam:
-            raise ValueError(
-                f"fparam last dim ({fp.shape[-1]}) != dim_fparam ({dim_fparam})"
-            )
-
-        # === Step 2. Canonicalize atomic parameters ===
-        if ap is None:
-            if dim_aparam > 0:
-                raise ValueError(
-                    "aparam is required because fitting net dim_aparam > 0"
-                )
-            ap = torch.empty((nf, nloc, 0), dtype=dtype, device=device)
-        elif ap.shape[-1] != dim_aparam:
-            raise ValueError(
-                f"aparam last dim ({ap.shape[-1]}) != dim_aparam ({dim_aparam})"
-            )
-
-        return fp, ap
 
 
 # =============================================================================

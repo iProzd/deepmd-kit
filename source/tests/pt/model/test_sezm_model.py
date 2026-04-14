@@ -42,9 +42,7 @@ class TestSeZMModelCompile(unittest.TestCase):
         self.device = env.DEVICE
         torch.manual_seed(2024)
 
-    def _build_model_params(
-        self, *, use_compile: bool, use_env_seed: bool = False
-    ) -> dict:
+    def _build_model_params(self, *, use_compile: bool) -> dict:
         return {
             "type": "SeZM",
             "type_map": ["A", "B"],
@@ -54,20 +52,20 @@ class TestSeZMModelCompile(unittest.TestCase):
                 "rcut": 3.0,
                 "channels": 4,
                 "n_focus": 1,
-                "focus_compete": False,
                 "n_radial": 3,
                 "radial_mlp": [6],
-                "use_env_seed": use_env_seed,
+                "use_env_seed": True,
                 "l_schedule": [1, 0],
                 "mmax": 1,
                 "so2_norm": False,
                 "so2_layers": 1,
-                "n_atten_head": 0,
+                "n_atten_head": 1,
                 "sandwich_norm": [True, False, True, False],
                 "ffn_neurons": 8,
-                "ffn_blocks": 2,
-                "mlp_bias": True,
-                "layer_scale": True,
+                "ffn_blocks": 1,
+                "s2_activation": [False, True],
+                "mlp_bias": False,
+                "layer_scale": False,
                 "use_amp": False,
                 "activation_function": "silu",
                 "glu_activation": True,
@@ -189,36 +187,10 @@ class TestSeZMModelCompile(unittest.TestCase):
             name: param.detach().clone() for name, param in model.named_parameters()
         }
 
-    def test_three_step_training_matches_compile(self) -> None:
-        """Train three steps and compare parameters between dynamic and compile paths."""
-        coord, atype, box, energy, force, _virial = self._load_water_frame()
-
-        # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
-        model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
-        model_cmp.load_state_dict(model_dyn.state_dict())
-        model_dyn.train()
-        model_cmp.train()
-        self.assertTrue(model_cmp.use_compile)
-
-        # === Step 2. Three-step training (first step triggers compile) ===
-        params_dyn = self._train_steps(
-            model_dyn, coord, atype, box, energy, force, _virial
-        )
-        params_cmp = self._train_steps(
-            model_cmp, coord, atype, box, energy, force, _virial
-        )
-
-        # === Step 3. Compare parameters ===
-        self.assertEqual(set(params_dyn.keys()), set(params_cmp.keys()))
-        for name in params_dyn.keys():
-            torch.testing.assert_close(
-                params_dyn[name], params_cmp[name], atol=1.0e-7, rtol=1.0e-7
-            )
-
-    def test_force_matches_compile(self) -> None:
-        """Single forward force should match between dynamic and compile paths."""
-        coord, atype, box, _, _, _ = self._load_water_frame()
+    def test_eval_outputs_match_compile_and_handle_shape_change(self) -> None:
+        """Eval compile path should match eager on first trace and after batch-size growth."""
+        coord_1, atype_1, box_1, _, _, _ = self._load_water_frame()
+        coord_2, atype_2, box_2, _, _, _ = self._load_water_frame(nframe=2)
 
         # === Step 1. Build paired models with shared weights ===
         model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
@@ -228,32 +200,32 @@ class TestSeZMModelCompile(unittest.TestCase):
         model_dyn.eval()
         model_cmp.eval()
 
-        # === Step 2. Forward and compare forces ===
-        out_dyn = model_dyn(coord, atype, box=box)
-        out_cmp = model_cmp(coord, atype, box=box)
+        # === Step 2. First eval call traces the compile graph on nf=1 ===
+        out_dyn_1 = model_dyn(coord_1, atype_1, box=box_1)
+        out_cmp_1 = model_cmp(coord_1, atype_1, box=box_1)
         torch.testing.assert_close(
-            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+            out_dyn_1["energy"], out_cmp_1["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn_1["force"], out_cmp_1["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn_1["virial"], out_cmp_1["virial"], atol=1.0e-5, rtol=1.0e-5
         )
 
-    def test_force_matches_compile_with_env_seed(self) -> None:
-        """Compile path should remain aligned when Env FiLM is enabled."""
-        coord, atype, box, _, _, _ = self._load_water_frame()
-
-        model_dyn = get_sezm_model(
-            self._build_model_params(use_compile=False, use_env_seed=True)
-        )
-        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
-            model_cmp = get_sezm_model(
-                self._build_model_params(use_compile=True, use_env_seed=True)
-            )
-        model_cmp.load_state_dict(model_dyn.state_dict())
-        model_dyn.eval()
-        model_cmp.eval()
-
-        out_dyn = model_dyn(coord, atype, box=box)
-        out_cmp = model_cmp(coord, atype, box=box)
+        # === Step 3. Reuse the traced graph on a larger batch ===
+        out_dyn_2 = model_dyn(coord_2, atype_2, box=box_2)
+        out_cmp_2 = model_cmp(coord_2, atype_2, box=box_2)
+        self.assertEqual(out_dyn_2["energy"].shape, (2, 1))
+        self.assertEqual(out_cmp_2["energy"].shape, (2, 1))
         torch.testing.assert_close(
-            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+            out_dyn_2["energy"], out_cmp_2["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn_2["force"], out_cmp_2["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn_2["virial"], out_cmp_2["virial"], atol=1.0e-5, rtol=1.0e-5
         )
 
     def test_fixed_edge_geometry_matches_standard_cache(self) -> None:
@@ -296,7 +268,7 @@ class TestSeZMModelCompile(unittest.TestCase):
             use_geometry_rbf_triton=False,
         )
 
-        edge_index, edge_vec, edge_mask = model.build_fixed_edge_list_from_nlist(
+        edge_index, edge_vec, edge_mask = model.build_edge_list_from_nlist(
             extended_coord=extended_coord,
             nlist=nlist,
             mapping=mapping,
@@ -326,8 +298,8 @@ class TestSeZMModelCompile(unittest.TestCase):
         torch.testing.assert_close(cache_std.D_full, cache_sparse.D_full)
         torch.testing.assert_close(cache_std.Dt_full, cache_sparse.Dt_full)
 
-    def test_eval_defaults_to_eager_without_env_override(self) -> None:
-        """Evaluation defaults to eager when `DP_COMPILE_INFER` is unset."""
+    def test_eval_compile_policy(self) -> None:
+        """Eval should stay eager by default and compile only with env override."""
         model = get_sezm_model(self._build_model_params(use_compile=True))
         self.assertTrue(model.use_compile)
 
@@ -337,68 +309,22 @@ class TestSeZMModelCompile(unittest.TestCase):
         model.eval()
         self.assertFalse(model._should_use_compile())
 
-    def test_eval_env_override_enables_compile(self) -> None:
-        """`DP_COMPILE_INFER` should enable eval compile at model init."""
         with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
-            model = get_sezm_model(self._build_model_params(use_compile=True))
-        model.eval()
-        self.assertTrue(model._should_use_compile())
-
-    def test_multi_frame_energy_matches_compile(self) -> None:
-        """Energy output must remain per-frame in compile path."""
-        nframe = 2
-        coord, atype, box, _, _, _ = self._load_water_frame(nframe=nframe)
-        # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
-        model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
-        model_cmp.load_state_dict(model_dyn.state_dict())
-        model_dyn.train()
-        model_cmp.train()
-
-        # === Step 2. Forward and compare per-frame energy ===
-        out_dyn = model_dyn(coord, atype, box=box)
-        out_cmp = model_cmp(coord, atype, box=box)
-
-        self.assertEqual(out_dyn["energy"].shape, (nframe, 1))
-        self.assertEqual(out_cmp["energy"].shape, (nframe, 1))
-        torch.testing.assert_close(
-            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
-        )
-
-    def test_virial_matches_compile(self) -> None:
-        """Single forward virial should match between dynamic and compile paths."""
-        coord, atype, box, _, _, _ = self._load_water_frame()
-
-        # === Step 1. Build paired models with shared weights ===
-        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
-        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
-            model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
-        model_cmp.load_state_dict(model_dyn.state_dict())
-        model_dyn.eval()
-        model_cmp.eval()
-
-        # === Step 2. Forward and compare virials ===
-        out_dyn = model_dyn(coord, atype, box=box)
-        out_cmp = model_cmp(coord, atype, box=box)
-
-        # Check virial exists in both outputs
-        self.assertIn("virial", out_dyn, "Virial not in dynamic model output")
-        self.assertIn("virial", out_cmp, "Virial not in compile model output")
-
-        # Compare virial values
-        torch.testing.assert_close(
-            out_dyn["virial"], out_cmp["virial"], atol=1.0e-5, rtol=1.0e-5
-        )
+            model_eval = get_sezm_model(self._build_model_params(use_compile=True))
+        model_eval.eval()
+        self.assertTrue(model_eval._should_use_compile())
 
     def test_forward_backward_double_backward_matches_compile(self) -> None:
         """
-        Check forward, backward, and double backward consistency vs compile.
+        Check forward, backward, double backward, and short training consistency.
 
         Forward: energy/force outputs should match.
         Backward: d(energy)/d(params) should match.
         Double backward: d(force_loss)/d(params) should match.
+        Training: three SGD steps and a larger follow-up batch should still match.
         """
-        coord, atype, box, _, _, _ = self._load_water_frame()
+        coord, atype, box, energy, force, virial = self._load_water_frame()
+        coord_2, atype_2, box_2, _, _, _ = self._load_water_frame(nframe=2)
 
         # === Step 1. Build paired models with shared weights ===
         model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
@@ -446,6 +372,28 @@ class TestSeZMModelCompile(unittest.TestCase):
                 grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
 
+        # === Step 5. Reuse the compiled training graph for three optimizer steps ===
+        params_dyn = self._train_steps(
+            model_dyn, coord, atype, box, energy, force, virial
+        )
+        params_cmp = self._train_steps(
+            model_cmp, coord, atype, box, energy, force, virial
+        )
+        self.assertEqual(set(params_dyn.keys()), set(params_cmp.keys()))
+        for name in params_dyn.keys():
+            torch.testing.assert_close(
+                params_dyn[name], params_cmp[name], atol=1.0e-7, rtol=1.0e-7
+            )
+
+        # === Step 6. The traced training graph should also handle a larger batch ===
+        out_dyn = model_dyn(coord_2, atype_2, box=box_2)
+        out_cmp = model_cmp(coord_2, atype_2, box=box_2)
+        self.assertEqual(out_dyn["energy"].shape, (2, 1))
+        self.assertEqual(out_cmp["energy"].shape, (2, 1))
+        torch.testing.assert_close(
+            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+
         # === Step 4. Double backward via force loss ===
         model_dyn.zero_grad(set_to_none=True)
         model_cmp.zero_grad(set_to_none=True)
@@ -472,33 +420,6 @@ class TestSeZMModelCompile(unittest.TestCase):
             torch.testing.assert_close(
                 grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
-
-    def test_shape_change_after_first_compile_matches_dynamic(self) -> None:
-        """A compiled model should handle a larger compact graph after first trace."""
-        coord_1, atype_1, box_1, _, _, _ = self._load_water_frame(nframe=1)
-        coord_2, atype_2, box_2, _, _, _ = self._load_water_frame(nframe=2)
-
-        model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
-        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
-            model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
-        model_cmp.load_state_dict(model_dyn.state_dict())
-        model_dyn.eval()
-        model_cmp.eval()
-
-        # First forward builds the traced graph on a smaller compact graph.
-        _ = model_cmp(coord_1, atype_1, box=box_1)
-
-        out_dyn = model_dyn(coord_2, atype_2, box=box_2)
-        out_cmp = model_cmp(coord_2, atype_2, box=box_2)
-        torch.testing.assert_close(
-            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
-        )
-        torch.testing.assert_close(
-            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
-        )
-        torch.testing.assert_close(
-            out_dyn["virial"], out_cmp["virial"], atol=1.0e-5, rtol=1.0e-5
-        )
 
 
 class TestInterPotential(unittest.TestCase):
