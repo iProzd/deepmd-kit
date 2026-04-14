@@ -39,6 +39,7 @@ from deepmd.loggers.training import (
 )
 from deepmd.pt.loss import (
     DenoiseLoss,
+    DeNSLoss,
     DOSLoss,
     EnergyHessianStdLoss,
     EnergySpinLoss,
@@ -428,6 +429,8 @@ class Trainer:
             resuming=resuming,
             _loss_params=loss_param_tmp,
         )
+        # SeZM specific process for DeNS training
+        prepare_model_for_loss(self.model, loss_param_tmp)
 
         # Loss
         if not self.multi_task:
@@ -1470,6 +1473,8 @@ class Trainer:
                                 self.train_loss_accu[item] = 0.0
                     for item in more_loss:
                         if "l2_" not in item:
+                            if item not in self.train_loss_accu:
+                                self.train_loss_accu[item] = 0.0
                             self.train_loss_accu[item] += more_loss[item]
                 else:
                     # Accumulate loss for multi-task
@@ -2228,6 +2233,23 @@ def whether_hessian(loss_params: dict[str, Any]) -> bool:
     return loss_type == "ener" and loss_params.get("start_pref_h", 0.0) > 0.0
 
 
+def prepare_model_for_loss(
+    model: Any,
+    loss_params: dict[str, Any] | None,
+) -> None:
+    """Align model execution mode with the configured training loss."""
+    if loss_params is None:
+        return
+    if isinstance(model, dict):
+        for model_key, sub_model in model.items():
+            sub_loss = loss_params.get(model_key)
+            if sub_loss is not None:
+                prepare_model_for_loss(sub_model, sub_loss)
+        return
+    if hasattr(model, "set_active_mode_from_loss"):
+        model.set_active_mode_from_loss(loss_params.get("type", "ener"))
+
+
 def get_loss(
     loss_params: dict[str, Any], start_lr: float, _ntypes: int, _model: Any
 ) -> TaskLoss:
@@ -2238,6 +2260,9 @@ def get_loss(
     elif loss_type == "ener":
         loss_params["starter_learning_rate"] = start_lr
         return EnergyStdLoss(**loss_params)
+    elif loss_type == "dens":
+        loss_params["starter_learning_rate"] = start_lr
+        return DeNSLoss(**loss_params)
     elif loss_type == "dos":
         loss_params["starter_learning_rate"] = start_lr
         loss_params["numb_dos"] = _model.model_output_def()["dos"].output_size

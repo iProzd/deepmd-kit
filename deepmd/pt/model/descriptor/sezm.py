@@ -738,6 +738,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         edge_mask: torch.Tensor | None = None,
         comm_dict: dict[str, torch.Tensor] | None = None,
         fparam: torch.Tensor | None = None,
+        force_embedding: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -772,6 +773,11 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         fparam
             Frame parameters with shape (nf, nfp). Not used by SeZM, kept for
             interface compatibility.
+        force_embedding
+            Optional precomputed equivariant force embedding with shape
+            ``(nf * nloc, D, 1, channels)``, where
+            ``D = (l_schedule[0] + 1) ** 2``. This tensor is added to the
+            initial SO(3) backbone state before the interaction blocks.
 
         Returns
         -------
@@ -794,12 +800,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             )
 
         if edge_index is not None:
-            descriptor = self.forward_with_edges(
+            descriptor, _ = self.forward_with_edges(
                 extended_coord=extended_coord,
                 extended_atype=extended_atype,
                 edge_index=edge_index,
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
+                force_embedding=force_embedding,
             )
             return (
                 descriptor,
@@ -915,6 +922,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         # === Step 10. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
             x = x.to(dtype=self.dtype)  # (N, D, 1, C)
+            if force_embedding is not None:
+                x = x + force_embedding.to(dtype=self.dtype)
             if edge_cache.src.numel() > 0:
                 edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
                 with self._compute_mode_ctx(extended_coord.device):
@@ -951,7 +960,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         edge_index: torch.Tensor,
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
-    ) -> torch.Tensor:
+        force_embedding: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the descriptor from a sparse edge list.
 
@@ -967,11 +977,17 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             Edge vectors with shape (E, 3) in Å.
         edge_mask
             Edge mask with shape (E,).
+        force_embedding
+            Optional precomputed equivariant force embedding with shape
+            ``(nf * nloc, D, 1, channels)``, where
+            ``D = (l_schedule[0] + 1) ** 2``. This tensor is added to the
+            initial SO(3) backbone state before the interaction blocks.
 
         Returns
         -------
-        torch.Tensor
-            Descriptor with shape (nf, nloc, channels). Only l=0 is returned.
+        tuple[torch.Tensor, torch.Tensor]
+            The scalar descriptor with shape ``(nf, nloc, channels)`` and the
+            final equivariant latent with shape ``(nf * nloc, D_final, 1, channels)``.
         """
         # === Step 1. Setup dimensions ===
         extended_coord = extended_coord.to(self.compute_dtype)
@@ -1061,6 +1077,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         # === Step 9. Convert to self.dtype and run blocks ===
         with nvtx_range("blocks"):
             x = x.to(dtype=self.dtype)  # (N, D, 1, C)
+            if force_embedding is not None:
+                x = x + force_embedding.to(dtype=self.dtype)
             edge_cache = edge_cache_to_dtype(edge_cache, self.dtype)
             with self._compute_mode_ctx(extended_coord.device):
                 x = self._forward_blocks(x, edge_cache, rad_feat_per_block)
@@ -1076,7 +1094,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === Step 11. Reshape to (nf, nloc, channels) and return ===
         descriptor = x_scalar.reshape(nf, nloc, self.channels)  # (nf, nloc, C)
-        return descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION)
+        return descriptor.to(dtype=env.GLOBAL_PT_FLOAT_PRECISION), x.contiguous()
 
     def _forward_blocks(
         self,
@@ -1576,7 +1594,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Ignore legacy checkpoint state that is rebuilt at construction."""
+        """Drop transient descriptor state that is rebuilt at construction."""
         expected_keys = {prefix + key for key in self.state_dict().keys()}
         for full_key in list(state_dict.keys()):
             if full_key.startswith(prefix) and full_key not in expected_keys:

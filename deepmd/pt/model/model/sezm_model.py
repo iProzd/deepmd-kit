@@ -126,11 +126,13 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         self.use_compile = bool(use_compile)
         self.enable_tf32 = bool(enable_tf32)
+        self._dens_compiled = False
         self._core_compute_compiled_train: bool | None = None
         self._core_compute_compiled_atomic_virial: bool | None = None
-        # Store core_compute_compiled outside the nn.Module tree so that
+        # Store compiled callables outside the nn.Module tree so that
         # FSDP2 / DDP do not shard or sync its duplicated parameters.
-        object.__setattr__(self, "core_compute_compiled", None)
+        object.__setattr__(self, "compiled_core_compute", None)
+        object.__setattr__(self, "compiled_dens_compute", None)
         # Training follows `use_compile`. Evaluation/inference reads
         # `DP_COMPILE_INFER` at init time and falls back to eager when unset.
         self._env_use_compile_infer: bool | None = _parse_optional_env_bool(
@@ -159,6 +161,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         fparam: Float[Tensor, "nf ndf"] | None = None,
         aparam: Float[Tensor, "nf nloc nda"] | None = None,
         do_atomic_virial: bool = False,
+        force_input: Float[Tensor, "nf nloc 3"] | None = None,
+        noise_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass using standard neighbor list.
@@ -177,6 +181,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Atomic parameters with shape (nf, nloc, nda) or None.
         do_atomic_virial
             Whether to compute atomic virial.
+        force_input
+            Optional atom-wise force input tensor with shape `(nf, nloc, 3)`.
+            It stays optional at the public model boundary because validation /
+            inference and clean `dens` batches may not provide force labels.
+        noise_mask
+            Optional corruption mask with shape `(nf, nloc)`. It stays optional
+            at the public model boundary because validation / inference and
+            clean `dens` batches may not provide corruption masks.
 
         Returns
         -------
@@ -191,6 +203,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             fparam=fparam,
             aparam=aparam,
             do_atomic_virial=do_atomic_virial,
+            force_input=force_input,
+            noise_mask=noise_mask,
         )
         if self.get_fitting_net() is not None:
             model_predict: dict[str, torch.Tensor] = {}
@@ -208,6 +222,20 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 )
             else:
                 model_predict["force"] = model_ret["dforce"]
+
+            if self.get_active_mode() == "dens":
+                if "energy_norm" in model_ret:
+                    model_predict["energy_norm"] = model_ret["energy_norm"]
+                if "atom_energy_norm" in model_ret:
+                    model_predict["atom_energy_norm"] = model_ret["atom_energy_norm"]
+                if "dforce_norm" in model_ret:
+                    model_predict["force_norm"] = model_ret["dforce_norm"]
+                if "clean_dforce_norm" in model_ret:
+                    model_predict["clean_force_norm"] = model_ret["clean_dforce_norm"]
+                if "denoising_dforce_norm" in model_ret:
+                    model_predict["denoising_force_norm"] = model_ret[
+                        "denoising_dforce_norm"
+                    ]
 
             # === Step 3. Virial ===
             if self.do_grad_c("energy"):
@@ -238,6 +266,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         fparam: Float[Tensor, "nf ndf"] | None = None,
         aparam: Float[Tensor, "nf nloc nda"] | None = None,
         do_atomic_virial: bool = False,
+        force_input: Float[Tensor, "nf nloc 3"] | None = None,
+        noise_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Return model prediction using standard neighbor list.
@@ -256,6 +286,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Atomic parameters with shape (nf, nloc, nda) or None.
         do_atomic_virial
             Whether to compute atomic virial.
+        force_input
+            Optional atom-wise force input tensor with shape `(nf, nloc, 3)`.
+            It stays optional at the public model boundary because validation /
+            inference and clean `dens` batches may not provide force labels.
+        noise_mask
+            Optional corruption mask with shape `(nf, nloc)`. It stays optional
+            at the public model boundary because validation / inference and
+            clean `dens` batches may not provide corruption masks.
 
         Returns
         -------
@@ -295,67 +333,129 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                     mapping=mapping,
                 )
 
-            need_coord_grad = self.do_grad_r() or self.do_grad_c()
-            if need_coord_grad:
-                cc = cc.detach().requires_grad_(True)
-            else:
-                cc = cc.detach()
-
-            # === Step 4. Eager / compile dispatch ===
-            if self.should_use_compile():
-                fp, ap = self.convert_fp_ap(
-                    fp,
-                    ap,
+            active_mode = self.get_active_mode()
+            if active_mode == "dens":
+                force_input, noise_mask = self.canonicalize_dens_inputs(
+                    force_input,
+                    noise_mask,
                     nf=nf,
                     nloc=nloc,
                     dtype=cc.dtype,
                     device=cc.device,
                 )
-                with self.tf32_precision_ctx():
-                    if (
-                        self.core_compute_compiled is None
-                        or self._core_compute_compiled_train != self.training
-                        or self._core_compute_compiled_atomic_virial != do_atomic_virial
-                    ):
-                        self.trace_and_compile(
-                            cc,
-                            atype,
-                            edge_index,
-                            edge_vec,
-                            edge_mask,
-                            fp,
-                            ap,
-                            do_atomic_virial,
-                        )
-                    with nvtx_range("SeZM/core_compute"):
-                        compute_ret = self.core_compute_compiled(
-                            cc,
-                            atype,
-                            edge_index,
-                            edge_vec,
-                            edge_mask,
-                            fp,
-                            ap,
-                        )
-            else:
-                with nvtx_range("SeZM/core_compute"):
-                    compute_ret = self.core_compute(
-                        cc,
-                        atype,
-                        edge_index,
-                        edge_vec,
-                        edge_mask,
-                        fparam=fp,
-                        aparam=ap,
-                    )
+                cc = cc.detach()
 
-            # === Step 5. Post-process local outputs ===
-            with nvtx_range("SeZM/post_process"):
-                model_predict = self.post_process_output(
-                    compute_ret,
-                    atype,
-                    do_atomic_virial=do_atomic_virial,
-                )
+                # === Step 4. `dens` eager / compile dispatch ===
+                if self.should_use_compile():
+                    fp, ap = self.convert_fp_ap(
+                        fp,
+                        ap,
+                        nf=nf,
+                        nloc=nloc,
+                        dtype=cc.dtype,
+                        device=cc.device,
+                    )
+                    with self.tf32_precision_ctx():
+                        if (
+                            self.compiled_dens_compute is None
+                            or not self._dens_compiled
+                        ):
+                            self.compile_dens()
+                        with nvtx_range("SeZM/core_compute_dens"):
+                            compute_ret = self.compiled_dens_compute(
+                                cc,
+                                atype,
+                                edge_index,
+                                edge_vec,
+                                edge_mask,
+                                force_input=force_input,
+                                noise_mask=noise_mask,
+                                fparam=fp,
+                                aparam=ap,
+                            )
+                else:
+                    with nvtx_range("SeZM/core_compute_dens"):
+                        compute_ret = self.core_compute_dens(
+                            cc,
+                            atype,
+                            edge_index,
+                            edge_vec,
+                            edge_mask,
+                            force_input=force_input,
+                            noise_mask=noise_mask,
+                            fparam=fp,
+                            aparam=ap,
+                        )
+                # === Step 5. Post-process local outputs ===
+                with nvtx_range("SeZM/post_process"):
+                    model_predict = self.post_process_output_dens(
+                        compute_ret,
+                        atype,
+                        noise_mask=noise_mask,
+                    )
+            else:
+                need_coord_grad = self.do_grad_r() or self.do_grad_c()
+                if need_coord_grad:
+                    cc = cc.detach().requires_grad_(True)
+                else:
+                    cc = cc.detach()
+
+                # === Step 4. `ener` eager / compile dispatch ===
+                if self.should_use_compile():
+                    fp, ap = self.convert_fp_ap(
+                        fp,
+                        ap,
+                        nf=nf,
+                        nloc=nloc,
+                        dtype=cc.dtype,
+                        device=cc.device,
+                    )
+                    with self.tf32_precision_ctx():
+                        if (
+                            self.compiled_core_compute is None
+                            or self._core_compute_compiled_train != self.training
+                            or self._core_compute_compiled_atomic_virial
+                            != do_atomic_virial
+                        ):
+                            self.trace_and_compile(
+                                cc,
+                                atype,
+                                edge_index,
+                                edge_vec,
+                                edge_mask,
+                                fp,
+                                ap,
+                                do_atomic_virial,
+                            )
+                        with nvtx_range("SeZM/core_compute"):
+                            compute_ret = self.compiled_core_compute(
+                                cc,
+                                atype,
+                                edge_index,
+                                edge_vec,
+                                edge_mask,
+                                fp,
+                                ap,
+                            )
+                else:
+                    with nvtx_range("SeZM/core_compute"):
+                        compute_ret = self.core_compute(
+                            cc,
+                            atype,
+                            edge_index,
+                            edge_vec,
+                            edge_mask,
+                            fparam=fp,
+                            aparam=ap,
+                        )
+
+                # === Step 5. Post-process local outputs ===
+                with nvtx_range("SeZM/post_process"):
+                    model_predict = self.post_process_output(
+                        compute_ret,
+                        atype,
+                        do_atomic_virial=do_atomic_virial,
+                    )
 
             # === Step 6. Type cast output ===
             with nvtx_range("SeZM/output_type_cast"):
@@ -409,7 +509,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # === Step 3. Descriptor forward through the sparse-edge entry ===
         with nvtx_range("SeZM/descriptor"):
             descriptor_model = self.atomic_model.descriptor
-            descriptor = descriptor_model.forward_with_edges(
+            descriptor, _ = descriptor_model.forward_with_edges(
                 extended_coord=coord,
                 extended_atype=atype,
                 edge_index=edge_index,
@@ -533,6 +633,100 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             dim=-1,
         )
 
+    def core_compute_dens(
+        self,
+        coord: torch.Tensor,
+        atype: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_vec: torch.Tensor,
+        edge_mask: torch.Tensor,
+        *,
+        force_input: torch.Tensor,
+        noise_mask: torch.Tensor,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute SeZM `dens` energy/direct-force tensors from sparse edges.
+
+        Parameters
+        ----------
+        coord
+            Local coordinates with shape `(nf, nloc, 3)` in Angstroms.
+        atype
+            Local atom types with shape `(nf, nloc)`.
+        edge_index
+            Edge source/destination indices with shape `(2, E)`.
+        edge_vec
+            Edge vectors with shape `(E, 3)` in Angstroms.
+        edge_mask
+            Edge validity mask with shape `(E,)`.
+        force_input
+            Atom-wise force input tensor with shape `(nf, nloc, 3)`.
+        noise_mask
+            Atom-wise corruption mask with shape `(nf, nloc)`.
+        fparam
+            Frame parameters with shape `(nf, ndf)`, or None.
+        aparam
+            Atomic parameters with shape `(nf, nloc, nda)`, or None.
+
+        Returns
+        -------
+        torch.Tensor
+            Concatenated local tensor with shape `(nf, nloc, 7)` and layout
+            `[atom_energy_norm | clean_dforce_norm | denoising_dforce_norm]`.
+        """
+        if self.inter_potential is not None:
+            raise NotImplementedError(
+                "SeZM `dens` path does not support analytical bridging potentials."
+            )
+
+        nf, nloc = atype.shape[:2]
+        descriptor_model = self.atomic_model.descriptor
+        dens_fitting = self.atomic_model.get_dens_fitting_net()
+        force_embedding = dens_fitting.build_force_embedding(
+            force_input,
+            noise_mask=noise_mask,
+        )
+
+        with nvtx_range("SeZM/descriptor_dens"):
+            descriptor, latent = descriptor_model.forward_with_edges(
+                extended_coord=coord,
+                extended_atype=atype,
+                edge_index=edge_index,
+                edge_vec=edge_vec,
+                edge_mask=edge_mask,
+                force_embedding=force_embedding,
+            )
+        if self.atomic_model.enable_eval_descriptor_hook:
+            self.atomic_model.eval_descriptor_list.append(descriptor.detach())
+
+        with nvtx_range("SeZM/dens_fitting_net"):
+            fit_ret = dens_fitting(
+                descriptor,
+                latent,
+                atype,
+                noise_mask=noise_mask,
+                fparam=fparam,
+                aparam=aparam,
+                return_components=True,
+            )
+        if self.atomic_model.enable_eval_fitting_last_layer_hook:
+            assert "middle_output" in fit_ret, (
+                "eval_fitting_last_layer not supported for this fitting net!"
+            )
+            self.atomic_model.eval_fitting_last_layer_list.append(
+                fit_ret.pop("middle_output").detach()
+            )
+        return torch.cat(
+            [
+                fit_ret["energy"],
+                fit_ret["clean_dforce"],
+                fit_ret["denoising_dforce"],
+            ],
+            dim=-1,
+        )
+
     @torch.jit.export
     def forward_lower(
         self,
@@ -583,6 +777,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
               only when both `self.do_grad_c("energy")` and `do_atomic_virial` are true
             If no fitting net is present, the raw result of `forward_common_lower()` is returned.
         """
+        if self.get_active_mode() == "dens":
+            raise NotImplementedError(
+                "SeZM `forward_lower` only supports the conservative `ener` mode."
+            )
         cc_ext, _, fp, ap, input_prec = self._input_type_cast(
             extended_coord, fparam=fparam, aparam=aparam
         )
@@ -715,7 +913,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         )
 
         # === Step 3. Descriptor forward through the sparse-edge entry ===
-        descriptor = descriptor_model.forward_with_edges(
+        descriptor, _ = descriptor_model.forward_with_edges(
             extended_coord=cc_ext[:, :nloc, :],
             extended_atype=atype,
             edge_index=edge_index,
@@ -856,7 +1054,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
         object.__setattr__(
             self,
-            "core_compute_compiled",
+            "compiled_core_compute",
             torch.compile(
                 traced,
                 backend="inductor",
@@ -872,6 +1070,31 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         )
         self._core_compute_compiled_train = self.training
         self._core_compute_compiled_atomic_virial = do_atomic_virial
+
+    def compile_dens(self) -> None:
+        """Compile the direct-force `dens` path."""
+        from torch._inductor import config as inductor_config
+
+        inductor_config.max_autotune_report_choices_stats = False
+        inductor_config.autotune_num_choices_displayed = 0
+
+        object.__setattr__(
+            self,
+            "compiled_dens_compute",
+            torch.compile(
+                self.core_compute_dens,
+                backend="inductor",
+                dynamic=True,
+                options={
+                    "max_autotune": False,
+                    "epilogue_fusion": False,
+                    "triton.cudagraphs": False,
+                    "shape_padding": True,
+                    "max_fusion_size": 8,
+                },
+            ),
+        )
+        self._dens_compiled = True
 
     def attach_edge_vec_grad(
         self,
@@ -1136,6 +1359,44 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         model_predict["mask"] = atom_mask
         return model_predict
 
+    def post_process_output_dens(
+        self,
+        compute_ret: torch.Tensor,
+        atype: torch.Tensor,
+        *,
+        noise_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Convert the concatenated `dens` output to DeePMD model outputs.
+
+        Parameters
+        ----------
+        compute_ret
+            Concatenated tensor with shape `(nf, nloc, 7)` or `(1, n_node, 7)`.
+        atype
+            Local atom types with shape `(nf, nloc)`.
+        noise_mask
+            Corruption mask with shape `(nf, nloc)`.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Standard DeePMD model predictions for `dens` mode.
+        """
+        nf, nloc = atype.shape[:2]
+        n_actual = nf * nloc
+        dens_ret = {
+            "energy": compute_ret[:, :n_actual, 0:1].view(nf, nloc, 1),
+            "clean_dforce": compute_ret[:, :n_actual, 1:4].view(nf, nloc, 3),
+            "denoising_dforce": compute_ret[:, :n_actual, 4:7].view(nf, nloc, 3),
+        }
+        return self.atomic_model.apply_out_stat_dens(
+            dens_ret,
+            atype,
+            noise_mask=noise_mask,
+            energy_redu_dtype=self.redu_prec,
+        )
+
     def convert_fp_ap(
         self,
         fp: torch.Tensor | None,
@@ -1175,6 +1436,110 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
         return fp, ap
 
+    def canonicalize_dens_inputs(
+        self,
+        force_input: torch.Tensor | None,
+        noise_mask: torch.Tensor | None,
+        nf: int,
+        nloc: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Canonicalize optional public `dens` inputs to concrete tensors.
+
+        Parameters
+        ----------
+        force_input
+            Optional atom-wise force input tensor.
+        noise_mask
+            Optional atom-wise corruption mask.
+        nf
+            Number of frames.
+        nloc
+            Number of local atoms per frame.
+        dtype
+            Target floating-point dtype.
+        device
+            Target device.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            Canonicalized force tensor with shape `(nf, nloc, 3)` and mask with
+            shape `(nf, nloc)`.
+
+        Notes
+        -----
+        `force_input` and `noise_mask` remain optional only at the outer model
+        API. Internal `dens` compute functions always receive concrete tensors.
+        """
+        if force_input is None:
+            force_input = torch.zeros((nf, nloc, 3), dtype=dtype, device=device)
+        else:
+            if force_input.ndim == 2:
+                force_input = force_input.view(nf, nloc, 3)
+            elif force_input.ndim != 3:
+                raise ValueError(
+                    "`force_input` must have shape (nf, nloc, 3) or (nf, nloc*3)."
+                )
+            force_input = force_input.to(device=device, dtype=dtype)
+
+        if noise_mask is None:
+            noise_mask = torch.zeros((nf, nloc), dtype=torch.bool, device=device)
+        else:
+            if noise_mask.ndim != 2:
+                raise ValueError("`noise_mask` must have shape (nf, nloc).")
+            noise_mask = noise_mask.to(device=device, dtype=torch.bool)
+
+        return force_input, noise_mask
+
+    def get_active_mode(self) -> str:
+        """Return the current SeZM execution mode."""
+        return self.atomic_model.get_active_mode()
+
+    def set_active_mode(self, mode: str) -> None:
+        """
+        Switch the active SeZM execution mode.
+
+        Parameters
+        ----------
+        mode
+            Target mode. Must be `ener` or `dens`.
+        """
+        self.atomic_model.set_active_mode(mode)
+
+    def set_active_mode_from_loss(self, loss_type: str) -> None:
+        """
+        Select the active SeZM path from `loss.type`.
+
+        Parameters
+        ----------
+        loss_type
+            Loss type name.
+        """
+        normalized = str(loss_type).lower()
+        if normalized in {"ener", "dens"}:
+            self.set_active_mode(normalized)
+
+    def reset_head_for_mode(self, mode: str) -> None:
+        """
+        Reinitialize one SeZM fitting head and reset mode-specific compile state.
+
+        Parameters
+        ----------
+        mode
+            Target mode to reset.
+        """
+        self.atomic_model.reset_head_for_mode(mode)
+        if mode == "dens":
+            self._dens_compiled = False
+            object.__setattr__(self, "compiled_dens_compute", None)
+        else:
+            self._core_compute_compiled_train = None
+            self._core_compute_compiled_atomic_virial = None
+            object.__setattr__(self, "compiled_core_compute", None)
+
     def translated_output_def(self) -> dict[str, Any]:
         """
         Translate model output definition to a dictionary format.
@@ -1189,7 +1554,9 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "atom_energy": out_def_data["energy"],
             "energy": out_def_data["energy_redu"],
         }
-        if self.do_grad_r("energy"):
+        if "dforce" in out_def_data:
+            output_def["force"] = out_def_data["dforce"]
+        elif self.do_grad_r("energy"):
             output_def["force"] = out_def_data["energy_derv_r"].squeeze(-2)
         if self.do_grad_c("energy"):
             output_def["virial"] = out_def_data["energy_derv_c_redu"].squeeze(-2)

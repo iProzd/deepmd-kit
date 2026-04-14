@@ -42,6 +42,8 @@ This document is the **final spec** for the SeZM descriptor (`SeZM`, alias: `se_
   - `EquivariantFFN`
 - `deepmd/pt/model/descriptor/sezm_nn/block.py`
   - `SeZMInteractionBlock`
+- `deepmd/pt/model/descriptor/sezm_nn/dens.py`
+  - `ForceEmbedding`, direct-force / denoising vector heads, parallel `dens` fitting net
 - `deepmd/pt/model/descriptor/sezm_nn/wignerd.py`
   - quaternion edge-frame construction and `WignerDCalculator`
 
@@ -49,10 +51,11 @@ ______________________________________________________________________
 
 ## Goals (Non-Negotiable)
 
-1. **Conservative forces**
+1. **Two explicit force modes**
 
-   - SeZM outputs features meant for an energy model; forces must come from `autograd` of energy w.r.t. coordinates.
-   - Geometry / rotations are fully differentiable; **no `.detach()`** in edge rotations.
+   - `ener` mode keeps the standard conservative path: forces come from `autograd` of energy w.r.t. coordinates.
+   - `dens` mode keeps the same descriptor trunk but swaps to a direct-force / denoising head that predicts forces without coordinate higher-order derivatives.
+   - Geometry / rotations remain fully differentiable in both modes; **no `.detach()`** in edge rotations.
 
 1. **Smooth cutoff**
 
@@ -77,9 +80,57 @@ ______________________________________________________________________
 ## Model Integration (PyTorch)
 
 - Set `model.type = "SeZM"` (aliases: `"se_zm"`, `"sezm"`) to select the SeZM model scaffold. Aliases are resolved during configuration validation.
-- `loss.type` still follows the fitting target (e.g., `"ener"`).
 - `descriptor.type` follows user input (SeZM is recommended), and `fitting_net.type` is ignored; SeZM always uses `sezm_ener`.
+- SeZM uses one public fitting config: `fitting_net`. The `dens` head reuses this same fitting configuration for its scalar energy branch; there is no separate user-facing `dens_fitting_net` setting.
+- The optional `dens` head is materialized lazily: training creates it when `loss.type = "dens"`, and checkpoint loading recreates it automatically when `dens` weights are present.
 - Internally it is built as `make_model(SeZMAtomicModel)`.
+
+### Mode Routing
+
+- Training mode is selected by `loss.type`.
+  - `loss.type = "ener"` activates the conservative energy / autograd-force path.
+  - `loss.type = "dens"` activates the parallel direct-force / denoising path.
+- `forward_lower(...)` / the LAMMPS-style conservative interface only supports `ener`.
+- Checkpoints without `dens` weights stay on the standard `ener` path.
+- Checkpoints with `dens` weights recreate the `dens` head during loading.
+
+### Descriptor Public Contract
+
+- `DescrptSeZM.forward_with_edges(...)` returns:
+  - scalar descriptor `(nf, nloc, channels)`
+  - final equivariant latent `(nf * nloc, D_final, 1, channels)`
+- The ordinary DeePMD descriptor entry `DescrptSeZM.forward(...)` keeps the standard return ABI and discards the latent internally, so existing descriptor call sites remain unchanged.
+
+### `dens` Loss Configuration
+
+- The `dens` loss keeps energy supervision and replaces the force branch with a mixed target:
+  - uncorrupted atoms supervise globally normalized direct force
+  - corrupted atoms supervise the normalized injected Gaussian noise vector `noise / dens_std`
+- Standard `dens` training perturbs coordinates, passes `noise_mask` through the model, and feeds the clean force label back as `force_input`; the model converts it to a masked external equivariant force embedding for corrupted atoms.
+- The initial SeZM defaults follow the EquiformerV3 DeNS recipe:
+  - `dens_prob = 0.5`
+  - `dens_fixed_noise_std = true`
+  - `dens_std = 0.025`
+  - `dens_corrupt_ratio = 0.5`
+  - `dens_denoising_pos_coefficient = 10`
+- The current implementation supports only `dens_fixed_noise_std = true`.
+- Output statistics use one dedicated `dens` normalization path that matches the
+  EquiformerV3 trainer semantics:
+  - the standard `ener` branch still keeps the DeePMD per-type energy bias path
+  - `dens` also fits one global direct-force RMSD scale and stores it as
+    `rmsd_dforce`
+  - the `dens` model outputs stay in normalized space during training:
+    reduced energy reuses the standard DeePMD per-type energy bias and the
+    broadcast global residual `out_std`, clean direct-force uses
+    `rmsd_dforce`, and denoising predictions stay in the normalized
+    `noise / dens_std` space
+  - the public `SeZMModel(...).energy` / `.force` outputs stay in physical
+    units; in `dens` mode the public `force` always denotes the clean direct
+    force branch, while denoising predictions remain internal normalized tensors
+    consumed by the `dens` loss
+  - logging converts normalized predictions back to physical units, and the
+    public `mae_f` / `rmse_f` in `dens` mode report only clean-force errors so
+    they stay directly comparable with the `ener` mode force logs
 
 ### Optional compile path (compact sparse edges)
 
@@ -93,10 +144,12 @@ the standard DeePMD neighbor list behavior:
 - The main SeZM graph takes **local** `(coord, atype)` together with that sparse edge list as input.
   `edge_vec` enters the graph directly, and the force gradient path is reattached cleanly from
   local coordinates before descriptor evaluation.
-- The descriptor accepts the sparse edge list directly and traces a **pure tensor graph**
-  with `make_fx(tracing_mode="symbolic")`, then runs `torch.compile(..., backend="inductor", dynamic=True)`.
-- The compiled graph keeps **dynamic total node / edge counts** while preserving second-order derivatives
-  needed by force training.
+- The descriptor accepts the sparse edge list directly and compiles a **pure tensor graph**.
+  - `ener` uses `make_fx(tracing_mode="symbolic")` before `torch.compile(...)` to stabilize higher-order autograd capture.
+  - `dens` compiles the direct-force compute function directly.
+- The compiled graph keeps **dynamic total node / edge counts**.
+  - `ener` compile keeps the second-order derivatives needed by conservative force training.
+  - `dens` compile uses a dedicated direct-force path that does not require coordinate higher-order derivatives.
 - Training follows `model.use_compile`, but `eval()/inference/full_validation` default to the eager path
   even when `use_compile=true`.
 - Set `DP_COMPILE_INFER=1` before model construction to make `eval()/inference` use the compile path
@@ -108,8 +161,13 @@ the standard DeePMD neighbor list behavior:
   `forward(extended_coord, extended_atype, nlist, mapping, ...)` entry remains available for other
   DeePMD models that want to reuse SeZM without going through `SeZMModel`.
 
-This path is designed for second-order derivatives during training; all geometry (edge vectors,
-Wigner-D, radial basis) remains differentiable, and no global node/edge padding is introduced.
+In both compile modes, all geometry (edge vectors, Wigner-D, radial basis) remains differentiable,
+and no global node/edge padding is introduced.
+
+`dens` compile limitation:
+
+- `dens` mode does not support analytical bridging potentials (`model.bridging_method != "none"`).
+- If short-range ZBL bridging is required, use `ener` mode.
 
 ______________________________________________________________________
 
@@ -277,6 +335,8 @@ Descriptor compatibility path for other models:
 
   Post-process in SeZMModel:
     ├─ fitting + output statistics + atom mask
+    │  ├─ `ener`: add per-type energy bias
+    │  └─ `dens`: keep energy / direct-force / denoising outputs in normalized space, reduce energy with the global `dens` normalizer semantics, then mix clean-force and denoising branches with `noise_mask`
     ├─ optional ZBL energy added on the sparse-edge path
     ├─ hand-written autograd for force / virial on the sparse-edge graph
     └─ local DeePMD-style outputs `(energy, energy_redu, energy_derv_r, energy_derv_c[_redu], mask)`

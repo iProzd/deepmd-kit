@@ -22,6 +22,12 @@ from .attn_res import (
 from .block import (
     SeZMInteractionBlock,
 )
+from .dens import (
+    ForceEmbedding,
+    SeZMDenoisingHead,
+    SeZMDeNSFittingNet,
+    SeZMDirectForceHead,
+)
 from .edge_cache import (
     EdgeFeatureCache,
     build_edge_cache,
@@ -98,6 +104,7 @@ __all__ = [
     "EquivariantFFN",
     "EquivariantRMSNorm",
     "FocusLinear",
+    "ForceEmbedding",
     "GatedActivation",
     "GeometricInitialEmbedding",
     "InnerClamp",
@@ -110,6 +117,9 @@ __all__ = [
     "SO2Linear",
     "SO3Linear",
     "ScalarRMSNorm",
+    "SeZMDeNSFittingNet",
+    "SeZMDenoisingHead",
+    "SeZMDirectForceHead",
     "SeZMInteractionBlock",
     "SeZMTypeEmbedding",
     "SwiGLU",

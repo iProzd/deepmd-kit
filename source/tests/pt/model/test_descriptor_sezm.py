@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import itertools
+import math
 import unittest
 
 # NOTE: avoid torch thread reconfiguration errors during import.
@@ -16,7 +17,9 @@ from deepmd.pt.model.descriptor.sezm import (
     DescrptSeZM,
 )
 from deepmd.pt.model.descriptor.sezm_nn import (
+    ForceEmbedding,
     InnerClamp,
+    SeZMDirectForceHead,
     SO2Linear,
     WignerDCalculator,
     build_edge_quaternion,
@@ -281,6 +284,48 @@ class TestDescrptSeZM(_SeZMTestCase):
             grad_edge.sum(), extended_coord, create_graph=False
         )
         torch.testing.assert_close(grad2_nlist, grad2_edge, atol=1e-6, rtol=1e-6)
+
+    def test_force_embedding_and_vector_head_roundtrip_l1_basis(self) -> None:
+        """Force encoding basis should match the vector-head Cartesian decode."""
+        force_input = torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 2.0, 0.0],
+                [0.0, 0.0, -3.0],
+            ],
+            dtype=torch.float64,
+            device=self.device,
+        )
+        encoder = ForceEmbedding(
+            lmax=1,
+            channels=1,
+            precision="float64",
+            mlp_bias=False,
+            trainable=True,
+            seed=123,
+        ).to(self.device)
+        decoder = SeZMDirectForceHead(
+            lmax=1,
+            channels=1,
+            precision="float64",
+            mlp_bias=False,
+            trainable=True,
+            seed=456,
+        ).to(self.device)
+
+        with torch.no_grad():
+            encoder.proj.weight.zero_()
+            encoder.proj.weight[1, 0, 0] = 1.0
+            if encoder.proj.bias is not None:
+                encoder.proj.bias.zero_()
+            decoder.proj.weight.zero_()
+            decoder.proj.weight[1, 0, 0] = math.sqrt(3.0)
+            if decoder.proj.bias is not None:
+                decoder.proj.bias.zero_()
+
+        latent = encoder(force_input)
+        decoded = decoder(latent)
+        torch.testing.assert_close(decoded, force_input, atol=1e-10, rtol=1e-10)
 
     def test_backward_gradient(self) -> None:
         """Test backward gradient through coordinates."""

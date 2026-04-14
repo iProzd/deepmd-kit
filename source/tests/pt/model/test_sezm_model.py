@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 import os
+import tempfile
 import unittest
 from pathlib import (
     Path,
@@ -8,6 +9,7 @@ from unittest import (
     mock,
 )
 
+import h5py
 import numpy as np
 
 # NOTE: avoid torch thread reconfiguration errors during import.
@@ -20,6 +22,10 @@ if torch_set_num_interop_threads is not None:
 if torch_set_num_threads is not None:
     torch.set_num_threads = lambda *args, **kwargs: None  # type: ignore[assignment]
 
+from deepmd.pt.loss import (
+    DeNSLoss,
+    EnergyStdLoss,
+)
 from deepmd.pt.model.descriptor.sezm_nn import (
     build_edge_cache,
     build_edge_cache_from_edges,
@@ -30,8 +36,14 @@ from deepmd.pt.model.model import (
 from deepmd.pt.model.model.sezm_model import (
     InterPotential,
 )
+from deepmd.pt.train.training import (
+    prepare_model_for_loss,
+)
 from deepmd.pt.utils import (
     env,
+)
+from deepmd.utils.path import (
+    DPPath,
 )
 
 
@@ -640,3 +652,356 @@ class TestSeZMModelBridging(unittest.TestCase):
             0.0,
             "ZBL bridging should add positive (repulsive) energy",
         )
+
+
+class TestSeZMModelModes(unittest.TestCase):
+    """Targeted regression tests for SeZM `ener` / `dens` mode routing."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+        torch.manual_seed(2024)
+
+    def _build_model_params(
+        self,
+        *,
+        use_compile: bool = False,
+        bridging_method: str = "none",
+    ) -> dict:
+        return {
+            "type": "SeZM",
+            "type_map": ["O", "H"],
+            "descriptor": {
+                "type": "SeZM",
+                "sel": [2, 2],
+                "rcut": 3.0,
+                "channels": 4,
+                "n_focus": 1,
+                "focus_compete": False,
+                "n_radial": 3,
+                "radial_mlp": [6],
+                "use_env_seed": False,
+                "l_schedule": [1, 1],
+                "mmax": 1,
+                "so2_norm": False,
+                "so2_layers": 1,
+                "n_atten_head": 0,
+                "sandwich_norm": [True, False, True, False],
+                "ffn_neurons": 8,
+                "ffn_blocks": 1,
+                "mlp_bias": True,
+                "layer_scale": False,
+                "use_amp": False,
+                "activation_function": "silu",
+                "glu_activation": True,
+                "precision": "float32",
+                "seed": 7,
+            },
+            "fitting_net": {
+                "neuron": [8],
+                "activation_function": "silu",
+                "precision": "float32",
+                "seed": 7,
+            },
+            "use_compile": use_compile,
+            "bridging_method": bridging_method,
+        }
+
+    def _tiny_system(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        coord = torch.tensor(
+            [
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.1, 0.2, 0.0],
+                    [0.2, 1.0, 0.3],
+                ]
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        atype = torch.tensor([[0, 1, 0]], device=self.device, dtype=torch.int32)
+        box = torch.tensor(
+            [[6.0, 0.0, 0.0, 0.0, 6.0, 0.0, 0.0, 0.0, 6.0]],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        force = torch.tensor(
+            [
+                [
+                    [0.2, -0.1, 0.0],
+                    [-0.3, 0.4, 0.1],
+                    [0.1, 0.2, -0.2],
+                ]
+            ],
+            device=self.device,
+            dtype=torch.float32,
+        )
+        noise_mask = torch.tensor(
+            [[True, False, True]],
+            device=self.device,
+            dtype=torch.bool,
+        )
+        return coord, atype, box, force, noise_mask
+
+    def _dens_stat_samples(self) -> list[dict[str, torch.Tensor | np.float32]]:
+        """Build a tiny SeZM `dens` statistics set with force labels."""
+        return [
+            {
+                "atype": torch.tensor(
+                    [[0, 1]],
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "natoms": torch.tensor(
+                    [[2, 2, 1, 1]],
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "energy": torch.tensor(
+                    [[10.0]],
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                "force": torch.tensor(
+                    [[[1.0, 2.0, 3.0], [2.0, 4.0, 6.0]]],
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                "find_energy": np.float32(1.0),
+                "find_force": np.float32(1.0),
+            },
+            {
+                "atype": torch.tensor(
+                    [[0, 0]],
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "natoms": torch.tensor(
+                    [[2, 2, 2, 0]],
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "energy": torch.tensor(
+                    [[8.0]],
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                "force": torch.tensor(
+                    [[[5.0, 6.0, 7.0], [5.0, 6.0, 7.0]]],
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                "find_energy": np.float32(1.0),
+                "find_force": np.float32(1.0),
+            },
+            {
+                "atype": torch.tensor(
+                    [[1, 1]],
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "natoms": torch.tensor(
+                    [[2, 2, 0, 2]],
+                    device=self.device,
+                    dtype=torch.int32,
+                ),
+                "energy": torch.tensor(
+                    [[12.0]],
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                "force": torch.tensor(
+                    [[[8.0, 10.0, 12.0], [8.0, 10.0, 12.0]]],
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                "find_energy": np.float32(1.0),
+                "find_force": np.float32(1.0),
+            },
+        ]
+
+    def _expected_dens_force_rmsd(
+        self,
+        sampled: list[dict[str, torch.Tensor | np.float32]],
+    ) -> float:
+        """Compute the expected global direct-force RMSD."""
+        force_square_sum = 0.0
+        force_atom_count = 0
+        for sample in sampled:
+            force = sample["force"].detach().cpu().numpy()
+            force_square_sum += float(np.square(force).sum())
+            force_atom_count += int(force.shape[0] * force.shape[1])
+        return float(np.sqrt(force_square_sum / force_atom_count))
+
+    def test_training_setup_routes_mode_without_rebuilding_energy_head(self) -> None:
+        """Training setup should route SeZM mode without rebuilding the energy head."""
+        model = get_sezm_model(self._build_model_params(use_compile=False))
+        energy_param_before = (
+            next(model.atomic_model.fitting_net.parameters()).detach().clone()
+        )
+        prepare_model_for_loss(model, {"type": "dens"})
+        self.assertEqual(model.get_active_mode(), "dens")
+        self.assertIsNotNone(model.atomic_model.dens_fitting_net)
+        prepare_model_for_loss(model, {"type": "ener"})
+        coord, atype, box, _, _ = self._tiny_system()
+        loss_module = EnergyStdLoss(
+            starter_learning_rate=1.0e-3,
+            start_pref_e=1.0,
+            limit_pref_e=1.0,
+        )
+        _, loss, _ = loss_module(
+            {
+                "coord": coord,
+                "atype": atype,
+                "box": box,
+            },
+            model,
+            {
+                "energy": torch.zeros((1, 1), device=self.device, dtype=torch.float32),
+                "find_energy": 1.0,
+            },
+            natoms=atype.shape[1],
+            learning_rate=1.0e-3,
+        )
+        energy_param_after = next(model.atomic_model.fitting_net.parameters()).detach()
+        torch.testing.assert_close(energy_param_after, energy_param_before)
+        self.assertEqual(model.get_active_mode(), "ener")
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_checkpoint_loading_handles_optional_dens_head(self) -> None:
+        """Checkpoint loading should respect whether `dens` weights exist."""
+        params = self._build_model_params(use_compile=False)
+        model = get_sezm_model(params)
+        state_without_dens = {
+            key: value
+            for key, value in model.state_dict().items()
+            if "dens_fitting_net" not in key
+        }
+        fresh_model = get_sezm_model(params)
+        self.assertIsNone(fresh_model.atomic_model.dens_fitting_net)
+        fresh_model.load_state_dict(state_without_dens, strict=True)
+        self.assertIsNone(fresh_model.atomic_model.dens_fitting_net)
+        self.assertEqual(fresh_model.get_active_mode(), "ener")
+        coord, atype, box, _, _ = self._tiny_system()
+        out = fresh_model(coord, atype, box=box)
+        self.assertIn("energy", out)
+        self.assertIn("force", out)
+        model = get_sezm_model(self._build_model_params(use_compile=False))
+        model.set_active_mode("dens")
+        dens_state = model.state_dict()
+        fresh_model = get_sezm_model(self._build_model_params(use_compile=False))
+        self.assertIsNone(fresh_model.atomic_model.dens_fitting_net)
+        fresh_model.load_state_dict(dens_state, strict=True)
+        self.assertIsNotNone(fresh_model.atomic_model.dens_fitting_net)
+        self.assertEqual(fresh_model.get_active_mode(), "dens")
+
+    def test_dens_forward_returns_direct_force_outputs(self) -> None:
+        """`dens` mode should expose direct-force outputs without virial branches."""
+        model = get_sezm_model(self._build_model_params(use_compile=False))
+        model.set_active_mode("dens")
+        coord, atype, box, force, noise_mask = self._tiny_system()
+        out = model(
+            coord,
+            atype,
+            box=box,
+            force_input=force,
+            noise_mask=noise_mask,
+        )
+        self.assertIn("energy", out)
+        self.assertIn("atom_energy", out)
+        self.assertIn("force", out)
+        self.assertNotIn("virial", out)
+        self.assertEqual(out["force"].shape, force.shape)
+
+    def test_dens_loss_forward_smoke(self) -> None:
+        """`DeNSLoss` should build noisy inputs and return a finite training loss."""
+        model = get_sezm_model(self._build_model_params(use_compile=False))
+        prepare_model_for_loss(model, {"type": "dens"})
+        loss_module = DeNSLoss(
+            starter_learning_rate=1.0e-3,
+            start_pref_e=1.0,
+            limit_pref_e=1.0,
+            start_pref_f=1.0,
+            limit_pref_f=1.0,
+            dens_prob=1.0,
+            dens_std=0.025,
+            dens_corrupt_ratio=0.5,
+            dens_denoising_pos_coefficient=10.0,
+            loss_func="mae",
+        )
+        coord, atype, box, force, _ = self._tiny_system()
+        label = {
+            "energy": torch.zeros((1, 1), device=self.device, dtype=torch.float32),
+            "force": force,
+            "find_energy": 1.0,
+            "find_force": 1.0,
+        }
+        model_pred, loss, more_loss = loss_module(
+            {
+                "coord": coord,
+                "atype": atype,
+                "box": box,
+            },
+            model,
+            label,
+            natoms=atype.shape[1],
+            learning_rate=1.0e-3,
+        )
+        self.assertEqual(model.get_active_mode(), "dens")
+        self.assertIn("force", model_pred)
+        self.assertTrue(torch.isfinite(loss))
+
+    def test_dens_stat_roundtrip(self) -> None:
+        """`dens` statistics should roundtrip the global direct-force RMSD."""
+        sampled = self._dens_stat_samples()
+        expected_force_rmsd = self._expected_dens_force_rmsd(sampled)
+
+        model = get_sezm_model(self._build_model_params(use_compile=False))
+        prepare_model_for_loss(model, {"type": "dens"})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            h5file = Path(tmpdir) / "sezm_stat.hdf5"
+            with h5py.File(h5file, "w"):
+                pass
+
+            stat_path = DPPath(str(h5file), "a")
+            try:
+                model.atomic_model.compute_or_load_stat(
+                    lambda: sampled,
+                    stat_file_path=stat_path,
+                )
+                self.assertAlmostEqual(
+                    model.atomic_model.dens_force_rmsd.item(),
+                    expected_force_rmsd,
+                    places=7,
+                )
+                self.assertEqual(model.get_active_mode(), "dens")
+
+                stored_force_rmsd = (stat_path / "O H" / "rmsd_dforce").load_numpy()
+                self.assertAlmostEqual(
+                    float(np.asarray(stored_force_rmsd).reshape(-1)[0]),
+                    expected_force_rmsd,
+                    places=7,
+                )
+
+                fresh_model = get_sezm_model(
+                    self._build_model_params(use_compile=False)
+                )
+                prepare_model_for_loss(fresh_model, {"type": "dens"})
+
+                def raise_error() -> None:
+                    raise RuntimeError("statistics should be restored from file")
+
+                fresh_model.atomic_model.compute_or_load_stat(
+                    raise_error,
+                    stat_file_path=stat_path,
+                )
+                self.assertAlmostEqual(
+                    fresh_model.atomic_model.dens_force_rmsd.item(),
+                    expected_force_rmsd,
+                    places=7,
+                )
+                self.assertEqual(fresh_model.get_active_mode(), "dens")
+            finally:
+                stat_path.root.close()

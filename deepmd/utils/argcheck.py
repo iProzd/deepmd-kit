@@ -2781,7 +2781,10 @@ def sezm_model_args() -> Argument:
         "torch.compile in the SeZM model. "
         "Only supported in the PyTorch backend."
     )
-    doc_enable_tf32 = "If True, enable TF32 matmul precision when use_compile=True. Only supported in the PyTorch backend."
+    doc_enable_tf32 = (
+        "If True, enable TF32 matmul precision when use_compile=True. "
+        "Only supported in the PyTorch backend."
+    )
 
     ca = Argument(
         "SeZM",
@@ -3831,6 +3834,107 @@ def loss_ener() -> list[Argument]:
     ]
 
 
+@loss_args_plugin.register("dens")
+def loss_dens() -> list[Argument]:
+    doc_start_pref_e = start_pref("energy", abbr="e")
+    doc_limit_pref_e = limit_pref("energy")
+    doc_start_pref_f = start_pref("force", abbr="f")
+    doc_limit_pref_f = limit_pref("force")
+    doc_loss_func = (
+        "Loss function type for energy and mixed direct-force / denoising supervision. "
+        "Options: 'mse' (Mean Squared Error, component-wise force loss) or "
+        "'mae' (Mean Absolute Error, default). In `dens` mode, `f_use_norm` is "
+        "not exposed: `mae` always uses per-atom force-vector L2 norms, while "
+        "`mse` always uses component-wise squared errors."
+    )
+    doc_dens_prob = (
+        "Probability of switching one batch to the denoising-enhanced training path. "
+        "When not selected, the `dens` head is still trained on clean direct forces."
+    )
+    doc_dens_fixed_noise_std = (
+        "Whether to use a fixed Gaussian noise standard deviation. "
+        "Only the fixed-noise path is supported in the initial SeZM `dens` integration."
+    )
+    doc_dens_std = "Standard deviation of the Gaussian coordinate corruption used in the denoising path."
+    doc_dens_corrupt_ratio = (
+        "Fraction of atoms corrupted within a denoising batch. "
+        "If omitted, all atoms in the batch are corrupted."
+    )
+    doc_dens_denoising_pos_coefficient = "Loss multiplier applied to corrupted atoms whose target is the injected noise vector."
+    return [
+        Argument(
+            "start_pref_e",
+            [float, int],
+            optional=True,
+            default=0.02,
+            doc=doc_start_pref_e,
+        ),
+        Argument(
+            "limit_pref_e",
+            [float, int],
+            optional=True,
+            default=1.00,
+            doc=doc_limit_pref_e,
+        ),
+        Argument(
+            "start_pref_f",
+            [float, int],
+            optional=True,
+            default=1000,
+            doc=doc_start_pref_f,
+        ),
+        Argument(
+            "limit_pref_f",
+            [float, int],
+            optional=True,
+            default=1.00,
+            doc=doc_limit_pref_f,
+        ),
+        Argument(
+            "loss_func",
+            str,
+            optional=True,
+            default="mae",
+            doc=doc_loss_func,
+        ),
+        Argument(
+            "dens_prob",
+            [float, int],
+            optional=True,
+            default=0.5,
+            doc=doc_dens_prob,
+        ),
+        Argument(
+            "dens_fixed_noise_std",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_dens_fixed_noise_std,
+        ),
+        Argument(
+            "dens_std",
+            [float, int],
+            optional=True,
+            default=0.025,
+            doc=doc_dens_std,
+        ),
+        Argument(
+            "dens_corrupt_ratio",
+            [float, int, None],
+            optional=True,
+            default=0.5,
+            doc=doc_dens_corrupt_ratio,
+        ),
+        Argument(
+            "dens_denoising_pos_coefficient",
+            [float, int],
+            optional=True,
+            default=10.0,
+            doc=doc_dens_denoising_pos_coefficient,
+        ),
+    ]
+
+
 @loss_args_plugin.register("ener_spin")
 def loss_ener_spin() -> list[Argument]:
     doc_start_pref_e = start_pref("energy")
@@ -4105,7 +4209,7 @@ def loss_tensor() -> list[Argument]:
 
 
 def loss_variant_type_args() -> Variant:
-    doc_loss = "The type of the loss. When the fitting type is `ener`, the loss type should be set to `ener` or left unset. When the fitting type is `dipole` or `polar`, the loss type should be set to `tensor`."
+    doc_loss = "The type of the loss. When the fitting type is `ener`, the loss type should be set to `ener`, `dens` (Only SeZM supported), or left unset. When the fitting type is `dipole` or `polar`, the loss type should be set to `tensor`."
 
     return Variant(
         "type",
@@ -4117,7 +4221,7 @@ def loss_variant_type_args() -> Variant:
 
 
 def loss_args() -> list[Argument]:
-    doc_loss = "The definition of loss function. The loss type should be set to `tensor`, `ener` or left unset."
+    doc_loss = "The definition of loss function. The loss type should be set to `tensor`, `ener`, `dens` or left unset."
     ca = Argument(
         "loss", dict, [], [loss_variant_type_args()], optional=True, doc=doc_loss
     )
