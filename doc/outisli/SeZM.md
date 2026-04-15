@@ -1115,6 +1115,7 @@ and the edge-aligned local frame. The block-diagonal matrices are computed by
 - All submodules use `dtype: torch.dtype` (not `precision: str`) for constructor parameter.
 - Device is obtained from global `env.DEVICE` at runtime; submodules store `self.device = env.DEVICE` only as a convenience reference, not for serialization.
 - Each submodule stores `self.precision = RESERVED_PRECISION_DICT[dtype]` for serialization compatibility.
+- `GatedActivation` and `SwiGLUS2Activation` are instantiated with the promoted `compute_dtype`. `GatedActivation` casts the scalar gate input to that compute dtype before `sigmoid` and casts the sigmoid result back to the incoming activation dtype before applying the multiplicative gate, while `SwiGLUS2Activation` keeps its original forward path and therefore uses that promoted dtype directly inside the scalar gate and S2-grid activation flow.
 - The `env_protection` parameter (stored as `self.eps`) is used for numerical stability in division and normalization. If 0.0 is passed, it defaults to `1e-7`.
 
 ______________________________________________________________________

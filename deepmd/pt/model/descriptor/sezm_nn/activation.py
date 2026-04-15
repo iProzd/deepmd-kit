@@ -85,7 +85,7 @@ class GatedActivation(nn.Module):
     n_focus
         Number of focus streams.
     dtype
-        Parameter dtype.
+        Internal compute dtype used by the gate projection and sigmoid path.
     activation_function
         Activation function for l=0 components (e.g., "silu", "tanh", "gelu").
     mlp_bias
@@ -204,7 +204,10 @@ class GatedActivation(nn.Module):
         if self.lmax == 0:
             return x0
 
-        gating_scalars = torch.sigmoid(self.gate_linear(gate_scalar_source))
+        input_dtype = gate_scalar_source.dtype
+        gating_scalars = torch.sigmoid(
+            self.gate_linear(gate_scalar_source.to(dtype=self.dtype))
+        ).to(dtype=input_dtype)
         gating_scalars = gating_scalars.reshape(
             x.shape[0], gate_scalar_source.shape[1], self.lmax, self.channels
         )
@@ -528,7 +531,9 @@ class SwiGLUS2Activation(nn.Module):
             the last axis.
         """
         input_dtype = x.dtype
-        scalar_inputs = self._extract_scalar_inputs(x).to(dtype=self.dtype)
+        # Promote before slicing to avoid the TorchInductor AMP compile bug on
+        # the scalar SwiGLU branch in PyTorch 2.11.
+        scalar_inputs = self._extract_scalar_inputs(x.to(dtype=self.dtype))
         scalar_outputs = self.scalar_act(scalar_inputs)
 
         if self.projector is None:

@@ -40,6 +40,7 @@ from .so3 import (
     SO3Linear,
 )
 from .utils import (
+    get_promoted_dtype,
     np_safe,
     safe_numpy_to_tensor,
 )
@@ -134,6 +135,7 @@ class EquivariantFFN(nn.Module):
         self.glu_activation = bool(glu_activation)
         self.mlp_bias = bool(mlp_bias)
         self.dtype = dtype
+        self.compute_dtype = get_promoted_dtype(self.dtype)
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[dtype]
 
@@ -197,7 +199,7 @@ class EquivariantFFN(nn.Module):
             self.act = SwiGLUS2Activation(
                 lmax=self.lmax,
                 channels=self.hidden_channels,
-                dtype=dtype,
+                dtype=self.compute_dtype,
                 n_focus=1,
                 layout="ndfc",
                 grid_resolution_list=self.s2_grid_resolution,
@@ -210,7 +212,7 @@ class EquivariantFFN(nn.Module):
             self.act = GatedActivation(
                 lmax=self.lmax,
                 channels=self.hidden_channels,
-                dtype=dtype,
+                dtype=self.compute_dtype,
                 activation_function=activation_function,
                 mlp_bias=self.mlp_bias,
                 layout="ndfc",
