@@ -151,7 +151,10 @@ def _post_process_stat(
         if vv.shape == out_std[kk].shape:
             new_std[kk] = out_std[kk]
         else:
-            new_std[kk] = np.ones_like(vv)
+            # Broadcast out_std to match out_bias shape (ntypes, ...)
+            ntypes = vv.shape[0]
+            reps = [ntypes] + [1] * (vv.ndim - 1)
+            new_std[kk] = np.tile(out_std[kk], reps)
     return out_bias, new_std
 
 
@@ -517,30 +520,32 @@ def compute_output_stats_global(
 
     # unbias_e is only used for print rmse
 
-    if model_pred is None:
-        unbias_e = {
-            kk: merged_natoms[kk] @ bias_atom_e[kk].reshape(ntypes, -1)
-            for kk in bias_atom_e.keys()
-        }
-    else:
-        unbias_e = {
-            kk: model_pred[kk].reshape(nf[kk], -1)
-            + merged_natoms[kk] @ bias_atom_e[kk].reshape(ntypes, -1)
-            for kk in bias_atom_e.keys()
-        }
-    atom_numbs = {kk: merged_natoms[kk].sum(-1) for kk in bias_atom_e.keys()}
+    unbias_e = {}
+    for kk in bias_atom_e.keys():
+        coeffs = merged_natoms[kk]
+        if intensive:
+            total_atoms = coeffs.sum(axis=1, keepdims=True)
+            coeffs = coeffs / total_atoms
+        recon = coeffs @ bias_atom_e[kk].reshape(ntypes, -1)
+        if model_pred is not None:
+            recon += model_pred[kk].reshape(nf[kk], -1)
+        unbias_e[kk] = recon
 
     def rmse(x):
         return np.sqrt(np.mean(np.square(x)))
 
     for kk in bias_atom_e.keys():
-        rmse_ae = rmse(
-            (unbias_e[kk].reshape(nf[kk], -1) - merged_output[kk].reshape(nf[kk], -1))
-            / atom_numbs[kk][:, None]
-        )
+        diff = unbias_e[kk].reshape(nf[kk], -1) - merged_output[kk].reshape(nf[kk], -1)
+        if not intensive:
+            diff /= merged_natoms[kk].sum(axis=-1, keepdims=True)
+        rmse_ae = rmse(diff)
+        stat_type = "per atom " if not intensive else ""
         log.info(
-            f"RMSE of {kk} per atom after linear regression is: {rmse_ae} in the unit of {kk}."
+            f"RMSE of {kk} {stat_type}after linear regression is: {rmse_ae} in the unit of {kk}."
         )
+        # use rmse per atom as the std for label scaling
+        std_atom_e[kk] = np.zeros_like(bias_atom_e[kk])
+        std_atom_e[kk][:] = rmse_ae
     return bias_atom_e, std_atom_e
 
 
