@@ -95,7 +95,7 @@ class TestMoERouter:
         router = self._make_router(input_dim, n_routing_experts=6, topk=2)
         type_emb = torch.randn(nb, nloc, input_dim, dtype=torch.float64, device=DEVICE)
         weights, _ = router(type_emb)
-        loss = weights.sum()
+        loss = (weights ** 2).sum()
         loss.backward()
         gate_param = router.gate.matrix
         assert gate_param.grad is not None, "gate.matrix has no grad"
