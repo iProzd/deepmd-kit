@@ -1,5 +1,324 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""SeZM: Smooth equivariant Zone-bridging Model."""
+"""SeZM: Smooth equivariant Zone-bridging Model.
+
+This module hosts the full ``torch.compile`` + ``make_fx`` pipeline that
+runs the SeZM energy (``ener``) path on the GPU.  To the authors'
+knowledge this is the first public implementation of a compiled,
+dynamically shaped machine-learning potential whose *second-order*
+derivatives -- required by force-loss training -- travel end-to-end
+through Inductor without any eager fallback.  The ``dens`` path below
+uses a plain ``torch.compile`` wrapper and is not covered by the rest of
+this docstring.
+
+Why force-loss training is hard to compile
+==========================================
+
+An ML potential models atomic energy ``E(x, theta)`` from coordinates
+``x`` and parameters ``theta``.  Force-loss training minimizes
+
+::
+
+    L = alpha * ||E_pred - E_label||^2 + beta * ||f_pred - f_label||^2
+
+with ``f_pred = -dE/dx``.  The parameter update needs ``dL/dtheta``,
+which contains ``d(f_pred)/dtheta = -d^2 E / (dx dtheta)`` -- a full
+second-order derivative of the network with respect to one input and
+one parameter axis.
+
+The standard ``torch.compile`` stack (AOT Autograd) captures forward and
+first backward; it does *not* natively handle an
+``autograd.grad(..., create_graph=True)`` call nested *inside* the
+compiled region.  So we compose two lower-level tools:
+
+1. ``make_fx`` traces the compute function *after* the inner
+   ``autograd.grad`` has been materialised, producing an FX graph whose
+   forward already contains the first-derivative graph as ordinary ops.
+2. ``torch.compile(..., dynamic=True)`` lowers that traced FX graph to
+   Inductor.  Because the graph no longer hides an autograd call,
+   Inductor's normal backward pipeline can differentiate the whole
+   thing a second time for the optimizer step.
+
+Everything else in this file exists to make that composition correct
+under dynamic shapes, FSDP/DDP, and the list of PyTorch bugs that
+surface along the way.  Every non-obvious choice is pinned to a source
+comment tagged ``NOTE:``; the numbered catalogue at the bottom of this
+docstring explains each tag in depth.
+
+Pipeline for one training batch
+===============================
+
+::
+
+    forward(coord, atype, ...)
+        |-- input dtype cast
+        |-- neighbor list built in the extended region
+        '-- forward_common -- ener branch
+              |-- extended_coord.detach().requires_grad_(True)       (NOTE 9)
+              |-- should_use_compile()?  yes ->
+              |     |-- trace_and_compile() on cache miss
+              |     |     |-- make_fx(compute_fn,
+              |     |     |           tracing_mode="symbolic",
+              |     |     |           _allow_non_fake_inputs=True,
+              |     |     |           decomposition_table=<silu>)    (NOTE 0)
+              |     |     |      * trace inputs are nf=2 copies       (NOTE 1)
+              |     |     |      * silu_backward is decomposed        (NOTE 2)
+              |     |     |      * traced graph already contains the
+              |     |     |        first autograd.grad over coords
+              |     |     |-- _strip_saved_tensor_detach (train only) (NOTE 3)
+              |     |     |-- _rebuild_graph_module                   (NOTE 4)
+              |     |     '-- torch.compile(backend="inductor",
+              |     |                        dynamic=True,
+              |     |                        options=<locked down>)   (NOTE 6)
+              |     |           stored via object.__setattr__         (NOTE 8)
+              |     '-- compiled_core_compute(...)
+              '-- communicate_extended_output
+
+Subsequent batches reuse the cached ``compiled_core_compute`` until the
+cache key ``(training, do_atomic_virial)`` changes (NOTE 7).
+
+Body of the traced compute
+==========================
+
+``compute_fn`` (defined inside ``trace_and_compile``) wraps
+``core_compute`` so that make_fx sees a pure tensor-in / tensor-out
+function:
+
+* ``core_compute`` rebuilds a compact, GPU-friendly edge list from the
+  padded DeePMD neighbor list (``build_edge_list_from_nlist``), with a
+  single masked dummy edge appended so the edge tensor is never empty
+  (NOTE 10).  Edge vectors come from ``index_select`` on the extended
+  coordinate tensor, which keeps the gradient path back to coordinates
+  explicit and safe under symbolic shapes (NOTE 11).
+* The SeZM descriptor consumes the edge list and produces per-atom
+  features.
+* The fitting network predicts per-atom energy; ``apply_out_stat`` adds
+  the per-type statistics and the atom mask zeroes out padding atoms.
+* ``fit_output_to_model_output(..., create_graph=self.training)`` calls
+  ``autograd.grad`` internally to compute ``force = -dE/dx``.
+  ``create_graph`` is the single toggle that activates the
+  second-derivative branch for training and omits it at inference
+  (NOTE 12).
+
+Because ``make_fx`` traces *after* that inner ``autograd.grad`` has
+executed, the resulting FX graph encodes both the forward and the first
+derivative as ordinary ops.  Any further ``.backward()`` on the compiled
+output therefore just walks an FX-level backward that Inductor is
+perfectly capable of lowering.
+
+The ``NOTE:`` catalogue
+=======================
+
+NOTE 0 -- ``make_fx(tracing_mode="symbolic", _allow_non_fake_inputs=True)``
+--------------------------------------------------------------------------
+
+``tracing_mode="symbolic"`` tells the proxy tensor that shapes are
+sympy-backed symbols; it is what makes ``dynamic=True`` compile work
+later.  ``_allow_non_fake_inputs=True`` lets us feed *real* tensors
+(not FakeTensors) to the trace.  We need real data because the edge
+compactor contains data-dependent operations (``torch.nonzero``,
+``index_select``) that cannot be executed on FakeTensors; the shapes
+become symbolic immediately after the first op, so only the control
+flow is decided by concrete values.
+
+NOTE 1 -- Tracing with ``nf=2``
+-------------------------------
+
+``make_fx(tracing_mode="symbolic")`` replaces tensor shapes with sympy
+symbols at trace time, but the moment a symbolic dim ends up equal to a
+concrete dim elsewhere in the same tensor it collapses into a constant.
+Concretely:
+
+* ``nf=1`` triggers PyTorch's 0/1 specialization and bakes ``nf`` into
+  the graph.
+* ``nf=3`` collides with the spatial ``3`` in ``extended_coord`` whose
+  shape is ``(nf, nall, 3)``.
+* ``nf=9`` would collide with the virial dim.
+
+Any of those collisions forces ``torch.compile(dynamic=True)`` to reject
+later batches whose ``nf`` differs from the traced constant.  ``nf=2``
+is the smallest batch size free of every known collision; we always
+repeat the first frame twice to satisfy this invariant during tracing.
+
+NOTE 2 -- Decomposing ``silu_backward``
+---------------------------------------
+
+PyTorch ships forward and first-order backward for SiLU but *no*
+symbolic higher-order derivative.  make_fx therefore emits
+``aten.silu_backward.default`` opaquely inside the first-derivative
+graph.  When Inductor later has to differentiate that op again for the
+optimizer step, it refuses because silu_backward is not differentiable
+in its registered form.  We pass an explicit decomposition
+``silu_backward -> sigmoid + pointwise mul`` to ``make_fx``; every
+pointwise piece then has a well-defined higher derivative of its own.
+
+NOTE 3 -- Stripping autograd-inserted detach chains
+---------------------------------------------------
+
+When ``autograd.grad(create_graph=True)`` runs under make_fx, the
+autograd engine wraps every saved forward activation in a double-detach
+chain, e.g.::
+
+    tanh  ->  detach_A  ->  detach_B  ->  tanh_backward
+
+In eager autograd those detaches are informational -- they mark saved
+tensors as belonging to a different graph.  After tracing, however,
+they become ordinary ops inside the FX graph and sever the gradient
+path from the force loss back to ``theta``; training then silently
+produces zero parameter updates for the second-derivative term.
+
+``_strip_saved_tensor_detach`` removes them by pure graph topology --
+no op-name matching -- so that user-explicit ``.detach()`` calls
+(e.g. cached SO2 weights, activation lookup matrices) survive:
+
+* *Chain inner*: input is another detach.
+* *Dead node*:   no downstream users.
+* *Chain head*:  every user is a detach.
+
+Any detach that matches none of the three is treated as user intent and
+is kept verbatim.  Stripping is guarded by ``self.training`` because
+eval mode does not set ``create_graph=True``; the chain is never
+inserted and removing it would be incorrect.
+
+NOTE 4 -- Rebuilding the FX graph from scratch
+----------------------------------------------
+
+``Graph.erase_node`` inside ``_strip_saved_tensor_detach`` unlinks nodes
+from the doubly linked list that represents the graph.  On several
+PyTorch builds (observed on 2.11+cu130) it leaves the C-level
+``prev/next`` pointers of *neighbouring* Node objects stale.  Dynamo,
+when it later re-traces the ``GraphModule`` and walks ``graph.nodes``
+inside ``output_graph.py:_create_proxy`` to read ``nd.meta``,
+dereferences one of those stale pointers and segfaults.
+
+``_rebuild_graph_module`` does a single ``node_copy`` pass into a
+freshly allocated ``torch.fx.Graph``.  The result is an equivalent graph
+whose linked list contains no erased entries, so dynamo can iterate it
+safely.  We always rebuild -- including in eval -- because a fresh
+graph is cheap while a segfault is fatal.
+
+NOTE 5 -- Disabling ``DDPOptimizer``
+------------------------------------
+
+``torch._dynamo.config.optimize_ddp = False`` is set unconditionally at
+import time.  DDPOptimizer is designed to split a DDP-wrapped model's
+graph at bucket boundaries so that gradients can overlap with
+all-reduce.  But here the compile region is *inside* the DDP-wrapped
+model -- it wraps only ``core_compute``.  DDPOptimizer assumes it owns
+the whole model, splits our inner graph at its internal bucket
+heuristic, and the split produces subgraphs whose outputs include
+symbolic integers.  AOT Autograd then crashes with
+``'int' object has no attribute 'meta'`` (pytorch/pytorch#134182).
+Disabling the optimizer globally is safe because SeZM always owns its
+own compile boundary and the surrounding DDP wrapper operates on the
+full model call.
+
+NOTE 6 -- Inductor / Triton option lockdown
+-------------------------------------------
+
+``torch.compile(backend="inductor", dynamic=True, options=...)`` is
+configured with:
+
+* ``max_autotune=False``
+      Autotune regresses on dynamic shapes because each recompile rolls
+      the search; deterministic kernels compiled once are consistently
+      faster on our edge-level reductions.
+* ``shape_padding=True``
+      Pads tensors to SIMD-friendly sizes when symbolic shapes
+      fluctuate batch-to-batch, eliminating tail-kernel generation cost.
+* ``epilogue_fusion=False``
+      Two independent reasons to keep it off.  (a) Inductor only
+      enables epilogue fusion when ``max_autotune`` is on, and we
+      deliberately disable autotune above; leaving the flag on would
+      pay the scheduling cost without ever activating the fusion.
+      (b) Fused epilogues occasionally reorder saved tensors in ways
+      the second backward cannot recover; disabling the fusion keeps
+      the backward graph shape-stable under make_fx.
+* ``triton.cudagraphs=False``
+      cudagraphs capture autograd metadata only once.  Higher-order
+      gradients need fresh metadata per call, so cudagraphs would feed
+      stale autograd state into the second backward.
+* ``max_fusion_size=64``
+      Caps kernel fusion complexity.  Without the cap Inductor's
+      scheduler occasionally times out on the large edge-level
+      reductions inside the descriptor when nsel is big.
+* ``triton.mix_order_reduction=False``
+      Workaround for PyTorch <=2.11 bugs pytorch/pytorch#174379,
+      #178080, #179494.  All three manifest only under data-dependent
+      symbolic shapes -- exactly our edge count.
+
+NOTE 7 -- Compile cache keyed on ``(training, do_atomic_virial)``
+-----------------------------------------------------------------
+
+Both flags alter the traced graph topology:
+
+* ``self.training`` switches ``create_graph`` in
+  ``fit_output_to_model_output`` -- it toggles the entire
+  second-derivative branch on or off.
+* ``do_atomic_virial`` adds or removes an extra per-atom virial tensor
+  in the compute output.
+
+No single compiled graph can serve both variants, so the cache keeps
+the last ``(training, do_atomic_virial)`` pair and retraces +
+recompiles whenever either flag flips.
+
+NOTE 8 -- Storing the compiled callable outside the ``nn.Module`` tree
+----------------------------------------------------------------------
+
+The assignment goes through ``object.__setattr__(self, ...)`` rather
+than plain ``self.compiled_core_compute = ...``.
+``nn.Module.__setattr__`` would register any module-looking value as a
+submodule; the compiled wrapper holds duplicated flat views of the
+trainable parameters, and FSDP2 / DDP would then shard or synchronise
+those duplicates and silently corrupt training.  Escaping the
+``nn.Module`` machinery keeps the wrapper a plain Python attribute
+invisible to parameter discovery.
+
+NOTE 9 -- Graph restart via ``detach().requires_grad_(True)``
+-------------------------------------------------------------
+
+Before calling into the traced graph we rebind the extended coordinates
+to a fresh leaf tensor: ``detach()`` breaks any upstream autograd graph
+carried over from the data pipeline, and ``requires_grad_(True)``
+reinstates a grad-endpoint owned by this forward.  The subsequent
+``autograd.grad`` in ``fit_output_to_model_output`` therefore computes
+``dE/dx`` against a graph of known shape and ownership -- the essential
+precondition for make_fx symbolic tracing.
+
+In eval mode we merely detach; no ``create_graph`` is requested, so the
+compiled kernel never has to build a backward graph.
+
+NOTE 10 -- Tail dummy edge
+--------------------------
+
+``build_edge_list_from_nlist`` appends exactly one masked edge at the
+end of every batch.  Real edge compaction happens via
+``torch.nonzero(valid_mask)``, whose output length is data-dependent
+and can be zero in sparse or single-type systems.  make_fx cannot trace
+an "if n_edges == 0: skip" branch symbolically; without the dummy it
+would fall back to concrete shape specialization and break
+``dynamic=True``.  The dummy's ``edge_mask`` is ``False`` so it
+contributes exactly zero to every downstream sum or gather.
+
+NOTE 11 -- ``index_select`` for coordinate gradients
+----------------------------------------------------
+
+Edge geometry is built with ``coord_flat.index_select(0, src)`` instead
+of advanced indexing ``coord_flat[src]``.  ``index_select`` registers
+an explicit backward that routes gradient cleanly back to the original
+extended coordinate tensor.  Advanced indexing combined with make_fx
+symbolic shapes has previously produced silent gradient truncation in
+this project -- the second-derivative gradient over coordinates was
+effectively zero, with no error raised.
+
+NOTE 12 -- ``create_graph=self.training``
+-----------------------------------------
+
+The single toggle that turns force-loss training on.  When ``True``,
+``autograd.grad`` keeps the graph over the first derivative alive so
+the outer optimizer's ``.backward()`` can continue walking it into the
+parameters.  When ``False`` the double-backward graph is never built,
+saving memory during inference.
+"""
 
 from __future__ import (
     annotations,
@@ -56,9 +375,28 @@ from deepmd.pt.utils.nlist import (
 
 SeZMModel_ = make_model(SeZMAtomicModel)
 
-# Keep compile-time autotune candidate dumps out of logs by default.
+# NOTE: Silence Inductor / Triton autotune dumps before any submodule is
+# imported.  ``torch.compile`` reads these environment variables exactly
+# once at backend initialisation; setting them after the first compile
+# would have no effect in the current run.  ``setdefault`` preserves any
+# explicit user-level override.
 os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_REPORT_CHOICES_STATS", "0")
 os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "0")
+
+# NOTE: Disable DDPOptimizer graph splitting globally.
+# ``compiled_core_compute`` / ``compiled_dens_compute`` are inner
+# ``torch.compile`` calls sitting *inside* a DDP-wrapped model;
+# DDPOptimizer assumes it sees the *whole* model and splits the FX graph
+# at DDP bucket boundaries.  For an inner submodule that heuristic
+# produces subgraphs whose outputs include symbolic integers, which then
+# crash aot_autograd with ``'int' object has no attribute 'meta'``.
+# See https://github.com/pytorch/pytorch/issues/134182.  Turning the
+# optimizer off globally is safe because SeZM always owns its own compile
+# boundary and the surrounding DDP wrapper operates on the full model
+# call.
+import torch._dynamo.config as _dynamo_cfg
+
+_dynamo_cfg.optimize_ddp = False
 
 
 def _parse_optional_env_bool(var_name: str) -> bool | None:
@@ -119,7 +457,12 @@ def _strip_saved_tensor_detach(gm: torch.fx.GraphModule) -> None:
     def _is_detach(n: torch.fx.Node) -> bool:
         return n.op == "call_function" and n.target == _DETACH
 
-    # Pass 1 — classify on the original, unmodified graph.
+    # NOTE: Pass 1 -- classify every detach against the *original* graph.
+    # If we erased nodes eagerly, later classifications would walk a
+    # mutated neighbourhood and misjudge the chain-inner / chain-head /
+    # dead boundaries; the double-detach pattern in particular flips
+    # class within a single erase.  Collecting first, mutating second
+    # keeps the topology rules well-defined.
     to_remove: list[torch.fx.Node] = []
     for node in gm.graph.nodes:
         if not _is_detach(node):
@@ -132,7 +475,12 @@ def _strip_saved_tensor_detach(gm: torch.fx.GraphModule) -> None:
         if is_chain_inner or is_dead or is_chain_head:
             to_remove.append(node)
 
-    # Pass 2 — remove in one shot so classification stays consistent.
+    # NOTE: Pass 2 -- rewire + erase atomically after the full
+    # classification.  ``replace_all_uses_with`` forwards every consumer
+    # to the detach's input; ``erase_node`` then removes the now-dead
+    # detach.  Doing both back-to-back means the graph never sits in a
+    # half-consistent state where one user sees the old detach and
+    # another the rewired source.
     for node in to_remove:
         node.replace_all_uses_with(node.args[0])
         gm.graph.erase_node(node)
@@ -451,6 +799,18 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                     )
             else:
                 # === Step 3. `ener` path (edges built inside core_compute) ===
+                # NOTE: Rebind the extended coordinates to a fresh leaf
+                # tensor before entering either ``core_compute`` or the
+                # compiled callable.  ``detach()`` breaks any upstream
+                # autograd graph carried by the batch (data pipeline
+                # artefacts, neighbor-list ops) and
+                # ``requires_grad_(True)`` reinstates a grad-endpoint
+                # owned exclusively by this forward.  The inner
+                # ``autograd.grad`` inside ``fit_output_to_model_output``
+                # will then compute ``dE/dx`` against a graph of known
+                # shape and ownership -- the essential precondition for
+                # symbolic make_fx tracing.  In eval without coordinate
+                # gradients a bare detach is enough.
                 if self.do_grad_r() or self.do_grad_c():
                     extended_coord = extended_coord.detach().requires_grad_(True)
                 else:
@@ -466,6 +826,17 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         device=cc.device,
                     )
                     with self.tf32_precision_ctx():
+                        # NOTE: Compile cache is keyed on
+                        # ``(training, do_atomic_virial)``.  Both flags
+                        # change the traced graph topology:
+                        # ``training`` toggles ``create_graph`` in
+                        # ``fit_output_to_model_output`` and therefore
+                        # the entire second-derivative branch;
+                        # ``do_atomic_virial`` pulls an extra per-atom
+                        # virial tensor into the outputs.  A single
+                        # compiled graph cannot serve both shapes, so we
+                        # retrace + recompile whenever either flag
+                        # flips.
                         if (
                             self.compiled_core_compute is None
                             or self._core_compute_compiled_train != self.training
@@ -635,6 +1006,19 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             )
 
         # === Step 6. Force / virial via fit_output_to_model_output ===
+        # NOTE: ``create_graph=self.training`` is the single toggle that
+        # activates force-loss training.  Internally this calls
+        # ``torch.autograd.grad(energy, extended_coord, create_graph=...)``
+        # to produce ``force = -dE/dx``.  When ``True`` the autograd graph
+        # over the first derivative is kept alive, so the outer
+        # optimiser's ``.backward()`` can continue differentiating into
+        # parameters -- that chain is the full
+        # ``d^2 E / (dx dtheta)`` second derivative.  When ``False`` the
+        # double-backward graph is never built, saving memory during
+        # inference.  The entire reason this file exists -- make_fx,
+        # detach stripping, graph rebuild -- is to keep that
+        # second-derivative chain intact after ``torch.compile`` has
+        # captured the whole thing.
         return fit_output_to_model_output(
             fit_ret,
             self.atomic_output_def(),
@@ -903,19 +1287,27 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         extended_coord: torch.Tensor,
         extended_atype: torch.Tensor,
         nlist: torch.Tensor,
-        mapping: torch.Tensor | None,
-        fp: torch.Tensor | None,
-        ap: torch.Tensor | None,
+        mapping: torch.Tensor,
+        fp: torch.Tensor,
+        ap: torch.Tensor,
         do_atomic_virial: bool,
     ) -> None:
-        """Trace ``core_compute()`` with ``make_fx`` and cache the compiled callable."""
+        """Trace ``core_compute()`` with ``make_fx`` and cache the compiled callable.
+
+        The full flow is: wrap ``core_compute`` in a tensor-only
+        ``compute_fn`` that also owns the coordinate grad-endpoint, trace
+        it with ``make_fx(tracing_mode="symbolic")`` so all shape axes
+        become sympy symbols, strip autograd-inserted detach chains in
+        training mode, rebuild the FX graph to flush stale linked-list
+        pointers, and finally hand the clean ``GraphModule`` to
+        ``torch.compile(backend="inductor", dynamic=True)``.  The
+        compiled callable is stored outside the ``nn.Module`` tree so
+        FSDP/DDP cannot see or shard its duplicated parameters.
+        """
         from torch._decomp import (
             get_decompositions,
         )
-        from torch._inductor import config as inductor_config
 
-        inductor_config.max_autotune_report_choices_stats = False
-        inductor_config.autotune_num_choices_displayed = 0
         need_coord_grad = self.do_grad_r() or self.do_grad_c()
 
         def compute_fn(
@@ -923,9 +1315,19 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             extended_atype: torch.Tensor,
             nlist: torch.Tensor,
             mapping: torch.Tensor,
-            fp: torch.Tensor | None,
-            ap: torch.Tensor | None,
+            fp: torch.Tensor,
+            ap: torch.Tensor,
         ) -> dict[str, torch.Tensor]:
+            # NOTE: Restart the autograd graph at the trace entry point.
+            # detach() severs any upstream graph carried by the trace
+            # inputs and requires_grad_(True) reinstates a fresh
+            # grad-endpoint owned by this compute.  The inner
+            # ``autograd.grad`` inside ``fit_output_to_model_output``
+            # then differentiates against a graph of known shape and
+            # ownership -- the essential precondition for make_fx
+            # symbolic tracing to capture dE/dx as ordinary FX nodes.
+            # In the eval-only branch we merely detach so the traced
+            # graph has no backward section at all.
             if need_coord_grad:
                 extended_coord = extended_coord.detach().requires_grad_(True)
             else:
@@ -941,59 +1343,108 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 extra_nlist_sort=self.need_sorted_nlist_for_lower(),
             )
 
-        # Avoid specializing the traced batch dimension to the concrete value 1.
-        trace_coord = extended_coord
-        trace_atype = extended_atype
-        trace_nlist = nlist
-        trace_mapping = mapping
-        trace_fp = fp
-        trace_ap = ap
-        if extended_coord.shape[0] == 1:
-            trace_coord = torch.cat([trace_coord, trace_coord], dim=0)
-            trace_atype = torch.cat([trace_atype, trace_atype], dim=0)
-            trace_nlist = torch.cat([trace_nlist, trace_nlist], dim=0)
-            if trace_mapping is not None:
-                trace_mapping = torch.cat([trace_mapping, trace_mapping], dim=0)
-            if trace_fp is not None:
-                trace_fp = torch.cat([trace_fp, trace_fp], dim=0)
-            if trace_ap is not None:
-                trace_ap = torch.cat([trace_ap, trace_ap], dim=0)
+        # NOTE: Always trace with exactly nf=2 -- the only batch size
+        # free of every known symbolic-shape collision.
+        #
+        # make_fx(tracing_mode="symbolic") replaces shapes with sympy
+        # symbols, but the moment a symbolic dim ends up equal to a
+        # *concrete* dim elsewhere in the same tensor it collapses into
+        # a constant and the graph specialises on that batch size.
+        # Concretely: nf=1 triggers PyTorch's 0/1 specialisation; nf=3
+        # collides with the trailing spatial ``3`` in ``extended_coord``
+        # shape ``(nf, nall, 3)``; nf=9 would collide with the virial
+        # dim.  Any of those collisions forces
+        # ``torch.compile(dynamic=True)`` to reject later batches whose
+        # nf differs from the traced constant.  nf=2 sidesteps all three.
+        #
+        # If a future code change introduces a new explicit dimension of
+        # size 2 and compile starts failing with a similar shape
+        # mismatch, change this constant accordingly.
+        coord_for_trace = extended_coord[:1].repeat(2, 1, 1)
+        atype_for_trace = extended_atype[:1].repeat(2, 1)
+        nlist_for_trace = nlist[:1].repeat(2, 1, 1)
+        mapping_for_trace = mapping[:1].repeat(2, 1)
+        fp_for_trace = fp[:1].repeat(2, 1)
+        ap_for_trace = ap[:1].repeat(2, 1, 1)
 
-        # Decompose silu_backward into primitive ops (sigmoid + mul + ...)
-        # so that inductor can compile the eval graph without requiring a
-        # higher-order derivative that PyTorch does not register for silu.
+        # NOTE: Decompose ``silu_backward`` into primitive ops.
+        # PyTorch ships forward and first-order backward for SiLU but no
+        # symbolic higher-order derivative.  Without this decomposition
+        # make_fx would emit ``aten.silu_backward.default`` opaquely
+        # inside the first-derivative graph; when Inductor later has to
+        # differentiate that op again for the optimiser step, it refuses
+        # because silu_backward is not differentiable in its registered
+        # form.  Lowering to ``sigmoid + pointwise mul + ...`` gives
+        # every pointwise piece a well-defined higher derivative.
         decomp_table = get_decompositions([torch.ops.aten.silu_backward.default])
 
+        # NOTE: ``tracing_mode="symbolic"`` makes every shape a sympy
+        # symbol so the compiled graph can later accept any
+        # (nframes, nall, n_edges, ...) at runtime.
+        # ``_allow_non_fake_inputs=True`` lets us feed real tensors to
+        # the trace -- the edge compactor contains data-dependent ops
+        # (``torch.nonzero``, ``index_select``) that cannot execute on
+        # FakeTensors, so we need concrete values to resolve their
+        # control flow exactly once; shapes become symbolic immediately
+        # afterwards.
         traced = make_fx(
             compute_fn,
             tracing_mode="symbolic",
             _allow_non_fake_inputs=True,
             decomposition_table=decomp_table,
         )(
-            trace_coord,
-            trace_atype,
-            trace_nlist,
-            trace_mapping,
-            trace_fp,
-            trace_ap,
+            coord_for_trace,
+            atype_for_trace,
+            nlist_for_trace,
+            mapping_for_trace,
+            fp_for_trace,
+            ap_for_trace,
         )
 
-        # When training, make_fx wraps saved forward activations in detach
-        # nodes that block second-order gradient flow. In eval mode those
-        # detach nodes are correct and must be kept.
+        # NOTE: Only strip autograd-inserted detach chains in training
+        # mode.  With ``create_graph=True`` make_fx wraps every saved
+        # forward activation in a
+        # ``fwd_op -> detach_A -> detach_B -> bwd_op`` chain.  Those
+        # detaches are informational in eager autograd but become real
+        # ops after tracing and sever the gradient path from the force
+        # loss back to theta -- training would silently emit zero
+        # parameter updates for the second-derivative term.  In eval
+        # mode ``create_graph=False`` so the chain is never inserted
+        # and stripping would be wrong.
         if self.training:
             _strip_saved_tensor_detach(traced)
 
-        # Rebuild the FX graph from scratch so that dynamo's re-tracing
-        # iterates over fresh Node objects.  On some PyTorch builds
-        # (e.g. 2.11+cu130) the C-level linked-list pointers inside
-        # nodes mutated by erase_node() become stale, causing a segfault
-        # in _create_proxy when dynamo reads nd.meta during re-tracing.
+        # NOTE: Rebuild the FX graph from scratch.
+        # ``Graph.erase_node`` inside ``_strip_saved_tensor_detach``
+        # unlinks nodes from the doubly linked list but on some PyTorch
+        # builds (observed on 2.11+cu130) leaves stale C-level
+        # prev/next pointers on neighbouring Node objects.  Dynamo later
+        # re-traces the ``GraphModule`` and walks ``graph.nodes`` inside
+        # ``output_graph.py:_create_proxy`` to read ``nd.meta``;
+        # dereferencing one of those stale pointers segfaults the
+        # process.  A single ``node_copy`` pass into a freshly allocated
+        # ``torch.fx.Graph`` builds an equivalent graph with a clean
+        # linked list.  We always rebuild -- even in eval -- because a
+        # fresh graph is cheap and a segfault is fatal.
         traced = _rebuild_graph_module(traced)
 
+        # NOTE: Store the compiled callable via ``object.__setattr__``.
+        # Plain ``self.compiled_core_compute = ...`` would go through
+        # ``nn.Module.__setattr__`` and register the compile wrapper as
+        # a submodule; the wrapper carries duplicated flat views of the
+        # trainable parameters, and FSDP2/DDP would then shard or
+        # synchronise those duplicates and silently corrupt training.
+        # Escaping the ``nn.Module`` machinery keeps the wrapper a plain
+        # Python attribute invisible to parameter discovery.
         object.__setattr__(
             self,
             "compiled_core_compute",
+            # NOTE: ``dynamic=True`` emits a single kernel per traced
+            # shape symbol, so changes in ``nframes``, ``nall`` or edge
+            # count do not trigger recompiles; and the option dict below
+            # disables every Inductor/Triton feature that has ever
+            # interacted badly with ``make_fx`` + double backward in
+            # this project.
             torch.compile(
                 traced,
                 backend="inductor",
@@ -1004,8 +1455,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                     "epilogue_fusion": False,
                     "triton.cudagraphs": False,
                     "max_fusion_size": 64,
-                    # PyTorch <=2.11 mix_order_reduction has multiple bugs with
-                    # data-dependent symbolic shapes (#174379, #178080, #179494).
+                    # NOTE: ``mix_order_reduction`` hits multiple bugs
+                    # under data-dependent symbolic shapes on PyTorch
+                    # <=2.11 (pytorch/pytorch#174379, #178080, #179494)
+                    # -- our edge count is exactly that kind of shape.
                     "triton.mix_order_reduction": False,
                 },
             ),
@@ -1126,6 +1579,17 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         coord_for_diff = extended_coord.to(dtype=descriptor_model.compute_dtype)
 
         # === Step 1. Build per-edge geometry via index_select (differentiable) ===
+        # NOTE: Edge vectors come from ``coord_flat.index_select(0, ...)``
+        # rather than advanced indexing ``coord_flat[...]``.
+        # ``index_select`` has an explicit, well-defined backward that
+        # routes gradient cleanly back to the original extended
+        # coordinate tensor.  Advanced indexing combined with make_fx
+        # symbolic shapes has previously produced silent gradient
+        # truncation in this project -- the second-derivative gradient
+        # over coordinates was effectively zero, with no error raised.
+        # ``torch.where(valid_flat, neighbor_flat, 0)`` sanitises padded
+        # ``-1`` entries before indexing so we never hit an out-of-range
+        # gather; the corresponding edges are filtered out below anyway.
         dst_actual = torch.arange(
             n_actual, device=device, dtype=torch.long
         ).repeat_interleave(nsel)
@@ -1158,6 +1622,16 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         valid_idx = torch.nonzero(edge_mask_actual, as_tuple=False).flatten()
 
         # === Step 3. Compact edges + append one masked dummy ===
+        # NOTE: Always append exactly one masked dummy edge.
+        # ``torch.nonzero(edge_mask_actual)`` produces a data-dependent
+        # number of valid edges, which can be zero on sparse or
+        # single-type systems.  make_fx cannot trace an
+        # ``if n_edges == 0: skip`` branch symbolically; without the
+        # dummy it would fall back to concrete shape specialisation and
+        # break ``torch.compile(dynamic=True)`` for later batches.  The
+        # dummy edge copies entry 0 (any in-range index is fine) and
+        # carries ``edge_mask=False`` so every downstream sum, gather
+        # or scatter ignores it.
         padded_idx = torch.cat(
             [valid_idx, torch.zeros(1, dtype=torch.long, device=device)]
         )

@@ -134,34 +134,99 @@ ______________________________________________________________________
 
 ### Optional compile path
 
-SeZM supports an optional compile path that enables `torch.compile` while preserving
-the standard DeePMD neighbor list behavior:
+SeZM supports an optional `torch.compile` path for the `ener` force-loss training.
+To our knowledge this is the first end-to-end compiled ML potential whose
+**second-order** coordinate derivatives (needed by force loss) survive Inductor
+without eager fallback. The implementation lives in `deepmd/pt/model/model/sezm_model.py`;
+every non-obvious choice is pinned to a `NOTE:` tag there, and the module docstring
+collects the full catalogue (NOTE 0 ... NOTE 12).
 
-- Enable with `model.use_compile = true`.
-- The model builds the DeePMD neighbor list eagerly (outside the compiled graph), then
-  passes `(extended_coord, extended_atype, nlist, mapping)` as graph inputs.
+Top-level usage:
+
+- Enable with `model.use_compile = true`. Training follows `use_compile`;
+  `eval() / inference / full_validation` default to eager even when
+  `use_compile=true`. Set `DP_COMPILE_INFER=1` before model construction to opt
+  evaluation into the compile path. The environment variable is read at model
+  init time.
 - `core_compute()` is the **single unified kernel** for both eager and compile paths.
-  It builds compact sparse edges from the neighbor list internally, runs the descriptor
-  and fitting evaluation, then calls `fit_output_to_model_output()` for standard DeePMD
-  force / virial computation via `autograd.grad`.
-- `ener` uses `make_fx(tracing_mode="symbolic")` before `torch.compile(...)` to stabilize
-  higher-order autograd capture. Two graph-level fixes are applied between `make_fx` and
-  `torch.compile`:
-  1. **`decomposition_table`**: `silu_backward` is decomposed into primitive ops during
-     tracing so the inductor backend can compile the eval graph.
-  1. **`_strip_saved_tensor_detach`** (training only): removes autograd-inserted `aten.detach`
-     nodes on saved forward activations that block second-order gradient flow needed for
-     force-loss training. User-explicit `.detach()` calls are preserved by a graph-topology
-     rule: only detach nodes forming autograd double-detach chains are removed.
-- `dens` compiles the direct-force compute function directly (no `make_fx`).
+  It builds compact sparse edges from the DeePMD neighbor list (built eagerly outside
+  the compiled graph), runs the descriptor and fitting evaluation, then calls
+  `fit_output_to_model_output(..., create_graph=self.training)` for force / virial
+  via `autograd.grad`.
+- `ener` uses `make_fx(tracing_mode="symbolic", _allow_non_fake_inputs=True)`
+  **before** `torch.compile(..., dynamic=True, backend="inductor")`. `make_fx` captures
+  the inner `autograd.grad` as ordinary FX nodes, so Inductor only has to walk a plain
+  forward+backward during the optimizer step. `create_graph=self.training` is the single
+  toggle that turns the entire second-derivative branch on in training and off in inference.
+- `dens` compiles `core_compute_dens` directly with `torch.compile` (no `make_fx`),
+  because its direct-force head needs no coordinate second derivative.
 - The compiled graph keeps **dynamic shapes** across batch, atom, and edge dimensions.
-- Training follows `model.use_compile`, but `eval()/inference/full_validation` default to the eager path
-  even when `use_compile=true`.
-- Set `DP_COMPILE_INFER=1` before model construction to make `eval()/inference` use the compile path
-  by default without changing any Python call sites. The environment variable is read at model init time.
 
-In both compile modes, all geometry (edge vectors, Wigner-D, radial basis) remains differentiable,
-and no global node/edge padding is introduced.
+Key tracing / compile invariants (each maps to a `NOTE:` tag in `sezm_model.py`):
+
+- **Trace inputs use `nf=2`.** `make_fx` symbolic shapes collapse to a constant whenever
+  the batch dim equals another concrete dim in the same tensor. `nf=1` triggers 0/1
+  specialization, `nf=3` collides with the trailing spatial `3` in `extended_coord`
+  `(nf, nall, 3)`, `nf=9` collides with the virial dim. `nf=2` is the smallest
+  collision-free choice.
+- **`silu_backward` is decomposed** into primitive ops (`sigmoid + mul + ...`) via
+  `get_decompositions`. PyTorch has no registered higher-order derivative for SiLU,
+  so an opaque `aten.silu_backward.default` in the first-derivative graph would crash
+  Inductor's double-backward lowering.
+- **Autograd detach chains are stripped in training only** via
+  `_strip_saved_tensor_detach`. `make_fx` under `create_graph=True` wraps every saved
+  forward activation in a `fwd_op -> detach_A -> detach_B -> bwd_op` chain; once traced,
+  those detaches become real FX ops that sever the gradient path from force loss back
+  to parameters. The stripper uses pure graph topology (chain-inner / dead / chain-head)
+  so user-explicit `.detach()` calls are preserved. Eval mode never inserts the chains.
+- **FX graph is rebuilt after stripping** via `_rebuild_graph_module` (a full
+  `node_copy` pass into a fresh `torch.fx.Graph`). `Graph.erase_node` leaves stale
+  C-level linked-list pointers on some PyTorch builds (observed on 2.11+cu130);
+  dynamo reads `nd.meta` during re-tracing and segfaults on them. Rebuild runs
+  unconditionally because a fresh graph is cheap and a crash is fatal.
+- **DDPOptimizer is disabled globally** (`torch._dynamo.config.optimize_ddp = False`,
+  set at import time). DDPOptimizer splits DDP-wrapped graphs at bucket boundaries,
+  but the compile region here sits *inside* the DDP wrapper. The split produces
+  subgraphs with symbolic-integer outputs, which crash AOT Autograd with
+  `'int' object has no attribute 'meta'` (pytorch/pytorch#134182).
+- **Inductor options are locked down** in `trace_and_compile`: `max_autotune=False`
+  (autotune regresses under dynamic shapes), `shape_padding=True`,
+  `epilogue_fusion=False` (epilogue fusion only activates with `max_autotune`, and it
+  also reorders saved tensors in ways the second backward cannot recover),
+  `triton.cudagraphs=False` (cudagraphs capture autograd metadata once; higher-order
+  gradients need fresh metadata per call), `max_fusion_size=64` (caps scheduler cost
+  on the large edge-level reductions inside the descriptor),
+  `triton.mix_order_reduction=False` (workaround for pytorch/pytorch#174379, #178080,
+  #179494 under data-dependent symbolic shapes — exactly our edge count).
+- **Compile cache is keyed on `(training, do_atomic_virial)`.** `training` toggles
+  `create_graph` (the whole second-derivative branch); `do_atomic_virial` adds an
+  extra per-atom virial tensor to the output. Neither can be expressed as dynamic
+  shape, so flipping either flag retraces + recompiles.
+- **Compiled callable is stored via `object.__setattr__`**, not plain assignment.
+  `nn.Module.__setattr__` would register the compile wrapper as a submodule, exposing
+  its duplicated flat parameter views to FSDP2 / DDP, which then shard or synchronise
+  them and silently corrupt training.
+- **Extended coordinates are rebound per forward** with
+  `extended_coord.detach().requires_grad_(True)`. This severs any upstream autograd
+  graph carried by the batch and reinstates a grad-endpoint owned by the current
+  forward, so the inner `autograd.grad` differentiates against a graph of known shape
+  and ownership — the precondition for symbolic `make_fx` tracing.
+- **Edge list appends one masked dummy edge.** `torch.nonzero(valid_mask)` is
+  data-dependent and can be zero; `make_fx` cannot trace a "skip when empty" branch
+  symbolically, so it would fall back to shape specialization and break
+  `dynamic=True`. The dummy keeps every tensor at length ≥ 1 with `edge_mask=False`
+  so it contributes zero downstream.
+- **Edge vectors use `index_select`, not advanced indexing.** `index_select` has an
+  explicit, well-defined backward. Advanced indexing combined with `make_fx` symbolic
+  shapes has previously produced silent second-derivative gradient truncation to zero
+  in this project, with no error raised.
+- **Inductor / Triton autotune log dumps are silenced** at import time via
+  `os.environ.setdefault` on `TORCHINDUCTOR_MAX_AUTOTUNE_REPORT_CHOICES_STATS` and
+  `TRITON_PRINT_AUTOTUNING`. These are read exactly once at backend initialisation,
+  so setting them post-import has no effect.
+
+In both compile modes, all geometry (edge vectors, Wigner-D, radial basis) remains
+differentiable, and no global node/edge padding is introduced.
 
 `dens` compile limitation:
 
