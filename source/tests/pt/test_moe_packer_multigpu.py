@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""Multi-GPU unit tests for MoEPacker.
+"""Multi-GPU unit tests for MoEPacker + exchange_metadata (Step 4 + Step 5).
 
 Run with torchrun:
     torchrun --nproc_per_node=2 source/tests/pt/test_moe_packer_multigpu.py
@@ -10,8 +10,11 @@ Tests:
   [2 GPU] Gradient through full A2A + packer pipeline
   [2 GPU] 2nd-order derivative through full pipeline
   [2 GPU] Asymmetric counts (different node/edge/angle per rank)
+  [2 GPU] exchange_metadata: correctness of 2-way metadata exchange
+  [2 GPU] exchange_metadata + packer full pipeline integration
   [4 GPU] Full roundtrip with 4 GPUs
   [4 GPU] 2nd-order derivative with 4 GPUs
+  [4 GPU] exchange_metadata: correctness of 4-way metadata exchange
 """
 
 from __future__ import annotations
@@ -22,8 +25,11 @@ import torch
 import torch.distributed as dist
 
 from deepmd.pt.model.network.moe_ep_ops import all_to_all_differentiable
-from deepmd.pt.model.network.moe_packer import MoEPacker
-from deepmd.utils.ddebug import ddebug
+from deepmd.pt.model.network.moe_packer import (
+    MoEPacker,
+    counts_to_packed_rows,
+    exchange_metadata,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -62,36 +68,23 @@ def _ceildiv(a: int, b: int) -> int:
 
 
 def _compute_send_splits(node_counts, edge_counts, angle_counts):
-    """Compute packed row counts per GPU (same logic as MoEPacker)."""
-    splits = []
-    for g in range(len(node_counts)):
-        n_node = node_counts[g]
-        n_edge_rows = _ceildiv(edge_counts[g], 4) if edge_counts[g] > 0 else 0
-        n_angle_rows = _ceildiv(angle_counts[g], 10) if angle_counts[g] > 0 else 0
-        splits.append(n_node + n_edge_rows + n_angle_rows)
-    return splits
+    """Compute packed row counts per GPU (delegates to counts_to_packed_rows)."""
+    return counts_to_packed_rows(node_counts, edge_counts, angle_counts)
 
 
-def _exchange_counts(send_counts, rank, world_size, group, device):
-    """Exchange per-GPU counts via all_to_all.
-
-    send_counts: [world_size, 3] int tensor (node, edge, angle per dest GPU)
-    Returns recv_counts: [world_size, 3] (node, edge, angle per src GPU)
-    """
-    send_t = torch.tensor(send_counts, dtype=torch.int64, device=device)
-    recv_t = torch.zeros_like(send_t)
-    # All-to-all each field: send_t[g] goes to GPU g, recv_t[g] comes from GPU g
-    for field_idx in range(3):
-        field_send = send_t[:, field_idx].contiguous()
-        field_recv = torch.zeros(world_size, dtype=torch.int64, device=device)
-        dist.all_to_all_single(
-            field_recv, field_send,
-            output_split_sizes=[1] * world_size,
-            input_split_sizes=[1] * world_size,
-            group=group,
-        )
-        recv_t[:, field_idx] = field_recv
-    return recv_t.tolist()
+def _exchange_counts_via_metadata(node_counts, edge_counts, angle_counts,
+                                  world_size, group, device):
+    """Use exchange_metadata to exchange counts, return (recv_node, recv_edge, recv_angle) lists."""
+    send_info = torch.tensor(
+        [[node_counts[g], edge_counts[g], angle_counts[g]] for g in range(world_size)],
+        dtype=torch.int64,
+        device=device,
+    )
+    recv_info = exchange_metadata(send_info, group)
+    recv_node = [int(recv_info[g, 0].item()) for g in range(world_size)]
+    recv_edge = [int(recv_info[g, 1].item()) for g in range(world_size)]
+    recv_angle = [int(recv_info[g, 2].item()) for g in range(world_size)]
+    return recv_node, recv_edge, recv_angle
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +95,7 @@ def test_full_roundtrip_2gpu(rank, world_size, group):
     """Pack → A2A dispatch → unpack → identity expert → repack → A2A combine → unpack.
 
     Each rank generates unique data, sends to the other, and verifies
-    everything comes back correctly.
+    everything comes back correctly.  Uses exchange_metadata for count exchange.
     """
     assert world_size == 2
     device = torch.device(f"cuda:{rank}")
@@ -120,8 +113,7 @@ def test_full_roundtrip_2gpu(rank, world_size, group):
     edge_in = torch.randn(n_edge, 10 * A_DIM, dtype=DTYPE, device=device)
     angle_in = torch.randn(n_angle, 4 * A_DIM, dtype=DTYPE, device=device)
 
-    # For simplicity: each rank sends ALL its data to the OTHER rank.
-    # node_counts_per_gpu[g] = how many of my nodes go to GPU g.
+    # Each rank sends ALL its data to the OTHER rank.
     if rank == 0:
         node_counts = [0, n_node]
         edge_counts = [0, n_edge]
@@ -137,13 +129,12 @@ def test_full_roundtrip_2gpu(rank, world_size, group):
         node_counts, edge_counts, angle_counts,
     )
 
-    # Exchange metadata to get recv splits.
-    send_info = [[node_counts[g], edge_counts[g], angle_counts[g]]
-                 for g in range(world_size)]
-    recv_info = _exchange_counts(send_info, rank, world_size, group, device)
-    recv_node_counts = [recv_info[g][0] for g in range(world_size)]
-    recv_edge_counts = [recv_info[g][1] for g in range(world_size)]
-    recv_angle_counts = [recv_info[g][2] for g in range(world_size)]
+    # Exchange metadata to get recv counts.
+    recv_node_counts, recv_edge_counts, recv_angle_counts = \
+        _exchange_counts_via_metadata(
+            node_counts, edge_counts, angle_counts,
+            world_size, group, device,
+        )
     recv_splits = _compute_send_splits(recv_node_counts, recv_edge_counts, recv_angle_counts)
 
     # Dispatch A2A.
@@ -165,7 +156,7 @@ def test_full_roundtrip_2gpu(rank, world_size, group):
     check(angle_recv.shape == (total_recv_angle, 4 * A_DIM),
           f"angle_recv shape: {angle_recv.shape}", rank)
 
-    # Simulate identity expert: output = truncated input (node 28a→8a, edge 10a→6a, angle 4a→3a).
+    # Simulate identity expert: output = truncated input.
     node_out = node_recv[:, :8 * A_DIM]
     edge_out = edge_recv[:, :6 * A_DIM]
     angle_out = angle_recv[:, :3 * A_DIM]
@@ -175,7 +166,6 @@ def test_full_roundtrip_2gpu(rank, world_size, group):
         node_out, edge_out, angle_out,
         recv_node_counts, recv_edge_counts, recv_angle_counts,
     )
-    # Row counts must match dispatch recv.
     check(packed_out.shape[0] == recv_tensor.shape[0],
           "combine rows != dispatch recv rows", rank)
 
@@ -195,7 +185,7 @@ def test_full_roundtrip_2gpu(rank, world_size, group):
     check(angle_final.shape == (n_angle, 3 * A_DIM),
           f"angle_final shape: {angle_final.shape}", rank)
 
-    # Verify data: node_final should be node_in[:, :8a], etc.
+    # Verify data roundtrip.
     check(
         torch.allclose(node_final, node_in[:, :8 * A_DIM]),
         f"node data mismatch: max diff = {(node_final - node_in[:, :8*A_DIM]).abs().max().item():.2e}",
@@ -235,7 +225,6 @@ def test_gradient_pipeline_2gpu(rank, world_size, group):
     edge_in = torch.randn(n_edge, 10 * A_DIM, dtype=DTYPE, device=device, requires_grad=True)
     angle_in = torch.randn(n_angle, 4 * A_DIM, dtype=DTYPE, device=device, requires_grad=True)
 
-    # Send everything to the other rank.
     if rank == 0:
         node_counts = [0, n_node]
         edge_counts = [0, n_edge]
@@ -250,12 +239,11 @@ def test_gradient_pipeline_2gpu(rank, world_size, group):
         node_counts, edge_counts, angle_counts,
     )
 
-    send_info = [[node_counts[g], edge_counts[g], angle_counts[g]]
-                 for g in range(world_size)]
-    recv_info = _exchange_counts(send_info, rank, world_size, group, device)
-    recv_node_counts = [recv_info[g][0] for g in range(world_size)]
-    recv_edge_counts = [recv_info[g][1] for g in range(world_size)]
-    recv_angle_counts = [recv_info[g][2] for g in range(world_size)]
+    recv_node_counts, recv_edge_counts, recv_angle_counts = \
+        _exchange_counts_via_metadata(
+            node_counts, edge_counts, angle_counts,
+            world_size, group, device,
+        )
     recv_splits = _compute_send_splits(recv_node_counts, recv_edge_counts, recv_angle_counts)
 
     recv_tensor = all_to_all_differentiable(packed, send_splits, recv_splits, group)
@@ -325,12 +313,11 @@ def test_2nd_order_pipeline_2gpu(rank, world_size, group):
         node_counts, edge_counts, angle_counts,
     )
 
-    send_info = [[node_counts[g], edge_counts[g], angle_counts[g]]
-                 for g in range(world_size)]
-    recv_info = _exchange_counts(send_info, rank, world_size, group, device)
-    recv_node_counts = [recv_info[g][0] for g in range(world_size)]
-    recv_edge_counts = [recv_info[g][1] for g in range(world_size)]
-    recv_angle_counts = [recv_info[g][2] for g in range(world_size)]
+    recv_node_counts, recv_edge_counts, recv_angle_counts = \
+        _exchange_counts_via_metadata(
+            node_counts, edge_counts, angle_counts,
+            world_size, group, device,
+        )
     recv_splits = _compute_send_splits(recv_node_counts, recv_edge_counts, recv_angle_counts)
 
     recv_tensor = all_to_all_differentiable(packed, send_splits, recv_splits, group)
@@ -393,7 +380,6 @@ def test_asymmetric_counts_2gpu(rank, world_size, group):
     edge_in = torch.randn(n_edge, 10 * A_DIM, dtype=DTYPE, device=device)
     angle_in = torch.randn(n_angle, 4 * A_DIM, dtype=DTYPE, device=device)
 
-    # Send all to the other rank.
     if rank == 0:
         node_counts = [0, n_node]
         edge_counts = [0, n_edge]
@@ -408,12 +394,11 @@ def test_asymmetric_counts_2gpu(rank, world_size, group):
         node_counts, edge_counts, angle_counts,
     )
 
-    send_info = [[node_counts[g], edge_counts[g], angle_counts[g]]
-                 for g in range(world_size)]
-    recv_info = _exchange_counts(send_info, rank, world_size, group, device)
-    recv_node_counts = [recv_info[g][0] for g in range(world_size)]
-    recv_edge_counts = [recv_info[g][1] for g in range(world_size)]
-    recv_angle_counts = [recv_info[g][2] for g in range(world_size)]
+    recv_node_counts, recv_edge_counts, recv_angle_counts = \
+        _exchange_counts_via_metadata(
+            node_counts, edge_counts, angle_counts,
+            world_size, group, device,
+        )
     recv_splits = _compute_send_splits(recv_node_counts, recv_edge_counts, recv_angle_counts)
 
     recv_tensor = all_to_all_differentiable(packed, send_splits, recv_splits, group)
@@ -454,24 +439,164 @@ def test_asymmetric_counts_2gpu(rank, world_size, group):
     check(angle_final.shape == (n_angle, 3 * A_DIM),
           f"angle_final shape: {angle_final.shape}", rank)
 
-    # Verify data roundtrip.
     if n_node > 0:
-        check(
-            torch.allclose(node_final, node_in[:, :8 * A_DIM]),
-            "node data mismatch", rank,
-        )
+        check(torch.allclose(node_final, node_in[:, :8 * A_DIM]),
+              "node data mismatch", rank)
     if n_edge > 0:
-        check(
-            torch.allclose(edge_final, edge_in[:, :6 * A_DIM]),
-            "edge data mismatch", rank,
-        )
+        check(torch.allclose(edge_final, edge_in[:, :6 * A_DIM]),
+              "edge data mismatch", rank)
     if n_angle > 0:
-        check(
-            torch.allclose(angle_final, angle_in[:, :3 * A_DIM]),
-            "angle data mismatch", rank,
-        )
+        check(torch.allclose(angle_final, angle_in[:, :3 * A_DIM]),
+              "angle data mismatch", rank)
 
     all_pass(rank, world_size, "test_asymmetric_counts_2gpu")
+
+
+# ---------------------------------------------------------------------------
+# Step 5: exchange_metadata dedicated tests (2 GPU)
+# ---------------------------------------------------------------------------
+
+def test_exchange_metadata_2gpu(rank, world_size, group):
+    """Verify exchange_metadata correctly swaps per-GPU counts between 2 ranks.
+
+    Rank 0 tells rank 1: "I will send you (5, 7, 13)"
+    Rank 1 tells rank 0: "I will send you (3, 12, 4)"
+    After exchange, each rank should know what it will receive.
+    """
+    assert world_size == 2
+    device = torch.device(f"cuda:{rank}")
+
+    if rank == 0:
+        # Row 0 = what I send to GPU 0 (myself), Row 1 = what I send to GPU 1
+        send_info = torch.tensor([
+            [0, 0, 0],       # send to self: nothing
+            [5, 7, 13],      # send to rank 1
+        ], dtype=torch.int64, device=device)
+    else:
+        send_info = torch.tensor([
+            [3, 12, 4],      # send to rank 0
+            [0, 0, 0],       # send to self: nothing
+        ], dtype=torch.int64, device=device)
+
+    recv_info = exchange_metadata(send_info, group)
+
+    # recv_info[g] = what GPU g will send to me.
+    if rank == 0:
+        # GPU 0 should receive from GPU 0: [0,0,0], from GPU 1: [3,12,4]
+        expected = torch.tensor([
+            [0, 0, 0],       # from rank 0 (self)
+            [3, 12, 4],      # from rank 1
+        ], dtype=torch.int64, device=device)
+    else:
+        # GPU 1 should receive from GPU 0: [5,7,13], from GPU 1: [0,0,0]
+        expected = torch.tensor([
+            [5, 7, 13],      # from rank 0
+            [0, 0, 0],       # from rank 1 (self)
+        ], dtype=torch.int64, device=device)
+
+    check(
+        torch.equal(recv_info, expected),
+        f"recv_info mismatch: got {recv_info.tolist()}, expected {expected.tolist()}",
+        rank,
+    )
+
+    all_pass(rank, world_size, "test_exchange_metadata_2gpu")
+
+
+def test_exchange_metadata_pipeline_2gpu(rank, world_size, group):
+    """Integration test: exchange_metadata → compute recv_splits → A2A → verify shape.
+
+    Tests the full metadata exchange + packer pipeline without manual count exchange.
+    """
+    assert world_size == 2
+    device = torch.device(f"cuda:{rank}")
+    packer = MoEPacker(A_DIM)
+
+    if rank == 0:
+        n_node, n_edge, n_angle = 4, 11, 6
+    else:
+        n_node, n_edge, n_angle = 7, 3, 18
+
+    torch.manual_seed(7000 + rank)
+    node_in = torch.randn(n_node, 28 * A_DIM, dtype=DTYPE, device=device)
+    edge_in = torch.randn(n_edge, 10 * A_DIM, dtype=DTYPE, device=device)
+    angle_in = torch.randn(n_angle, 4 * A_DIM, dtype=DTYPE, device=device)
+
+    # Send all to the other rank.
+    if rank == 0:
+        node_counts = [0, n_node]
+        edge_counts = [0, n_edge]
+        angle_counts = [0, n_angle]
+    else:
+        node_counts = [n_node, 0]
+        edge_counts = [n_edge, 0]
+        angle_counts = [n_angle, 0]
+
+    packed, send_splits = packer.pack_for_dispatch(
+        node_in, edge_in, angle_in,
+        node_counts, edge_counts, angle_counts,
+    )
+
+    # Use exchange_metadata (the Step 5 API) to exchange counts.
+    send_info = torch.tensor(
+        [[node_counts[g], edge_counts[g], angle_counts[g]] for g in range(world_size)],
+        dtype=torch.int64,
+        device=device,
+    )
+    recv_info = exchange_metadata(send_info, group)
+
+    recv_node_counts = [int(recv_info[g, 0].item()) for g in range(world_size)]
+    recv_edge_counts = [int(recv_info[g, 1].item()) for g in range(world_size)]
+    recv_angle_counts = [int(recv_info[g, 2].item()) for g in range(world_size)]
+    recv_splits = counts_to_packed_rows(recv_node_counts, recv_edge_counts, recv_angle_counts)
+
+    # Data A2A.
+    recv_tensor = all_to_all_differentiable(packed, send_splits, recv_splits, group)
+    check(recv_tensor.shape[0] == sum(recv_splits),
+          f"recv shape mismatch after metadata exchange", rank)
+
+    # Unpack and verify shapes.
+    node_recv, edge_recv, angle_recv = packer.unpack_from_dispatch(
+        recv_tensor, recv_node_counts, recv_edge_counts, recv_angle_counts,
+    )
+
+    total_recv_node = sum(recv_node_counts)
+    total_recv_edge = sum(recv_edge_counts)
+    total_recv_angle = sum(recv_angle_counts)
+
+    check(node_recv.shape == (total_recv_node, 28 * A_DIM),
+          f"node_recv shape: {node_recv.shape}", rank)
+    check(edge_recv.shape == (total_recv_edge, 10 * A_DIM),
+          f"edge_recv shape: {edge_recv.shape}", rank)
+    check(angle_recv.shape == (total_recv_angle, 4 * A_DIM),
+          f"angle_recv shape: {angle_recv.shape}", rank)
+
+    # Full roundtrip: expert → combine A2A → verify data.
+    node_out = node_recv[:, :8 * A_DIM]
+    edge_out = edge_recv[:, :6 * A_DIM]
+    angle_out = angle_recv[:, :3 * A_DIM]
+
+    packed_out = packer.pack_for_combine(
+        node_out, edge_out, angle_out,
+        recv_node_counts, recv_edge_counts, recv_angle_counts,
+    )
+
+    returned = all_to_all_differentiable(packed_out, recv_splits, send_splits, group)
+    node_final, edge_final, angle_final = packer.unpack_from_combine(
+        returned, node_counts, edge_counts, angle_counts,
+    )
+
+    if n_node > 0:
+        check(torch.allclose(node_final, node_in[:, :8 * A_DIM]),
+              "node data mismatch in pipeline test", rank)
+    if n_edge > 0:
+        check(torch.allclose(edge_final, edge_in[:, :6 * A_DIM]),
+              "edge data mismatch in pipeline test", rank)
+    if n_angle > 0:
+        check(torch.allclose(angle_final, angle_in[:, :3 * A_DIM]),
+              "angle data mismatch in pipeline test", rank)
+
+    all_pass(rank, world_size, "test_exchange_metadata_pipeline_2gpu")
 
 
 # ---------------------------------------------------------------------------
@@ -479,12 +604,11 @@ def test_asymmetric_counts_2gpu(rank, world_size, group):
 # ---------------------------------------------------------------------------
 
 def test_full_roundtrip_4gpu(rank, world_size, group):
-    """4-GPU full roundtrip: each rank sends data to ALL other ranks."""
+    """4-GPU full roundtrip: each rank sends data to next rank (ring pattern)."""
     assert world_size == 4
     device = torch.device(f"cuda:{rank}")
     packer = MoEPacker(A_DIM)
 
-    # Each rank has different amounts of data.
     per_rank = {
         0: (5, 7, 13),
         1: (3, 12, 4),
@@ -498,8 +622,7 @@ def test_full_roundtrip_4gpu(rank, world_size, group):
     edge_in = torch.randn(n_edge, 10 * A_DIM, dtype=DTYPE, device=device)
     angle_in = torch.randn(n_angle, 4 * A_DIM, dtype=DTYPE, device=device)
 
-    # Distribute evenly: send roughly equal amounts to each GPU.
-    # For simplicity: all tokens go to GPU (rank+1) % world_size.
+    # All tokens go to GPU (rank+1) % world_size.
     dest = (rank + 1) % world_size
     node_counts = [0] * world_size
     edge_counts = [0] * world_size
@@ -513,12 +636,11 @@ def test_full_roundtrip_4gpu(rank, world_size, group):
         node_counts, edge_counts, angle_counts,
     )
 
-    send_info = [[node_counts[g], edge_counts[g], angle_counts[g]]
-                 for g in range(world_size)]
-    recv_info = _exchange_counts(send_info, rank, world_size, group, device)
-    recv_node_counts = [recv_info[g][0] for g in range(world_size)]
-    recv_edge_counts = [recv_info[g][1] for g in range(world_size)]
-    recv_angle_counts = [recv_info[g][2] for g in range(world_size)]
+    recv_node_counts, recv_edge_counts, recv_angle_counts = \
+        _exchange_counts_via_metadata(
+            node_counts, edge_counts, angle_counts,
+            world_size, group, device,
+        )
     recv_splits = _compute_send_splits(recv_node_counts, recv_edge_counts, recv_angle_counts)
 
     recv_tensor = all_to_all_differentiable(packed, send_splits, recv_splits, group)
@@ -592,12 +714,11 @@ def test_2nd_order_4gpu(rank, world_size, group):
         node_counts, edge_counts, angle_counts,
     )
 
-    send_info = [[node_counts[g], edge_counts[g], angle_counts[g]]
-                 for g in range(world_size)]
-    recv_info = _exchange_counts(send_info, rank, world_size, group, device)
-    recv_node_counts = [recv_info[g][0] for g in range(world_size)]
-    recv_edge_counts = [recv_info[g][1] for g in range(world_size)]
-    recv_angle_counts = [recv_info[g][2] for g in range(world_size)]
+    recv_node_counts, recv_edge_counts, recv_angle_counts = \
+        _exchange_counts_via_metadata(
+            node_counts, edge_counts, angle_counts,
+            world_size, group, device,
+        )
     recv_splits = _compute_send_splits(recv_node_counts, recv_edge_counts, recv_angle_counts)
 
     recv_tensor = all_to_all_differentiable(packed, send_splits, recv_splits, group)
@@ -639,6 +760,50 @@ def test_2nd_order_4gpu(rank, world_size, group):
 
 
 # ---------------------------------------------------------------------------
+# Step 5: exchange_metadata dedicated test (4 GPU)
+# ---------------------------------------------------------------------------
+
+def test_exchange_metadata_4gpu(rank, world_size, group):
+    """4-way exchange_metadata: each rank sends different counts to each other rank.
+
+    Verifies that recv_info[g] correctly holds what GPU g intends to send to me.
+    """
+    assert world_size == 4
+    device = torch.device(f"cuda:{rank}")
+
+    # Each rank sends unique counts to each destination.
+    # send_info[g] = (node, edge, angle) I will send to GPU g.
+    # Use deterministic pattern: rank * 10 + dest for node, etc.
+    send_data = []
+    for dest in range(world_size):
+        n = rank * 10 + dest       # node count
+        e = rank * 10 + dest + 1   # edge count
+        a = rank * 10 + dest + 2   # angle count
+        send_data.append([n, e, a])
+
+    send_info = torch.tensor(send_data, dtype=torch.int64, device=device)
+    recv_info = exchange_metadata(send_info, group)
+
+    # recv_info[g] should be what GPU g sends to me (rank).
+    # GPU g's send_info[rank] = (g * 10 + rank, g * 10 + rank + 1, g * 10 + rank + 2)
+    for g in range(world_size):
+        expected_n = g * 10 + rank
+        expected_e = g * 10 + rank + 1
+        expected_a = g * 10 + rank + 2
+        actual_n = int(recv_info[g, 0].item())
+        actual_e = int(recv_info[g, 1].item())
+        actual_a = int(recv_info[g, 2].item())
+        check(
+            actual_n == expected_n and actual_e == expected_e and actual_a == expected_a,
+            f"recv from GPU {g}: got ({actual_n},{actual_e},{actual_a}), "
+            f"expected ({expected_n},{expected_e},{expected_a})",
+            rank,
+        )
+
+    all_pass(rank, world_size, "test_exchange_metadata_4gpu")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -647,7 +812,8 @@ def main():
     group = dist.group.WORLD
 
     if rank == 0:
-        print(f"Running moe_packer multi-GPU tests with {world_size} GPUs", flush=True)
+        print(f"Running moe_packer + exchange_metadata multi-GPU tests with {world_size} GPUs",
+              flush=True)
 
     try:
         if world_size == 2:
@@ -655,10 +821,13 @@ def main():
             test_gradient_pipeline_2gpu(rank, world_size, group)
             test_2nd_order_pipeline_2gpu(rank, world_size, group)
             test_asymmetric_counts_2gpu(rank, world_size, group)
+            test_exchange_metadata_2gpu(rank, world_size, group)
+            test_exchange_metadata_pipeline_2gpu(rank, world_size, group)
 
         if world_size == 4:
             test_full_roundtrip_4gpu(rank, world_size, group)
             test_2nd_order_4gpu(rank, world_size, group)
+            test_exchange_metadata_4gpu(rank, world_size, group)
 
         if rank == 0:
             print(f"\nAll tests passed with {world_size} GPUs!", flush=True)

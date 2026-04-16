@@ -5,6 +5,7 @@ Provides:
 - ``validate_dim_ratio``: check n_dim:e_dim:a_dim = 4:2:1
 - ``MoEPacker``: pure formatting pack/unpack for All-to-All communication.
   Completely unaware of routing, experts, or topk.
+- ``exchange_metadata``: exchange per-GPU send counts via All-to-All.
 
 Packing rules (a = a_dim, base unit):
 
@@ -21,7 +22,12 @@ Output (30a per row):
 
 from __future__ import annotations
 
+from typing import (
+    Optional,
+)
+
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 
@@ -465,3 +471,87 @@ class MoEPacker:
         angle_out = torch.cat(angle_parts, dim=0) if angle_parts else returned.new_zeros(0, self.D_angle_out)
 
         return node_out, edge_out, angle_out
+
+
+# ======================================================================
+# Step 5: Metadata exchange
+# ======================================================================
+
+
+def exchange_metadata(
+    send_info: torch.Tensor,
+    ep_group: Optional[dist.ProcessGroup],
+) -> torch.Tensor:
+    """Exchange per-GPU metadata (token counts) via All-to-All.
+
+    Each GPU prepares ``send_info[g] = (node_count, edge_count, angle_count)``
+    describing what it will send to GPU *g*.  After the exchange,
+    ``recv_info[g]`` holds what GPU *g* will send to the current GPU.
+
+    This is a non-differentiable integer exchange used to set up the
+    ``send_splits`` / ``recv_splits`` for the subsequent data All-to-All.
+
+    Parameters
+    ----------
+    send_info : Tensor, shape ``[ep_size, n_fields]``, dtype int64
+        Row *g* contains the metadata this GPU intends to send to GPU *g*.
+        Typical fields: ``(node_count, edge_count, angle_count)``.
+    ep_group : ProcessGroup or None
+        Expert-parallelism communication group.
+        When ``None`` (single-GPU / no EP), *send_info* is returned as-is.
+
+    Returns
+    -------
+    recv_info : Tensor, shape ``[ep_size, n_fields]``, dtype int64
+        Row *g* contains the metadata GPU *g* will send to this GPU.
+    """
+    if ep_group is None:
+        return send_info
+
+    ep_size = dist.get_world_size(group=ep_group)
+    n_fields = send_info.shape[1]
+
+    # Each rank sends one row (n_fields ints) to every other rank.
+    # Use all_to_all on the flattened tensor.
+    recv_info = torch.empty_like(send_info)
+    # dist.all_to_all requires a list of tensors.
+    send_list = list(send_info.chunk(ep_size, dim=0))  # each [1, n_fields]
+    recv_list = list(recv_info.chunk(ep_size, dim=0))   # each [1, n_fields]
+    dist.all_to_all(recv_list, send_list, group=ep_group)
+
+    return torch.cat(recv_list, dim=0)
+
+
+def counts_to_packed_rows(
+    node_counts: list[int],
+    edge_counts: list[int],
+    angle_counts: list[int],
+    edge_group_size: int = 4,
+    angle_group_size: int = 10,
+) -> list[int]:
+    """Convert per-GPU token counts to packed row counts.
+
+    Given the number of node / edge / angle tokens for each GPU, compute
+    the total number of packed rows destined for (or received from) each GPU.
+
+    Parameters
+    ----------
+    node_counts, edge_counts, angle_counts : list[int]
+        Per-GPU token counts (length ``ep_size``).
+    edge_group_size : int
+        Number of edges packed per row (default 4).
+    angle_group_size : int
+        Number of angles packed per row (default 10).
+
+    Returns
+    -------
+    list[int]
+        Packed row count per GPU (length ``ep_size``).
+    """
+    splits: list[int] = []
+    for g in range(len(node_counts)):
+        n_n = node_counts[g]
+        n_e = _ceildiv(edge_counts[g], edge_group_size) if edge_counts[g] > 0 else 0
+        n_a = _ceildiv(angle_counts[g], angle_group_size) if angle_counts[g] > 0 else 0
+        splits.append(n_n + n_e + n_a)
+    return splits

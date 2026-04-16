@@ -14,6 +14,8 @@ Tests cover:
   - Empty feature handling
   - Edge cases (count=1)
   - Full dispatch→combine cycle
+  - exchange_metadata (group=None noop)
+  - counts_to_packed_rows
 """
 
 import torch
@@ -21,6 +23,8 @@ import pytest
 
 from deepmd.pt.model.network.moe_packer import (
     MoEPacker,
+    counts_to_packed_rows,
+    exchange_metadata,
     validate_dim_ratio,
 )
 
@@ -711,6 +715,88 @@ class TestFullCycle:
 
         # Row count identity.
         assert packed.shape[0] == packed_out.shape[0]
+
+
+# ---------------------------------------------------------------------------
+# exchange_metadata (group=None noop)
+# ---------------------------------------------------------------------------
+
+
+class TestExchangeMetadataSingleGPU:
+    """exchange_metadata with group=None must return input unchanged."""
+
+    def test_noop_returns_same(self):
+        """group=None returns the exact same tensor."""
+        send = torch.tensor([[3, 7, 13]], dtype=torch.int64, device=DEVICE)
+        recv = exchange_metadata(send, ep_group=None)
+        assert recv is send
+
+    def test_noop_multi_row(self):
+        """group=None with multi-row input returns the same tensor."""
+        send = torch.tensor([
+            [5, 8, 20],
+            [2, 0, 11],
+            [0, 3, 0],
+        ], dtype=torch.int64, device=DEVICE)
+        recv = exchange_metadata(send, ep_group=None)
+        assert recv is send
+
+
+# ---------------------------------------------------------------------------
+# counts_to_packed_rows
+# ---------------------------------------------------------------------------
+
+
+class TestCountsToPackedRows:
+    """Test the counts_to_packed_rows utility."""
+
+    def test_basic(self):
+        """Standard case: node + edge + angle counts → packed rows."""
+        node_counts = [3, 5]
+        edge_counts = [7, 12]
+        angle_counts = [13, 20]
+        result = counts_to_packed_rows(node_counts, edge_counts, angle_counts)
+        # GPU 0: 3 + ceil(7/4) + ceil(13/10) = 3 + 2 + 2 = 7
+        # GPU 1: 5 + ceil(12/4) + ceil(20/10) = 5 + 3 + 2 = 10
+        assert result == [7, 10]
+
+    def test_zeros(self):
+        """All-zero counts give all-zero rows."""
+        result = counts_to_packed_rows([0, 0], [0, 0], [0, 0])
+        assert result == [0, 0]
+
+    def test_edge_only(self):
+        """Only edge counts, rest zero."""
+        result = counts_to_packed_rows([0], [7], [0])
+        assert result == [2]  # ceil(7/4) = 2
+
+    def test_angle_only(self):
+        """Only angle counts, rest zero."""
+        result = counts_to_packed_rows([0], [0], [13])
+        assert result == [2]  # ceil(13/10) = 2
+
+    def test_node_only(self):
+        """Only node counts, rest zero."""
+        result = counts_to_packed_rows([5], [0], [0])
+        assert result == [5]
+
+    def test_consistent_with_packer(self):
+        """counts_to_packed_rows must agree with MoEPacker.pack_for_dispatch."""
+        p = _make_packer()
+        node_counts = [3, 5, 0, 2]
+        edge_counts = [7, 0, 12, 1]
+        angle_counts = [13, 20, 0, 3]
+
+        node = _rand(sum(node_counts), 28 * A)
+        edge = _rand(sum(edge_counts), 10 * A)
+        angle = _rand(sum(angle_counts), 4 * A)
+
+        _, send_splits = p.pack_for_dispatch(
+            node, edge, angle,
+            node_counts, edge_counts, angle_counts,
+        )
+        computed = counts_to_packed_rows(node_counts, edge_counts, angle_counts)
+        assert send_splits == computed
 
 
 if __name__ == "__main__":
