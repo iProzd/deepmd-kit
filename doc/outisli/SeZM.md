@@ -145,7 +145,9 @@ the standard DeePMD neighbor list behavior:
   `edge_vec` enters the graph directly, and the force gradient path is reattached cleanly from
   local coordinates before descriptor evaluation.
 - The descriptor accepts the sparse edge list directly and compiles a **pure tensor graph**.
-  - `ener` uses `make_fx(tracing_mode="symbolic")` before `torch.compile(...)` to stabilize higher-order autograd capture.
+  - `ener` uses `make_fx(tracing_mode="symbolic")` before `torch.compile(...)` to stabilize higher-order autograd capture. Two graph-level fixes are applied between `make_fx` and `torch.compile`:
+    1. **`decomposition_table`**: `silu_backward` is decomposed into primitive ops (`sigmoid + mul + ...`) during tracing, so that the inductor backend can compile the eval graph without requiring a higher-order derivative that PyTorch does not register for `silu_backward`.
+    1. **`_strip_saved_tensor_detach`** (training only): removes autograd-inserted `aten.detach` nodes on saved forward activations (sigmoid, tanh, sqrt, etc.) that would otherwise block second-order gradient flow needed for force-loss training. User-explicit `.detach()` calls (e.g. in `attach_edge_vec_grad`) are preserved by a graph-topology rule: only detach nodes forming autograd double-detach chains are removed.
   - `dens` compiles the direct-force compute function directly.
 - The compiled graph keeps **dynamic total node / edge counts**.
   - `ener` compile keeps the second-order derivatives needed by conservative force training.

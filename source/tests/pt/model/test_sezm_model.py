@@ -54,6 +54,18 @@ class TestSeZMModelCompile(unittest.TestCase):
         self.device = env.DEVICE
         torch.manual_seed(2024)
 
+    @staticmethod
+    def _randomize_params(model: torch.nn.Module, seed: int = 1234) -> None:
+        """Fill all parameters with small random values.
+
+        Zero-initialized parameters mask second-order gradient bugs because
+        many multiplicative paths collapse to zero.
+        """
+        torch.manual_seed(seed)
+        with torch.no_grad():
+            for p in model.parameters():
+                p.copy_(torch.randn_like(p) * 0.1)
+
     def _build_model_params(self, *, use_compile: bool) -> dict:
         return {
             "type": "SeZM",
@@ -204,8 +216,9 @@ class TestSeZMModelCompile(unittest.TestCase):
         coord_1, atype_1, box_1, _, _, _ = self._load_water_frame()
         coord_2, atype_2, box_2, _, _, _ = self._load_water_frame(nframe=2)
 
-        # === Step 1. Build paired models with shared weights ===
+        # === Step 1. Build paired models with shared random weights ===
         model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        self._randomize_params(model_dyn)
         with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
             model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
@@ -316,15 +329,15 @@ class TestSeZMModelCompile(unittest.TestCase):
         self.assertTrue(model.use_compile)
 
         model.train()
-        self.assertTrue(model._should_use_compile())
+        self.assertTrue(model.should_use_compile())
 
         model.eval()
-        self.assertFalse(model._should_use_compile())
+        self.assertFalse(model.should_use_compile())
 
         with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
             model_eval = get_sezm_model(self._build_model_params(use_compile=True))
         model_eval.eval()
-        self.assertTrue(model_eval._should_use_compile())
+        self.assertTrue(model_eval.should_use_compile())
 
     def test_forward_backward_double_backward_matches_compile(self) -> None:
         """
@@ -338,8 +351,9 @@ class TestSeZMModelCompile(unittest.TestCase):
         coord, atype, box, energy, force, virial = self._load_water_frame()
         coord_2, atype_2, box_2, _, _, _ = self._load_water_frame(nframe=2)
 
-        # === Step 1. Build paired models with shared weights ===
+        # === Step 1. Build paired models with shared random weights ===
         model_dyn = get_sezm_model(self._build_model_params(use_compile=False))
+        self._randomize_params(model_dyn)
         model_cmp = get_sezm_model(self._build_model_params(use_compile=True))
         model_cmp.load_state_dict(model_dyn.state_dict())
         model_dyn.train()

@@ -92,6 +92,54 @@ def _parse_optional_env_bool(var_name: str) -> bool | None:
     )
 
 
+def _strip_saved_tensor_detach(gm: torch.fx.GraphModule) -> None:
+    """Strip ``aten.detach`` nodes that ``make_fx`` inserts for saved tensors.
+
+    When ``make_fx`` decomposes ``autograd.grad(..., create_graph=True)``,
+    the autograd engine wraps every saved forward activation in a double-detach
+    chain (e.g. ``tanh -> detach_A -> detach_B -> tanh_backward``).  These
+    detach nodes block the second-order gradient path from the loss back to
+    model parameters, causing incorrect parameter updates during force-loss
+    training.
+
+    User-explicit ``.detach()`` calls (e.g. inside ``attach_edge_vec_grad``)
+    are preserved.  The two categories are distinguished by graph topology
+    alone — no hard-coded op names — using three rules:
+
+    * *Chain inner*: input is another detach node.
+    * *Dead node*: no downstream users.
+    * *Chain head*: *all* users are detach nodes.
+
+    Any detach that does **not** match these rules is treated as user-explicit
+    and left untouched.
+    """
+    _DETACH = torch.ops.aten.detach.default
+
+    def _is_detach(n: torch.fx.Node) -> bool:
+        return n.op == "call_function" and n.target == _DETACH
+
+    # Pass 1 — classify on the original, unmodified graph.
+    to_remove: list[torch.fx.Node] = []
+    for node in gm.graph.nodes:
+        if not _is_detach(node):
+            continue
+        input_node = node.args[0]
+        users = list(node.users.keys())
+        is_chain_inner = _is_detach(input_node)
+        is_dead = len(users) == 0
+        is_chain_head = len(users) > 0 and all(_is_detach(u) for u in users)
+        if is_chain_inner or is_dead or is_chain_head:
+            to_remove.append(node)
+
+    # Pass 2 — remove in one shot so classification stays consistent.
+    for node in to_remove:
+        node.replace_all_uses_with(node.args[0])
+        gm.graph.erase_node(node)
+
+    gm.graph.lint()
+    gm.recompile()
+
+
 @BaseModel.register("SeZM")
 @BaseModel.register("se_zm")
 @BaseModel.register("sezm")
@@ -1038,10 +1086,20 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             if trace_ap is not None:
                 trace_ap = torch.cat([trace_ap, trace_ap], dim=0)
 
+        # Decompose silu_backward into primitive ops (sigmoid + mul + ...)
+        # so that inductor can compile the eval graph without requiring a
+        # higher-order derivative that PyTorch does not register for silu.
+        from torch._decomp import (
+            get_decompositions,
+        )
+
+        decomp_table = get_decompositions([torch.ops.aten.silu_backward.default])
+
         traced = make_fx(
             compute_fn,
             tracing_mode="symbolic",
             _allow_non_fake_inputs=True,
+            decomposition_table=decomp_table,
         )(
             trace_coord,
             trace_atype,
@@ -1051,6 +1109,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             trace_fp,
             trace_ap,
         )
+
+        # When training with force/virial loss, make_fx wraps saved forward
+        # activations in detach nodes that block second-order gradient flow.
+        # In eval mode (create_graph=False) those detach nodes are correct
+        # and must be kept — removing them causes inductor to attempt
+        # higher-order differentiation of remaining backward ops.
+        if self.training:
+            _strip_saved_tensor_detach(traced)
 
         object.__setattr__(
             self,
