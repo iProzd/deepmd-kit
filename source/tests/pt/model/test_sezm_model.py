@@ -315,13 +315,16 @@ class TestSeZMModelCompile(unittest.TestCase):
             wigner_calc=descriptor.wigner_calc,
         )
 
-        self.assertTrue(torch.equal(cache_std.src, cache_sparse.src))
-        self.assertTrue(torch.equal(cache_std.dst, cache_sparse.dst))
-        torch.testing.assert_close(cache_std.edge_vec, cache_sparse.edge_vec)
-        torch.testing.assert_close(cache_std.edge_rbf, cache_sparse.edge_rbf)
-        torch.testing.assert_close(cache_std.edge_env, cache_sparse.edge_env)
-        torch.testing.assert_close(cache_std.D_full, cache_sparse.D_full)
-        torch.testing.assert_close(cache_std.Dt_full, cache_sparse.Dt_full)
+        # build_edge_list_from_nlist appends one masked dummy edge;
+        # compare only the real edges (all except the trailing dummy).
+        n_real = cache_std.src.shape[0]
+        self.assertTrue(torch.equal(cache_std.src, cache_sparse.src[:n_real]))
+        self.assertTrue(torch.equal(cache_std.dst, cache_sparse.dst[:n_real]))
+        torch.testing.assert_close(cache_std.edge_vec, cache_sparse.edge_vec[:n_real])
+        torch.testing.assert_close(cache_std.edge_rbf, cache_sparse.edge_rbf[:n_real])
+        torch.testing.assert_close(cache_std.edge_env, cache_sparse.edge_env[:n_real])
+        torch.testing.assert_close(cache_std.D_full, cache_sparse.D_full[:n_real])
+        torch.testing.assert_close(cache_std.Dt_full, cache_sparse.Dt_full[:n_real])
 
     def test_eval_compile_policy(self) -> None:
         """Eval should stay eager by default and compile only with env override."""
