@@ -110,7 +110,10 @@ class TestMoERouter:
             requires_grad=True,
         )
         weights, _ = router(type_emb)
-        loss = weights.sum()
+        # Use (weights**2).sum() instead of weights.sum() because
+        # sum(softmax(topk_logits)) = 1.0 (constant), so its gradient
+        # w.r.t. input is mathematically zero.
+        loss = (weights ** 2).sum()
         loss.backward()
         assert type_emb.grad is not None, "input grad is None"
         assert type_emb.grad.abs().sum() > 0, "input grad is all zeros"
