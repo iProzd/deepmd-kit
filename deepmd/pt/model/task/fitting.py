@@ -466,6 +466,12 @@ class GeneralFitting(Fitting):
         if not self.mixed_types:
             assert self.ntypes == bias_atom_e.shape[0], "Element count mismatches!"
         self.register_buffer("bias_atom_e", bias_atom_e)
+        self.register_buffer(
+            "out_std",
+            torch.ones(
+                [self.ntypes, net_dim_out], dtype=env.GLOBAL_PT_FLOAT_PRECISION
+            ),
+        )
 
         if self.numb_fparam > 0:
             self.register_buffer(
@@ -600,6 +606,7 @@ class GeneralFitting(Fitting):
                 "fparam_inv_std": to_numpy_array(self.fparam_inv_std),
                 "aparam_avg": to_numpy_array(self.aparam_avg),
                 "aparam_inv_std": to_numpy_array(self.aparam_inv_std),
+                "out_std": to_numpy_array(self.out_std),
             },
             "type_map": self.type_map,
             # "tot_ener_zero": self.tot_ener_zero ,
@@ -693,6 +700,12 @@ class GeneralFitting(Fitting):
             self.aparam_inv_std = value
         elif key in ["case_embd"]:
             self.case_embd = value
+        elif key in ["out_std"]:
+            self.out_std = value
+            log.info(
+                f"Successfully loaded out_std for {self.var_name}: "
+                f"{to_numpy_array(value).flatten()}"
+            )
         elif key in ["scale"]:
             self.scale = value
         elif key in ["default_fparam_tensor"]:
@@ -713,6 +726,8 @@ class GeneralFitting(Fitting):
             return self.aparam_inv_std
         elif key in ["case_embd"]:
             return self.case_embd
+        elif key in ["out_std"]:
+            return self.out_std
         elif key in ["scale"]:
             return self.scale
         elif key in ["default_fparam_tensor"]:
@@ -842,7 +857,9 @@ class GeneralFitting(Fitting):
             if xx_zeros is not None:
                 atom_property -= self.filter_layers.networks[0](xx_zeros)
             outs = (
-                outs + atom_property + self.bias_atom_e[atype].to(self.prec)
+                outs
+                + atom_property * self.out_std[atype].to(self.prec)
+                + self.bias_atom_e[atype].to(self.prec)
             )  # Shape is [nframes, natoms[0], net_dim_out]
         else:
             for type_i, ll in enumerate(self.filter_layers.networks):
@@ -857,7 +874,10 @@ class GeneralFitting(Fitting):
                         and not self.remove_vaccum_contribution[type_i]
                     ):
                         atom_property -= ll(xx_zeros)
-                atom_property = atom_property + self.bias_atom_e[type_i].to(self.prec)
+                atom_property = (
+                    atom_property * self.out_std[type_i].to(self.prec)
+                    + self.bias_atom_e[type_i].to(self.prec)
+                )
                 atom_property = torch.where(mask, atom_property, 0.0)
                 outs = (
                     outs + atom_property

@@ -433,7 +433,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
         out_bias, out_std = self._fetch_out_stat(self.bias_keys)
         for kk in self.bias_keys:
             # nf x nloc x odims, out_bias: ntypes x odims
-            ret[kk] = ret[kk] + out_bias[kk][atype]
+            ret[kk] = ret[kk] * out_std[kk][atype] + out_bias[kk][atype]
         return ret
 
     def change_out_bias(
@@ -572,6 +572,8 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             out_std_data[idx, :, :size] = out_std[kk].view(ntypes, size)
         self.out_bias.copy_(out_bias_data)
         self.out_std.copy_(out_std_data)
+        log.info(f"Stored output bias: {to_numpy_array(self.out_bias).flatten()}")
+        log.info(f"Stored output std: {to_numpy_array(self.out_std).flatten()}")
 
     def _fetch_out_stat(
         self,
