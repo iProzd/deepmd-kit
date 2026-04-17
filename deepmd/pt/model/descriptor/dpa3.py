@@ -122,6 +122,10 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         use_loc_mapping: bool = True,
         type_map: list[str] | None = None,
         add_chg_spin_ebd: bool = False,
+        # MoE EP params (not part of RepFlowArgs, set at runtime).
+        ep_group=None,
+        ep_rank: int = 0,
+        ep_size: int = 1,
     ) -> None:
         super().__init__()
 
@@ -173,6 +177,13 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
             precision=precision,
             seed=child_seed(seed, 1),
             trainable=trainable,
+            use_moe=self.repflow_args.use_moe,
+            n_routing_experts=self.repflow_args.n_routing_experts,
+            moe_topk=self.repflow_args.moe_topk,
+            n_shared_experts=self.repflow_args.n_shared_experts,
+            ep_group=ep_group,
+            ep_rank=ep_rank,
+            ep_size=ep_size,
         )
 
         self.use_econf_tebd = use_econf_tebd

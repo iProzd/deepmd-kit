@@ -170,6 +170,14 @@ class RepFlowArgs:
         In the dynamic selection case, neighbor-scale normalization will use `e_sel / sel_reduce_factor`
         or `a_sel / sel_reduce_factor` instead of the raw `e_sel` or `a_sel` values,
         accommodating larger selection numbers.
+    use_moe : bool, optional
+        Whether to use Mixture-of-Experts for the MLP layers in each RepFlowLayer.
+    n_routing_experts : int, optional
+        Total number of routing experts across all GPUs.
+    moe_topk : int, optional
+        Number of experts selected per token.
+    n_shared_experts : int, optional
+        Number of shared experts (replicated on every GPU).
     """
 
     def __init__(
@@ -201,6 +209,10 @@ class RepFlowArgs:
         use_exp_switch: bool = False,
         use_dynamic_sel: bool = False,
         sel_reduce_factor: float = 10.0,
+        use_moe: bool = False,
+        n_routing_experts: int = 0,
+        moe_topk: int = 0,
+        n_shared_experts: int = 0,
     ) -> None:
         self.n_dim = n_dim
         self.e_dim = e_dim
@@ -231,6 +243,10 @@ class RepFlowArgs:
         self.use_exp_switch = use_exp_switch
         self.use_dynamic_sel = use_dynamic_sel
         self.sel_reduce_factor = sel_reduce_factor
+        self.use_moe = use_moe
+        self.n_routing_experts = n_routing_experts
+        self.moe_topk = moe_topk
+        self.n_shared_experts = n_shared_experts
 
     def __getitem__(self, key: str) -> Any:
         if hasattr(self, key):
@@ -266,6 +282,10 @@ class RepFlowArgs:
             "use_exp_switch": self.use_exp_switch,
             "use_dynamic_sel": self.use_dynamic_sel,
             "sel_reduce_factor": self.sel_reduce_factor,
+            "use_moe": self.use_moe,
+            "n_routing_experts": self.n_routing_experts,
+            "moe_topk": self.moe_topk,
+            "n_shared_experts": self.n_shared_experts,
         }
 
     @classmethod

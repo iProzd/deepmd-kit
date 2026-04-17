@@ -226,6 +226,13 @@ class DescrptBlockRepflows(DescriptorBlock):
         optim_update: bool = True,
         seed: int | list[int] | None = None,
         trainable: bool = True,
+        use_moe: bool = False,
+        n_routing_experts: int = 0,
+        moe_topk: int = 0,
+        n_shared_experts: int = 0,
+        ep_group=None,
+        ep_rank: int = 0,
+        ep_size: int = 1,
     ) -> None:
         super().__init__()
         self.e_rcut = float(e_rcut)
@@ -256,6 +263,7 @@ class DescrptBlockRepflows(DescriptorBlock):
         self.a_compress_use_split = a_compress_use_split
         self.use_loc_mapping = use_loc_mapping
         self.optim_update = optim_update
+        self.use_moe = use_moe
         self.smooth_edge_update = smooth_edge_update
         self.edge_init_use_dist = edge_init_use_dist
         self.use_exp_switch = use_exp_switch
@@ -335,6 +343,13 @@ class DescrptBlockRepflows(DescriptorBlock):
                     smooth_edge_update=self.smooth_edge_update,
                     seed=child_seed(child_seed(seed, 1), ii),
                     trainable=trainable,
+                    use_moe=use_moe,
+                    n_routing_experts=n_routing_experts,
+                    moe_topk=moe_topk,
+                    n_shared_experts=n_shared_experts,
+                    ep_group=ep_group,
+                    ep_rank=ep_rank,
+                    ep_size=ep_size,
                 )
             )
         self.layers = torch.nn.ModuleList(layers)
@@ -656,6 +671,7 @@ class DescrptBlockRepflows(DescriptorBlock):
                 a_sw,
                 edge_index=edge_index,
                 angle_index=angle_index,
+                type_embedding=atype_embd if self.use_moe else None,
             )
 
         # nb x nloc x 3 x e_dim
