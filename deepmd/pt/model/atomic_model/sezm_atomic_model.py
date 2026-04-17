@@ -120,6 +120,9 @@ class SeZMAtomicModel(DPAtomicModel):
         error_msgs: list[str],
     ) -> None:
         """Materialize the optional `dens` head before recursive loading."""
+        dens_rmsd_key = prefix + "dens_force_rmsd"
+        if dens_rmsd_key not in state_dict:
+            state_dict[dens_rmsd_key] = self.dens_force_rmsd.data.clone()
         has_dens_state = any(
             key.startswith(prefix + "dens_fitting_net.") for key in state_dict
         )
