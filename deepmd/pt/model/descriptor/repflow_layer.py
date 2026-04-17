@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 
@@ -14,6 +16,15 @@ from deepmd.pt.model.descriptor.repformer_layer import (
 )
 from deepmd.pt.model.network.mlp import (
     MLPLayer,
+)
+from deepmd.pt.model.network.moe_layer import (
+    MoEDispatchCombine,
+)
+from deepmd.pt.model.network.moe_packer import (
+    validate_dim_ratio,
+)
+from deepmd.pt.model.network.moe_router import (
+    MoERouter,
 )
 from deepmd.pt.model.network.utils import (
     aggregate,
@@ -61,6 +72,13 @@ class RepFlowLayer(torch.nn.Module):
         precision: str = "float64",
         seed: int | list[int] | None = None,
         trainable: bool = True,
+        use_moe: bool = False,
+        n_routing_experts: int = 0,
+        moe_topk: int = 0,
+        n_shared_experts: int = 0,
+        ep_group=None,
+        ep_rank: int = 0,
+        ep_size: int = 1,
     ) -> None:
         super().__init__()
         self.epsilon = 1e-4  # protection of 1./nnei
@@ -117,14 +135,22 @@ class RepFlowLayer(torch.nn.Module):
         self.a_residual = []
         self.edge_info_dim = self.n_dim * 2 + self.e_dim
 
-        # node self mlp
-        self.node_self_mlp = MLPLayer(
-            n_dim,
-            n_dim,
-            precision=precision,
-            seed=child_seed(seed, 0),
-            trainable=trainable,
-        )
+        # MoE flag (must be set before MLP creation).
+        self.use_moe = use_moe
+        if self.use_moe:
+            if not self.use_dynamic_sel:
+                raise ValueError("MoE requires use_dynamic_sel=True")
+            if self.optim_update:
+                raise ValueError("MoE requires optim_update=False")
+            if not self.update_angle:
+                raise ValueError("MoE requires update_angle=True")
+            if self.n_multi_edge_message != 1:
+                raise ValueError("MoE requires n_multi_edge_message=1")
+            if not self.a_compress_use_split:
+                raise ValueError("MoE requires a_compress_use_split=True")
+            validate_dim_ratio(n_dim, e_dim, a_dim)
+
+        # ---- Residual for M1 (node self) ----
         if self.update_style == "res_residual":
             self.n_residual.append(
                 get_residual(
@@ -137,15 +163,10 @@ class RepFlowLayer(torch.nn.Module):
                 )
             )
 
-        # node sym (grrg + drrd)
+        # node sym (grrg + drrd) dimension
         self.n_sym_dim = n_dim * self.axis_neuron + e_dim * self.axis_neuron
-        self.node_sym_linear = MLPLayer(
-            self.n_sym_dim,
-            n_dim,
-            precision=precision,
-            seed=child_seed(seed, 2),
-            trainable=trainable,
-        )
+
+        # ---- Residual for M2 (node sym) ----
         if self.update_style == "res_residual":
             self.n_residual.append(
                 get_residual(
@@ -158,14 +179,7 @@ class RepFlowLayer(torch.nn.Module):
                 )
             )
 
-        # node edge message
-        self.node_edge_linear = MLPLayer(
-            self.edge_info_dim,
-            self.n_multi_edge_message * n_dim,
-            precision=precision,
-            seed=child_seed(seed, 4),
-            trainable=trainable,
-        )
+        # ---- Residual for M3 (node edge message) ----
         if self.update_style == "res_residual":
             for head_index in range(self.n_multi_edge_message):
                 self.n_residual.append(
@@ -179,14 +193,7 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
 
-        # edge self message
-        self.edge_self_linear = MLPLayer(
-            self.edge_info_dim,
-            e_dim,
-            precision=precision,
-            seed=child_seed(seed, 6),
-            trainable=trainable,
-        )
+        # ---- Residual for M4 (edge self) ----
         if self.update_style == "res_residual":
             self.e_residual.append(
                 get_residual(
@@ -199,17 +206,16 @@ class RepFlowLayer(torch.nn.Module):
                 )
             )
 
+        # ---- Angle dimension computation (shared) ----
         if self.update_angle:
             self.angle_dim = self.a_dim
             if self.a_compress_rate == 0:
-                # angle + node + edge * 2
                 self.angle_dim += self.n_dim + 2 * self.e_dim
                 self.a_compress_n_linear = None
                 self.a_compress_e_linear = None
                 self.e_a_compress_dim = e_dim
                 self.n_a_compress_dim = n_dim
             else:
-                # angle + a_dim/c + a_dim/2c * 2 * e_rate
                 self.angle_dim += (1 + self.a_compress_e_rate) * (
                     self.a_dim // self.a_compress_rate
                 )
@@ -238,21 +244,7 @@ class RepFlowLayer(torch.nn.Module):
                     self.a_compress_n_linear = None
                     self.a_compress_e_linear = None
 
-            # edge angle message
-            self.edge_angle_linear1 = MLPLayer(
-                self.angle_dim,
-                self.e_dim,
-                precision=precision,
-                seed=child_seed(seed, 10),
-                trainable=trainable,
-            )
-            self.edge_angle_linear2 = MLPLayer(
-                self.e_dim,
-                self.e_dim,
-                precision=precision,
-                seed=child_seed(seed, 11),
-                trainable=trainable,
-            )
+            # ---- Residual for M6 (edge angle) ----
             if self.update_style == "res_residual":
                 self.e_residual.append(
                     get_residual(
@@ -265,14 +257,7 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
 
-            # angle self message
-            self.angle_self_linear = MLPLayer(
-                self.angle_dim,
-                self.a_dim,
-                precision=precision,
-                seed=child_seed(seed, 13),
-                trainable=trainable,
-            )
+            # ---- Residual for M7 (angle self) ----
             if self.update_style == "res_residual":
                 self.a_residual.append(
                     get_residual(
@@ -285,9 +270,6 @@ class RepFlowLayer(torch.nn.Module):
                     )
                 )
         else:
-            self.angle_self_linear = None
-            self.edge_angle_linear1 = None
-            self.edge_angle_linear2 = None
             self.a_compress_n_linear = None
             self.a_compress_e_linear = None
             self.angle_dim = 0
@@ -295,6 +277,106 @@ class RepFlowLayer(torch.nn.Module):
         self.n_residual = nn.ParameterList(self.n_residual)
         self.e_residual = nn.ParameterList(self.e_residual)
         self.a_residual = nn.ParameterList(self.a_residual)
+
+        # ---- Branch: Non-MoE MLPs vs MoE components ----
+        if not self.use_moe:
+            # M1: node self mlp
+            self.node_self_mlp = MLPLayer(
+                n_dim, n_dim,
+                precision=precision, seed=child_seed(seed, 0), trainable=trainable,
+            )
+            # M2: node sym linear
+            self.node_sym_linear = MLPLayer(
+                self.n_sym_dim, n_dim,
+                precision=precision, seed=child_seed(seed, 2), trainable=trainable,
+            )
+            # M3: node edge linear
+            self.node_edge_linear = MLPLayer(
+                self.edge_info_dim, self.n_multi_edge_message * n_dim,
+                precision=precision, seed=child_seed(seed, 4), trainable=trainable,
+            )
+            # M4: edge self linear
+            self.edge_self_linear = MLPLayer(
+                self.edge_info_dim, e_dim,
+                precision=precision, seed=child_seed(seed, 6), trainable=trainable,
+            )
+            if self.update_angle:
+                # M5: edge angle linear1
+                self.edge_angle_linear1 = MLPLayer(
+                    self.angle_dim, self.e_dim,
+                    precision=precision, seed=child_seed(seed, 10), trainable=trainable,
+                )
+                # M6: edge angle linear2
+                self.edge_angle_linear2 = MLPLayer(
+                    self.e_dim, self.e_dim,
+                    precision=precision, seed=child_seed(seed, 11), trainable=trainable,
+                )
+                # M7: angle self linear
+                self.angle_self_linear = MLPLayer(
+                    self.angle_dim, self.a_dim,
+                    precision=precision, seed=child_seed(seed, 13), trainable=trainable,
+                )
+            else:
+                self.edge_angle_linear1 = None
+                self.edge_angle_linear2 = None
+                self.angle_self_linear = None
+            # MoE attrs not used.
+            self.node_router = None
+            self.edge_router = None
+            self.angle_router = None
+            self.moe_phase1 = None
+            self.edge_angle_linear2_moe = None
+        else:
+            # Non-MoE MLPs not used.
+            self.node_self_mlp = None
+            self.node_sym_linear = None
+            self.node_edge_linear = None
+            self.edge_self_linear = None
+            self.edge_angle_linear1 = None
+            self.edge_angle_linear2 = None
+            self.angle_self_linear = None
+
+            experts_per_gpu = n_routing_experts // ep_size
+
+            # 3 independent routers (node, edge, angle).
+            self.node_router = MoERouter(
+                n_dim, n_routing_experts, moe_topk,
+                precision=precision, seed=child_seed(seed, 200),
+            )
+            self.edge_router = MoERouter(
+                n_dim, n_routing_experts, moe_topk,
+                precision=precision, seed=child_seed(seed, 201),
+            )
+            self.angle_router = MoERouter(
+                n_dim, n_routing_experts, moe_topk,
+                precision=precision, seed=child_seed(seed, 202),
+            )
+
+            # MoE dispatch-compute-combine for Phase 1 MLPs.
+            self.moe_phase1 = MoEDispatchCombine(
+                n_dim=n_dim,
+                e_dim=e_dim,
+                a_dim=a_dim,
+                n_sym_dim=self.n_sym_dim,
+                edge_info_dim=self.edge_info_dim,
+                angle_dim=self.angle_dim,
+                n_routing_experts=n_routing_experts,
+                topk=moe_topk,
+                n_shared_experts=n_shared_experts,
+                ep_group=ep_group,
+                ep_rank=ep_rank,
+                ep_size=ep_size,
+                experts_per_gpu=experts_per_gpu,
+                activation_function=activation_function,
+                precision=precision,
+                seed=child_seed(seed, 210),
+            )
+
+            # M6 (edge_angle_linear2): not MoE, local shared param.
+            self.edge_angle_linear2_moe = MLPLayer(
+                e_dim, e_dim,
+                precision=precision, seed=child_seed(seed, 220), trainable=trainable,
+            )
 
     @staticmethod
     def _cal_hg(
@@ -708,7 +790,17 @@ class RepFlowLayer(torch.nn.Module):
         a_sw: torch.Tensor,  # switch func, nf x nloc x a_nnei
         edge_index: torch.Tensor,  # 2 x n_edge
         angle_index: torch.Tensor,  # 3 x n_angle
+        type_embedding: torch.Tensor | None = None,  # nf x nloc x n_dim
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.use_moe:
+            assert type_embedding is not None, (
+                "type_embedding is required for MoE forward"
+            )
+            return self.forward_moe(
+                node_ebd_ext, edge_ebd, h2, angle_ebd,
+                nlist, nlist_mask, sw, a_nlist, a_nlist_mask, a_sw,
+                edge_index, angle_index, type_embedding,
+            )
         """
         Parameters
         ----------
@@ -1128,6 +1220,187 @@ class RepFlowLayer(torch.nn.Module):
             e_updated = self.list_update(e_update_list, "edge")
 
         # update angle_ebd
+        a_updated = self.list_update(a_update_list, "angle")
+        return n_updated, e_updated, a_updated
+
+    def forward_moe(
+        self,
+        node_ebd_ext: torch.Tensor,  # nf x nall x n_dim
+        edge_ebd: torch.Tensor,  # n_edge x e_dim (dynamic_sel)
+        h2: torch.Tensor,  # n_edge x 3 (dynamic_sel)
+        angle_ebd: torch.Tensor,  # n_angle x a_dim (dynamic_sel)
+        nlist: torch.Tensor,  # nf x nloc x nnei
+        nlist_mask: torch.Tensor,  # nf x nloc x nnei (unused in MoE path)
+        sw: torch.Tensor,  # n_edge (dynamic_sel)
+        a_nlist: torch.Tensor,  # nf x nloc x a_nnei (unused)
+        a_nlist_mask: torch.Tensor,  # nf x nloc x a_nnei (unused)
+        a_sw: torch.Tensor,  # n_angle (dynamic_sel)
+        edge_index: torch.Tensor,  # 2 x n_edge
+        angle_index: torch.Tensor,  # 3 x n_angle
+        type_embedding: torch.Tensor,  # nf x nloc x n_dim
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """MoE forward path (dynamic_sel=True, optim_update=False only).
+
+        Returns
+        -------
+        n_updated : nf x nloc x n_dim
+        e_updated : n_edge x e_dim
+        a_updated : n_angle x a_dim
+        """
+        nb, nloc, nnei = nlist.shape
+        nall = node_ebd_ext.shape[1]
+        node_ebd = node_ebd_ext[:, :nloc, :]
+        n_edge = h2.shape[0]
+        n_angle = angle_ebd.shape[0]
+        del a_nlist  # unused
+
+        n2e_index, n_ext2e_index = edge_index[0], edge_index[1]
+        n2a_index, eij2a_index, eik2a_index = (
+            angle_index[0],
+            angle_index[1],
+            angle_index[2],
+        )
+
+        # ---- Step 1: Build MLP inputs ----
+        # Neighbor node embedding: n_edge x n_dim.
+        nei_node_ebd = torch.index_select(
+            node_ebd_ext.reshape(-1, self.n_dim), 0, n_ext2e_index
+        )
+
+        # Symmetrization: grrg from edge_ebd, drrd from nei_node_ebd.
+        grrg = self.symmetrization_op_dynamic(
+            edge_ebd, h2, sw,
+            owner=n2e_index, num_owner=nb * nloc,
+            nb=nb, nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+        drrd = self.symmetrization_op_dynamic(
+            nei_node_ebd, h2, sw,
+            owner=n2e_index, num_owner=nb * nloc,
+            nb=nb, nloc=nloc,
+            scale_factor=self.dynamic_e_sel ** (-0.5),
+            axis_neuron=self.axis_neuron,
+        )
+
+        # M1 input: node_ebd flat, [N_node, n_dim].
+        N_node = nb * nloc
+        node_m1_input = node_ebd.reshape(N_node, self.n_dim)
+
+        # M2 input: cat(grrg, drrd) flat, [N_node, n_sym_dim].
+        node_m2_input = torch.cat([grrg, drrd], dim=-1).reshape(
+            N_node, self.n_sym_dim
+        )
+
+        # Edge info for merged M3+M4: cat(node_i, node_j, edge_ebd).
+        # n_edge x (n_dim + n_dim + e_dim) = n_edge x edge_info_dim.
+        edge_info = torch.cat(
+            [
+                torch.index_select(
+                    node_ebd.reshape(-1, self.n_dim), 0, n2e_index
+                ),
+                nei_node_ebd,
+                edge_ebd,
+            ],
+            dim=-1,
+        )
+
+        # Angle info for merged M5+M7.
+        # Compress node/edge for angle (a_compress_use_split=True).
+        node_ebd_for_angle = node_ebd[..., : self.n_a_compress_dim]
+        edge_ebd_for_angle = edge_ebd[..., : self.e_a_compress_dim]
+        # n_angle x n_a_compress_dim.
+        node_for_angle_info = torch.index_select(
+            node_ebd_for_angle.reshape(-1, self.n_a_compress_dim),
+            0, n2a_index,
+        )
+        # n_angle x e_a_compress_dim.
+        edge_for_angle_k = torch.index_select(
+            edge_ebd_for_angle, 0, eik2a_index
+        )
+        edge_for_angle_j = torch.index_select(
+            edge_ebd_for_angle, 0, eij2a_index
+        )
+        # n_angle x angle_dim.
+        angle_info = torch.cat(
+            [angle_ebd, node_for_angle_info, edge_for_angle_k, edge_for_angle_j],
+            dim=-1,
+        )
+
+        # ---- Step 2: Routing ----
+        node_router_out = self.node_router(type_embedding)
+        edge_router_out = self.edge_router(type_embedding)
+        angle_router_out = self.angle_router(type_embedding)
+
+        # ---- Step 3: MoE Phase 1 ----
+        node_m1_out, node_m2_out, edge_merged_out, angle_merged_out = (
+            self.moe_phase1(
+                node_m1_input=node_m1_input,
+                node_m2_input=node_m2_input,
+                edge_input=edge_info,
+                angle_input=angle_info,
+                node_router_out=node_router_out,
+                edge_router_out=edge_router_out,
+                angle_router_out=angle_router_out,
+                n2e_index=n2e_index,
+                n2a_index=n2a_index,
+            )
+        )
+
+        # ---- Step 4: Split merged outputs ----
+        # edge_merged_out: [N_edge, n_dim + e_dim] → M3 part (node update) + M4 part (edge self).
+        node_edge_out, edge_self_out = edge_merged_out.split(
+            [self.n_dim, self.e_dim], dim=-1
+        )
+        # angle_merged_out: [N_angle, e_dim + a_dim] → M5 part (edge angle) + M7 part (angle self).
+        edge_angle1_out, angle_self_out = angle_merged_out.split(
+            [self.e_dim, self.a_dim], dim=-1
+        )
+
+        # ---- Step 5: Post-processing ----
+        # Node edge aggregation: sw-weighted reduce over edges → per-node.
+        # node_edge_out: [N_edge, n_dim], sw: [N_edge].
+        node_edge_agg = (
+            aggregate(
+                node_edge_out * sw.unsqueeze(-1),
+                n2e_index,
+                average=False,
+                num_owner=N_node,
+            ).reshape(nb, nloc, self.n_dim)
+            / self.dynamic_e_sel
+        )
+
+        # Angle → edge aggregation: a_sw-weighted reduce over angles → per-edge.
+        # edge_angle1_out: [N_angle, e_dim], a_sw: [N_angle].
+        edge_angle_agg = aggregate(
+            edge_angle1_out * a_sw.unsqueeze(-1),
+            eij2a_index,
+            average=False,
+            num_owner=n_edge,
+        ) / (self.dynamic_a_sel ** 0.5)
+
+        # ---- Step 6: M6 (local, not MoE) ----
+        edge_angle2_out = self.act(self.edge_angle_linear2_moe(edge_angle_agg))
+
+        # ---- Step 7: list_update ----
+        n_update_list: list[torch.Tensor] = [
+            node_ebd,
+            node_m1_out.reshape(nb, nloc, self.n_dim),
+            node_m2_out.reshape(nb, nloc, self.n_dim),
+            node_edge_agg,
+        ]
+        e_update_list: list[torch.Tensor] = [
+            edge_ebd,
+            edge_self_out,
+            edge_angle2_out,
+        ]
+        a_update_list: list[torch.Tensor] = [
+            angle_ebd,
+            angle_self_out,
+        ]
+
+        n_updated = self.list_update(n_update_list, "node")
+        e_updated = self.list_update(e_update_list, "edge")
         a_updated = self.list_update(a_update_list, "angle")
         return n_updated, e_updated, a_updated
 
