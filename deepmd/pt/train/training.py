@@ -461,19 +461,19 @@ class Trainer:
                 self.validation_data,
                 self.valid_numb_batch,
             ) = get_data_loader(training_data, validation_data, training_params)
-            training_data.print_summary(
-                "training",
-                to_numpy_array(self.training_dataloader.sampler.weights)
-                if not isinstance(training_data, LmdbDataset)
-                else [1.0],
-            )
-            if validation_data is not None:
-                validation_data.print_summary(
-                    "validation",
-                    to_numpy_array(self.validation_dataloader.sampler.weights)
-                    if not isinstance(validation_data, LmdbDataset)
-                    else [1.0],
-                )
+            # training_data.print_summary(
+            #     "training",
+            #     to_numpy_array(self.training_dataloader.sampler.weights)
+            #     if not isinstance(training_data, LmdbDataset)
+            #     else [1.0],
+            # )
+            # if validation_data is not None:
+            #     validation_data.print_summary(
+            #         "validation",
+            #         to_numpy_array(self.validation_dataloader.sampler.weights)
+            #         if not isinstance(validation_data, LmdbDataset)
+            #         else [1.0],
+            #     )
         else:
             (
                 self.training_dataloader,
@@ -536,24 +536,24 @@ class Trainer:
                     training_params["data_dict"][model_key],
                 )
 
-                training_data[model_key].print_summary(
-                    f"training in {model_key}",
-                    to_numpy_array(self.training_dataloader[model_key].sampler.weights)
-                    if not isinstance(training_data[model_key], LmdbDataset)
-                    else [1.0],
-                )
-                if (
-                    validation_data is not None
-                    and validation_data[model_key] is not None
-                ):
-                    validation_data[model_key].print_summary(
-                        f"validation in {model_key}",
-                        to_numpy_array(
-                            self.validation_dataloader[model_key].sampler.weights
-                        )
-                        if not isinstance(validation_data[model_key], LmdbDataset)
-                        else [1.0],
-                    )
+                # training_data[model_key].print_summary(
+                #     f"training in {model_key}",
+                #     to_numpy_array(self.training_dataloader[model_key].sampler.weights)
+                #     if not isinstance(training_data[model_key], LmdbDataset)
+                #     else [1.0],
+                # )
+                # if (
+                #     validation_data is not None
+                #     and validation_data[model_key] is not None
+                # ):
+                #     validation_data[model_key].print_summary(
+                #         f"validation in {model_key}",
+                #         to_numpy_array(
+                #             self.validation_dataloader[model_key].sampler.weights
+                #         )
+                #         if not isinstance(validation_data[model_key], LmdbDataset)
+                #         else [1.0],
+                #     )
 
         # Resolve training steps
         per_task_total = []
