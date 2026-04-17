@@ -611,6 +611,19 @@ class Trainer:
             frz_model = torch.jit.load(init_frz_model, map_location=DEVICE)
             self.model.load_state_dict(frz_model.state_dict())
 
+        # Sync out_std from model to loss for gradient normalization.
+        # Must be done after all model initialization (fresh training, resuming, finetune,
+        # frozen model) so that out_std reflects the final correct values.
+        if not self.multi_task:
+            if hasattr(self.loss, "label_std"):
+                self.loss.label_std = self.model.atomic_model.out_std[0, 0, 0].item()
+        else:
+            for model_key in self.model_keys:
+                if hasattr(self.loss[model_key], "label_std"):
+                    self.loss[model_key].label_std = (
+                        self.model[model_key].atomic_model.out_std[0, 0, 0].item()
+                    )
+
         # Get model prob for multi-task
         if self.multi_task:
             self.model_prob = np.array([0.0 for key in self.model_keys])
