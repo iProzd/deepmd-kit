@@ -371,6 +371,19 @@ class TestOriginalForwardUnchanged(unittest.TestCase):
         self.assertEqual(e_out.shape, (N_EDGE, E_DIM))
         self.assertEqual(a_out.shape, (N_ANGLE, A_DIM))
 
+    def test_non_moe_jit_script(self):
+        """Non-MoE layer can be JIT-scripted without error."""
+        layer = _make_layer(use_moe=False)
+        scripted = torch.jit.script(layer)
+
+        inputs = _make_inputs()
+        del inputs["type_embedding"]
+        n_out, e_out, a_out = scripted(**inputs)
+
+        self.assertEqual(n_out.shape, (NB, NLOC, N_DIM))
+        self.assertEqual(e_out.shape, (N_EDGE, E_DIM))
+        self.assertEqual(a_out.shape, (N_ANGLE, A_DIM))
+
 
 # ======================================================================
 # Test config validation

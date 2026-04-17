@@ -792,15 +792,16 @@ class RepFlowLayer(torch.nn.Module):
         angle_index: torch.Tensor,  # 3 x n_angle
         type_embedding: torch.Tensor | None = None,  # nf x nloc x n_dim
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.use_moe:
-            assert type_embedding is not None, (
-                "type_embedding is required for MoE forward"
-            )
-            return self.forward_moe(
-                node_ebd_ext, edge_ebd, h2, angle_ebd,
-                nlist, nlist_mask, sw, a_nlist, a_nlist_mask, a_sw,
-                edge_index, angle_index, type_embedding,
-            )
+        if not torch.jit.is_scripting():
+            if self.use_moe:
+                assert type_embedding is not None, (
+                    "type_embedding is required for MoE forward"
+                )
+                return self.forward_moe(
+                    node_ebd_ext, edge_ebd, h2, angle_ebd,
+                    nlist, nlist_mask, sw, a_nlist, a_nlist_mask, a_sw,
+                    edge_index, angle_index, type_embedding,
+                )
         """
         Parameters
         ----------
@@ -1223,6 +1224,7 @@ class RepFlowLayer(torch.nn.Module):
         a_updated = self.list_update(a_update_list, "angle")
         return n_updated, e_updated, a_updated
 
+    @torch.jit.unused
     def forward_moe(
         self,
         node_ebd_ext: torch.Tensor,  # nf x nall x n_dim
