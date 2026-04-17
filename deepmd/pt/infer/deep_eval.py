@@ -557,7 +557,7 @@ class DeepEval(DeepEvalBackend):
         else:
             aparam_input = None
         if charge_spin is not None:
-            charge_spin_input = to_torch_tensor(fparam.reshape(nframes, 2))
+            charge_spin_input = to_torch_tensor(charge_spin.reshape(nframes, 2))
         else:
             charge_spin_input = None
         do_atomic_virial = any(
@@ -641,7 +641,7 @@ class DeepEval(DeepEvalBackend):
         else:
             aparam_input = None
         if charge_spin is not None:
-            charge_spin_input = to_torch_tensor(fparam.reshape(nframes, 2))
+            charge_spin_input = to_torch_tensor(charge_spin.reshape(nframes, 2))
         else:
             charge_spin_input = None
 
