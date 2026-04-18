@@ -208,10 +208,26 @@ def _scan_frame_nlocs(
 
 
 def _compute_batch_size(nloc: int, rule: int) -> int:
-    """Compute batch_size for a given nloc using the auto rule."""
+    """Compute batch_size for a given nloc using the auto (ceiling) rule.
+
+    The result satisfies ``batch_size * nloc >= rule`` (round up).
+    This matches the standard ``_make_auto_bs`` logic in
+    ``deepmd/utils/data_system.py``.
+    """
     bsi = rule // max(nloc, 1)
     if bsi * nloc < rule:
         bsi += 1
+    return max(bsi, 1)
+
+
+def _compute_batch_size_max(nloc: int, rule: int) -> int:
+    """Compute batch_size using the max (floor) rule.
+
+    The result satisfies ``batch_size * nloc <= rule`` (round down),
+    with a minimum of 1.  This matches the standard ``max:N`` logic in
+    ``deepmd/utils/data_system.py``.
+    """
+    bsi = rule // max(nloc, 1)
     return max(bsi, 1)
 
 
@@ -239,7 +255,16 @@ class LmdbDataReader:
     type_map : list[str]
         Global type map from model config.
     batch_size : int or str
-        Batch size. Supports int, "auto", "auto:N".
+        Batch size specification. Supports:
+
+        - ``int``: fixed batch size for all nloc groups.
+        - ``"auto"`` / ``"auto:N"``: per-nloc-group batch size using the
+          ceiling rule (``bs * nloc >= N``, default N=32).
+        - ``"max:N"``: per-nloc-group batch size using the floor rule
+          (``bs * nloc <= N``), minimum 1.
+        - ``"filter:N"``: same as ``"max:N"`` but also removes all frames
+          from nloc groups where ``nloc > N``.
+        - ``"mixed:N"``: fixed batch size N (LMDB is always mixed_type).
     mixed_batch : bool
         If True, allow different nloc in the same batch (future).
         If False (default), enforce same-nloc-per-batch.
@@ -326,17 +351,67 @@ class LmdbDataReader:
 
         # Parse batch_size spec
         self._auto_rule: int | None = None
+        self._max_rule: int | None = None
+        self._filter_rule: int | None = None
         if isinstance(batch_size, str):
-            if batch_size == "auto":
-                self._auto_rule = 32
-            elif batch_size.startswith("auto:"):
-                self._auto_rule = int(batch_size.split(":")[1])
+            words = batch_size.split(":")
+            if words[0] == "auto":
+                self._auto_rule = int(words[1]) if len(words) == 2 else 32
+            elif words[0] == "max":
+                if len(words) != 2:
+                    raise RuntimeError(
+                        "batch size must be specified for max systems, e.g. 'max:256'"
+                    )
+                self._max_rule = int(words[1])
+            elif words[0] == "filter":
+                if len(words) != 2:
+                    raise RuntimeError(
+                        "batch size must be specified for filter systems, e.g. 'filter:256'"
+                    )
+                rule = int(words[1])
+                self._max_rule = rule
+                self._filter_rule = rule
+            elif words[0] == "mixed":
+                if len(words) != 2:
+                    raise RuntimeError(
+                        "batch size must be specified for mixed systems, e.g. 'mixed:4'"
+                    )
+                self.batch_size = int(words[1])
             else:
-                self._auto_rule = 32
-            # Default batch_size uses first frame's nloc (for total_batch estimate)
-            self.batch_size = _compute_batch_size(self._natoms, self._auto_rule)
-        else:
+                raise RuntimeError("unknown batch_size rule " + words[0])
+            if self._auto_rule is not None:
+                self.batch_size = _compute_batch_size(self._natoms, self._auto_rule)
+            elif self._max_rule is not None:
+                self.batch_size = _compute_batch_size_max(self._natoms, self._max_rule)
+        elif isinstance(batch_size, int):
             self.batch_size = int(batch_size)
+        elif isinstance(batch_size, list):
+            raise RuntimeError("list batch_size is not supported for LMDB datasets")
+        else:
+            raise RuntimeError("invalid batch_size")
+
+        # Apply filter: remove nloc groups where nloc > filter_rule
+        if self._filter_rule is not None and not mixed_batch:
+            filtered_groups: dict[int, list[int]] = {}
+            removed_count = 0
+            for nloc, indices in self._nloc_groups.items():
+                if nloc <= self._filter_rule:
+                    filtered_groups[nloc] = indices
+                else:
+                    removed_count += len(indices)
+            if not filtered_groups:
+                raise RuntimeError(
+                    f"No frames left after filtering nloc > {self._filter_rule}. "
+                    f"Available nloc groups: {sorted(self._nloc_groups.keys())}"
+                )
+            if removed_count > 0:
+                log.warning(
+                    "LMDB filter:%d removed %d frames from nloc groups > %d",
+                    self._filter_rule,
+                    removed_count,
+                    self._filter_rule,
+                )
+            self._nloc_groups = filtered_groups
 
         # Data requirements tracking
         self._data_requirements: dict[str, DataRequirementItem] = {}
@@ -389,9 +464,14 @@ class LmdbDataReader:
             _close_lmdb(path)
 
     def get_batch_size_for_nloc(self, nloc: int) -> int:
-        """Get batch_size for a given nloc. Uses auto rule if configured."""
+        """Get batch_size for a given nloc.
+
+        Uses auto (ceiling) rule, max (floor) rule, or fixed batch_size.
+        """
         if self._auto_rule is not None:
             return _compute_batch_size(nloc, self._auto_rule)
+        if self._max_rule is not None:
+            return _compute_batch_size_max(nloc, self._max_rule)
         return self.batch_size
 
     def __len__(self) -> int:
@@ -546,10 +626,19 @@ class LmdbDataReader:
         """Print basic dataset info."""
         n_groups = len(self._nloc_groups)
 
+        if self._auto_rule is not None:
+            bs_str = f"auto:{self._auto_rule}"
+        elif self._filter_rule is not None:
+            bs_str = f"filter:{self._filter_rule}"
+        elif self._max_rule is not None:
+            bs_str = f"max:{self._max_rule}"
+        else:
+            bs_str = str(self.batch_size)
+
         log.info(
             f"LMDB {name}: {self.lmdb_path}, "
             f"{self.nframes} frames, {n_groups} nloc groups, "
-            f"batch_size={'auto' if self._auto_rule else self.batch_size}, "
+            f"batch_size={bs_str}, "
             f"mixed_batch={self.mixed_batch}"
         )
         # Print nloc groups in rows of ~10 for readability

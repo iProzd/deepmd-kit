@@ -112,7 +112,16 @@ class LmdbDataset(Dataset):
     type_map : list[str]
         Global type map from model config.
     batch_size : int or str
-        Batch size. Supports int, "auto", "auto:N".
+        Batch size specification. Supports:
+
+        - ``int``: fixed batch size for all nloc groups.
+        - ``"auto"`` / ``"auto:N"``: per-nloc-group batch size using the
+          ceiling rule (``bs * nloc >= N``, default N=32).
+        - ``"max:N"``: per-nloc-group batch size using the floor rule
+          (``bs * nloc <= N``), minimum 1.
+        - ``"filter:N"``: same as ``"max:N"`` but also removes all frames
+          from nloc groups where ``nloc > N``.
+        - ``"mixed:N"``: fixed batch size N (LMDB is always mixed_type).
     mixed_batch : bool
         If True, allow different nloc in the same batch (future).
         If False (default), use SameNlocBatchSampler.

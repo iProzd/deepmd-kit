@@ -845,3 +845,245 @@ class TestMultitaskLmdbTraining:
 
         del trainer
         gc.collect()
+
+
+# ============================================================
+# Batch size modes (max, filter, mixed, error cases)
+# ============================================================
+
+
+class TestBatchSizeModes:
+    """Test all batch_size mode parsing and semantics."""
+
+    def test_max_batch_size(self, multi_nloc_lmdb):
+        """max:24 -> floor(24/nloc) per group, min 1."""
+        reader = LmdbDataReader(
+            multi_nloc_lmdb, type_map=["O", "H"], batch_size="max:24"
+        )
+        # nloc=4: 24//4=6, nloc=6: 24//6=4, nloc=8: 24//8=3
+        assert reader.get_batch_size_for_nloc(4) == 6
+        assert reader.get_batch_size_for_nloc(6) == 4
+        assert reader.get_batch_size_for_nloc(8) == 3
+
+    def test_max_vs_auto_difference(self, multi_nloc_lmdb):
+        """Auto uses ceiling, max uses floor — they differ when nloc doesn't divide evenly."""
+        reader_auto = LmdbDataReader(
+            multi_nloc_lmdb, type_map=["O", "H"], batch_size="auto:10"
+        )
+        reader_max = LmdbDataReader(
+            multi_nloc_lmdb, type_map=["O", "H"], batch_size="max:10"
+        )
+        # nloc=4: auto -> ceil(10/4)=3 (3*4=12>=10), max -> floor(10/4)=2 (2*4=8<=10)
+        assert reader_auto.get_batch_size_for_nloc(4) == 3
+        assert reader_max.get_batch_size_for_nloc(4) == 2
+        # nloc=6: auto -> ceil(10/6)=2 (2*6=12>=10), max -> floor(10/6)=1 (1*6=6<=10)
+        assert reader_auto.get_batch_size_for_nloc(6) == 2
+        assert reader_max.get_batch_size_for_nloc(6) == 1
+
+    def test_max_batch_size_missing_rule(self, lmdb_dir):
+        """Max without value raises RuntimeError."""
+        with pytest.raises(RuntimeError, match="batch size must be specified for max"):
+            LmdbDataReader(lmdb_dir, type_map=["O", "H"], batch_size="max")
+
+    def test_filter_batch_size(self, multi_nloc_lmdb):
+        """filter:6 removes nloc=8 group, keeps nloc=4 and nloc=6."""
+        reader = LmdbDataReader(
+            multi_nloc_lmdb, type_map=["O", "H"], batch_size="filter:6"
+        )
+        assert 8 not in reader.nloc_groups
+        assert 4 in reader.nloc_groups
+        assert 6 in reader.nloc_groups
+        # batch sizes use floor rule
+        assert reader.get_batch_size_for_nloc(4) == 1  # 6//4=1
+        assert reader.get_batch_size_for_nloc(6) == 1  # 6//6=1
+
+    def test_filter_removes_all_raises(self, multi_nloc_lmdb):
+        """filter:2 with min nloc=4 raises RuntimeError."""
+        with pytest.raises(RuntimeError, match="No frames left after filtering"):
+            LmdbDataReader(multi_nloc_lmdb, type_map=["O", "H"], batch_size="filter:2")
+
+    def test_filter_batch_size_missing_rule(self, lmdb_dir):
+        """Filter without value raises RuntimeError."""
+        with pytest.raises(
+            RuntimeError, match="batch size must be specified for filter"
+        ):
+            LmdbDataReader(lmdb_dir, type_map=["O", "H"], batch_size="filter")
+
+    def test_mixed_batch_size(self, lmdb_dir):
+        """mixed:5 yields fixed batch_size=5."""
+        reader = LmdbDataReader(lmdb_dir, type_map=["O", "H"], batch_size="mixed:5")
+        assert reader.batch_size == 5
+        # All nloc groups use the same fixed batch size
+        assert reader.get_batch_size_for_nloc(6) == 5
+        assert reader.get_batch_size_for_nloc(100) == 5
+
+    def test_mixed_batch_size_missing_rule(self, lmdb_dir):
+        """Mixed without value raises RuntimeError."""
+        with pytest.raises(
+            RuntimeError, match="batch size must be specified for mixed"
+        ):
+            LmdbDataReader(lmdb_dir, type_map=["O", "H"], batch_size="mixed")
+
+    def test_list_batch_size_raises(self, lmdb_dir):
+        """List batch_size raises RuntimeError for LMDB."""
+        with pytest.raises(RuntimeError, match="list batch_size is not supported"):
+            LmdbDataReader(lmdb_dir, type_map=["O", "H"], batch_size=[1, 2, 3])
+
+    def test_unknown_mode_raises(self, lmdb_dir):
+        """Unknown batch_size mode raises RuntimeError."""
+        with pytest.raises(RuntimeError, match="unknown batch_size rule"):
+            LmdbDataReader(lmdb_dir, type_map=["O", "H"], batch_size="foo:3")
+
+
+class TestBatchSizeModesDataset:
+    """Test batch_size modes through the LmdbDataset (PT wrapper) interface."""
+
+    def test_max_dataset(self, multi_nloc_lmdb):
+        """LmdbDataset with max:24 creates correct batches."""
+        ds = LmdbDataset(multi_nloc_lmdb, type_map=["O", "H"], batch_size="max:24")
+        # Should iterate without error
+        total_frames = 0
+        for batch in ds._batch_sampler:
+            total_frames += len(batch)
+        assert total_frames == 30
+
+    def test_filter_dataset(self, multi_nloc_lmdb):
+        """LmdbDataset with filter:6 excludes nloc=8 group."""
+        ds = LmdbDataset(multi_nloc_lmdb, type_map=["O", "H"], batch_size="filter:6")
+        total_frames = 0
+        for batch in ds._batch_sampler:
+            total_frames += len(batch)
+        # 10 frames with nloc=4 + 10 with nloc=6 = 20 (nloc=8 removed)
+        assert total_frames == 20
+
+    def test_mixed_dataset(self, lmdb_dir):
+        """LmdbDataset with mixed:3 uses fixed batch size."""
+        ds = LmdbDataset(lmdb_dir, type_map=["O", "H"], batch_size="mixed:3")
+        assert ds.batch_size == 3
+        # Iterate and check batch sizes
+        for batch in ds._batch_sampler:
+            assert len(batch) <= 3
+
+
+# ============================================================
+# End-to-end training with various batch_size modes
+# ============================================================
+
+
+def _create_water_lmdb(path: str, nframes: int = 20, natoms: int = 6) -> None:
+    """Create a water-like LMDB for E2E training tests."""
+    _create_test_lmdb_with_type_map(
+        path, nframes=nframes, natoms=natoms, lmdb_type_map=["O", "H"]
+    )
+
+
+def _make_training_config(
+    tmp_path, train_lmdb: str, val_lmdb: str, batch_size: str | int
+) -> dict:
+    """Build a minimal single-task training config."""
+    return {
+        "model": {
+            "type_map": ["O", "H"],
+            "descriptor": {
+                "type": "se_e2_a",
+                "sel": [4, 4],
+                "rcut_smth": 0.5,
+                "rcut": 4.0,
+                "neuron": [4, 8],
+                "axis_neuron": 4,
+                "precision": "float64",
+            },
+            "fitting_net": {"neuron": [8, 8], "precision": "float64", "seed": 1},
+            "data_stat_nbatch": 1,
+        },
+        "learning_rate": {
+            "type": "exp",
+            "decay_steps": 50,
+            "start_lr": 1e-3,
+            "stop_lr": 1e-8,
+        },
+        "loss": {
+            "type": "ener",
+            "start_pref_e": 0.2,
+            "limit_pref_e": 1,
+            "start_pref_f": 100,
+            "limit_pref_f": 1,
+            "start_pref_v": 0.0,
+            "limit_pref_v": 0.0,
+        },
+        "training": {
+            "training_data": {
+                "systems": train_lmdb,
+                "batch_size": batch_size,
+            },
+            "validation_data": {
+                "systems": val_lmdb,
+                "batch_size": 1,
+            },
+            "numb_steps": 3,
+            "seed": 10,
+            "disp_file": str(tmp_path / "lcurve.out"),
+            "disp_freq": 1,
+            "save_freq": 3,
+        },
+    }
+
+
+class TestBatchSizeModesE2E:
+    """End-to-end training tests with various batch_size modes."""
+
+    @pytest.fixture(autouse=True)
+    def setup_lmdb(self, tmp_path):
+        self.tmp_path = tmp_path
+        self.train_lmdb = str(tmp_path / "train.lmdb")
+        self.val_lmdb = str(tmp_path / "val.lmdb")
+        _create_water_lmdb(self.train_lmdb, nframes=20, natoms=6)
+        _create_water_lmdb(self.val_lmdb, nframes=10, natoms=6)
+
+    def _run_training(self, batch_size: str | int) -> None:
+        from copy import (
+            deepcopy,
+        )
+
+        from deepmd.pt.entrypoints.main import (
+            get_trainer,
+        )
+        from deepmd.utils.argcheck import (
+            normalize,
+        )
+        from deepmd.utils.compat import (
+            update_deepmd_input,
+        )
+
+        config = _make_training_config(
+            self.tmp_path, self.train_lmdb, self.val_lmdb, batch_size
+        )
+        import os
+
+        orig_dir = os.getcwd()
+        os.chdir(self.tmp_path)
+        try:
+            config = update_deepmd_input(deepcopy(config), warning=True)
+            config = normalize(config)
+            trainer = get_trainer(config)
+            trainer.run()
+            assert len(list(self.tmp_path.glob("model.ckpt*.pt"))) > 0
+        finally:
+            os.chdir(orig_dir)
+
+        import gc
+
+        del trainer
+        gc.collect()
+
+    def test_e2e_auto(self):
+        self._run_training("auto")
+
+    def test_e2e_max(self):
+        self._run_training("max:24")
+
+    def test_e2e_mixed(self):
+        self._run_training("mixed:4")
+
+    def test_e2e_int(self):
+        self._run_training(3)
