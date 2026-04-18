@@ -923,6 +923,7 @@ class DeepmdData:
             natoms_sel = 0
             idx_map_sel = None
         ndof = vv["ndof"]
+        repeat = vv["repeat"]
 
         # Determine target data type from requirements
         dtype = vv.get("dtype")
@@ -946,6 +947,8 @@ class DeepmdData:
             else:
                 # For non-atomic data, shape should be [ndof]
                 data = np.full([ndof], vv["default"], dtype=dtype)
+            if repeat != 1:
+                data = np.repeat(data, repeat)
             return np.float32(0.0), data
 
         # Branch 2: Data loading
@@ -1007,6 +1010,9 @@ class DeepmdData:
                     data = data[idx_map, :]
             else:
                 data = data.reshape([ndof])
+
+            if repeat != 1:
+                data = np.repeat(data, repeat)
 
             # Atomic: return [natoms, ndof] or flattened hessian above
             # Non-atomic: return [ndof]
