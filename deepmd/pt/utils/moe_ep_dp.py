@@ -132,8 +132,12 @@ def sync_moe_gradients(
         if param.grad is None:
             continue
         if _is_routing_expert_param(name):
+            # Routing expert grads: all-reduce across DP group only (same expert
+            # exists only on dp_size ranks in the same DP column).
+            # Divide by world_size (not dp_size) because All-to-All backward
+            # already aggregates gradients from ep_size ranks within the EP group.
             dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=dp_group)
-            param.grad.div_(dp_size)
+            param.grad.div_(world_size)
         else:
             dist.all_reduce(
                 param.grad, op=dist.ReduceOp.SUM, group=world_group
