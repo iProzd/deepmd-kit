@@ -131,6 +131,13 @@ class Trainer:
         shared_links: dict[str, str] | None = None,
         finetune_links: dict[str, str] | None = None,
         init_frz_model: str | None = None,
+        use_moe_ep: bool = False,
+        ep_group=None,
+        dp_group=None,
+        ep_rank: int = 0,
+        ep_size: int = 1,
+        dp_rank: int = 0,
+        dp_size: int = 1,
     ) -> None:
         """Construct a DeePMD trainer.
 
@@ -161,6 +168,15 @@ class Trainer:
         self.world_size = dist.get_world_size() if self.is_distributed else 1
         self.num_model = len(self.model_keys)
         self.model_prob = None
+
+        # MoE EP+DP group initialization (passed from get_trainer)
+        self.use_moe_ep = use_moe_ep
+        self.ep_group = ep_group
+        self.dp_group = dp_group
+        self.ep_rank = ep_rank
+        self.ep_size = ep_size
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
 
         # Iteration config
         self.num_steps = training_params.get("numb_steps")
@@ -400,6 +416,11 @@ class Trainer:
             }
 
         # Model
+        if self.use_moe_ep:
+            # Set MoE EP context (thread-local) for model construction.
+            # This avoids putting ProcessGroup in config dict (which breaks deepcopy).
+            from deepmd.pt.utils.moe_context import set_moe_ep_context
+            set_moe_ep_context(self.ep_group, self.ep_rank, self.ep_size)
         self.model = get_model_for_wrapper(
             model_params,
             resuming=resuming,
@@ -1020,6 +1041,18 @@ class Trainer:
             return self.wrapper.module
         return self.wrapper
 
+    def _get_experts_per_gpu(self, module: ModelWrapper) -> int:
+        """Extract experts_per_gpu from the MoE model structure."""
+        # The model is wrapped in ModelWrapper; the actual model is module.model["Default"]
+        # or similar. We search for the first MoEDispatchCombine to read experts_per_gpu.
+        for name, mod in module.named_modules():
+            if hasattr(mod, "experts_per_gpu"):
+                return mod.experts_per_gpu
+        raise RuntimeError(
+            "Cannot extract experts_per_gpu from MoE model. "
+            "Ensure the model has MoEDispatchCombine layers."
+        )
+
     def _load_optimizer_state(
         self, optimizer_state_dict: dict[str, Any] | None
     ) -> None:
@@ -1100,7 +1133,25 @@ class Trainer:
                 model_pred, loss, more_loss = self.wrapper(
                     **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
                 )
-                loss.backward()
+                # MoE EP+DP: manual gradient sync with correct groups (clean separation).
+                # Standard DDP all-reduces ALL gradients across world_size, which is incorrect
+                # for routing experts (should only sync within DP group). Use no_sync() to
+                # disable DDP's automatic sync, then manually sync with correct groups.
+                if self.use_moe_ep:
+                    with self.wrapper.no_sync():
+                        loss.backward()
+                    # Manual sync: routing experts → DP group, others → world group.
+                    from deepmd.pt.utils.moe_ep_dp import sync_moe_gradients
+                    sync_moe_gradients(
+                        self._get_inner_module(),
+                        self.dp_group,
+                        None,  # world_group (use default)
+                        self.dp_size,
+                        self.world_size,
+                    )
+                else:
+                    # Standard DDP: automatic gradient sync during backward.
+                    loss.backward()
                 # === Initialize gradient diagnostics variables ===
                 total_norm: torch.Tensor | None = None
                 pre_clip_named_norms: list[tuple[str, float]] = []
@@ -1456,8 +1507,9 @@ class Trainer:
                     and _step_id != self.start_step
                 )
                 or (display_step_id) == self.num_steps
-            ) and (self.zero_stage > 0 or self.rank == 0 or dist.get_rank() == 0):
+            ) and (self.zero_stage > 0 or self.use_moe_ep or self.rank == 0 or dist.get_rank() == 0):
                 # Handle the case if rank 0 aborted and re-assigned
+                # NOTE: For MoE EP, all ranks must call save_model (collective op in moe_state_dict_to_global)
                 self.latest_model = Path(self.save_ckpt + f"-{display_step_id}.pt")
                 self.save_model(self.latest_model, lr=cur_lr, step=_step_id)
                 if self.rank == 0 or dist.get_rank() == 0:
@@ -1619,10 +1671,21 @@ class Trainer:
                 deepcopy(self.optimizer.state_dict()) if self.rank == 0 else {}
             )
         else:
-            model_state = module.state_dict()
+            # Standard DDP or no DDP
+            if self.use_moe_ep:
+                # MoE with EP: gather routing expert params to rank 0 with global indices.
+                from deepmd.pt.utils.moe_checkpoint import moe_state_dict_to_global
+                experts_per_gpu = self._get_experts_per_gpu(module)
+                model_state = moe_state_dict_to_global(
+                    module, self.ep_rank, self.ep_size, experts_per_gpu, self.ep_group
+                )
+            else:
+                model_state = module.state_dict()
             optim_state = deepcopy(self.optimizer.state_dict())
 
         # === Only rank 0 writes to disk ===
+        # NOTE: For MoE EP, moe_state_dict_to_global() above is a collective op
+        # (broadcast within EP group), so all ranks must participate before this point.
         if self.rank != 0:
             return
         for item in optim_state["param_groups"]:

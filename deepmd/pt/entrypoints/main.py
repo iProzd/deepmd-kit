@@ -206,6 +206,35 @@ def get_trainer(
         )
 
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
+    # MoE EP+DP group initialization (must be done before data loading)
+    use_moe_ep = False
+    ep_group, dp_group = None, None
+    ep_rank, ep_size = 0, 1
+    dp_rank, dp_size = 0, 1
+
+    if dist.is_available() and dist.is_initialized():
+        # Set CUDA device BEFORE creating process groups (NCCL requirement)
+        if torch.cuda.is_available():
+            torch.cuda.set_device(LOCAL_RANK)
+        if not multi_task:
+            model_params = config["model"]
+            descriptor_params = model_params.get("descriptor", {})
+            if descriptor_params.get("type") == "dpa3":
+                repflow_params = descriptor_params.get("repflow", {})
+                use_moe = repflow_params.get("use_moe", False)
+                ep_size_config = config["training"].get("moe_ep_size", 1)
+                if use_moe and ep_size_config > 1:
+                    use_moe_ep = True
+                    from deepmd.pt.utils.moe_ep_dp import init_ep_dp_groups
+                    import logging as _logging
+                    _moe_log = _logging.getLogger(__name__)
+                    (ep_group, dp_group, ep_rank, ep_size, dp_rank, dp_size) = init_ep_dp_groups(ep_size_config)
+                    _moe_log.info(
+                        f"Rank {rank}: MoE EP+DP initialized — "
+                        f"EP rank {ep_rank}/{ep_size}, DP rank {dp_rank}/{dp_size}"
+                    )
+
     data_seed = config["training"].get("seed", None)
     if not multi_task:
         (
@@ -244,6 +273,13 @@ def get_trainer(
         shared_links=shared_links,
         finetune_links=finetune_links,
         init_frz_model=init_frz_model,
+        use_moe_ep=use_moe_ep,
+        ep_group=ep_group,
+        dp_group=dp_group,
+        ep_rank=ep_rank,
+        ep_size=ep_size,
+        dp_rank=dp_rank,
+        dp_size=dp_size,
     )
     return trainer
 

@@ -1686,6 +1686,38 @@ def dpa3_repflow_args() -> list[Argument]:
             default=10.0,
             doc=doc_sel_reduce_factor,
         ),
+        Argument(
+            "use_moe",
+            bool,
+            optional=True,
+            default=False,
+            doc="Whether to use Mixture of Experts (MoE) for node, edge, and angle updates. "
+            "Requires use_dynamic_sel=True and optim_update=False.",
+        ),
+        Argument(
+            "n_routing_experts",
+            int,
+            optional=True,
+            default=0,
+            doc="Number of routing (non-shared) experts per MoE layer. "
+            "Each expert is an independent MLP. Only used when use_moe=True.",
+        ),
+        Argument(
+            "moe_topk",
+            int,
+            optional=True,
+            default=0,
+            doc="Number of experts selected per token by the MoE router. "
+            "Only used when use_moe=True.",
+        ),
+        Argument(
+            "n_shared_experts",
+            int,
+            optional=True,
+            default=0,
+            doc="Number of shared experts that process all tokens unconditionally. "
+            "Only used when use_moe=True.",
+        ),
     ]
 
 
@@ -4099,6 +4131,17 @@ def training_args(
             "Uses make_fx to decompose autograd into primitive ops, "
             "then compiles with torch.compile/Inductor for kernel fusion. "
             "The first training step will be slower due to one-time compilation.",
+        ),
+        Argument(
+            "moe_ep_size",
+            int,
+            optional=True,
+            default=1,
+            doc=doc_only_pt_supported
+            + "Expert Parallelism group size for MoE models. "
+            "world_size must be divisible by moe_ep_size. "
+            "The Data Parallelism group size is world_size / moe_ep_size. "
+            "Set to 1 (default) to disable EP and use standard DDP.",
         ),
     ]
 

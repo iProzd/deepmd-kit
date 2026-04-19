@@ -118,8 +118,15 @@ def moe_state_dict_to_global(
 
     # Then, gather routing expert params from all ranks.
     # Each rank broadcasts its renamed (global-indexed) routing expert params.
+    # Compute this rank's DP rank to convert EP group ranks to global ranks.
+    global_rank = dist.get_rank() if dist.is_initialized() else 0
+    dp_rank = (global_rank - ep_rank) // ep_size
+
     for r in range(ep_size):
-        # Compute global expert indices for rank r.
+        # Convert EP group rank r to global rank for broadcast src.
+        # EP group layout: [dp_rank * ep_size + 0, ..., dp_rank * ep_size + (ep_size-1)]
+        src_global_rank = dp_rank * ep_size + r
+
         for local_idx in range(experts_per_gpu):
             global_idx = r * experts_per_gpu + local_idx
 
@@ -132,7 +139,7 @@ def moe_state_dict_to_global(
                     if m and int(m.group(1)) == global_idx:
                         # Broadcast this tensor from this rank.
                         tensor = tensor.contiguous().clone()
-                        dist.broadcast(tensor, src=r, group=ep_group)
+                        dist.broadcast(tensor, src=src_global_rank, group=ep_group)
                         global_sd[key] = tensor
             else:
                 # This rank doesn't own this expert; receive via broadcast.
@@ -155,7 +162,7 @@ def moe_state_dict_to_global(
                                 key, local_idx_in_key, global_idx,
                             )
                             recv_tensor = torch.empty_like(tensor)
-                            dist.broadcast(recv_tensor, src=r, group=ep_group)
+                            dist.broadcast(recv_tensor, src=src_global_rank, group=ep_group)
                             global_sd[target_key] = recv_tensor
 
     return global_sd

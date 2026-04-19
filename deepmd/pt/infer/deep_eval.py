@@ -167,7 +167,14 @@ class DeepEval(DeepEvalBackend):
                         ] = state_dict[item].clone()
                 state_dict = state_dict_head
             model = get_model(self.input_param).to(DEVICE)
-            if not self.input_param.get("hessian_mode") and not no_jit:
+            # Check if model uses MoE (not JIT-scriptable due to ProcessGroup)
+            use_moe = False
+            if "descriptor" in self.input_param:
+                desc_params = self.input_param["descriptor"]
+                if desc_params.get("type") == "dpa3":
+                    repflow_params = desc_params.get("repflow", {})
+                    use_moe = repflow_params.get("use_moe", False)
+            if not self.input_param.get("hessian_mode") and not no_jit and not use_moe:
                 model = torch.jit.script(model)
             self.dp = ModelWrapper(model)
             missing, unexpected = self.dp.load_state_dict(state_dict, strict=False)

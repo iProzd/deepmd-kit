@@ -126,8 +126,18 @@ class DescrptDPA3(BaseDescriptor, torch.nn.Module):
         ep_group=None,
         ep_rank: int = 0,
         ep_size: int = 1,
+        **kwargs,
     ) -> None:
         super().__init__()
+
+        # Obtain EP runtime params from thread-local context (set by Trainer).
+        # This avoids putting non-serializable ProcessGroup objects in the config dict.
+        from deepmd.pt.utils.moe_context import get_moe_ep_context
+        ctx_ep_group, ctx_ep_rank, ctx_ep_size = get_moe_ep_context()
+        if ctx_ep_group is not None:
+            ep_group = ctx_ep_group
+            ep_rank = ctx_ep_rank
+            ep_size = ctx_ep_size
 
         def init_subclass_params(sub_data: Any, sub_class: Any) -> Any:
             if isinstance(sub_data, dict):
