@@ -602,16 +602,12 @@ def grad_probe(FLAGS) -> None:
                         if p.requires_grad
                     ]
 
-        # Compute pairwise similarity for this batch
+        # Compute pairwise dot products for this batch
         for k1, k2 in pairwise_sims.keys():
             if k1 in batch_grads and k2 in batch_grads:
                 g1 = batch_grads[k1]
                 g2 = batch_grads[k2]
-                norm1 = np.linalg.norm(g1)
-                norm2 = np.linalg.norm(g2)
-                if norm1 > 1e-10 and norm2 > 1e-10:
-                    sim = np.dot(g1, g2) / (norm1 * norm2)
-                    pairwise_sims[(k1, k2)].append(sim)
+                pairwise_sims[(k1, k2)].append(float(np.dot(g1, g2)))
 
     # Compute final statistics and log for each task
     for task_key in trainer.model_keys:
@@ -639,33 +635,28 @@ def grad_probe(FLAGS) -> None:
             float(norm_std),
         )
 
-    # Compute pairwise similarity statistics
-    for (k1, k2), sims in pairwise_sims.items():
-        if sims:
-            sim_mean = np.mean(sims)
-            sim_std = np.std(sims)
+    # Compute pairwise dot product statistics
+    for (k1, k2), dots in pairwise_sims.items():
+        if dots:
+            dot_mean = np.mean(dots)
+            dot_std = np.std(dots)
 
-            # Compute similarity of accumulated gradients (reproducible from avg_grad_vec)
+            # Dot product of accumulated average gradient vectors
             g1_avg = grads_per_task[k1]
             g2_avg = grads_per_task[k2]
-            norm1_avg = np.linalg.norm(g1_avg)
-            norm2_avg = np.linalg.norm(g2_avg)
-            if norm1_avg > 1e-10 and norm2_avg > 1e-10:
-                sim_accum = np.dot(g1_avg, g2_avg) / (norm1_avg * norm2_avg)
-            else:
-                sim_accum = 0.0
+            dot_accum = float(np.dot(g1_avg, g2_avg))
 
-            grads_per_task[f"sim_{k1}_{k2}_mean"] = sim_mean
-            grads_per_task[f"sim_{k1}_{k2}_std"] = sim_std
-            grads_per_task[f"sim_{k1}_{k2}_accum"] = sim_accum
+            grads_per_task[f"dot_{k1}_{k2}_mean"] = dot_mean
+            grads_per_task[f"dot_{k1}_{k2}_std"] = dot_std
+            grads_per_task[f"dot_{k1}_{k2}_accum"] = dot_accum
 
             log.info(
-                "Similarity '%s' vs '%s': Mean=%.4f, Std=%.4f, Accum=%.4f",
+                "Grad dot product '%s' vs '%s': Mean=%.4e, Std=%.4e, Accum=%.4e",
                 k1,
                 k2,
-                float(sim_mean),
-                float(sim_std),
-                float(sim_accum),
+                float(dot_mean),
+                float(dot_std),
+                float(dot_accum),
             )
 
     save_dict = {f"grads_{k}": v for k, v in grads_per_task.items()}
