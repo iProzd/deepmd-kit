@@ -28,6 +28,11 @@ repos:
       - id: isort
         files: \.py$
         exclude: ^source/3rdparty
+        # isort 8.x has a bug where `pyproject.toml` is ignored when files are
+        # passed explicitly on the CLI (as pre-commit does). Force it to load
+        # the project config so `force_grid_wrap=1` / `profile="black"` apply.
+        # See: https://github.com/PyCQA/isort/issues/1872
+        args: ["--settings-path", "pyproject.toml"]
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
     rev: v0.15.12

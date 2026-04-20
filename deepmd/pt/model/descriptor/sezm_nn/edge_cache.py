@@ -132,11 +132,24 @@ def compute_edge_src_gate(
     identity ``1`` so they never spuriously mute a valid source node;
     callers supply ``edge_keep_f`` for this.
 
-    The product is realised by ``scatter_reduce(reduce="prod")``, which
-    keeps exact zeros without any ``log``/``exp`` detour and has a
-    registered gradient that uses the leave-one-out product rule. Both
-    forward and gradient paths therefore stay ``C^3`` in the edge length
-    and compatible with ``make_fx`` symbolic tracing.
+    The product is **not** realised by ``scatter_reduce(reduce="prod")``:
+    its registered backward handles exact zeros with a data-dependent
+    "count leave-one-out" branch that creates unbacked symints under
+    ``make_fx(tracing_mode="symbolic")`` and breaks the SeZM compile
+    path's double-backward tracing. Instead, the product is decomposed
+    into a log-sum on non-zero contributions combined with an explicit
+    "any zero per group" indicator that routes the frozen case through
+    ``torch.where``. Both branches use only shape-preserving standard
+    ops (``scatter_add``, ``where``, ``exp``, ``log``) with backed
+    symints, so the graph survives symbolic tracing cleanly.
+
+    The gradient consequence at the plateau is exact: ``BridgingSwitch``
+    places ``w'(r) = 0`` for every ``r <= r_inner``, so the chain rule
+    ``d eta / d r = (leave-one-out factor) * w'(r) = anything * 0 = 0``
+    holds regardless of how the muted ``torch.where`` branch treats the
+    upstream gradient. In the transition zone every edge has strictly
+    positive ``w`` and the log-sum branch gives the standard product
+    gradient.
 
     Parameters
     ----------
@@ -166,19 +179,31 @@ def compute_edge_src_gate(
         # Force w = 1 on masked edges so they are neutral for the product.
         edge_w = edge_w * edge_keep_f + (1.0 - edge_keep_f)
 
-    # === Step 2. Per-source-node product via scatter_reduce("prod") ===
-    # include_self=True starts from the identity 1.0, so nodes with zero
-    # outgoing edges stay at eta = 1 (empty product).
-    eta = torch.ones(n_nodes, dtype=edge_w.dtype, device=edge_w.device)
-    eta = eta.scatter_reduce(
-        0,
-        src,
-        edge_w.squeeze(-1),
-        reduce="prod",
-        include_self=True,
-    )
+    edge_w_flat = edge_w.squeeze(-1)  # (E,)
+    is_zero = edge_w_flat <= 0.0  # (E,) bool
 
-    # === Step 3. Broadcast the per-node gate back to edges via source ===
+    # === Step 2. Log-sum reduction on non-zero contributions ===
+    # Replace exact zeros with the multiplicative identity 1 so their
+    # ``log`` contribution is 0 and the group-wise sum equals the log of
+    # the product of non-zero ``w`` values.
+    safe_w = torch.where(is_zero, torch.ones_like(edge_w_flat), edge_w_flat)
+    log_safe = torch.log(safe_w)
+    log_eta = torch.zeros(
+        n_nodes, dtype=edge_w.dtype, device=edge_w.device
+    ).scatter_add(0, src, log_safe)
+    eta_nonzero_path = torch.exp(log_eta)
+
+    # === Step 3. Exact-zero indicator per source node ===
+    # ``scatter_add`` over an ``int64`` cast of the zero mask counts how
+    # many frozen edges each source node owns. A strictly positive count
+    # means the product is 0 by the hard-freeze rule.
+    zero_count = torch.zeros(
+        n_nodes, dtype=torch.int64, device=edge_w.device
+    ).scatter_add(0, src, is_zero.to(torch.int64))
+    any_zero = zero_count > 0
+
+    # === Step 4. Combine and broadcast back to edges via source ===
+    eta = torch.where(any_zero, torch.zeros_like(eta_nonzero_path), eta_nonzero_path)
     return eta.index_select(0, src).unsqueeze(-1)
 
 
