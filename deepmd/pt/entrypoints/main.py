@@ -548,7 +548,7 @@ def grad_probe(FLAGS) -> None:
     param_shapes: list | None = None
 
     accumulate_k = getattr(FLAGS, "accumulate_k", 1)
-    total_batches = FLAGS.nbatches * accumulate_k
+    total_batches = FLAGS.nbatches
 
     # Initialize trackers
     task_batch_norms = {k: [] for k in trainer.model_keys}
@@ -610,14 +610,19 @@ def grad_probe(FLAGS) -> None:
 
         # At the end of each group of K batches, record norms and dot products then reset
         if (b + 1) % accumulate_k == 0:
+            # Normalize to per-batch mean so scale is independent of k
+            group_means = {
+                k: g / accumulate_k if g is not None else None
+                for k, g in group_grads.items()
+            }
             for task_key in trainer.model_keys:
-                if group_grads[task_key] is not None:
+                if group_means[task_key] is not None:
                     task_batch_norms[task_key].append(
-                        np.linalg.norm(group_grads[task_key])
+                        np.linalg.norm(group_means[task_key])
                     )
             for k1, k2 in pairwise_dots.keys():
-                g1 = group_grads.get(k1)
-                g2 = group_grads.get(k2)
+                g1 = group_means.get(k1)
+                g2 = group_means.get(k2)
                 if g1 is not None and g2 is not None:
                     pairwise_dots[(k1, k2)].append(float(np.dot(g1, g2)))
             group_grads = {k: None for k in trainer.model_keys}
@@ -641,10 +646,10 @@ def grad_probe(FLAGS) -> None:
 
         log.info(
             "Task '%s': collected %d batches (groups=%d, k=%d). "
-            "Avg Grad Norm=%.4e, Mean(Batch Norms)=%.4e, Std(Batch Norms)=%.4e",
+            "Avg Grad Norm=%.4e, Mean(Group Norms)=%.4e, Std(Group Norms)=%.4e",
             task_key,
             total_batches,
-            FLAGS.nbatches,
+            total_batches // accumulate_k,
             accumulate_k,
             float(np.linalg.norm(avg_grad_vec)),
             float(norm_mean),

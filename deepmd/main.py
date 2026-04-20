@@ -884,8 +884,8 @@ def main_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         dest="accumulate_k",
-        help="Accumulate K batches before computing each dot product. "
-        "Total batches collected = nbatches * accumulate_k. "
+        help="Group size for gradient accumulation before computing each dot product. "
+        "Total batches collected = nbatches; number of dot product samples = nbatches // k. "
         "Larger K reduces norm variance and improves SNR of mean/std.",
     )
     return parser
