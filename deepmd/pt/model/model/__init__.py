@@ -307,8 +307,8 @@ def get_sezm_model(model_params: dict) -> BaseModel:
 
     # === Bridging parameters ===
     bridging_method = str(model_params.get("bridging_method", "none")).upper()
-    bridging_r_inner = float(model_params.get("bridging_r_inner", 0.9))
-    bridging_r_outer = float(model_params.get("bridging_r_outer", 1.3))
+    bridging_r_inner = float(model_params.get("bridging_r_inner", 0.8))
+    bridging_r_outer = float(model_params.get("bridging_r_outer", 1.2))
     # Only inject bridging parameters when bridging is enabled.
     if bridging_method != "NONE":
         model_params["descriptor"]["inner_clamp_r_inner"] = bridging_r_inner
@@ -373,7 +373,7 @@ def get_model(model_params: dict) -> Any:
             return get_standard_model(model_params)
     elif model_type == "linear_ener":
         return get_linear_model(model_params)
-    elif model_type in ("SeZM", "SeZM-Net"):
+    elif model_type in ("SeZM", "sezm"):
         return get_sezm_model(model_params)
     else:
         return BaseModel.get_class_by_type(model_type).get_model(model_params)

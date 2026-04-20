@@ -284,7 +284,6 @@ class TestSeZMModelCompile(unittest.TestCase):
             mapping=mapping,
             pair_keep_mask=pair_keep_mask,
             eps=descriptor.eps,
-            inner_clamp=descriptor.inner_clamp,
             edge_envelope=descriptor.edge_envelope,
             radial_basis=descriptor.radial_basis,
             n_radial=descriptor.radial_basis.n_radial,
@@ -307,6 +306,7 @@ class TestSeZMModelCompile(unittest.TestCase):
             compute_dtype=descriptor.compute_dtype,
             eps=descriptor.eps,
             inner_clamp=descriptor.inner_clamp,
+            bridging_switch=descriptor.bridging_switch,
             edge_envelope=descriptor.edge_envelope,
             radial_basis=descriptor.radial_basis,
             has_exclude_types=False,
@@ -620,8 +620,8 @@ class TestSeZMModelBridging(unittest.TestCase):
             },
             "use_compile": False,
             "bridging_method": bridging_method,
-            "bridging_r_inner": 0.9,
-            "bridging_r_outer": 1.3,
+            "bridging_r_inner": 0.8,
+            "bridging_r_outer": 1.2,
         }
 
     def test_bridging_none_unchanged(self) -> None:

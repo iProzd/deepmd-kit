@@ -80,6 +80,17 @@ class EdgeFeatureCache(NamedTuple):
     Dt_from_m_cache
         Lazy cache for projected Dt matrices keyed by a normalized
         ``"lmax:mmax"`` identifier.
+    edge_src_gate
+        Optional per-edge Source Freeze Propagation Gate (SFPG) weight with
+        shape (E, 1). Equals ``eta[src]`` where
+        ``eta[j] = prod_{k in N(j)} w(r_{jk})`` and ``w`` is the
+        :class:`BridgingSwitch` C3 switching amplitude. Present only when
+        the model runs in bridging mode; ``None`` otherwise. Aggregation
+        sites (``GeometricInitialEmbedding``, ``EnvironmentInitialEmbedding``,
+        ``SO2Convolution``) multiply their per-edge message contribution
+        by this gate to forbid any node whose local neighborhood enters
+        the frozen zone from propagating information along its outgoing
+        edges.
     """
 
     src: torch.Tensor
@@ -94,6 +105,81 @@ class EdgeFeatureCache(NamedTuple):
     Dt_full: torch.Tensor | None = None
     D_to_m_cache: dict[str, torch.Tensor] | None = None
     Dt_from_m_cache: dict[str, torch.Tensor] | None = None
+    edge_src_gate: torch.Tensor | None = None
+
+
+def compute_edge_src_gate(
+    *,
+    edge_len: torch.Tensor,
+    src: torch.Tensor,
+    n_nodes: int,
+    bridging_switch: Callable[[torch.Tensor], torch.Tensor],
+    edge_keep_f: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    Compute the per-edge source gate for SFPG from edge lengths.
+
+    The gate implements a per-node "non-frozen confidence" and broadcasts
+    it back to edges along the source axis::
+
+        w_e      = bridging_switch(edge_len_e)               in [0, 1]
+        eta_j    = prod_{e: src_e = j} w_e                   in [0, 1]
+        gate_e   = eta_{src_e}                               in [0, 1]
+
+    ``w_e = 0`` at ``r_{jk} <= r_inner`` ensures ``eta_j = 0`` for any
+    node with at least one neighbor in the frozen zone. Masked edges
+    (padding, excluded type pairs) must contribute the multiplicative
+    identity ``1`` so they never spuriously mute a valid source node;
+    callers supply ``edge_keep_f`` for this.
+
+    The product is realised by ``scatter_reduce(reduce="prod")``, which
+    keeps exact zeros without any ``log``/``exp`` detour and has a
+    registered gradient that uses the leave-one-out product rule. Both
+    forward and gradient paths therefore stay ``C^3`` in the edge length
+    and compatible with ``make_fx`` symbolic tracing.
+
+    Parameters
+    ----------
+    edge_len
+        Per-edge distances with shape (E, 1).
+    src
+        Source node indices with shape (E,).
+    n_nodes
+        Total number of nodes N.
+    bridging_switch
+        Callable ``r -> w(r)`` with ``w: [0, ∞) -> [0, 1]``, typically a
+        :class:`BridgingSwitch` instance.
+    edge_keep_f
+        Optional per-edge keep weights with shape (E, 1), with ``0`` on
+        masked edges and ``1`` on kept edges. If provided, masked edges
+        are rewritten to ``w = 1`` before the product reduction.
+
+    Returns
+    -------
+    torch.Tensor
+        Per-edge source gate with shape (E, 1), aligned on the same edge
+        axis as the rest of the cache.
+    """
+    # === Step 1. Per-edge switching amplitude w(r) in [0, 1] ===
+    edge_w = bridging_switch(edge_len)  # (E, 1)
+    if edge_keep_f is not None:
+        # Force w = 1 on masked edges so they are neutral for the product.
+        edge_w = edge_w * edge_keep_f + (1.0 - edge_keep_f)
+
+    # === Step 2. Per-source-node product via scatter_reduce("prod") ===
+    # include_self=True starts from the identity 1.0, so nodes with zero
+    # outgoing edges stay at eta = 1 (empty product).
+    eta = torch.ones(n_nodes, dtype=edge_w.dtype, device=edge_w.device)
+    eta = eta.scatter_reduce(
+        0,
+        src,
+        edge_w.squeeze(-1),
+        reduce="prod",
+        include_self=True,
+    )
+
+    # === Step 3. Broadcast the per-node gate back to edges via source ===
+    return eta.index_select(0, src).unsqueeze(-1)
 
 
 @torch.amp.autocast("cuda", enabled=False)
@@ -105,7 +191,6 @@ def build_edge_cache(
     mapping: torch.Tensor | None,
     pair_keep_mask: torch.Tensor,
     eps: float,
-    inner_clamp: Callable[[torch.Tensor], torch.Tensor] | None,
     edge_envelope: Callable[[torch.Tensor], torch.Tensor],
     radial_basis: Callable[[torch.Tensor], torch.Tensor],
     n_radial: int,
@@ -158,8 +243,6 @@ def build_edge_cache(
         Pair keep mask from `PairExcludeMask` with shape (nf, nloc, nnei). True means keep.
     eps
         Small positive epsilon for safe norm and degree normalization.
-    inner_clamp
-        Optional inner clamp used to freeze short-range geometry below `r_inner`.
     edge_envelope
         C^3 edge envelope module.
     radial_basis
@@ -174,7 +257,7 @@ def build_edge_cache(
         blocks.
     use_geometry_rbf_triton
         Whether to allow the standard-path fused Triton geometry/RBF chain
-        ``gather -> vec -> len -> clamp -> env -> rbf``.
+        ``gather -> vec -> len -> env -> rbf``.
 
     Returns
     -------
@@ -207,11 +290,12 @@ def build_edge_cache(
             dtype=extended_coord.dtype,
         )
 
-    # === Step 3-6. Edge geometry/RBF chain ===
+    # === Step 3-5. Edge geometry/RBF chain ===
     # This segment covers:
-    #   gather -> edge_vec -> edge_len -> inner_clamp -> edge_env -> edge_rbf
+    #   gather -> edge_vec -> edge_len -> edge_env -> edge_rbf
     # The Triton path is only used on the standard non-compile path when the
-    # caller explicitly allows it (descriptor eval/inference path).
+    # caller explicitly allows it (descriptor eval/inference path). Bridging
+    # primitives never enter here; they are owned by the sparse-edge path.
     coord_flat = coord.reshape(nf * nall, 3)
     if use_geometry_rbf_triton:
         with nvtx_range("edge_geometry_rbf_triton"):
@@ -222,7 +306,7 @@ def build_edge_cache(
                 edge_envelope=edge_envelope,
                 radial_basis=radial_basis,
                 eps=eps,
-                inner_clamp=inner_clamp,
+                inner_clamp=None,
             )
     else:
         # === Step 3. Gather per-edge geometry ===
@@ -234,28 +318,18 @@ def build_edge_cache(
             edge_vec = neighbor_pos - center_pos  # (E, 3)
             edge_len = safe_norm(edge_vec, eps)  # (E, 1)
 
-        # === Step 4. Inner clamping for zone bridging ===
-        # Freeze the descriptor below r_inner: both scalar distance and
-        # displacement vector are clamped so the descriptor sees no
-        # information about the true distance when r < r_inner.
-        if inner_clamp is not None:
-            clamped = inner_clamp(edge_len)  # (E, 1)
-            scale = clamped / edge_len
-            edge_vec = edge_vec * scale  # direction preserved, length -> clamped
-            edge_len = clamped
-
-        # === Step 5. C^3 envelope weight ===
+        # === Step 4. C^3 envelope weight ===
         # Edges with r >= rcut are not removed from the cache. Their envelope is
         # exactly zero, so messages vanish naturally while degree normalization
         # remains smooth at the cutoff boundary.
         with nvtx_range("envelope"):
             edge_env = edge_envelope(edge_len)  # (E, 1)
 
-        # === Step 6. Radial basis (envelope already baked in) ===
+        # === Step 5. Radial basis (envelope already baked in) ===
         with nvtx_range("radial_basis"):
             edge_rbf = radial_basis(edge_len)  # (E, n_radial)
 
-    # === Step 7. Edge quaternion -> Wigner-D blocks ===
+    # === Step 6. Edge quaternion -> Wigner-D blocks ===
     with nvtx_range("wigner_d"):
         D_full, Dt_full = _build_edge_wigner(
             edge_vec=edge_vec,
@@ -292,6 +366,7 @@ def build_edge_cache_from_edges(
     compute_dtype: torch.dtype,
     eps: float,
     inner_clamp: Callable[[torch.Tensor], torch.Tensor] | None,
+    bridging_switch: Callable[[torch.Tensor], torch.Tensor] | None,
     edge_envelope: Callable[[torch.Tensor], torch.Tensor],
     radial_basis: Callable[[torch.Tensor], torch.Tensor],
     has_exclude_types: bool,
@@ -320,6 +395,13 @@ def build_edge_cache_from_edges(
         Small positive epsilon for safe norm and degree normalization.
     inner_clamp
         Optional inner clamp used to freeze short-range geometry below `r_inner`.
+    bridging_switch
+        Optional C3 switching amplitude ``w(r) -> [0, 1]`` that drives
+        the Source Freeze Propagation Gate. When provided, a per-edge
+        ``edge_src_gate`` is computed from the node-wise product of
+        ``w(r_{jk})`` along each source node's outgoing edges. Masked
+        edges (``edge_keep=False``) are forced to ``w=1`` so they never
+        leak into the product.
     edge_envelope
         C^3 edge envelope module.
     radial_basis
@@ -380,6 +462,22 @@ def build_edge_cache_from_edges(
     edge_type_feat = build_edge_type_feat(type_ebed, src, dst)
     edge_type_feat = edge_type_feat * edge_keep_f.to(dtype=edge_type_feat.dtype)
 
+    # === Step 6. Source Freeze Propagation Gate (optional) ===
+    # The sparse-edge path packs one dummy masked edge per frame so the
+    # compiled graph sees a statically non-empty tensor. ``edge_keep_f``
+    # rewrites any such slot to ``w=1`` inside ``compute_edge_src_gate``,
+    # keeping the product reduction unaffected by padding.
+    edge_src_gate: torch.Tensor | None = None
+    if bridging_switch is not None:
+        with nvtx_range("src_gate"):
+            edge_src_gate = compute_edge_src_gate(
+                edge_len=edge_len,
+                src=src,
+                n_nodes=n_nodes,
+                bridging_switch=bridging_switch,
+                edge_keep_f=edge_keep_f,
+            )
+
     return _finalize_edge_cache(
         n_nodes=n_nodes,
         src=src,
@@ -391,6 +489,7 @@ def build_edge_cache_from_edges(
         D_full=D_full,
         Dt_full=Dt_full,
         eps=eps,
+        edge_src_gate=edge_src_gate,
     )
 
 
@@ -456,6 +555,7 @@ def _finalize_edge_cache(
     D_full: torch.Tensor,
     Dt_full: torch.Tensor,
     eps: float,
+    edge_src_gate: torch.Tensor | None = None,
 ) -> EdgeFeatureCache:
     """
     Assemble the shared `EdgeFeatureCache` layout.
@@ -482,6 +582,9 @@ def _finalize_edge_cache(
         Transposed packed Wigner-D matrices with shape (E, D, D).
     eps
         Small positive epsilon used in degree normalization.
+    edge_src_gate
+        Optional per-edge SFPG weight with shape (E, 1). ``None`` in
+        non-bridging mode.
 
     Returns
     -------
@@ -510,6 +613,7 @@ def _finalize_edge_cache(
         Dt_full=Dt_full,
         D_to_m_cache={},
         Dt_from_m_cache={},
+        edge_src_gate=edge_src_gate,
     )
 
 
@@ -561,6 +665,7 @@ def _get_empty_edge_cache(
         Dt_full=None,
         D_to_m_cache={},
         Dt_from_m_cache={},
+        edge_src_gate=None,
     )
 
 
@@ -716,12 +821,16 @@ def edge_cache_to_dtype(
     # Use local variables with explicit None check and assignment.
     _D_full = cache.D_full
     _Dt_full = cache.Dt_full
+    _edge_src_gate = cache.edge_src_gate
     D_full: torch.Tensor | None = None
     Dt_full: torch.Tensor | None = None
+    edge_src_gate: torch.Tensor | None = None
     if _D_full is not None:
         D_full = _D_full.to(dtype=dtype)
     if _Dt_full is not None:
         Dt_full = _Dt_full.to(dtype=dtype)
+    if _edge_src_gate is not None:
+        edge_src_gate = _edge_src_gate.to(dtype=dtype)
 
     return EdgeFeatureCache(
         src=cache.src,
@@ -736,4 +845,5 @@ def edge_cache_to_dtype(
         Dt_full=Dt_full,
         D_to_m_cache=None if cache.D_to_m_cache is None else {},
         Dt_from_m_cache=None if cache.Dt_from_m_cache is None else {},
+        edge_src_gate=edge_src_gate,
     )

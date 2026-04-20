@@ -266,7 +266,17 @@ class GeometricInitialEmbedding(nn.Module):
             zonal_m0_value_for_row.unsqueeze(-1) * radial_value_for_row
         )  # (E, D-1, C)
 
-        # === Step 4. Scatter to nodes and normalize ===
+        # === Step 4. Source Freeze Propagation Gate (optional) ===
+        # Mute messages emitted by nodes whose local neighborhood enters
+        # the frozen zone. ``edge_src_gate`` is ``None`` outside bridging
+        # mode so this is a no-op in normal training.
+        src_gate = edge_cache.edge_src_gate
+        if src_gate is not None:
+            non_scalar_message = non_scalar_message * src_gate.to(
+                dtype=non_scalar_message.dtype
+            ).unsqueeze(-1)
+
+        # === Step 5. Scatter to nodes and normalize ===
         # Avoid advanced-index writeback (out[:, non_scalar_row_index, :]) which produces a copy.
         non_scalar_out = out.new_zeros(
             n_nodes, self.non_scalar_row_index.numel(), self.channels
@@ -529,6 +539,11 @@ class EnvironmentInitialEmbedding(nn.Module):
         # outer = r_tilde[:, :, None] * g[:, None, :]  # (E, 4, embed_dim)
         outer = torch.einsum("ei,ej->eij", r_tilde, g)  # (E, 4, embed_dim)
         outer_flat = outer.reshape(-1, 4 * self.embed_dim)  # (E, 4*embed_dim)
+        # Source Freeze Propagation Gate: mute the outer-product contribution
+        # of any edge whose source node has a neighbor in the frozen zone.
+        src_gate = edge_cache.edge_src_gate
+        if src_gate is not None:
+            outer_flat = outer_flat * src_gate.to(dtype=outer_flat.dtype)
         env_agg = outer_flat.new_zeros(n_nodes, 4 * self.embed_dim)  # (N, 4*embed_dim)
         env_agg.index_add_(0, dst, outer_flat)
         env_agg = env_agg.reshape(n_nodes, 4, self.embed_dim)  # (N, 4, embed_dim)

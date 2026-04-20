@@ -33,6 +33,7 @@ from .edge_cache import (
     build_edge_cache,
     build_edge_cache_from_edges,
     build_edge_type_feat,
+    compute_edge_src_gate,
     edge_cache_to_dtype,
 )
 from .embedding import (
@@ -61,6 +62,7 @@ from .norm import (
     ScalarRMSNorm,
 )
 from .radial import (
+    BridgingSwitch,
     C3CutoffEnvelope,
     InnerClamp,
     RadialBasis,
@@ -96,6 +98,7 @@ from .wignerd import (
 
 __all__ = [
     "ATTN_RES_MODES",
+    "BridgingSwitch",
     "C3CutoffEnvelope",
     "ChannelLinear",
     "DepthAttnRes",
@@ -133,6 +136,7 @@ __all__ = [
     "build_m_major_index",
     "build_m_major_l_index",
     "build_rotate_inv_rescale",
+    "compute_edge_src_gate",
     "edge_cache_to_dtype",
     "get_promoted_dtype",
     "get_so3_dim_of_lmax",

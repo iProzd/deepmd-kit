@@ -355,6 +355,83 @@ class InnerClamp(nn.Module):
         return torch.where(r >= self.r_outer, r, interpolated)
 
 
+class BridgingSwitch(nn.Module):
+    r"""
+    C3-continuous switching amplitude for the SeZM bridging zone.
+
+    ``BridgingSwitch`` returns a per-edge scalar amplitude in ``[0, 1]``
+    that measures how far an edge sits outside the frozen zone. It is
+    the elementary piece the Source Freeze Propagation Gate (SFPG)
+    aggregates into a per-node "non-frozen confidence" via a product
+    over each source node's outgoing edges::
+
+        w(r) = 0                                             if r <= r_inner  (frozen)
+        w(r) = h((r - r_inner) / (r_outer - r_inner))        if r_inner < r < r_outer  (transition)
+        w(r) = 1                                             if r >= r_outer  (normal)
+
+        h(t) = 35 t^4 - 84 t^5 + 70 t^6 - 20 t^7
+
+    Boundary conditions at ``t=0`` and ``t=1``::
+
+        h(0)   = h'(0)   = h''(0)   = h'''(0)   = 0
+        h(1)=1, h'(1)    = h''(1)   = h'''(1)   = 0
+
+    The vanishing first three derivatives at both endpoints give
+    ``w \in C^3(\mathbb{R}_{\ge 0})`` with zero slope/curvature at
+    ``r_inner`` and ``r_outer``, so forces (first derivatives) and the
+    force derivatives consumed by second-order training stay continuous
+    across both zone boundaries.
+
+    The surrounding infrastructure (``compute_edge_src_gate``) owns the
+    per-node product reduction and broadcast; this module only encodes
+    the scalar amplitude shape.
+
+    Parameters
+    ----------
+    r_inner : float
+        Inner radius in Å. At or below this distance ``w = 0``.
+    r_outer : float
+        Outer radius in Å. At or above this distance ``w = 1``.
+
+    Raises
+    ------
+    ValueError
+        If ``r_inner <= 0``, ``r_outer <= 0``, or ``r_inner >= r_outer``.
+    """
+
+    def __init__(self, r_inner: float, r_outer: float) -> None:
+        super().__init__()
+        if r_inner <= 0 or r_outer <= 0:
+            raise ValueError("r_inner and r_outer must be positive")
+        if r_inner >= r_outer:
+            raise ValueError(f"r_inner ({r_inner}) must be < r_outer ({r_outer})")
+        self.r_inner = float(r_inner)
+        self.r_outer = float(r_outer)
+
+    def forward(self, r: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the C3 switching amplitude.
+
+        Parameters
+        ----------
+        r : torch.Tensor
+            Pair distances with shape (...) or (..., 1) in Å.
+
+        Returns
+        -------
+        torch.Tensor
+            Switching amplitudes in ``[0, 1]`` with the same shape as input.
+        """
+        t = ((r - self.r_inner) / (self.r_outer - self.r_inner)).clamp(0.0, 1.0)
+        t2 = t * t
+        t4 = t2 * t2
+        # h(t) = 35 t^4 - 84 t^5 + 70 t^6 - 20 t^7  (Horner form).
+        # Degree-7 smootherstep: the unique polynomial of this degree that
+        # hits ``w(r_inner)=0, w(r_outer)=1`` together with C3 flatness at
+        # both radii.
+        return t4 * (35.0 + t * (-84.0 + t * (70.0 - 20.0 * t)))
+
+
 class RadialBasis(nn.Module):
     """
     Spherical Bessel radial basis with C^3 cutoff envelope.

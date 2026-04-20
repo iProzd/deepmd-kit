@@ -71,6 +71,7 @@ from .base_descriptor import (
 )
 from .sezm_nn import (
     ATTN_RES_MODES,
+    BridgingSwitch,
     C3CutoffEnvelope,
     DepthAttnRes,
     EdgeFeatureCache,
@@ -110,7 +111,7 @@ if TYPE_CHECKING:
 
 
 @BaseDescriptor.register("SeZM")
-@BaseDescriptor.register("se_zm")
+@BaseDescriptor.register("sezm")
 class DescrptSeZM(BaseDescriptor, nn.Module):
     """
     SeZM: The descriptor of smooth equivariant Zone-bridging Model for DeePMD-kit.
@@ -422,7 +423,17 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.seed = seed
         self.random_gamma = bool(random_gamma)
 
-        # === Inner clamping for zone bridging ===
+        # === Zone bridging: InnerClamp + Source Freeze Propagation Gate ===
+        # Both the geometry clamp (``InnerClamp``) and the message-passing
+        # switch (``BridgingSwitch``) are activated together on the same
+        # ``[r_inner, r_outer]`` window. The clamp freezes scalar distance
+        # on every ``(j, k)`` edge with ``r_{jk} < r_inner``; the switch
+        # feeds a per-edge C3 amplitude into ``compute_edge_src_gate`` so
+        # that any node with a frozen neighbor cannot propagate
+        # information through the GNN, closing the direction / multi-hop
+        # leakage channels that a pure ``InnerClamp`` cannot reach. Both
+        # modules are parameter-free, so enabling bridging does not add
+        # any keys to the descriptor's state dict.
         self.inner_clamp_r_inner = (
             float(inner_clamp_r_inner) if inner_clamp_r_inner is not None else None
         )
@@ -436,8 +447,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             self.inner_clamp: InnerClamp | None = InnerClamp(
                 self.inner_clamp_r_inner, self.inner_clamp_r_outer
             )
+            self.bridging_switch: BridgingSwitch | None = BridgingSwitch(
+                self.inner_clamp_r_inner, self.inner_clamp_r_outer
+            )
         else:
             self.inner_clamp = None
+            self.bridging_switch = None
 
         # === Env seed parameters ===
         self.use_env_seed = bool(use_env_seed)
@@ -839,6 +854,11 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             )  # (N, C)
 
         # === Step 4. Build edge cache once (geometry + RBF + Wigner-D) ===
+        # Zone bridging (InnerClamp + SFPG + ZBL) is not routed through the
+        # standard DeePMD path: bridging only makes physical sense when
+        # paired with the ZBL energy that ``SeZMModel`` injects on the
+        # sparse-edge path, so ``forward`` keeps the original
+        # bridging-free aggregation semantics.
         with nvtx_range("build_edge_cache"):
             edge_cache = build_edge_cache(
                 type_ebed=type_ebed,
@@ -847,7 +867,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 mapping=mapping,
                 pair_keep_mask=pair_keep_mask,
                 eps=self.eps,
-                inner_clamp=self.inner_clamp,
                 edge_envelope=self.edge_envelope,
                 radial_basis=self.radial_basis,
                 n_radial=self.radial_basis.n_radial,
@@ -1012,6 +1031,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 compute_dtype=self.compute_dtype,
                 eps=self.eps,
                 inner_clamp=self.inner_clamp,
+                bridging_switch=self.bridging_switch,
                 edge_envelope=self.edge_envelope,
                 radial_basis=self.radial_basis,
                 has_exclude_types=bool(self.exclude_types),

@@ -514,9 +514,7 @@ def _rebuild_graph_module(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
 
 
 @BaseModel.register("SeZM")
-@BaseModel.register("se_zm")
 @BaseModel.register("sezm")
-@BaseModel.register("SeZM-Net")
 class SeZMModel(DPModelCommon, SeZMModel_):
     """
     SeZM energy model with an optional compiled sparse-edge path.
@@ -538,8 +536,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         use_compile: bool = False,
         enable_tf32: bool = False,
         bridging_method: str = "none",
-        bridging_r_inner: float = 0.9,
-        bridging_r_outer: float = 1.3,
+        bridging_r_inner: float = 0.8,
+        bridging_r_outer: float = 1.2,
         **kwargs: Any,
     ) -> None:
         DPModelCommon.__init__(self)

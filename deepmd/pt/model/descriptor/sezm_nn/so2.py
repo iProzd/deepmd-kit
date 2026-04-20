@@ -1139,9 +1139,22 @@ class SO2Convolution(nn.Module):
 
         # === Step 8. Aggregate with optional head-wise gating ===
         with nvtx_range("SO2Conv/aggregate"):
+            # Source Freeze Propagation Gate: broadcast the per-edge scalar
+            # eta[src] to the edge message before destination aggregation.
+            # ``edge_src_gate`` is ``None`` outside bridging mode, in which
+            # case this branch disappears and the baseline / attention paths
+            # run unchanged.
+            edge_src_gate = edge_cache.edge_src_gate
             if self.n_atten_head == 0:
-                # Baseline path: fused envelope-weighted scatter add -> degree norm
-                x_message = x_message * edge_cache.edge_env.unsqueeze(-1)
+                # Baseline path: fused envelope-weighted scatter add -> degree norm.
+                # Folding edge_src_gate into the scalar envelope keeps the
+                # op count unchanged.
+                edge_weight = edge_cache.edge_env  # (E, 1)
+                if edge_src_gate is not None:
+                    edge_weight = edge_weight * edge_src_gate.to(
+                        dtype=edge_weight.dtype
+                    )
+                x_message = x_message * edge_weight.unsqueeze(-1)
                 out = x.new_zeros(x.shape, dtype=self.compute_dtype)
                 out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
                 out.mul_(edge_cache.inv_sqrt_deg.to(dtype=self.compute_dtype))
@@ -1173,6 +1186,14 @@ class SO2Convolution(nn.Module):
                 attn_logits = attn_logits + radial_bias
 
                 # === Step 8.2. Destination-wise stable envelope-gated softmax ===
+                # ``src_weight=edge_src_gate`` folds SFPG into both the
+                # numerator and the denominator of the softmax. A muted
+                # source (``eta_src = 0``) therefore drops out of the
+                # destination's attention normalization entirely, which
+                # is required for the attention path to honor the
+                # frozen-zone invariance: a post-multiplication on
+                # ``attn_alpha`` alone would still leave the muted
+                # source leaking through the shared denominator.
                 attn_alpha = segment_envelope_gated_softmax(
                     logits=attn_logits,
                     edge_env=edge_cache.edge_env.to(dtype=compute_dtype),
@@ -1180,6 +1201,11 @@ class SO2Convolution(nn.Module):
                     n_nodes=n_node,
                     z_bias_raw=self.adamw_attn_z_bias_raw,
                     eps=self.eps,
+                    src_weight=(
+                        None
+                        if edge_src_gate is None
+                        else edge_src_gate.to(dtype=compute_dtype)
+                    ),
                 )  # (E, F, H)
 
                 # === Step 8.3. Head-wise value aggregation ===

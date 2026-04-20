@@ -67,8 +67,8 @@
     },
     "use_compile": false,
     "bridging_method": "none",
-    "bridging_r_inner": 0.9,
-    "bridging_r_outer": 1.3,
+    "bridging_r_inner": 0.8,
+    "bridging_r_outer": 1.2,
     "_comment": "that's all"
   },
   "learning_rate": {

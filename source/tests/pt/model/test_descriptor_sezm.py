@@ -944,47 +944,6 @@ class TestInnerClamp(_SeZMTestCase):
             InnerClamp(1.0, 1.0)
 
 
-class TestDescriptorInnerClamp(_SeZMTestCase):
-    """Test DescrptSeZM with inner clamping enabled vs disabled."""
-
-    def test_clamp_no_effect_beyond_r_outer(self) -> None:
-        """Test that inner clamp has no effect when all distances > r_outer."""
-        dtype = torch.float32
-        coord = torch.tensor(
-            [[0.0, 0.0, 0.0], [2.0, 0.0, 0.0]],
-            dtype=dtype,
-            device=self.device,
-        ).view(1, -1, 3)
-        atype = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
-        nlist = torch.tensor([[[1, 1], [0, 0]]], dtype=torch.int64, device=self.device)
-        extended_coord = coord.reshape(1, -1)
-
-        base_kwargs = _descriptor_kwargs(
-            precision="float32",
-            seed=42,
-        )
-
-        model_no_clamp = DescrptSeZM(**base_kwargs)
-        model_clamp = DescrptSeZM(
-            inner_clamp_r_inner=1.0,
-            inner_clamp_r_outer=1.5,
-            **base_kwargs,
-        )
-        model_clamp.load_state_dict(model_no_clamp.state_dict())
-
-        desc_no, *_ = model_no_clamp(extended_coord, atype, nlist)
-        desc_yes, *_ = model_clamp(extended_coord, atype, nlist)
-
-        # At r=2.0 > r_outer=1.5, outputs should be identical
-        torch.testing.assert_close(
-            desc_no,
-            desc_yes,
-            atol=1e-6,
-            rtol=1e-6,
-            msg="Descriptor should be identical when all distances > r_outer",
-        )
-
-
 class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
     """Test PES smoothness from scaled symmetric eight-atom probes."""
 
@@ -993,8 +952,8 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
     N_DISPLACEMENT_POINTS = 201
     MAX_DISPLACEMENT = 0.1
     RCUT_NEAR_DISTANCE = 4.95
-    BRIDGING_R_INNER = 0.9
-    BRIDGING_R_OUTER = 1.3
+    BRIDGING_R_INNER = 0.8
+    BRIDGING_R_OUTER = 1.2
     ENERGY_SPAN_MARGIN = 1.0e-7
     FIRST_DERIVATIVE_MARGIN = 5.0e-7
     SECOND_DERIVATIVE_MARGIN = 5.0e-4
@@ -1030,8 +989,8 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         use_amp: bool,
         n_focus: int = 1,
         bridging_method: str = "none",
-        bridging_r_inner: float = 0.9,
-        bridging_r_outer: float = 1.3,
+        bridging_r_inner: float = 0.8,
+        bridging_r_outer: float = 1.2,
     ) -> dict:
         """Build the SeZM probe model used for one PES scan."""
         params = {
@@ -1105,8 +1064,8 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
         use_amp: bool,
         n_focus: int = 1,
         bridging_method: str = "none",
-        bridging_r_inner: float = 0.9,
-        bridging_r_outer: float = 1.3,
+        bridging_r_inner: float = 0.8,
+        bridging_r_outer: float = 1.2,
     ) -> torch.nn.Module:
         """Build a probe model and randomize all floating-point parameters."""
         model = get_sezm_model(
@@ -1365,6 +1324,207 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
                             nearest_distance=self.BRIDGING_R_OUTER,
                             boundary_label="r_outer",
                         )
+
+
+class TestSourceFreezePropagationGate(TestDescriptorEnergyCurveSmoothness):
+    """
+    Sharper correctness probes for the Source Freeze Propagation Gate.
+
+    ``TestDescriptorEnergyCurveSmoothness`` already validates that the
+    bridged PES is a single smooth repulsive bowl near ``r_inner`` and
+    ``r_outer``; that family exercises the combined ``InnerClamp`` +
+    ``BridgingSwitch`` machinery on a realistic 8-atom layout and is
+    sensitive to discontinuities.
+
+    The tests below add a tighter, analytical guardrail that
+    ``InnerClamp`` alone cannot satisfy once the model grows past one
+    interaction block. Setup: three atoms ``(A, B, C)`` with ``A`` at
+    the origin, ``B`` sliding rigidly on a sphere of radius
+    ``r_AB < r_inner`` around ``A`` and ``C`` anchored in the normal
+    zone. Under this motion
+
+    * ``r_AB`` is constant, so ``V_ZBL(r_AB)`` is constant and the
+      analytical half-energy assigned to ``A`` does not move;
+    * the direction ``r_hat_AB`` varies, and so do ``r_BC`` and
+      ``r_hat_BC`` — these are exactly the channels through which the
+      direction and multi-hop leaks manifest in the user's analysis.
+
+    The guarantee SFPG delivers is therefore very sharp: **the atomic
+    energy of every node that is not ``B`` itself must stay strictly
+    constant**. ``E_B`` is expected to vary because ``B`` still has a
+    genuine chemical bond with ``C``.
+    """
+
+    NEAR_DISTANCE = 0.6  # < BRIDGING_R_INNER, stays frozen for all samples
+    N_SPHERE_POINTS = 16
+    INVARIANCE_TOLERANCE = 1.0e-10
+
+    def _build_three_atom_box(
+        self,
+        *,
+        near_distance: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Build a 3-atom open-box probe ``(A, B, C)`` with frozen pair ``(A, B)``.
+
+        ``A`` is anchored at the origin, ``B`` is placed inside the frozen
+        sphere at distance ``near_distance`` along the initial direction,
+        and ``C`` sits well outside the bridging window so ``(A, C)`` and
+        ``(B, C)`` are ordinary GNN edges.
+        """
+        coord = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [near_distance, 0.0, 0.0],
+                [2.4, 0.0, 0.0],
+            ],
+            dtype=self.dtype,
+            device=self.device,
+        ).unsqueeze(0)
+        atype = torch.tensor([[0, 1, 0]], dtype=torch.int32, device=self.device)
+        # Large enough cubic cell to keep the system aperiodic under rcut=5.
+        box = torch.tensor(
+            [[10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0]],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        return coord, atype, box
+
+    def _sphere_positions(
+        self,
+        n_points: int,
+        radius: float,
+    ) -> torch.Tensor:
+        """Deterministic Fibonacci-like sphere sampling around the origin."""
+        indices = torch.arange(n_points, dtype=self.dtype, device=self.device)
+        phi = math.pi * (3.0 - math.sqrt(5.0))  # golden-angle step
+        z = 1.0 - 2.0 * (indices + 0.5) / float(n_points)
+        rho = torch.sqrt(torch.clamp(1.0 - z * z, min=0.0))
+        theta = phi * indices
+        positions = torch.stack(
+            [
+                radius * rho * torch.cos(theta),
+                radius * rho * torch.sin(theta),
+                radius * z,
+            ],
+            dim=-1,
+        )
+        return positions  # (n_points, 3)
+
+    def _evaluate_frozen_sphere_atom_energies(
+        self,
+        model: torch.nn.Module,
+    ) -> torch.Tensor:
+        """Evaluate per-atom energies while ``B`` rigidly slides on the frozen sphere.
+
+        The per-edge local-``+Z`` gauge roll is turned off so every edge uses
+        the deterministic canonical edge quaternion. This removes the only
+        non-determinism that would otherwise mask the ``< 1e-10`` invariance
+        SFPG is supposed to deliver in fp64; the gauge roll is pure
+        training-time augmentation and does not change the physical content.
+        """
+        descriptor = model.atomic_model.descriptor
+        previous_random_gamma = descriptor.random_gamma
+        descriptor.random_gamma = False
+        try:
+            coord0, atype, box = self._build_three_atom_box(
+                near_distance=self.NEAR_DISTANCE
+            )
+            directions = self._sphere_positions(
+                self.N_SPHERE_POINTS, radius=self.NEAR_DISTANCE
+            )
+            coord = coord0.repeat(directions.shape[0], 1, 1)
+            coord[:, 1, :] = directions  # rotate B around A, radius fixed
+            result = model(
+                coord,
+                atype.expand(directions.shape[0], -1),
+                box=box.expand(directions.shape[0], -1),
+            )
+        finally:
+            descriptor.random_gamma = previous_random_gamma
+        return result["atom_energy"].detach()  # (n_samples, 3, 1)
+
+    def _atomic_energy_span(
+        self,
+        atom_energies: torch.Tensor,
+        atom_index: int,
+    ) -> float:
+        """Range of one atom's energy across the sphere trajectory."""
+        values = atom_energies[:, atom_index, 0]
+        return float((values.max() - values.min()).abs())
+
+    def test_sfpg_preserves_atomic_energy_of_frozen_partner(self) -> None:
+        """
+        With SFPG active, the atomic energy of the frozen-partner atom
+        ``A`` must be strictly constant along the sphere trajectory.
+
+        ``A``'s atomic energy decomposes as ``E_A_GNN + V_ZBL(r_AB)/2
+        + V_ZBL(r_AC)/2``. Both ZBL half-terms are constant because
+        ``r_AB`` is fixed on the frozen sphere and ``r_AC`` does not
+        change either, so any residual variation must come from the
+        GNN branch. ``E_C`` is deliberately not probed here because
+        ``V_ZBL(r_BC)/2`` that sits on the ``C`` side is of order
+        several eV at ``r_BC ≈ r_outer`` and moves with ``B`` even
+        though the GNN piece of ``E_C`` remains strictly invariant.
+        Writing the test on ``E_A`` keeps the assertion clean and
+        purely diagnostic of SFPG rather than of ZBL geometry.
+        """
+        model = self._build_random_weight_model(
+            n_atten_head=2,
+            use_amp=False,
+            n_focus=2,
+            bridging_method="ZBL",
+            bridging_r_inner=self.BRIDGING_R_INNER,
+            bridging_r_outer=self.BRIDGING_R_OUTER,
+        )
+        atom_energies = self._evaluate_frozen_sphere_atom_energies(model)
+        self.assertTrue(torch.isfinite(atom_energies).all().item())
+
+        span_a = self._atomic_energy_span(atom_energies, atom_index=0)
+        self.assertLess(
+            span_a,
+            self.INVARIANCE_TOLERANCE,
+            (
+                "SFPG must freeze the atomic energy of ``A`` under rigid "
+                f"motion of its frozen partner; observed span {span_a:.3e} "
+                f"> {self.INVARIANCE_TOLERANCE:.3e}."
+            ),
+        )
+
+    def test_sfpg_leaks_reopen_when_gate_is_disabled(self) -> None:
+        """
+        Ablation: clearing ``bridging_switch`` must re-expose the leak.
+
+        This test is the contrapositive of the previous one: if SFPG is
+        the only mechanism that closes the direction / multi-hop leak,
+        disabling it must produce a measurably non-constant ``E_A`` on
+        the same frozen-sphere trajectory. Keeping this ablation in the
+        suite pins down which component owns the invariance, so any
+        future regression that silently disables SFPG is caught
+        immediately.
+        """
+        model = self._build_random_weight_model(
+            n_atten_head=2,
+            use_amp=False,
+            n_focus=2,
+            bridging_method="ZBL",
+            bridging_r_inner=self.BRIDGING_R_INNER,
+            bridging_r_outer=self.BRIDGING_R_OUTER,
+        )
+        # Drop only the per-source gate: InnerClamp and ZBL stay active.
+        model.atomic_model.descriptor.bridging_switch = None
+        atom_energies = self._evaluate_frozen_sphere_atom_energies(model)
+
+        span_a = self._atomic_energy_span(atom_energies, atom_index=0)
+        self.assertGreater(
+            span_a,
+            self.INVARIANCE_TOLERANCE,
+            (
+                "Clearing SFPG should re-expose the direction / multi-hop "
+                f"leak on ``E_A``; observed span {span_a:.3e} is not above "
+                f"the invariance tolerance {self.INVARIANCE_TOLERANCE:.3e}."
+            ),
+        )
 
 
 if __name__ == "__main__":

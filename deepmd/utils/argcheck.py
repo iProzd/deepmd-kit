@@ -343,7 +343,7 @@ def descrpt_se_a_args() -> list[Argument]:
 
 @descrpt_args_plugin.register(
     "SeZM",
-    alias=["se_zm"],
+    alias=["sezm"],
     doc=doc_only_pt_supported + doc_se_zm,
 )
 def descrpt_se_zm_args() -> list[Argument]:
@@ -2759,7 +2759,7 @@ def standard_model_args() -> Argument:
 
 @model_args_plugin.register(
     "SeZM",
-    alias=["se_zm", "sezm"],
+    alias=["sezm"],
 )
 def sezm_model_args() -> Argument:
     doc_descrpt = (
@@ -2840,7 +2840,7 @@ def sezm_model_args() -> Argument:
                 "bridging_r_inner",
                 float,
                 optional=True,
-                default=0.9,
+                default=0.8,
                 doc="Inner clamping radius in Å. Distances below this are frozen for the ML model. "
                 "Only used when bridging_method is set. "
                 "When using ZBL bridging, set training_data.min_pair_dist to the same value "
@@ -2850,9 +2850,9 @@ def sezm_model_args() -> Argument:
                 "bridging_r_outer",
                 float,
                 optional=True,
-                default=1.3,
+                default=1.2,
                 doc="Outer clamping radius in Å. The transition zone [bridging_r_inner, bridging_r_outer] "
-                "uses a C2-continuous quintic Hermite polynomial. Only used when bridging_method is set.",
+                "uses a C3-continuous septic Hermite polynomial. Only used when bridging_method is set.",
             ),
         ],
         doc="SeZM model scaffold with fixed descriptor and fitting types.",

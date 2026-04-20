@@ -22,6 +22,7 @@ def segment_envelope_gated_softmax(
     n_nodes: int,
     z_bias_raw: torch.Tensor,
     eps: float,
+    src_weight: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute destination-wise envelope-gated softmax attention.
@@ -41,23 +42,41 @@ def segment_envelope_gated_softmax(
         Softplus is applied to keep the bias strictly positive.
     eps
         Small epsilon for denominator stability.
+    src_weight
+        Optional per-edge source-side multiplier with shape (E, 1) or
+        (E,). When provided the per-edge weight becomes
+        ``edge_env**2 * src_weight`` and the attention reduces to
+        ``edge_env**2 * src_weight * exp(logits) /
+        (zeta + sum(edge_env**2 * src_weight * exp(logits)))``.
+        ``src_weight = 0`` therefore removes the source from both the
+        numerator and the denominator, which is what SFPG needs so that
+        a muted source does not even leak through the softmax
+        normalization.
 
     Returns
     -------
     torch.Tensor
-        Normalized edge weights with shape (E, F, H), computed as
-        ``edge_env**2 * exp(logits) / (zeta + sum(edge_env**2 * exp(logits)))``.
+        Normalized edge weights with shape (E, F, H).
     """
     n_edge, n_focus, n_head = logits.shape
     n_channel = n_focus * n_head
     eps_f = float(eps)
 
-    # === Step 1. Flatten (F, H) to reduce index tensor traffic ===
+    # === Step 1. Flatten (F, H) and build the effective per-edge weight ===
     logits_2d = logits.reshape(n_edge, n_channel)
     edge_env_1d = edge_env.squeeze(-1).to(dtype=logits.dtype).clamp_min(0.0)
+    # edge_weight_sq acts as the non-negative multiplier applied to every
+    # ``exp(logit)`` term. Folding ``src_weight`` here guarantees that any
+    # edge with ``src_weight = 0`` is excluded from the group max, the
+    # numerator, and the denominator in a single pass.
+    edge_weight_sq = edge_env_1d.square()
+    if src_weight is not None:
+        edge_weight_sq = edge_weight_sq * src_weight.reshape(n_edge).to(
+            dtype=logits.dtype
+        ).clamp_min(0.0)
     zeta = F.softplus(z_bias_raw).reshape(1, n_channel).to(dtype=logits.dtype)
     dst_index = dst.reshape(n_edge, 1).expand(n_edge, n_channel)
-    has_weight = edge_env_1d > 0.0
+    has_weight = edge_weight_sq > 0.0
     logits_for_max = torch.where(
         has_weight.reshape(n_edge, 1),
         logits_2d,
@@ -87,9 +106,9 @@ def segment_envelope_gated_softmax(
         torch.isfinite(group_max), group_max, torch.zeros_like(group_max)
     )
 
-    # === Step 3. Envelope-gated exponential terms ===
+    # === Step 3. Envelope/SFPG-gated exponential terms ===
     exp_shifted = torch.exp(logits_2d - edge_max)
-    edge_weighted_exp = edge_env_1d.square().reshape(n_edge, 1) * exp_shifted
+    edge_weighted_exp = edge_weight_sq.reshape(n_edge, 1) * exp_shifted
 
     # === Step 4. Destination-wise normalization with positive denominator bias ===
     denom_sum = torch.zeros(
