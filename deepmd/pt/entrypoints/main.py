@@ -547,20 +547,25 @@ def grad_probe(FLAGS) -> None:
     param_names: list | None = None
     param_shapes: list | None = None
 
+    accumulate_k = getattr(FLAGS, "accumulate_k", 1)
+    total_batches = FLAGS.nbatches * accumulate_k
+
     # Initialize trackers
     task_batch_norms = {k: [] for k in trainer.model_keys}
     task_accum_grads = {k: None for k in trainer.model_keys}
-    pairwise_sims = {
+    pairwise_dots = {
         (k1, k2): []
         for i, k1 in enumerate(trainer.model_keys)
         for j, k2 in enumerate(trainer.model_keys)
         if i < j
     }
 
+    # Accumulators within each group of K batches
+    group_grads = {k: None for k in trainer.model_keys}
+
     cur_lr = config["learning_rate"]["start_lr"]
 
-    for b in range(FLAGS.nbatches):
-        batch_grads = {}
+    for b in range(total_batches):
         for task_key in trainer.model_keys:
             trainer.optimizer.zero_grad(set_to_none=True)
             input_dict, label_dict, _ = trainer.get_data(
@@ -574,7 +579,6 @@ def grad_probe(FLAGS) -> None:
             model = module.model[task_key]
             descriptor = model.get_descriptor()
 
-            # Extract current batch gradient
             current_grads = []
             for name, param in descriptor.named_parameters():
                 if param.grad is not None:
@@ -584,15 +588,17 @@ def grad_probe(FLAGS) -> None:
 
             if current_grads:
                 grad_vec = np.concatenate(current_grads)
-                task_batch_norms[task_key].append(np.linalg.norm(grad_vec))
                 if task_accum_grads[task_key] is None:
-                    task_accum_grads[task_key] = grad_vec
+                    task_accum_grads[task_key] = grad_vec.copy()
                 else:
                     task_accum_grads[task_key] += grad_vec
-                batch_grads[task_key] = grad_vec
+
+                if group_grads[task_key] is None:
+                    group_grads[task_key] = grad_vec.copy()
+                else:
+                    group_grads[task_key] += grad_vec
 
                 if param_names is None:
-                    # get names and shapes from descriptor parameters
                     param_names = [
                         n for n, p in descriptor.named_parameters() if p.requires_grad
                     ]
@@ -602,19 +608,26 @@ def grad_probe(FLAGS) -> None:
                         if p.requires_grad
                     ]
 
-        # Compute pairwise dot products for this batch
-        for k1, k2 in pairwise_sims.keys():
-            if k1 in batch_grads and k2 in batch_grads:
-                g1 = batch_grads[k1]
-                g2 = batch_grads[k2]
-                pairwise_sims[(k1, k2)].append(float(np.dot(g1, g2)))
+        # At the end of each group of K batches, record norms and dot products then reset
+        if (b + 1) % accumulate_k == 0:
+            for task_key in trainer.model_keys:
+                if group_grads[task_key] is not None:
+                    task_batch_norms[task_key].append(
+                        np.linalg.norm(group_grads[task_key])
+                    )
+            for k1, k2 in pairwise_dots.keys():
+                g1 = group_grads.get(k1)
+                g2 = group_grads.get(k2)
+                if g1 is not None and g2 is not None:
+                    pairwise_dots[(k1, k2)].append(float(np.dot(g1, g2)))
+            group_grads = {k: None for k in trainer.model_keys}
 
     # Compute final statistics and log for each task
     for task_key in trainer.model_keys:
         accumulated_grads = task_accum_grads[task_key]
         norms = task_batch_norms[task_key]
         if accumulated_grads is not None:
-            avg_grad_vec = accumulated_grads / FLAGS.nbatches
+            avg_grad_vec = accumulated_grads / total_batches
             norm_mean = np.mean(norms)
             norm_std = np.std(norms)
         else:
@@ -627,16 +640,19 @@ def grad_probe(FLAGS) -> None:
         grads_per_task[f"{task_key}_norm_std"] = norm_std
 
         log.info(
-            "Task '%s': collected %d batches. Avg Grad Norm=%.4e, Mean(Batch Norms)=%.4e, Std(Batch Norms)=%.4e",
+            "Task '%s': collected %d batches (groups=%d, k=%d). "
+            "Avg Grad Norm=%.4e, Mean(Batch Norms)=%.4e, Std(Batch Norms)=%.4e",
             task_key,
-            len(norms),
+            total_batches,
+            FLAGS.nbatches,
+            accumulate_k,
             float(np.linalg.norm(avg_grad_vec)),
             float(norm_mean),
             float(norm_std),
         )
 
     # Compute pairwise dot product statistics
-    for (k1, k2), dots in pairwise_sims.items():
+    for (k1, k2), dots in pairwise_dots.items():
         if dots:
             dot_mean = np.mean(dots)
             dot_std = np.std(dots)
@@ -651,12 +667,15 @@ def grad_probe(FLAGS) -> None:
             grads_per_task[f"dot_{k1}_{k2}_accum"] = dot_accum
 
             log.info(
-                "Grad dot product '%s' vs '%s': Mean=%.4e, Std=%.4e, Accum=%.4e",
+                "Grad dot product '%s' vs '%s': Mean=%.4e, Std=%.4e, Accum=%.4e  "
+                "(SNR=%.2f, n_groups=%d)",
                 k1,
                 k2,
                 float(dot_mean),
                 float(dot_std),
                 float(dot_accum),
+                abs(dot_mean) / dot_std if dot_std > 0 else float("inf"),
+                len(dots),
             )
 
     save_dict = {f"grads_{k}": v for k, v in grads_per_task.items()}

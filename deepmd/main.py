@@ -878,6 +878,16 @@ def main_parser() -> argparse.ArgumentParser:
         default=1,
         help="Number of batches per task to average gradient over.",
     )
+    parser_grad_probe.add_argument(
+        "-k",
+        "--accumulate-k",
+        type=int,
+        default=1,
+        dest="accumulate_k",
+        help="Accumulate K batches before computing each dot product. "
+        "Total batches collected = nbatches * accumulate_k. "
+        "Larger K reduces norm variance and improves SNR of mean/std.",
+    )
     return parser
 
 
