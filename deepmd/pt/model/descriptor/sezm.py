@@ -88,6 +88,7 @@ from .sezm_nn import (
     build_edge_cache,
     build_edge_cache_from_edges,
     edge_cache_to_dtype,
+    fold_lora_state_dict_keys,
     get_promoted_dtype,
     get_so3_dim_of_lmax,
     np_safe,
@@ -366,7 +367,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.n_radial = int(n_radial)
         if radial_mlp is None:
             radial_mlp = [64]
-        self.radial_mlp = list(radial_mlp)
+        self.radial_mlp = [self.channels if x == 0 else int(x) for x in radial_mlp]
         if sandwich_norm is None:
             sandwich_norm = [True, False, True, False]
         if not isinstance(sandwich_norm, (list, tuple)) or len(sandwich_norm) != 4:
@@ -1614,7 +1615,21 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         unexpected_keys: list[str],
         error_msgs: list[str],
     ) -> None:
-        """Drop transient descriptor state that is rebuilt at construction."""
+        """Fold LoRA adapters and drop transient state before loading.
+
+        When a LoRA-trained checkpoint is loaded into a plain (non-LoRA)
+        descriptor, any ``A_by_l``/``B_by_l`` (SO3) and
+        ``A_m0``/``B_m0``/``A_m.*``/``B_m.*`` (SO2) keys are folded into
+        their corresponding base weight keys (``weight``, ``weight_m0``,
+        ``weight_m.*``) using ``ΔW = einsum(B, A) * scaling``.  The LoRA
+        keys are then removed so the load proceeds as if the checkpoint
+        were a plain SeZM.  This enables resume, finetune, and full-train
+        from any LoRA checkpoint without manual merging.
+        """
+        # === Step 1. Fold any LoRA keys into base weights ===
+        fold_lora_state_dict_keys(state_dict, prefix)
+
+        # === Step 2. Drop transient descriptor state rebuilt at construction ===
         expected_keys = {prefix + key for key in self.state_dict().keys()}
         for full_key in list(state_dict.keys()):
             if full_key.startswith(prefix) and full_key not in expected_keys:

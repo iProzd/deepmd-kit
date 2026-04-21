@@ -16,7 +16,7 @@
       "channels": 64,
       "n_radial": 16,
       "radial_mlp": [
-        64
+        0
       ],
       "use_env_seed": true,
       "random_gamma": true,
@@ -47,7 +47,7 @@
       "block_attn_res": "none",
       "s2_activation": [
         false,
-        false
+        true
       ],
       "activation_function": "silu",
       "glu_activation": true,
@@ -72,11 +72,13 @@
     "_comment": "that's all"
   },
   "learning_rate": {
-    "type": "cosine",
+    "type": "wsd",
     "start_lr": 5e-4,
     "stop_lr": 1e-6,
-    "warmup_steps": 100,
-    "warmup_start_factor": 0.2
+    "warmup_steps": 5000,
+    "warmup_start_factor": 0.2,
+    "decay_phase_ratio": 0.65,
+    "decay_type": "cosine"
   },
   "loss": {
     "type": "ener",
@@ -147,7 +149,7 @@
     "max_best_ckpt": 1,
     "validation_metric": "E:MAE",
     "full_val_file": "val.log",
-    "full_val_start": 0.0,
+    "full_val_start": 0.5,
     "_comment": "that's all"
   },
   "_comment": "that's all"

@@ -1082,53 +1082,55 @@ ______________________________________________________________________
 
 ### 20.1 Descriptor Parameters
 
-| Parameter             | Type              | Default     | Description                                                       |
-| --------------------- | ----------------- | ----------- | ----------------------------------------------------------------- |
-| `rcut`                | float             | —           | Cutoff radius in Å                                                |
-| `sel`                 | int \| list[int]  | —           | Max neighbors (int: total, list: per-type)                        |
-| `env_exp`             | list[int]         | `[7, 5]`    | Envelope exponents `[rbf_env_exp, edge_env_exp]`                  |
-| `channels`            | int               | 64          | Total channels per `(l,m)` coefficient                            |
-| `n_radial`            | int               | 10          | Number of radial basis functions                                  |
-| `radial_mlp`          | list[int]         | `[64]`      | Hidden sizes for radial MLP                                       |
-| `use_env_seed`        | bool              | True        | Enable FiLM conditioning from environment matrix                  |
-| `random_gamma`        | bool              | True        | Random edge roll for data augmentation                            |
-| `lmax`                | int               | 2           | Max degree (when `l_schedule` is None)                            |
-| `n_blocks`            | int               | 2           | Number of blocks (when `l_schedule` is None)                      |
-| `l_schedule`          | list[int] \| None | None        | Pyramid schedule of lmax per block (non-increasing)               |
-| `mmax`                | int \| None       | None        | Max SO(2) order (when `m_schedule` is None)                       |
-| `m_schedule`          | list[int] \| None | None        | Schedule of mmax per block                                        |
-| `n_focus`             | int               | 1           | Parallel focus streams in SO(2) convolution                       |
-| `focus_dim`           | int               | 0           | Per-focus hidden width (0 = use `channels`)                       |
-| `n_atten_head`        | int               | 1           | Attention heads in SO(2) aggregation (0 = plain scatter)          |
-| `so2_norm`            | bool              | False       | Pre-norm between SO(2) layers                                     |
-| `so2_layers`          | int               | 4           | SO2Linear layers per convolution                                  |
-| `so2_attn_res`        | str               | `"none"`    | SO(2)-internal depth attention (`none`/`independent`/`dependent`) |
-| `ffn_neurons`         | int               | 0           | FFN hidden width (0 = auto from channels)                         |
-| `grid_mlp`            | bool              | False       | Grid-MLP FFN variant                                              |
-| `ffn_blocks`          | int               | 1           | FFN subblocks per interaction block                               |
-| `sandwich_norm`       | list[bool]        | `[T,F,T,F]` | `[so2_pre, so2_post, ffn_pre, ffn_post]`                          |
-| `mlp_bias`            | bool              | False       | Bias in equivariant layers                                        |
-| `layer_scale`         | bool              | False       | Learnable LayerScale (init 1e-3)                                  |
-| `full_attn_res`       | str               | `"none"`    | Descriptor-level full attention residual                          |
-| `block_attn_res`      | str               | `"none"`    | Descriptor-level block attention residual                         |
-| `s2_activation`       | list[bool]        | `[F, F]`    | `[so2_s2_enabled, ffn_s2_enabled]`                                |
-| `s2_grid_resolution`  | list[int] \| None | None        | `[R_phi, R_theta]` for S2-grid activation                         |
-| `activation_function` | str               | `"silu"`    | Base activation                                                   |
-| `glu_activation`      | bool              | True        | Base GLU switch for FFN                                           |
-| `use_amp`             | bool              | True        | AMP with bf16 during training on CUDA                             |
-| `precision`           | str               | `"float32"` | Working precision for interaction blocks                          |
-| `eps`                 | float             | 1e-7        | Numerical stability epsilon                                       |
-| `exclude_types`       | list[tuple]       | `[]`        | Excluded type pairs                                               |
+| Parameter             | Type              | Default     | Description                                                        |
+| --------------------- | ----------------- | ----------- | ------------------------------------------------------------------ |
+| `rcut`                | float             | —           | Cutoff radius in Å                                                 |
+| `sel`                 | int \| list[int]  | —           | Max neighbors (int: total, list: per-type)                         |
+| `env_exp`             | list[int]         | `[7, 5]`    | Envelope exponents `[rbf_env_exp, edge_env_exp]`                   |
+| `channels`            | int               | 64          | Total channels per `(l,m)` coefficient                             |
+| `n_radial`            | int               | 10          | Number of radial basis functions                                   |
+| `radial_mlp`          | list[int]         | `[64]`      | Hidden sizes for radial MLP; use `0` as placeholder for `channels` |
+| `use_env_seed`        | bool              | True        | Enable FiLM conditioning from environment matrix                   |
+| `random_gamma`        | bool              | True        | Random edge roll for data augmentation                             |
+| `lmax`                | int               | 2           | Max degree (when `l_schedule` is None)                             |
+| `n_blocks`            | int               | 2           | Number of blocks (when `l_schedule` is None)                       |
+| `l_schedule`          | list[int] \| None | None        | Pyramid schedule of lmax per block (non-increasing)                |
+| `mmax`                | int \| None       | None        | Max SO(2) order (when `m_schedule` is None)                        |
+| `m_schedule`          | list[int] \| None | None        | Schedule of mmax per block                                         |
+| `n_focus`             | int               | 1           | Parallel focus streams in SO(2) convolution                        |
+| `focus_dim`           | int               | 0           | Per-focus hidden width (0 = use `channels`)                        |
+| `n_atten_head`        | int               | 1           | Attention heads in SO(2) aggregation (0 = plain scatter)           |
+| `so2_norm`            | bool              | False       | Pre-norm between SO(2) layers                                      |
+| `so2_layers`          | int               | 4           | SO2Linear layers per convolution                                   |
+| `so2_attn_res`        | str               | `"none"`    | SO(2)-internal depth attention (`none`/`independent`/`dependent`)  |
+| `ffn_neurons`         | int               | 0           | FFN hidden width (0 = auto from channels)                          |
+| `grid_mlp`            | bool              | False       | Grid-MLP FFN variant                                               |
+| `ffn_blocks`          | int               | 1           | FFN subblocks per interaction block                                |
+| `sandwich_norm`       | list[bool]        | `[T,F,T,F]` | `[so2_pre, so2_post, ffn_pre, ffn_post]`                           |
+| `mlp_bias`            | bool              | False       | Bias in equivariant layers                                         |
+| `layer_scale`         | bool              | False       | Learnable LayerScale (init 1e-3)                                   |
+| `full_attn_res`       | str               | `"none"`    | Descriptor-level full attention residual                           |
+| `block_attn_res`      | str               | `"none"`    | Descriptor-level block attention residual                          |
+| `s2_activation`       | list[bool]        | `[F, F]`    | `[so2_s2_enabled, ffn_s2_enabled]`                                 |
+| `s2_grid_resolution`  | list[int] \| None | None        | `[R_phi, R_theta]` for S2-grid activation                          |
+| `activation_function` | str               | `"silu"`    | Base activation                                                    |
+| `glu_activation`      | bool              | True        | Base GLU switch for FFN                                            |
+| `use_amp`             | bool              | True        | AMP with bf16 during training on CUDA                              |
+| `precision`           | str               | `"float32"` | Working precision for interaction blocks                           |
+| `eps`                 | float             | 1e-7        | Numerical stability epsilon                                        |
+| `exclude_types`       | list[tuple]       | `[]`        | Excluded type pairs                                                |
 
 ### 20.2 Model Parameters
 
-| Parameter                | Type  | Default  | Description               |
-| ------------------------ | ----- | -------- | ------------------------- |
-| `model.type`             | str   | —        | `"SeZM"` / `"sezm"`       |
-| `model.use_compile`      | bool  | False    | Enable torch.compile path |
-| `model.bridging_method`  | str   | `"none"` | `"none"` or `"ZBL"`       |
-| `model.bridging_r_inner` | float | 0.8      | Inner radius in Å         |
-| `model.bridging_r_outer` | float | 1.2      | Outer radius in Å         |
+| Parameter                | Type  | Default  | Description                                                 |
+| ------------------------ | ----- | -------- | ----------------------------------------------------------- |
+| `model.type`             | str   | —        | `"SeZM"` / `"sezm"`                                         |
+| `model.use_compile`      | bool  | False    | Enable torch.compile path                                   |
+| `model.bridging_method`  | str   | `"none"` | `"none"` or `"ZBL"`                                         |
+| `model.bridging_r_inner` | float | 0.8      | Inner radius in Å                                           |
+| `model.bridging_r_outer` | float | 1.2      | Outer radius in Å                                           |
+| `model.lora.rank`        | int   | —        | LoRA rank (enables LoRA fine-tune; see §22)                 |
+| `model.lora.alpha`       | float | `rank`   | LoRA scaling numerator; effective scaling is `alpha / rank` |
 
 ### 20.3 Environment Variables
 
@@ -1192,3 +1194,83 @@ A three-atom setup verifies that the SFPG correctly freezes information propagat
 ### 21.4 Caching Strategy
 
 Triton kernel correctness is validated by comparing Triton output against the eager PyTorch reference path with tight numerical tolerances. The comparison covers both forward and backward passes for each rotation kernel family (`SMALL_LE1`, `SMALL_L2`, `SMALL_L3`, `GENERIC_TILED`) and the fused geometry/RBF chain.
+
+## 22. LoRA Fine-Tuning
+
+LoRA low-rank adapters let you fine-tune a pre-trained SeZM checkpoint on a downstream dataset (domain shift, new chemistries, condensed-phase data) while keeping the bulk of the backbone frozen. Implementation lives in `deepmd/pt/model/descriptor/sezm_nn/lora.py`.
+
+### 22.1 Design Principles
+
+- **Injection sites**: only the two large equivariant operators, `SO3Linear` and `SO2Linear`, receive LoRA adapters. Every other trainable layer is either fully unfrozen (small params, see the freeze/unfreeze table below) or kept frozen.
+- **Shape isomorphy**: adapter parameters `A`/`B` share the base weight's batch structure, so the existing `HybridMuon` `muon_mode="slice"` routing applies uniformly: every `l`-block (SO3) / `m`-group (SO2) gets its own Newton-Schulz update.
+- **Forward-path transparency**: `LoRASO3` / `LoRASO2` override the single weight-construction entry point of their base class and fold `ΔW = BA · scaling` into the *effective* weight before the base's single large `einsum`. Forward FLOPs match the base; overhead comes only from an `O(rank)` weight-side matmul that is independent of the edge/node count (≤ ~0.4 % for SO3 and ~0.1 % for SO2).
+- **Equivariance**: per-`l` LoRA preserves SO(3) equivariance by construction (no cross-`l` mixing). Per-`|m|`-group LoRA preserves SO(2) equivariance because the block-diagonal 2×2 coupling `[[W_u, −W_v], [W_v, W_u]]` stays a legal complex linear after absorbing `ΔW_u = B_u A` and `ΔW_v = B_v A` (where `B = [B_u; B_v]` splits along the output axis).
+
+### 22.2 Freeze / Unfreeze Policy
+
+| Module / parameter                                                                                                                                                                                                                                            | Treatment             | Rationale                                                                                                                                                                                                                                             |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SO3Linear.weight`                                                                                                                                                                                                                                            | LoRA (base frozen)    | Main equivariant matrix                                                                                                                                                                                                                               |
+| `SO2Linear.weight_m0`, `weight_m[i]`                                                                                                                                                                                                                          | LoRA (base frozen)    | Main equivariant matrices                                                                                                                                                                                                                             |
+| `fitting_net` (incl. `dens_fitting_net` if present)                                                                                                                                                                                                           | Fully unfrozen        | Absorbs energy/force scale & zero-point shift                                                                                                                                                                                                         |
+| `radial_embedding` (`RadialMLP`)                                                                                                                                                                                                                              | Fully unfrozen        | RBF response drifts with bond-length distribution                                                                                                                                                                                                     |
+| `env_seed_embedding` (except `env_type_embed.adam_type_embedding`)                                                                                                                                                                                            | Fully unfrozen        | Local geometry → FiLM, domain-sensitive                                                                                                                                                                                                               |
+| `film_scale_norm`, `film_shift_norm`, `film_*_strength_log`                                                                                                                                                                                                   | Fully unfrozen        | FiLM branch                                                                                                                                                                                                                                           |
+| descriptor-level `final_full_attn_res` / `final_block_attn_res`                                                                                                                                                                                               | Fully unfrozen        | Small attention residuals                                                                                                                                                                                                                             |
+| each block's `full_attn_res_so2` / `full_attn_res_ffns`, `block_attn_res_so2` / `block_attn_res_ffns`, `so2_conv.attn_q_proj` / `attn_k_proj` / `attn_qk_norm` / `attn_output_gate_norm` / `focus_compete_norm` / `radial_hidden_proj` / `so2_layer_attn_res` | Fully unfrozen        | Small attention projections + norms                                                                                                                                                                                                                   |
+| leaf name ∈ {`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adamw_attn_logit_w`, `adamw_attn_z_bias_raw`, `adamw_attn_gate_w`, `adamw_focus_compete_w`, `adamw_pseudo_query`, `focus_compete_bias`}                                         | Fully unfrozen        | Small routed params, zero-cost. Matching is model-wide: every RMSNorm scale named `adam_scale` (per-block `pre/post_so2_norm`, `pre/post_ffn_norms`, `so2_inter_norms`, `key_norm` in every `DepthAttnRes`, radial-MLP norms, etc.) becomes trainable |
+| any leaf name containing `bias`                                                                                                                                                                                                                               | Fully unfrozen        | Constant offsets absorb domain mean shift. Includes the LoRA-preserved `SO3Linear.bias` / `SO2Linear.bias0` and every norm bias (`EquivariantRMSNorm.bias`, `ReducedEquivariantRMSNorm.bias0`) across the model                                       |
+| `type_embedding.adam_type_embedding`                                                                                                                                                                                                                          | **Frozen** (override) | Already converged on all elements                                                                                                                                                                                                                     |
+| `radial_basis.adam_freqs`                                                                                                                                                                                                                                     | **Frozen** (override) | Radial frequencies already converged                                                                                                                                                                                                                  |
+| anything inside a `GatedActivation` submodule                                                                                                                                                                                                                 | **Frozen** (override) | Downstream gate patterns are stable; also shields `gate_linear.bias` from the generic "any bias unfrozen" rule                                                                                                                                        |
+| `GIE`, `InnerClamp`, `BridgingSwitch`, `C3CutoffEnvelope`, `WignerDCalculator`, `InterPotential`                                                                                                                                                              | No trainable params   | —                                                                                                                                                                                                                                                     |
+
+### 22.3 Optimizer Routing
+
+`HybridMuon.get_adam_route` decides the route by the trailing non-numeric segment of the parameter name. The LoRA parameter names (`A_by_l`, `B_by_l`, `A_m0`, `B_m0`, `A_m`, `B_m`) deliberately do **not** start with `adam_` / `adamw_` and do not contain `bias`, so they fall into the `muon` branch. The slice-mode matrix view then gives:
+
+- `A_by_l` (shape `(L+1, R, C_in)`): `batch=L+1, rows=R, cols=C_in` → per-`l` Newton-Schulz on a squat rectangular matrix.
+- `B_by_l` (shape `(L+1, F·C_out, R)`): `batch=L+1, rows=F·C_out, cols=R` → per-`l` NS on a tall rectangle.
+- `A_m0`, `B_m0`, `A_m[i]`, `B_m[i]`: 2D matrices, single-matrix NS (`batch=1`).
+
+`B` is initialised to zero, so the first forward is exactly the base forward; backward produces `grad_A = 0` and non-zero `grad_B`, and Muon updates `B` first. From the second step onward both `A` and `B` receive non-zero gradients, each processed by the standard rectangular-NS path with the existing `lr_adjust` / Magma damping logic.
+
+### 22.4 Checkpoint Handling
+
+Two distinct save paths coexist during a LoRA fine-tune run:
+
+- **mid-train `latest_model-{step}.pt`** — written by `Trainer.save_model`. Contains the LoRA `A`/`B` keys, optimizer state, EMA shadow. Meant for resume. `_extra_state.model_params` keeps the `lora` block so `Trainer.__init__` re-triggers LoRA injection after loading.
+- **best top-K ckpt from full validation** — written by the new `Trainer.save_model_merged`. Produces a *plain SeZM checkpoint*: `A`/`B` keys removed, `ΔW` folded into every `weight` / `weight_m0` / `weight_m.*`, `_extra_state.model_params.lora` stripped, no optimizer state, no EMA. Ready for `deep_pot` / LAMMPS deployment or for re-training a plain SeZM from the merged starting point.
+
+The merged save path is wired automatically: `Trainer.__init__` caches `self._lora_enabled` after injection, and the training loop passes `save_model_merged` as the `save_checkpoint` callback to `full_validator` and `ema_full_validator` whenever LoRA is active.
+
+Offline merge is also available via `merge_lora_into_base(model)` (destructive, rewrites submodules in place) or `build_merged_state_dict(module)` (non-destructive, produces a flat state dict). `strip_lora_from_extra_state` is the complementary helper for cleaning `_extra_state.model_params`.
+
+### 22.5 Configuration Example
+
+```json
+"model": {
+  "type": "SeZM",
+  "type_map": ["O", "H"],
+  "descriptor": {...},
+  "fitting_net": {...},
+  "lora": {
+    "rank": 16,
+    "alpha": 16.0
+  }
+}
+```
+
+`rank` is required; `alpha` is optional and defaults to `rank` (scaling `= 1.0`). Typical usage:
+
+```bash
+dp --pt train input_lora.json --finetune pretrained.pt
+```
+
+See `examples/water/sezm/input_lora.json` for a full example input.
+
+### 22.6 Test Coverage
+
+- `TestLoRASO3Adapter` / `TestLoRASO2Adapter` — merge numerical parity (`merge_into_base` forward equals LoRA forward), SO(2) z-rotation equivariance after LoRA injection.
+- `TestApplyLoRAToSeZM` — end-to-end injection on a minimal SeZM: subclass replacement, base weights frozen, adapters trainable, full-unfreeze list, override-freeze for type embedding / radial frequencies / `GatedActivation`.
+- `TestBuildMergedStateDict` — merged-state-dict key set equals a never-LoRA'ed sibling, weight values equal `W + ΔW`.

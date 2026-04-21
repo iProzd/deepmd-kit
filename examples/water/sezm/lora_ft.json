@@ -66,28 +66,32 @@
       "_comment": "that's all"
     },
     "use_compile": false,
+    "bridging_method": "none",
+    "bridging_r_inner": 0.8,
+    "bridging_r_outer": 1.2,
+    "lora": {
+      "rank": 16,
+      "alpha": 16.0
+    },
     "_comment": "that's all"
   },
   "learning_rate": {
-    "type": "wsd",
+    "type": "cosine",
     "start_lr": 5e-4,
     "stop_lr": 1e-6,
-    "warmup_steps": 5000,
-    "warmup_start_factor": 0.2,
-    "decay_phase_ratio": 0.65,
-    "decay_type": "cosine"
+    "warmup_steps": 100,
+    "warmup_start_factor": 0.2
   },
   "loss": {
-    "type": "dens",
+    "type": "ener",
     "loss_func": "mae",
+    "f_use_norm": true,
     "start_pref_e": 20,
     "limit_pref_e": 20,
     "start_pref_f": 20,
     "limit_pref_f": 20,
-    "dens_prob": 0.5,
-    "dens_std": 0.025,
-    "dens_corrupt_ratio": 0.5,
-    "dens_denoising_pos_coefficient": 10.0
+    "start_pref_v": 5,
+    "limit_pref_v": 5
   },
   "optimizer": {
     "type": "HybridMuon",
@@ -140,7 +144,7 @@
     "_comment": "that's all"
   },
   "validating": {
-    "full_validation": false,
+    "full_validation": true,
     "ema_full_validation": false,
     "validation_freq": 100,
     "save_best": true,

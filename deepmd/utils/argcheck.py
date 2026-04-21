@@ -361,7 +361,7 @@ def descrpt_se_zm_args() -> list[Argument]:
     )
     doc_channels = "Total channels per (l,m) coefficient."
     doc_n_radial = "Number of radial basis functions."
-    doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended."
+    doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended. Use 0 as a placeholder to be replaced by channels."
     doc_use_env_seed = (
         "If True, apply environment matrix initial embedding as FiLM conditioning on "
         "l=0 features using 4D [s, s*r_hat] representation. Internal dimensions are "
@@ -2853,6 +2853,39 @@ def sezm_model_args() -> Argument:
                 default=1.2,
                 doc="Outer clamping radius in Å. The transition zone [bridging_r_inner, bridging_r_outer] "
                 "uses a C3-continuous septic Hermite polynomial. Only used when bridging_method is set.",
+            ),
+            Argument(
+                "lora",
+                dict,
+                [
+                    Argument(
+                        "rank",
+                        int,
+                        doc="LoRA rank; adapters are injected on every SO3Linear and SO2Linear.",
+                    ),
+                    Argument(
+                        "alpha",
+                        float,
+                        optional=True,
+                        default=None,
+                        doc="LoRA scaling numerator; effective scaling is alpha / rank. "
+                        "When omitted, alpha defaults to rank (scaling = 1.0).",
+                    ),
+                ],
+                optional=True,
+                default=None,
+                doc=doc_only_pt_supported
+                + "Low-rank adaptation for fine-tuning. When set, backbone SO3Linear and "
+                "SO2Linear weights are frozen and low-rank A/B adapters are injected "
+                "alongside them (the adapters share the base shape family so HybridMuon's "
+                "slice route applies identically). fitting_net, env_seed_embedding, "
+                "radial_embedding, and small parameters (norm scales, LayerScale, FiLM "
+                "strength, attention projections, bias terms) stay fully trainable; type "
+                "embeddings, radial frequencies, and GatedActivation gate projections are "
+                "frozen. mid-train latest checkpoints include LoRA parameters for resume; "
+                "best checkpoints from full validation are saved with LoRA deltas folded "
+                "into base weights, producing plain SeZM checkpoints suitable for "
+                "deployment.",
             ),
         ],
         doc="SeZM model scaffold with fixed descriptor and fitting types.",

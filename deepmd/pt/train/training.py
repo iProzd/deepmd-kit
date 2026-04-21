@@ -48,9 +48,17 @@ from deepmd.pt.loss import (
     TaskLoss,
     TensorLoss,
 )
+from deepmd.pt.model.descriptor.sezm_nn import (
+    apply_lora_to_sezm,
+    build_merged_state_dict,
+    strip_lora_from_extra_state,
+)
 from deepmd.pt.model.model import (
     get_model,
     get_zbl_model,
+)
+from deepmd.pt.model.model.sezm_model import (
+    SeZMModel,
 )
 from deepmd.pt.optimizer import (
     AdaMuonOptimizer,
@@ -917,6 +925,34 @@ class Trainer:
                 data_stat_protect=_data_stat_protect[0],
             )
 
+        # LoRA adapter injection for SeZM.
+        self._lora_enabled = False
+        for _mkey in self.model_keys:
+            _branch_params = (
+                model_params["model_dict"][_mkey] if self.multi_task else model_params
+            )
+            _lora_cfg = _branch_params.get("lora")
+            if _lora_cfg is None:
+                continue
+            _branch_model = self.wrapper.model[_mkey]
+            if not isinstance(_branch_model, SeZMModel):
+                log.warning(
+                    f"[LoRA] skipping branch {_mkey}: model is not SeZMModel; "
+                    "LoRA fine-tuning is only supported for SeZM."
+                )
+                continue
+            apply_lora_to_sezm(
+                _branch_model,
+                rank=int(_lora_cfg["rank"]),
+                alpha=_lora_cfg.get("alpha"),
+            )
+            self._lora_enabled = True
+            log.info(
+                f"[LoRA] injected into branch {_mkey}: "
+                f"rank={_lora_cfg['rank']}, "
+                f"alpha={_lora_cfg.get('alpha', _lora_cfg['rank'])}"
+            )
+
         if self.is_distributed:
             torch.cuda.set_device(LOCAL_RANK)
             if self.zero_stage >= 2:
@@ -1700,14 +1736,22 @@ class Trainer:
                     step_id=_step_id,
                     display_step=display_step_id,
                     lr=cur_lr,
-                    save_checkpoint=self.save_model,
+                    save_checkpoint=(
+                        self.save_model_merged
+                        if self._lora_enabled
+                        else self.save_model
+                    ),
                 )
             if self.ema_full_validator is not None:
                 self.ema_full_validator.run(
                     step_id=_step_id,
                     display_step=display_step_id,
                     lr=cur_lr,
-                    save_checkpoint=self.save_ema_model,
+                    save_checkpoint=(
+                        self.save_ema_model_merged
+                        if self._lora_enabled
+                        else self.save_ema_model
+                    ),
                 )
 
             if (
@@ -2051,6 +2095,76 @@ class Trainer:
             use_ema_weights=True,
             include_ema_state=False,
             include_optimizer=False,
+        )
+
+    def save_model_merged(
+        self,
+        save_path: str | Path,
+        lr: float = 0.0,
+        step: int = 0,
+        *,
+        ckpt_prefix: str | None = None,
+        max_ckpt_keep: int | None = None,
+        use_ema_weights: bool = False,
+    ) -> None:
+        """Save a plain SeZM checkpoint with LoRA adapters folded into base weights.
+
+        Behaviour relative to :meth:`save_model`:
+
+        - state_dict: every ``A_by_l`` / ``B_by_l`` / ``A_m0`` / ``B_m0`` /
+          ``A_m.*`` / ``B_m.*`` key is removed; the corresponding ``weight`` /
+          ``weight_m0`` / ``weight_m.*`` tensors absorb ``ΔW = BA·scaling``.
+        - ``_extra_state.model_params``: the ``lora`` entry is stripped (both
+          single-task and multi-task layouts) so the resulting checkpoint
+          loads as plain SeZM without re-triggering LoRA injection.
+        - optimizer state is **not** saved.  Optimizer moments are keyed on
+          LoRA parameters that no longer exist in the merged layout, so
+          resuming training from a merged checkpoint is not supported.
+        - EMA state is **not** saved (this is a deployment snapshot).
+        - The live ``self.wrapper`` / ``optimizer`` / ``model_ema`` are
+          untouched; the fold happens on a detached copy of the state dict.
+
+        Intended use: validator-driven best-topk checkpoint saves for LoRA
+        fine-tune runs.  For plain (non-LoRA) runs the result is bit-level
+        identical to a regular :meth:`save_model` output minus optimizer
+        and EMA state.
+        """
+        module = self._get_inner_module()
+        module.train_infos["lr"] = float(lr)
+        module.train_infos["step"] = step
+        model_state, _ = self._collect_checkpoint_states(
+            use_ema_weights=use_ema_weights,
+            include_optimizer=False,
+        )
+        merged_state = build_merged_state_dict(module, state_dict=model_state)
+        if "_extra_state" in merged_state:
+            merged_state["_extra_state"] = strip_lora_from_extra_state(
+                merged_state["_extra_state"]
+            )
+        self._write_checkpoint(
+            Path(save_path),
+            {"model": merged_state},
+            ckpt_prefix=self.save_ckpt if ckpt_prefix is None else ckpt_prefix,
+            max_ckpt_keep=(
+                self.max_ckpt_keep if max_ckpt_keep is None else max_ckpt_keep
+            ),
+        )
+
+    def save_ema_model_merged(
+        self, save_path: str | Path, lr: float = 0.0, step: int = 0
+    ) -> None:
+        """EMA-weight variant of :meth:`save_model_merged`."""
+        if self.model_ema is None:
+            raise ValueError(
+                "EMA checkpoint saving requires `training.enable_ema=true`."
+            )
+        self.save_model_merged(
+            save_path,
+            lr=lr,
+            step=step,
+            ckpt_prefix=self.ema_save_ckpt,
+            max_ckpt_keep=self.ema_ckpt_keep,
+            use_ema_weights=True,
         )
 
     def get_data(

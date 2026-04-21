@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
+import math
 import os
 import tempfile
 import unittest
@@ -27,14 +28,22 @@ from deepmd.pt.loss import (
     EnergyStdLoss,
 )
 from deepmd.pt.model.descriptor.sezm_nn import (
+    GatedActivation,
+    LoRASO2,
+    LoRASO3,
+    SO2Linear,
+    SO3Linear,
+    apply_lora_to_sezm,
     build_edge_cache,
     build_edge_cache_from_edges,
+    build_merged_state_dict,
 )
 from deepmd.pt.model.model import (
     get_sezm_model,
 )
 from deepmd.pt.model.model.sezm_model import (
     InterPotential,
+    SeZMModel,
 )
 from deepmd.pt.train.training import (
     prepare_model_for_loss,
@@ -45,6 +54,109 @@ from deepmd.pt.utils import (
 from deepmd.utils.path import (
     DPPath,
 )
+
+
+def _build_m_major_z_rotation(
+    angles: torch.Tensor, lmax: int, mmax: int, device: torch.device
+) -> torch.Tensor:
+    """Build the m-major block z-rotation matrix used by SO(2) equivariance tests.
+
+    Given per-sample rotation ``angles`` and the ``(lmax, mmax)`` truncation,
+    return a tensor with shape ``(batch, dim_red, dim_red)`` where ``dim_red``
+    is the truncated coefficient dimension of the m-major layout.
+    """
+    batch = angles.shape[0]
+    m0_size = lmax + 1
+    dim_red = m0_size
+    for m in range(1, mmax + 1):
+        num_l = lmax - m + 1
+        dim_red += 2 * num_l
+
+    Z = angles.new_zeros(batch, dim_red, dim_red)
+    eye0 = torch.eye(m0_size, device=device, dtype=angles.dtype).expand(
+        batch, m0_size, m0_size
+    )
+    Z[:, :m0_size, :m0_size] = eye0
+
+    offset = m0_size
+    for m in range(1, mmax + 1):
+        num_l = lmax - m + 1
+        eye = torch.eye(num_l, device=device, dtype=angles.dtype).expand(
+            batch, num_l, num_l
+        )
+        cos_m = torch.cos(m * angles).view(batch, 1, 1)
+        sin_m = torch.sin(m * angles).view(batch, 1, 1)
+
+        # Each m group stores the coefficients as [neg(l), pos(l)]; the rotation
+        # is [[cos I, -sin I], [sin I, cos I]] for the (neg, pos) pair.
+        Z[:, offset : offset + num_l, offset : offset + num_l] = cos_m * eye
+        Z[
+            :,
+            offset : offset + num_l,
+            offset + num_l : offset + 2 * num_l,
+        ] = -sin_m * eye
+        Z[
+            :,
+            offset + num_l : offset + 2 * num_l,
+            offset : offset + num_l,
+        ] = sin_m * eye
+        Z[
+            :,
+            offset + num_l : offset + 2 * num_l,
+            offset + num_l : offset + 2 * num_l,
+        ] = cos_m * eye
+        offset += 2 * num_l
+
+    return Z
+
+
+def _build_lora_sezm_model_params(**overrides) -> dict:
+    """Minimal SeZMModel config suitable for LoRA injection tests.
+
+    Uses ``s2_activation=[False, False]`` so the model keeps a
+    ``GatedActivation`` (the override-freeze policy is easier to exercise) and
+    sets ``use_compile=False`` by default; set ``use_compile=True`` via
+    ``overrides`` to exercise the compile path.
+    """
+    params = {
+        "type": "SeZM",
+        "type_map": ["A", "B"],
+        "descriptor": {
+            "type": "SeZM",
+            "sel": [2, 2],
+            "rcut": 3.0,
+            "channels": 4,
+            "n_focus": 1,
+            "n_radial": 3,
+            "radial_mlp": [6],
+            "use_env_seed": True,
+            "l_schedule": [1, 0],
+            "mmax": 1,
+            "so2_norm": False,
+            "so2_layers": 1,
+            "n_atten_head": 1,
+            "sandwich_norm": [True, False, True, False],
+            "ffn_neurons": 8,
+            "ffn_blocks": 1,
+            "s2_activation": [False, False],
+            "mlp_bias": True,
+            "layer_scale": True,
+            "use_amp": False,
+            "activation_function": "silu",
+            "glu_activation": True,
+            "precision": "float32",
+            "seed": 7,
+        },
+        "fitting_net": {
+            "neuron": [8],
+            "activation_function": "silu",
+            "precision": "float32",
+            "seed": 7,
+        },
+        "use_compile": False,
+    }
+    params.update(overrides)
+    return params
 
 
 class TestSeZMModelCompile(unittest.TestCase):
@@ -1022,3 +1134,481 @@ class TestSeZMModelModes(unittest.TestCase):
                 self.assertEqual(fresh_model.get_active_mode(), "dens")
             finally:
                 stat_path.root.close()
+
+
+# =============================================================================
+# LoRA fine-tune tests
+# =============================================================================
+
+
+class _LoRATestCase(unittest.TestCase):
+    """Shared device / seeding base for LoRA tests."""
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+
+
+class TestLoRASO3Adapter(_LoRATestCase):
+    """Unit tests for :class:`LoRASO3`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        torch.manual_seed(17)
+
+    def _build_base_and_lora(
+        self,
+        *,
+        rank: int = 4,
+        lmax: int = 2,
+        in_channels: int = 4,
+        out_channels: int = 5,
+        n_focus: int = 1,
+        mlp_bias: bool = False,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[SO3Linear, LoRASO3]:
+        base = SO3Linear(
+            lmax=lmax,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            n_focus=n_focus,
+            dtype=dtype,
+            mlp_bias=mlp_bias,
+            trainable=True,
+            seed=101,
+        )
+        lora = LoRASO3(base, rank=rank, alpha=float(rank))
+        return base, lora
+
+    def _random_input(self, lora: LoRASO3) -> torch.Tensor:
+        n_dim = (lora.lmax + 1) ** 2
+        return torch.randn(
+            3,
+            n_dim,
+            lora.n_focus,
+            lora.in_channels,
+            device=self.device,
+            dtype=lora.dtype,
+        )
+
+    def test_merge_into_base_matches_forward(self) -> None:
+        """Numerical parity between LoRASO3 forward and its merged base."""
+        _, lora = self._build_base_and_lora()
+        torch.nn.init.normal_(lora.B_by_l, std=0.05)
+        x = self._random_input(lora)
+        out_lora = lora(x)
+        merged = lora.merge_into_base()
+        out_merged = merged(x)
+        torch.testing.assert_close(out_lora, out_merged, atol=1e-6, rtol=1e-5)
+        self.assertIs(type(merged), SO3Linear)
+
+
+class TestLoRASO2Adapter(_LoRATestCase):
+    """Unit tests for :class:`LoRASO2`."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        torch.manual_seed(23)
+
+    def _build_base_and_lora(
+        self,
+        *,
+        rank: int = 4,
+        lmax: int = 2,
+        mmax: int = 2,
+        in_channels: int = 4,
+        out_channels: int = 5,
+        n_focus: int = 1,
+        mlp_bias: bool = False,
+        dtype: torch.dtype = torch.float32,
+    ) -> tuple[SO2Linear, LoRASO2]:
+        base = SO2Linear(
+            lmax=lmax,
+            mmax=mmax,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            n_focus=n_focus,
+            dtype=dtype,
+            mlp_bias=mlp_bias,
+            seed=202,
+            trainable=True,
+        )
+        lora = LoRASO2(base, rank=rank, alpha=float(rank))
+        return base, lora
+
+    def _random_input(self, lora: LoRASO2) -> torch.Tensor:
+        return torch.randn(
+            3,
+            lora.n_focus,
+            lora.reduced_dim,
+            lora.in_channels,
+            device=self.device,
+            dtype=lora.dtype,
+        )
+
+    def _randomize_lora_B(self, lora: LoRASO2) -> None:
+        torch.nn.init.normal_(lora.B_m0, std=0.05)
+        for b in lora.B_m:
+            torch.nn.init.normal_(b, std=0.05)
+
+    def test_merge_into_base_matches_forward(self) -> None:
+        """Numerical parity between LoRASO2 forward and its merged base."""
+        _, lora = self._build_base_and_lora()
+        self._randomize_lora_B(lora)
+        x = self._random_input(lora)
+        out_lora = lora(x)
+        merged = lora.merge_into_base()
+        out_merged = merged(x)
+        torch.testing.assert_close(out_lora, out_merged, atol=1e-6, rtol=1e-5)
+        self.assertIs(type(merged), SO2Linear)
+
+    def test_z_rotation_equivariance(self) -> None:
+        """Rotating x by the m-major z-block rotation commutes with LoRASO2 forward."""
+        lmax, mmax = 2, 1
+        _, lora = self._build_base_and_lora(
+            rank=3, lmax=lmax, mmax=mmax, in_channels=6, out_channels=4, n_focus=1
+        )
+        self._randomize_lora_B(lora)
+        batch = 8
+        dtype = lora.dtype
+        x = torch.randn(
+            batch,
+            lora.n_focus,
+            lora.reduced_dim,
+            lora.in_channels,
+            device=self.device,
+            dtype=dtype,
+        )
+        angles = torch.rand(batch, device=self.device, dtype=dtype) * 2 * math.pi
+        z_mat = _build_m_major_z_rotation(angles, lmax, mmax, self.device)
+        x_rot = torch.einsum("bij,bfjc->bfic", z_mat, x)
+        lhs = lora(x_rot)
+        rhs = torch.einsum("bij,bfjc->bfic", z_mat, lora(x))
+        torch.testing.assert_close(lhs, rhs, atol=1e-5, rtol=1e-5)
+
+
+class TestApplyLoRAToSeZM(_LoRATestCase):
+    """Tests for the full SeZM LoRA injection policy."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        torch.manual_seed(31)
+        self.model = get_sezm_model(_build_lora_sezm_model_params())
+        apply_lora_to_sezm(self.model, rank=4, alpha=4.0)
+
+    def test_so3_and_so2_are_subclassed(self) -> None:
+        """Every SO3Linear / SO2Linear submodule is now a LoRA subclass."""
+        n_lora_so3 = 0
+        n_lora_so2 = 0
+        for mod in self.model.modules():
+            if type(mod) is SO3Linear:
+                self.fail("Found a bare SO3Linear; apply_lora_to_sezm missed it.")
+            if type(mod) is SO2Linear:
+                self.fail("Found a bare SO2Linear; apply_lora_to_sezm missed it.")
+            if isinstance(mod, LoRASO3):
+                n_lora_so3 += 1
+            elif isinstance(mod, LoRASO2):
+                n_lora_so2 += 1
+        self.assertGreater(n_lora_so3, 0)
+        self.assertGreater(n_lora_so2, 0)
+
+    def test_lora_base_weights_are_frozen(self) -> None:
+        """Base weight matrices inside every LoRA wrapper stay frozen.
+
+        Bias-like parameters (``bias`` / ``bias0``) remain trainable by the
+        leaf-name rule "any leaf containing 'bias' is unfrozen"; this test
+        asserts the large weight matrices specifically.
+        """
+        for mod in self.model.modules():
+            if isinstance(mod, LoRASO3):
+                self.assertFalse(mod.weight.requires_grad)
+            elif isinstance(mod, LoRASO2):
+                self.assertFalse(mod.weight_m0.requires_grad)
+                for w in mod.weight_m:
+                    self.assertFalse(w.requires_grad)
+
+    def test_lora_adapter_params_are_trainable(self) -> None:
+        """LoRA A/B parameters are trainable everywhere."""
+        for mod in self.model.modules():
+            if isinstance(mod, LoRASO3):
+                self.assertTrue(mod.A_by_l.requires_grad)
+                self.assertTrue(mod.B_by_l.requires_grad)
+            elif isinstance(mod, LoRASO2):
+                self.assertTrue(mod.A_m0.requires_grad)
+                self.assertTrue(mod.B_m0.requires_grad)
+                for a, b in zip(mod.A_m, mod.B_m, strict=True):
+                    self.assertTrue(a.requires_grad)
+                    self.assertTrue(b.requires_grad)
+
+    def test_full_unfreezes(self) -> None:
+        """fitting_net / radial_embedding / env_seed_embedding are fully trainable."""
+        fitting = self.model.atomic_model.fitting_net
+        self.assertIsNotNone(fitting)
+        for p in fitting.parameters():
+            self.assertTrue(p.requires_grad)
+        radial = self.model.atomic_model.descriptor.radial_embedding
+        for p in radial.parameters():
+            self.assertTrue(p.requires_grad)
+        env_seed = self.model.atomic_model.descriptor.env_seed_embedding
+        self.assertIsNotNone(env_seed)
+        # All non-type-embed params inside env_seed must be trainable.
+        for name, p in env_seed.named_parameters():
+            if name.endswith("adam_type_embedding"):
+                continue
+            self.assertTrue(
+                p.requires_grad, msg=f"env_seed param {name} should be trainable"
+            )
+
+    def test_override_freezes_type_embed_and_radial_freqs(self) -> None:
+        """``adam_type_embedding`` and ``adam_freqs`` stay frozen."""
+        frozen_leaves = {"adam_type_embedding", "adam_freqs"}
+        hit = dict.fromkeys(frozen_leaves, 0)
+        for name, p in self.model.named_parameters():
+            leaf = name.rsplit(".", 1)[-1]
+            if leaf in frozen_leaves:
+                self.assertFalse(
+                    p.requires_grad,
+                    msg=f"{name} should stay frozen after LoRA injection",
+                )
+                hit[leaf] += 1
+        for leaf, count in hit.items():
+            self.assertGreater(
+                count,
+                0,
+                msg=f"No parameter with leaf {leaf} found; test coverage gap.",
+            )
+
+    def test_override_freezes_gated_activation(self) -> None:
+        """Every parameter inside a GatedActivation is frozen."""
+        found = False
+        for mod in self.model.modules():
+            if isinstance(mod, GatedActivation):
+                for p in mod.parameters():
+                    self.assertFalse(p.requires_grad)
+                    found = True
+        self.assertTrue(found, msg="Expected at least one GatedActivation in SeZM.")
+
+
+class TestBuildMergedStateDict(_LoRATestCase):
+    """Tests for the non-destructive merged-state-dict helper."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        torch.manual_seed(41)
+        self.model = get_sezm_model(_build_lora_sezm_model_params())
+        apply_lora_to_sezm(self.model, rank=4, alpha=4.0)
+        # Randomize every B so LoRA delta is non-trivial.
+        for mod in self.model.modules():
+            if isinstance(mod, LoRASO3):
+                torch.nn.init.normal_(mod.B_by_l, std=0.05)
+            elif isinstance(mod, LoRASO2):
+                torch.nn.init.normal_(mod.B_m0, std=0.05)
+                for b in mod.B_m:
+                    torch.nn.init.normal_(b, std=0.05)
+
+    def test_keys_match_plain_sezm(self) -> None:
+        """Merged state dict has the same keys as a never-LoRA'ed sibling model."""
+        plain_model = get_sezm_model(_build_lora_sezm_model_params())
+        plain_keys = set(plain_model.state_dict().keys())
+        merged = build_merged_state_dict(self.model)
+        merged_keys = set(merged.keys())
+        self.assertEqual(merged_keys, plain_keys)
+        # Explicitly assert that no LoRA-only key survived.
+        for key in merged_keys:
+            leaf = key.rsplit(".", 1)[-1]
+            self.assertNotIn(
+                leaf,
+                {"A_by_l", "B_by_l", "A_m0", "B_m0"},
+                msg=f"LoRA-only leaf {leaf} should not appear in merged state",
+            )
+            parts = key.split(".")
+            i = len(parts) - 1
+            while i > 0 and parts[i].isdigit():
+                i -= 1
+            self.assertNotIn(parts[i], {"A_m", "B_m"})
+
+    def test_weight_values_include_delta(self) -> None:
+        """Every LoRA weight key in the merged state equals ``W + ΔW``."""
+        merged = build_merged_state_dict(self.model)
+        # Keys live under `atomic_model.descriptor....` inside SeZMModel; helper
+        # walks self.model.named_modules() so prefix is "" at the top.
+        for name, mod in self.model.named_modules():
+            prefix = name + "." if name else ""
+            if isinstance(mod, LoRASO3):
+                expected = (
+                    mod.weight.detach()
+                    + torch.einsum("lor,lri->lio", mod.B_by_l, mod.A_by_l).detach()
+                    * mod.scaling
+                )
+                torch.testing.assert_close(
+                    merged[prefix + "weight"], expected, atol=1e-6, rtol=1e-5
+                )
+            elif isinstance(mod, LoRASO2):
+                expected_m0 = (
+                    mod.weight_m0.detach()
+                    + torch.einsum("ri,or->io", mod.A_m0, mod.B_m0).detach()
+                    * mod.scaling
+                )
+                torch.testing.assert_close(
+                    merged[prefix + "weight_m0"], expected_m0, atol=1e-6, rtol=1e-5
+                )
+                for m_idx, w in enumerate(mod.weight_m):
+                    expected_m = (
+                        w.detach()
+                        + torch.einsum(
+                            "ri,or->io", mod.A_m[m_idx], mod.B_m[m_idx]
+                        ).detach()
+                        * mod.scaling
+                    )
+                    torch.testing.assert_close(
+                        merged[prefix + f"weight_m.{m_idx}"],
+                        expected_m,
+                        atol=1e-6,
+                        rtol=1e-5,
+                    )
+
+
+class TestSeZMModelLoRACompile(unittest.TestCase):
+    """LoRA + ``torch.compile`` end-to-end consistency test.
+
+    Runs the SeZM ``ener`` path with ``use_compile=True`` against the eager
+    reference on the same LoRA-injected model (randomized ``B`` so the LoRA
+    delta is non-trivial) and checks forward / first-order / second-order
+    consistency, mirroring the style of
+    :meth:`TestSeZMModelCompile.test_forward_backward_double_backward_matches_compile`.
+    """
+
+    def setUp(self) -> None:
+        self.device = env.DEVICE
+        torch.manual_seed(2024)
+
+    def _tiny_system(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build a compact two-frame, three-atom system for LoRA compile tests."""
+        coord = torch.tensor(
+            [
+                [[0.0, 0.0, 0.0], [1.1, 0.3, 0.0], [0.2, 1.5, 0.4]],
+                [[0.1, 0.2, 0.3], [0.9, 1.0, 0.1], [2.0, 0.5, 1.2]],
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        atype = torch.tensor(
+            [[0, 1, 0], [1, 0, 1]], dtype=torch.int32, device=self.device
+        )
+        box = torch.tensor(
+            [
+                [10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0],
+                [10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 0.0, 10.0],
+            ],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        return coord, atype, box
+
+    @staticmethod
+    def _build_matched_lora_models() -> tuple[SeZMModel, SeZMModel]:
+        """Build eager + compile SeZM twins that share LoRA-augmented weights."""
+        params_eager = _build_lora_sezm_model_params(use_compile=False)
+        model_eager = get_sezm_model(params_eager)
+        apply_lora_to_sezm(model_eager, rank=4, alpha=4.0)
+        # Randomize every LoRA B so the LoRA delta is non-trivial across both
+        # branches; randomize A similarly so the low-rank term has full rank.
+        for mod in model_eager.modules():
+            if isinstance(mod, LoRASO3):
+                torch.nn.init.normal_(mod.A_by_l, std=0.05)
+                torch.nn.init.normal_(mod.B_by_l, std=0.05)
+            elif isinstance(mod, LoRASO2):
+                torch.nn.init.normal_(mod.A_m0, std=0.05)
+                torch.nn.init.normal_(mod.B_m0, std=0.05)
+                for a, b in zip(mod.A_m, mod.B_m, strict=True):
+                    torch.nn.init.normal_(a, std=0.05)
+                    torch.nn.init.normal_(b, std=0.05)
+
+        params_compile = _build_lora_sezm_model_params(use_compile=True)
+        model_compile = get_sezm_model(params_compile)
+        apply_lora_to_sezm(model_compile, rank=4, alpha=4.0)
+        # After injection both models share the same named-parameter layout;
+        # copying the eager state_dict also copies the randomized LoRA A/B.
+        model_compile.load_state_dict(model_eager.state_dict())
+        return model_eager, model_compile
+
+    def test_forward_and_backward_match_eager(self) -> None:
+        """Forward / first-order / second-order outputs agree with eager."""
+        coord, atype, box = self._tiny_system()
+        model_eager, model_compile = self._build_matched_lora_models()
+        model_eager.train()
+        model_compile.train()
+
+        # === Forward ===
+        out_eager = model_eager(coord, atype, box=box)
+        out_compile = model_compile(coord, atype, box=box)
+        torch.testing.assert_close(
+            out_eager["energy"], out_compile["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_eager["force"], out_compile["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+
+        # === First-order backward (d energy / d params) ===
+        model_eager.zero_grad(set_to_none=True)
+        model_compile.zero_grad(set_to_none=True)
+        out_eager["energy"].sum().backward()
+        out_compile["energy"].sum().backward()
+        grad_atol = 1.0e-5 if self.device == torch.device("cpu") else 2.0e-3
+        grad_rtol = 1.0e-5 if self.device == torch.device("cpu") else 1.0e-4
+        grads_eager = {
+            name: (
+                torch.zeros_like(param)
+                if param.grad is None
+                else param.grad.detach().clone()
+            )
+            for name, param in model_eager.named_parameters()
+        }
+        grads_compile = {
+            name: (
+                torch.zeros_like(param)
+                if param.grad is None
+                else param.grad.detach().clone()
+            )
+            for name, param in model_compile.named_parameters()
+        }
+        self.assertEqual(set(grads_eager.keys()), set(grads_compile.keys()))
+        for name in grads_eager.keys():
+            torch.testing.assert_close(
+                grads_eager[name],
+                grads_compile[name],
+                atol=grad_atol,
+                rtol=grad_rtol,
+                msg=f"energy-grad mismatch at {name}",
+            )
+
+        # === Second-order backward via force loss (d force^2 / d params) ===
+        model_eager.zero_grad(set_to_none=True)
+        model_compile.zero_grad(set_to_none=True)
+        out_eager = model_eager(coord, atype, box=box)
+        out_compile = model_compile(coord, atype, box=box)
+        torch.sum(out_eager["force"] * out_eager["force"]).backward()
+        torch.sum(out_compile["force"] * out_compile["force"]).backward()
+        grads_eager_2 = {
+            name: (
+                torch.zeros_like(param)
+                if param.grad is None
+                else param.grad.detach().clone()
+            )
+            for name, param in model_eager.named_parameters()
+        }
+        grads_compile_2 = {
+            name: (
+                torch.zeros_like(param)
+                if param.grad is None
+                else param.grad.detach().clone()
+            )
+            for name, param in model_compile.named_parameters()
+        }
+        for name in grads_eager_2.keys():
+            torch.testing.assert_close(
+                grads_eager_2[name],
+                grads_compile_2[name],
+                atol=grad_atol,
+                rtol=grad_rtol,
+                msg=f"force-grad-sq mismatch at {name}",
+            )

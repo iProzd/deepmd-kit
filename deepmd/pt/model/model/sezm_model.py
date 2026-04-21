@@ -538,6 +538,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         bridging_method: str = "none",
         bridging_r_inner: float = 0.8,
         bridging_r_outer: float = 1.2,
+        lora: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         DPModelCommon.__init__(self)
@@ -545,6 +546,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self.redu_prec = env.GLOBAL_PT_ENER_FLOAT_PRECISION
         self.use_compile = bool(use_compile)
         self.enable_tf32 = bool(enable_tf32)
+        # LoRA injection happens in Trainer.__init__ after pre-trained state is loaded.
+        self.lora_config: dict[str, Any] | None = None if lora is None else dict(lora)
         self._dens_compiled = False
         self._core_compute_compiled_train: bool | None = None
         self._core_compute_compiled_atomic_virial: bool | None = None
@@ -1904,6 +1907,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "bridging_method": self.bridging_method,
             "bridging_r_inner": self.bridging_r_inner,
             "bridging_r_outer": self.bridging_r_outer,
+            "lora": self.lora_config,
         }
 
     @classmethod
