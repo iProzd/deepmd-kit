@@ -237,10 +237,24 @@ configured with:
       cudagraphs capture autograd metadata only once.  Higher-order
       gradients need fresh metadata per call, so cudagraphs would feed
       stale autograd state into the second backward.
-* ``max_fusion_size=64``
-      Caps kernel fusion complexity.  Without the cap Inductor's
-      scheduler occasionally times out on the large edge-level
-      reductions inside the descriptor when nsel is big.
+* ``max_fusion_size`` -- mode-dependent
+      Caps kernel fusion complexity so Inductor's scheduler does not
+      time out on the large edge-level reductions inside the
+      descriptor when nsel is big.  Training uses ``64`` (the long-
+      standing default, observed stable on every training run so far);
+      inference uses the tighter ``8`` to dodge the Triton lowering
+      failure described by the next bullet.
+* ``triton.persistent_reductions=False`` -- inference only
+      Inductor's persistent-reduction scheduler fuses a ``sum`` with
+      *all* neighbouring pointwise ops (``tanh_backward``, ``pow``,
+      ``exp``, ``mul``, ``select``, ``slice``, ``view`` ...) into one
+      ``triton_per_fused_...`` kernel.  On the graph emitted by
+      inference (``create_graph=False``, no double-detach stripping,
+      different fused topology than training) this kernel hits Triton
+      bug ``PassManager::run failed`` inside ``make_ttgir``.  Training
+      never produces the same fused shape and does not benefit from
+      disabling the optimisation, so the flag is left on for training
+      to preserve kernel quality.
 * ``triton.mix_order_reduction=False``
       Workaround for PyTorch <=2.11 bugs pytorch/pytorch#174379,
       #178080, #179494.  All three manifest only under data-dependent
@@ -324,7 +338,9 @@ from __future__ import (
     annotations,
 )
 
+import logging
 import os
+import time
 from contextlib import (
     contextmanager,
 )
@@ -372,6 +388,8 @@ from deepmd.pt.utils import (
 from deepmd.pt.utils.nlist import (
     extend_input_and_build_neighbor_list,
 )
+
+log = logging.getLogger(__name__)
 
 SeZMModel_ = make_model(SeZMAtomicModel)
 
@@ -1309,6 +1327,15 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             get_decompositions,
         )
 
+        mode = "train" if self.training else "eval"
+        log.info(
+            "SeZM: start tracing and compiling core_compute "
+            "(mode=%s, do_atomic_virial=%s)",
+            mode,
+            do_atomic_virial,
+        )
+        _compile_t0 = time.perf_counter()
+
         need_coord_grad = self.do_grad_r() or self.do_grad_c()
 
         def compute_fn(
@@ -1429,6 +1456,45 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # fresh graph is cheap and a segfault is fatal.
         traced = _rebuild_graph_module(traced)
 
+        # NOTE: Inductor options are mode-dependent.  Training has been
+        # running cleanly with ``max_fusion_size=64`` for a while, so we
+        # keep that path untouched to avoid destabilising it.  Inference
+        # (``self.training is False``) has shown a Triton
+        # ``make_ttgir`` / ``PassManager::run failed`` on the fused
+        # per-reduction kernel
+        # ``triton_per_fused_clone_exp_mul_pow_select_slice_sum_tanh_...``;
+        # the kernel itself is fine, but the *fused* IR is too big /
+        # too complex for Triton's lowering pipeline on this version.
+        # So inference:
+        #   * disables ``triton.persistent_reductions`` -- persistent
+        #     reduction is what lets Inductor pull a ``sum`` together
+        #     with all surrounding pointwise ops (including the
+        #     activation-backward pointwise chain) into one
+        #     ``per_fused_...`` kernel; turning it off forces the sum
+        #     to emit its own kernel and stops the pathological fuse.
+        #   * tightens ``max_fusion_size`` from 64 to 8, so even
+        #     non-persistent fusions stay small enough for Triton IR
+        #     generation to succeed.
+        # Training does not hit this path in practice (different graph
+        # topology under ``create_graph=True``), so we keep the looser
+        # options there to preserve kernel quality.
+        compile_options: dict[str, Any] = {
+            "max_autotune": False,
+            "shape_padding": True,
+            "epilogue_fusion": False,
+            "triton.cudagraphs": False,
+            # NOTE: ``mix_order_reduction`` hits multiple bugs under
+            # data-dependent symbolic shapes on PyTorch <=2.11
+            # (pytorch/pytorch#174379, #178080, #179494) -- our edge
+            # count is exactly that kind of shape.
+            "triton.mix_order_reduction": False,
+        }
+        if self.training:
+            compile_options["max_fusion_size"] = 64
+        else:
+            compile_options["max_fusion_size"] = 8
+            compile_options["triton.persistent_reductions"] = False
+
         # NOTE: Store the compiled callable via ``object.__setattr__``.
         # Plain ``self.compiled_core_compute = ...`` would go through
         # ``nn.Module.__setattr__`` and register the compile wrapper as
@@ -1442,7 +1508,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "compiled_core_compute",
             # NOTE: ``dynamic=True`` emits a single kernel per traced
             # shape symbol, so changes in ``nframes``, ``nall`` or edge
-            # count do not trigger recompiles; and the option dict below
+            # count do not trigger recompiles; and the option dict above
             # disables every Inductor/Triton feature that has ever
             # interacted badly with ``make_fx`` + double backward in
             # this project.
@@ -1450,26 +1516,25 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 traced,
                 backend="inductor",
                 dynamic=True,
-                options={
-                    "max_autotune": False,
-                    "shape_padding": True,
-                    "epilogue_fusion": False,
-                    "triton.cudagraphs": False,
-                    "max_fusion_size": 64,
-                    # NOTE: ``mix_order_reduction`` hits multiple bugs
-                    # under data-dependent symbolic shapes on PyTorch
-                    # <=2.11 (pytorch/pytorch#174379, #178080, #179494)
-                    # -- our edge count is exactly that kind of shape.
-                    "triton.mix_order_reduction": False,
-                },
+                options=compile_options,
             ),
         )
         self._core_compute_compiled_train = self.training
         self._core_compute_compiled_atomic_virial = do_atomic_virial
+        log.info(
+            "SeZM: finished compiling core_compute "
+            "(mode=%s, do_atomic_virial=%s) in %.2fs",
+            mode,
+            do_atomic_virial,
+            time.perf_counter() - _compile_t0,
+        )
 
     def compile_dens(self) -> None:
         """Compile the direct-force `dens` path."""
         from torch._inductor import config as inductor_config
+
+        log.info("SeZM: start compiling dens path")
+        _compile_t0 = time.perf_counter()
 
         inductor_config.max_autotune_report_choices_stats = False
         inductor_config.autotune_num_choices_displayed = 0
@@ -1491,6 +1556,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             ),
         )
         self._dens_compiled = True
+        log.info(
+            "SeZM: finished compiling dens path in %.2fs",
+            time.perf_counter() - _compile_t0,
+        )
 
     def should_use_compile(self) -> bool:
         """Return whether the current forward should use the compile path."""
@@ -1902,8 +1971,6 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             "@version": 1,
             "type": self.model_type,
             "atomic_model": self.atomic_model.serialize(),
-            "use_compile": self.use_compile,
-            "enable_tf32": self.enable_tf32,
             "bridging_method": self.bridging_method,
             "bridging_r_inner": self.bridging_r_inner,
             "bridging_r_outer": self.bridging_r_outer,
@@ -1940,13 +2007,19 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
     @contextmanager
     def tf32_precision_ctx(self) -> Generator[None, None, None]:
-        """Context manager to temporarily set TF32 matmul precision."""
+        """Context manager to temporarily set TF32 matmul precision.
+
+        TF32 is only enabled when the model is in training mode; during
+        inference we force ``highest`` precision because the reduced
+        mantissa of TF32 can introduce unacceptable errors in force
+        predictions and downstream MD trajectories.
+        """
         if not self.should_use_compile() or not torch.cuda.is_available():
             yield
             return
         prev_precision = torch.get_float32_matmul_precision()
         try:
-            if self.enable_tf32:
+            if self.enable_tf32 and self.training:
                 torch.set_float32_matmul_precision("high")
             else:
                 torch.set_float32_matmul_precision("highest")

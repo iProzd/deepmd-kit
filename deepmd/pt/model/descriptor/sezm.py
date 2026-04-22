@@ -1530,7 +1530,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "glu_activation": self.glu_activation,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "mlp_bias": self.mlp_bias,
-                "use_amp": self.use_amp,
                 "exclude_types": self.exclude_types,
                 "eps": self.eps,
                 "trainable": self.trainable,
