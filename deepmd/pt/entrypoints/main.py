@@ -656,20 +656,72 @@ def grad_probe(FLAGS) -> None:
             float(norm_std),
         )
 
-    # Compute pairwise dot product statistics
+    # Compute pairwise dot product and Pearson correlation statistics
     for (k1, k2), dots in pairwise_dots.items():
         if dots:
             dot_mean = np.mean(dots)
             dot_std = np.std(dots)
 
-            # Dot product of accumulated average gradient vectors
             g1_avg = grads_per_task[k1]
             g2_avg = grads_per_task[k2]
             dot_accum = float(np.dot(g1_avg, g2_avg))
 
+            # Pearson correlation across groups:
+            #   cov_sum = Σ_j Cov(g1_j, g2_j) = E[dot(g1,g2)] - dot(ḡ1, ḡ2)
+            #   var_sum = Σ_j Var(g_j)         = E[||g||²] - ||ḡ||²
+            #   pearson = cov_sum / sqrt(var1_sum * var2_sum)
+            cov_sum = float(dot_mean - dot_accum)
+            norms_1 = np.array(task_batch_norms[k1])
+            norms_2 = np.array(task_batch_norms[k2])
+            var1_sum = float(np.mean(norms_1**2) - np.dot(g1_avg, g1_avg))
+            var2_sum = float(np.mean(norms_2**2) - np.dot(g2_avg, g2_avg))
+            denom = np.sqrt(max(var1_sum, 0.0) * max(var2_sum, 0.0))
+            pearson = float(cov_sum / denom) if denom > 1e-12 else float("nan")
+
+            # Group-level weighted cosine similarity:
+            #   per-group cos_i = dot_i / (||g1_i|| * ||g2_i||)
+            #   weight w_i = ||g1_i|| * ||g2_i|| so high-norm groups dominate
+            norm_products = norms_1 * norms_2  # (n_groups,) weight per group
+            valid = norm_products > 1e-12
+            cos_per_group = np.where(
+                valid,
+                np.array(dots) / np.where(valid, norm_products, 1.0),
+                0.0,
+            )
+            norm_product_sum = float(np.sum(norm_products))
+            if norm_product_sum > 1e-12:
+                cos_group_mean = float(
+                    np.sum(norm_products * cos_per_group) / norm_product_sum
+                )
+                cos_group_std = float(
+                    np.sqrt(
+                        np.sum(norm_products * (cos_per_group - cos_group_mean) ** 2)
+                        / norm_product_sum
+                    )
+                )
+            else:
+                cos_group_mean = float("nan")
+                cos_group_std = float("nan")
+
+            # Global-level cosine similarity:
+            #   cosine of accumulated average gradient vectors;
+            #   large-norm batches naturally dominate the direction of the average
+            norm_g1 = float(np.linalg.norm(g1_avg))
+            norm_g2 = float(np.linalg.norm(g2_avg))
+            denom_global = norm_g1 * norm_g2
+            cos_global = (
+                float(dot_accum / denom_global)
+                if denom_global > 1e-12
+                else float("nan")
+            )
+
             grads_per_task[f"dot_{k1}_{k2}_mean"] = dot_mean
             grads_per_task[f"dot_{k1}_{k2}_std"] = dot_std
             grads_per_task[f"dot_{k1}_{k2}_accum"] = dot_accum
+            grads_per_task[f"pearson_{k1}_{k2}"] = pearson
+            grads_per_task[f"cos_group_mean_{k1}_{k2}"] = cos_group_mean
+            grads_per_task[f"cos_group_std_{k1}_{k2}"] = cos_group_std
+            grads_per_task[f"cos_global_{k1}_{k2}"] = cos_global
 
             log.info(
                 "Grad dot product '%s' vs '%s': Mean=%.4e, Std=%.4e, Accum=%.4e  "
@@ -681,6 +733,25 @@ def grad_probe(FLAGS) -> None:
                 float(dot_accum),
                 abs(dot_mean) / dot_std if dot_std > 0 else float("inf"),
                 len(dots),
+            )
+            log.info(
+                "Pearson correlation '%s' vs '%s': %.4f  "
+                "(cov_sum=%.4e, var1=%.4e, var2=%.4e)",
+                k1,
+                k2,
+                pearson,
+                cov_sum,
+                var1_sum,
+                var2_sum,
+            )
+            log.info(
+                "Cosine similarity '%s' vs '%s': "
+                "group_mean=%.4f, group_std=%.4f, global=%.4f",
+                k1,
+                k2,
+                cos_group_mean,
+                cos_group_std,
+                cos_global,
             )
 
     save_dict = {f"grads_{k}": v for k, v in grads_per_task.items()}
