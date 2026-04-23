@@ -285,13 +285,17 @@ class TestSeZMExportPipeline(unittest.TestCase):
         )
 
 
-class TestSeZMExportArchive(unittest.TestCase):
-    """AOTI ``.pt2`` archive structure + load-and-run smoke.
+class _FrozenPt2Fixture:
+    """Shared setUp/tearDown: freeze a tiny SeZM checkpoint to ``.pt2`` once.
 
-    Numerical parity of the compiled ``.pt2`` is covered by the
-    pipeline class through the ``.pte`` round-trip; here we only
-    verify the archive layout and the C++ consumer contract.
+    AOTInductor compilation costs a few seconds; classes that share this
+    fixture avoid paying that cost twice.  ``cls.ckpt_path`` / ``cls.out_path``
+    / ``cls.params`` are populated and live for the lifetime of the class.
     """
+
+    params: dict
+    ckpt_path: Path
+    out_path: Path
 
     @classmethod
     def setUpClass(cls) -> None:
@@ -313,6 +317,15 @@ class TestSeZMExportArchive(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._device_ctx.__exit__(None, None, None)
+
+
+class TestSeZMExportArchive(_FrozenPt2Fixture, unittest.TestCase):
+    """AOTI ``.pt2`` archive structure + load-and-run smoke.
+
+    Numerical parity of the compiled ``.pt2`` is covered by the
+    pipeline class through the ``.pte`` round-trip; here we only
+    verify the archive layout and the C++ consumer contract.
+    """
 
     def test_detector_recognises_sezm(self) -> None:
         self.assertTrue(is_sezm_checkpoint(str(self.ckpt_path)))
@@ -337,6 +350,7 @@ class TestSeZMExportArchive(unittest.TestCase):
             "has_default_fparam",
             "output_keys",
             "fitting_output_defs",
+            "sel_type",
             "is_spin",
         ):
             self.assertIn(key, metadata)
@@ -348,6 +362,12 @@ class TestSeZMExportArchive(unittest.TestCase):
         self.assertFalse(metadata["is_spin"])
         self.assertEqual(metadata["dim_fparam"], 0)
         self.assertEqual(metadata["dim_aparam"], 0)
+        # sel_type must agree with the eager SeZM model — this is the
+        # field DeepEval._init_from_metadata reads when no model.json is
+        # present.  SeZM's sezm_ener fitting head enumerates every type,
+        # so the list is non-empty in general.
+        probe = _build_tiny_sezm_model()
+        self.assertEqual(list(metadata["sel_type"]), list(probe.get_sel_type()))
         self.assertTrue(_REQUIRED_OUTPUT_KEYS.issubset(set(metadata["output_keys"])))
 
         # model_def_script preserves the training params verbatim.
@@ -380,6 +400,160 @@ class TestSeZMExportArchive(unittest.TestCase):
         for key in ("energy_redu", "energy_derv_r", "energy_derv_c_redu"):
             self.assertIn(key, out_map)
             self.assertTrue(torch.isfinite(out_map[key]).all().item())
+
+
+class TestSeZMViaDeepPot(_FrozenPt2Fixture, unittest.TestCase):
+    """Integration through the standard :class:`deepmd.infer.DeepPot` entry.
+
+    Locks in the contract that makes ``dp test -m frozen.pt2`` and the
+    deepmd ASE calculator work on a SeZM-produced archive.  Everything
+    here goes through the public backend-agnostic API —
+    :class:`DeepPot` dispatches ``.pt2`` to
+    :class:`deepmd.pt_expt.infer.deep_eval.DeepEval`, which since the
+    metadata-only patch no longer needs ``extra/model.json``.
+
+    Numerical tolerance is looser than the ``.pte`` pipeline tests
+    because AOTInductor fuses pointwise / reduction kernels and the
+    fused accumulation order differs from eager; the intent here is
+    contract parity, not bitwise parity.
+    """
+
+    RTOL = 1e-5
+    ATOL = 1e-7
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # The ``.pt2`` archive is compiled on CPU by the fixture; AOTI
+        # packages are device-locked, so ``pt_expt.DeepEval``'s input
+        # preparation must also place tensors on CPU — otherwise
+        # ``_pt2_runner(...)`` segfaults on dtype/device mismatch.
+        # ``_prepare_inputs`` does a function-local
+        # ``from deepmd.pt_expt.utils.env import DEVICE``, so patching
+        # the module attribute is enough (no rebinding required).
+        import deepmd.pt_expt.utils.env as _pt_expt_env
+
+        cls._orig_pt_expt_device = _pt_expt_env.DEVICE
+        _pt_expt_env.DEVICE = _CPU
+
+        super().setUpClass()
+
+        # Late import: building the deepmd Backend registry is cheap, but
+        # doing it at collection time conflicts with the conftest
+        # default-device sentinel used elsewhere in this package.
+        from deepmd.infer import (
+            DeepPot,
+        )
+
+        cls.dp = DeepPot(str(cls.out_path))
+
+        # A deterministic bulk sample; coord is centred in a cubic box
+        # well inside the periodic image, and the atype distribution
+        # exercises both type-0 and type-1 slots of sel=[2, 2].
+        rng = np.random.default_rng(2026)
+        cls.natoms = 5
+        cls.atype = np.array([0, 1, 0, 1, 0], dtype=np.int32)
+        box_edge = cls.params["descriptor"]["rcut"] * 3.0
+        cls.coord = (
+            rng.random((1, cls.natoms, 3), dtype=np.float64) * box_edge * 0.4
+            + box_edge * 0.3
+        )
+        cls.cell = (np.eye(3, dtype=np.float64) * box_edge).reshape(1, 9)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        import deepmd.pt_expt.utils.env as _pt_expt_env
+
+        _pt_expt_env.DEVICE = cls._orig_pt_expt_device
+        super().tearDownClass()
+
+    def _eager_energy_force_virial(self) -> tuple[np.ndarray, ...]:
+        """Run the eager SeZMModel forward and return arrays shaped like DeepPot."""
+        model = _build_tiny_sezm_model()
+        wrapper = ModelWrapper(model, model_params=copy.deepcopy(self.params))
+        raw = torch.load(self.ckpt_path, map_location=_CPU, weights_only=False)
+        wrapper.load_state_dict(raw["model"])
+        model.eval()
+
+        coord_t = torch.tensor(self.coord, dtype=torch.float64).requires_grad_(True)
+        atype_t = torch.tensor(self.atype, dtype=torch.int64).unsqueeze(0)
+        box_t = torch.tensor(self.cell, dtype=torch.float64)
+        out = model.forward(coord_t, atype_t, box_t, do_atomic_virial=True)
+        return (
+            out["energy"].detach().cpu().numpy(),
+            out["force"].detach().cpu().numpy(),
+            out["virial"].detach().cpu().numpy(),
+            out["atom_energy"].detach().cpu().numpy(),
+        )
+
+    # ---- metadata accessors ----------------------------------------
+
+    def test_deeppot_metadata_accessors(self) -> None:
+        dp = self.dp
+        self.assertEqual(list(dp.deep_eval.get_type_map()), self.params["type_map"])
+        self.assertEqual(dp.deep_eval.get_ntypes(), len(self.params["type_map"]))
+        self.assertAlmostEqual(
+            dp.deep_eval.get_rcut(), self.params["descriptor"]["rcut"]
+        )
+        self.assertEqual(dp.deep_eval.get_dim_fparam(), 0)
+        self.assertEqual(dp.deep_eval.get_dim_aparam(), 0)
+        # get_sel_type() must agree with the eager model; SeZM's
+        # ``sezm_ener`` fitting head selects every type by enumerating them,
+        # so the concrete value is ``list(range(ntypes))`` rather than ``[]``
+        # — both are valid DeepPot conventions for "all types selected".
+        eager = _build_tiny_sezm_model()
+        self.assertEqual(list(dp.deep_eval.get_sel_type()), list(eager.get_sel_type()))
+        self.assertFalse(dp.deep_eval.get_has_spin())
+
+    def test_deeppot_is_metadata_only(self) -> None:
+        """SeZM's .pt2 omits model.json, so the loader must take the fallback."""
+        self.assertIsNone(self.dp.deep_eval._dpmodel)
+
+    # ---- numeric parity against eager -------------------------------
+
+    def test_deeppot_eval_matches_eager(self) -> None:
+        e_ref, f_ref, v_ref, atom_e_ref = self._eager_energy_force_virial()
+        e, f, v = self.dp.eval(self.coord, self.cell, self.atype, atomic=False)[:3]
+        np.testing.assert_allclose(
+            e,
+            e_ref.reshape(e.shape),
+            rtol=self.RTOL,
+            atol=self.ATOL,
+            err_msg="energy mismatch (DeepPot vs eager)",
+        )
+        np.testing.assert_allclose(
+            f,
+            f_ref.reshape(f.shape),
+            rtol=self.RTOL,
+            atol=self.ATOL,
+            err_msg="force mismatch (DeepPot vs eager)",
+        )
+        np.testing.assert_allclose(
+            v,
+            v_ref.reshape(v.shape),
+            rtol=self.RTOL,
+            atol=self.ATOL,
+            err_msg="virial mismatch (DeepPot vs eager)",
+        )
+
+    def test_deeppot_eval_atomic_matches_eager(self) -> None:
+        """``atomic=True`` additionally returns atom_energy and atom_virial."""
+        e_ref, _, _, atom_e_ref = self._eager_energy_force_virial()
+        out = self.dp.eval(self.coord, self.cell, self.atype, atomic=True)
+        e, _, _, atom_e, _ = out
+        np.testing.assert_allclose(
+            e,
+            e_ref.reshape(e.shape),
+            rtol=self.RTOL,
+            atol=self.ATOL,
+            err_msg="energy mismatch (atomic path)",
+        )
+        np.testing.assert_allclose(
+            atom_e,
+            atom_e_ref.reshape(atom_e.shape),
+            rtol=self.RTOL,
+            atol=self.ATOL,
+            err_msg="atom_energy mismatch (atomic path)",
+        )
 
 
 class TestSeZMFreezeGuards(unittest.TestCase):

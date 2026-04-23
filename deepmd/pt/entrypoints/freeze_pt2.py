@@ -107,8 +107,12 @@ def _to_py_list(value: Any) -> Any:
 def _collect_metadata(model: torch.nn.Module, output_keys: list[str]) -> dict:
     """Assemble the flat metadata dict expected by :class:`DeepPotPTExpt`.
 
-    Mirrors the reader contract at ``source/api_cc/src/DeepPotPTExpt.cc``.
-    ``output_keys`` is the insertion order that the C++ loader zips with
+    Mirrors the reader contract at ``source/api_cc/src/DeepPotPTExpt.cc`` and
+    the metadata-only load path in ``deepmd.pt_expt.infer.deep_eval.DeepEval``:
+    every field consumed by C++ LAMMPS inference **and** every field
+    consumed by ``DeepEval._init_from_metadata`` must be present here.
+
+    ``output_keys`` is the insertion order that the loader zips with
     ``AOTIModelPackageLoader::run``'s flat output vector.
     """
     fitting_output_defs: list[dict[str, Any]] = []
@@ -121,7 +125,9 @@ def _collect_metadata(model: torch.nn.Module, output_keys: list[str]) -> dict:
                 "r_differentiable": vdef.r_differentiable,
                 "c_differentiable": vdef.c_differentiable,
                 "atomic": vdef.atomic,
-                "category": vdef.category,
+                # OutputVariableCategory is an IntEnum; force plain int for
+                # deterministic JSON serialisation across Python versions.
+                "category": int(vdef.category),
                 "r_hessian": vdef.r_hessian,
                 "magnetic": vdef.magnetic,
                 "intensive": vdef.intensive,
@@ -138,6 +144,9 @@ def _collect_metadata(model: torch.nn.Module, output_keys: list[str]) -> dict:
         "default_fparam": _to_py_list(model.get_default_fparam()),
         "output_keys": list(output_keys),
         "fitting_output_defs": fitting_output_defs,
+        # sel_type feeds DeepEval.get_sel_type() in metadata-only mode.
+        # SeZM energy models return [] (every type selected).
+        "sel_type": [int(t) for t in model.get_sel_type()],
         "is_spin": False,
     }
 
@@ -347,12 +356,12 @@ def freeze_sezm_to_pt2(
 
     metadata = _collect_metadata(model, output_keys=output_keys)
     with zipfile.ZipFile(out_path_str, "a") as zf:
-        zf.writestr("extra/metadata.json", json.dumps(metadata))
+        zf.writestr("model/extra/metadata.json", json.dumps(metadata))
         # The raw training params are preserved so `dp change-bias` and
         # other downstream tooling can recover the exact training config.
         # ``default=str`` is a safety net for exotic nested values.
         zf.writestr(
-            "extra/model_def_script.json",
+            "model/extra/model_def_script.json",
             json.dumps(params, default=str),
         )
 
