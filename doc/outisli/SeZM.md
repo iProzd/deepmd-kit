@@ -1280,3 +1280,71 @@ See `examples/water/sezm/input_lora.json` for a full example input.
 - `TestLoRASO3Adapter` / `TestLoRASO2Adapter` — merge numerical parity (`merge_into_base` forward equals LoRA forward), SO(2) z-rotation equivariance after LoRA injection.
 - `TestApplyLoRAToSeZM` — end-to-end injection on a minimal SeZM: subclass replacement, base weights frozen, adapters trainable, full-unfreeze list, override-freeze for type embedding / radial frequencies / `GatedActivation`.
 - `TestBuildMergedStateDict` — merged-state-dict key set equals a never-LoRA'ed sibling, weight values equal `W + ΔW`.
+
+## 23. Exporting SeZM to .pt2 for LAMMPS
+
+SeZM compiles its force-loss graph through `make_fx` + `torch.compile`, a pipeline that TorchScript cannot represent because a nested `autograd.grad(create_graph=True)` lives inside `fit_output_to_model_output`. AOTInductor (`.pt2`) is the official successor to `torch.jit.script` on PyTorch ≥2.11 and is the format `DeepPotPTExpt::init` already consumes, so the pt backend routes SeZM checkpoints to an AOTInductor freeze path while every non-SeZM checkpoint keeps the legacy `torch.jit.script` branch.
+
+### 23.1 CLI Usage
+
+```bash
+dp --pt freeze -c run_dir -o frozen_model
+```
+
+`main.freeze` calls `is_sezm_checkpoint`; when the `type` field in `_extra_state.model_params` is `"SeZM"` it rewrites the output suffix to `.pt2` and hands off to `freeze_sezm_to_pt2`. The dispatch is transparent to the user.
+
+The resulting archive:
+
+```
+frozen_model.pt2  (ZIP archive)
+├── data/aotinductor/model/*.cubin / *.so   # Inductor AOT shared library
+├── extra/metadata.json                     # flat fields for DeepPotPTExpt.cc
+└── extra/model_def_script.json             # raw training params (verbatim)
+```
+
+`extra/metadata.json` matches the reader contract at `source/api_cc/src/DeepPotPTExpt.cc` lines ~88-137. Emitted fields:
+
+- `type_map`, `rcut`, `sel`: descriptor geometry.
+- `dim_fparam`, `dim_aparam`, `has_default_fparam`, `default_fparam`: fitting parameter wiring (SeZM v1 ships `0 / 0 / False / null`).
+- `mixed_types`, `is_spin`: SeZM is `True` / `False`.
+- `output_keys`: insertion-order names of the tensors returned by the traced graph (currently `energy`, `mask`, `energy_redu`, `energy_derv_r`, `energy_derv_c`, `energy_derv_c_redu`). `DeepPotPTExpt::extract_outputs` zips this list with the flat output vector of `AOTIModelPackageLoader::run`.
+- `fitting_output_defs`: serialised `OutputVariableDef` entries so the C++ side can rebuild `ModelOutputDef` without importing any Python class.
+
+`extra/model_def_script.json` preserves the training `model_params` verbatim so downstream tooling (`dp change-bias`, follow-up fine-tune) can recover the full knob set that produced the checkpoint.
+
+### 23.2 Dtype Contract
+
+The AOTI package is compiled with **fp64 inputs and fp64 outputs**, regardless of the checkpoint's internal compute dtype. This matches `source/api_cc/src/DeepPotPTExpt.cc:222-225`, where LAMMPS coordinates are unconditionally cast to `torch::kFloat64` — AOTInductor performs no auto-cast, so any mismatch would fail at load time. `freeze` never reads or writes the `descriptor.precision` / `fitting_net.precision` fields; SeZM's own `_input_type_cast` / `_output_type_cast` bridge fp64 I/O to whatever internal dtype the checkpoint uses.
+
+### 23.3 LAMMPS Usage
+
+`pair_style deepmd frozen_model.pt2` works without any C++ change: `DeepPotPTExpt` recognises the `.pt2` suffix and hands the path to `AOTIModelPackageLoader`. Data flow:
+
+```
+LAMMPS coord (fp64) → DeepPotPTExpt::compute → AOTIModelPackageLoader::run → .pt2 .so
+                                                                             ↓
+                   DeepPotPTExpt::extract_outputs ← keyed outputs (output_keys)
+```
+
+`.pt2` is device-specific (CPU / CUDA compute capability / libtorch ABI all bake into the compiled kernels); re-freeze on the host that runs LAMMPS. A minimal end-to-end recipe ships in `examples/water/sezm/lmp/`.
+
+### 23.4 Limitations (v1)
+
+- **No multi-task**: `freeze_sezm_to_pt2` rejects any checkpoint carrying `model_dict` in `_extra_state.model_params`.
+- **No `head` selection**: `head=None` is the only accepted value.
+
+### 23.5 Implementation Layer
+
+- `deepmd/pt/model/model/sezm_model.py` adds `SeZMModel.forward_common_lower_exportable`: detaches the coordinate and reinstates `requires_grad=True` inside the traced closure so LAMMPS's non-leaf fp64 tensors get a fresh grad endpoint for the inner `autograd.grad`, and decomposes `silu_backward` the same way the training compile path does.
+- `deepmd/pt/entrypoints/freeze_pt2.py` owns ckpt loading, sample-input synthesis (`_resolve_nframes` picks a duck-sizing-safe `nframes`), the `torch.export.export` call, AOTInductor compilation, and the `extra/` sidecar writes.
+- `deepmd/pt/entrypoints/main.py::freeze` detects SeZM checkpoints via `is_sezm_checkpoint` and dispatches; every non-SeZM path keeps the legacy `torch.jit.script` behaviour.
+
+### 23.6 Test Coverage
+
+`source/tests/pt/model/test_sezm_export.py` ships three self-contained suites (no external checkpoint; a tiny fp64 SeZM is built on the fly):
+
+- `TestSeZMExportPipeline`: traces `forward_common_lower` via `forward_common_lower_exportable`, exports to an `ExportedProgram`, saves / loads `.pte`, and asserts *bitwise* parity (`rtol=1e-10, atol=1e-10`) between eager, traced and loaded outputs on both the trace shape and a different inference shape. Mirrors `pt_expt/model/test_export_pipeline.py`.
+- `TestSeZMExportArchive`: drives `freeze_sezm_to_pt2` end-to-end on a tiny synthetic ckpt, verifies the ZIP layout, the `metadata.json` field coverage, and that the AOTI loader produces finite outputs. Numerical parity of the compiled `.pt2` is *not* asserted here because Inductor's fused-kernel accumulation order is a correctness-preserving but numerically visible transform — the pipeline class above already nails down graph-level correctness.
+- `TestSeZMFreezeGuards`: error paths — `is_sezm_checkpoint` rejects a non-SeZM file, and `freeze_sezm_to_pt2` raises `NotImplementedError` on `head != None` and on `model_dict` checkpoints. The `dens` mode also raises inside `forward_common_lower_exportable`; it is not exercised in CI because driving a `dens` model through LAMMPS is not a supported workflow.
+
+Every suite clears the pt-test sentinel default device (`cuda:9999999`) inside a context manager so PyTorch 2.11's AOTI / export passes can create their internal unnamed tensors without tripping the guard — matching the `pt_expt/test_change_bias.py` pattern.

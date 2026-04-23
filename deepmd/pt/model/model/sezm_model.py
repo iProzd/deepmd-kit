@@ -1297,6 +1297,73 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         )
         return self._output_type_cast(model_predict, input_prec)
 
+    def forward_common_lower_exportable(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+    ) -> torch.nn.Module:
+        """Trace ``forward_common_lower`` into an exportable FX ``GraphModule``.
+
+        ``make_fx`` unfolds the inner ``autograd.grad`` that
+        ``fit_output_to_model_output`` performs for force and virial, so
+        the returned module can be handed to :func:`torch.export.export`
+        directly.  ``silu_backward`` is decomposed to primitive ops so
+        Inductor never sees an opaque higher-order derivative — the same
+        decomposition the training compile path uses.
+
+        Only the conservative ``ener`` mode is supported: ``dens``
+        emits a direct-force tensor that has no ``DeepPotPTExpt`` consumer.
+        """
+        from torch._decomp import (
+            get_decompositions,
+        )
+
+        if self.get_active_mode() == "dens":
+            raise NotImplementedError(
+                "SeZM export supports only the conservative `ener` path."
+            )
+
+        model = self
+        extra_sort = self.need_sorted_nlist_for_lower()
+
+        def fn(
+            ext_coord: torch.Tensor,
+            ext_atype: torch.Tensor,
+            nlist_: torch.Tensor,
+            mapping_: torch.Tensor | None,
+            fparam_: torch.Tensor | None,
+            aparam_: torch.Tensor | None,
+        ) -> dict[str, torch.Tensor]:
+            # detach + requires_grad_ must live INSIDE the traced closure:
+            # LAMMPS feeds a plain fp64 non-leaf tensor, and the exported
+            # graph needs its own grad endpoint for the inner autograd.grad
+            # that fit_output_to_model_output performs.
+            ext_coord = ext_coord.detach().requires_grad_(True)
+            return model.forward_common_lower(
+                ext_coord,
+                ext_atype,
+                nlist_,
+                mapping_,
+                fparam=fparam_,
+                aparam=aparam_,
+                do_atomic_virial=do_atomic_virial,
+                extra_nlist_sort=extra_sort,
+            )
+
+        return make_fx(
+            fn,
+            tracing_mode="symbolic",
+            _allow_non_fake_inputs=True,
+            decomposition_table=get_decompositions(
+                [torch.ops.aten.silu_backward.default]
+            ),
+        )(extended_coord, extended_atype, nlist, mapping, fparam, aparam)
+
     # =========================================================================
     # Compile Utilities
     # =========================================================================
