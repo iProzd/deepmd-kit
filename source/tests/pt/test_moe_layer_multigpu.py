@@ -352,12 +352,13 @@ def test_consistency_single_vs_multi_2gpu(rank, world_size, ep_group):
             multi_col = getattr(multi_layer, collection_name)
             for local_eid in range(experts_per_gpu):
                 global_eid = rank * experts_per_gpu + local_eid
-                # Copy routing expert params.
-                multi_col.routing_experts[local_eid].mlp.matrix.copy_(
-                    single_col.routing_experts[global_eid].mlp.matrix,
+                # Copy routing expert params from shared 3D tensor.
+                # single_col.routing_matrix[:, :, global_eid] → multi_col.routing_matrix[:, :, local_eid]
+                multi_col.routing_matrix[:, :, local_eid].copy_(
+                    single_col.routing_matrix[:, :, global_eid],
                 )
-                multi_col.routing_experts[local_eid].mlp.bias.copy_(
-                    single_col.routing_experts[global_eid].mlp.bias,
+                multi_col.routing_bias[:, local_eid].copy_(
+                    single_col.routing_bias[:, global_eid],
                 )
 
     inputs = {
@@ -505,11 +506,11 @@ def test_consistency_4gpu(rank, world_size, ep_group):
             multi_col = getattr(multi_layer, col_name)
             for local_eid in range(experts_per_gpu):
                 global_eid = rank * experts_per_gpu + local_eid
-                multi_col.routing_experts[local_eid].mlp.matrix.copy_(
-                    single_col.routing_experts[global_eid].mlp.matrix,
+                multi_col.routing_matrix[:, :, local_eid].copy_(
+                    single_col.routing_matrix[:, :, global_eid],
                 )
-                multi_col.routing_experts[local_eid].mlp.bias.copy_(
-                    single_col.routing_experts[global_eid].mlp.bias,
+                multi_col.routing_bias[:, local_eid].copy_(
+                    single_col.routing_bias[:, global_eid],
                 )
 
     inputs = {

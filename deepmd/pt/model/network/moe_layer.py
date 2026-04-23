@@ -395,7 +395,13 @@ class MoEDispatchCombine(nn.Module):
         N: int,
         topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Sort-split-forward for node M1 and M2."""
+        """Sort-split-forward for node M1 and M2.
+
+        Matches old code's experts_regroup_dynamic pattern:
+        - No repeat_interleave (uses index_select per expert)
+        - Direct scatter to [N, O, topk] output tensor
+        - Efficient einsum weighted sum
+        """
         device = m1_input.device
         dtype = m1_input.dtype
 
@@ -405,47 +411,59 @@ class MoEDispatchCombine(nn.Module):
                 m2_input.new_zeros(0, self.node_sym_out_dim),
             )
 
-        # Flatten and expand.
-        flat_eids = indices.reshape(-1)        # [N*topk]
-        flat_weights = weights.reshape(-1)     # [N*topk]
-        m1_exp = m1_input.repeat_interleave(topk, dim=0)  # [N*topk, nd]
-        m2_exp = m2_input.repeat_interleave(topk, dim=0)  # [N*topk, n_sym_dim]
+        m1_out_dim = self.node_out_dim
+        m2_out_dim = self.node_sym_out_dim
 
-        # Sort by expert_id.
-        sort_idx = torch.argsort(flat_eids, stable=True)
-        m1_sorted = m1_exp[sort_idx]
-        m2_sorted = m2_exp[sort_idx]
-        eids_sorted = flat_eids[sort_idx]
+        # Build token_idx, slot_idx, expert_idx (matches old code pattern).
+        token_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, topk).reshape(-1)  # [N*topk]
+        slot_idx = torch.arange(topk, device=device).unsqueeze(0).expand(N, topk).reshape(-1)  # [N*topk]
+        expert_idx = indices.reshape(-1)  # [N*topk]
 
-        # Split sizes.
-        counts = torch.bincount(eids_sorted, minlength=self.n_routing_experts)
-        split_sizes = counts.tolist()
+        # Sort by expert.
+        order = torch.argsort(expert_idx, stable=True)
+        token_idx_sorted = token_idx[order]
+        slot_idx_sorted = slot_idx[order]
+        expert_idx_sorted = expert_idx[order]
 
-        # Forward each expert on its contiguous chunk.
-        m1_chunks = torch.split(m1_sorted, split_sizes)
-        m2_chunks = torch.split(m2_sorted, split_sizes)
-        m1_out_parts: list[torch.Tensor] = []
-        m2_out_parts: list[torch.Tensor] = []
-        for eid, (m1c, m2c) in enumerate(zip(m1_chunks, m2_chunks)):
-            if m1c.shape[0] > 0:
-                m1_out_parts.append(self.node_self_experts.forward_expert(m1c, eid))
-                m2_out_parts.append(self.node_sym_experts.forward_expert(m2c, eid))
-            else:
-                m1_out_parts.append(m1c.new_zeros(0, self.node_out_dim))
-                m2_out_parts.append(m2c.new_zeros(0, self.node_sym_out_dim))
+        counts = torch.bincount(expert_idx_sorted, minlength=self.n_routing_experts)
+        offsets = torch.zeros(self.n_routing_experts + 1, device=device, dtype=counts.dtype)
+        offsets[1:] = counts.cumsum(0)
+        offsets_cpu = offsets.tolist()
 
-        m1_sorted_out = torch.cat(m1_out_parts, dim=0)  # [N*topk, nd]
-        m2_sorted_out = torch.cat(m2_out_parts, dim=0)
+        # Per-expert matmul using shared 3D tensor (no repeat_interleave!).
+        W1 = self.node_self_experts.routing_matrix.permute(2, 0, 1)  # [E, I, O]
+        b1 = self.node_self_experts.routing_bias  # [O, E]
+        W2 = self.node_sym_experts.routing_matrix.permute(2, 0, 1)  # [E, I, O]
+        b2 = self.node_sym_experts.routing_bias  # [O, E]
 
-        # Unsort back to original [N*topk] order.
-        unsort_idx = torch.empty_like(sort_idx)
-        unsort_idx[sort_idx] = torch.arange(len(sort_idx), device=device)
-        m1_orig = m1_sorted_out[unsort_idx]
-        m2_orig = m2_sorted_out[unsort_idx]
+        m1_y_list: list[torch.Tensor] = []
+        m2_y_list: list[torch.Tensor] = []
+        for e in range(self.n_routing_experts):
+            start = offsets_cpu[e]
+            end = offsets_cpu[e + 1]
+            if start == end:
+                continue
+            local_eid = e % self.node_self_experts.experts_per_gpu
+            tok_e = token_idx_sorted[start:end]  # [N_e]
+            # index_select: no data duplication (unlike repeat_interleave)
+            x1_e = m1_input.index_select(0, tok_e)  # [N_e, nd]
+            x2_e = m2_input.index_select(0, tok_e)  # [N_e, n_sym_dim]
+            m1_y_list.append(torch.matmul(x1_e, W1[local_eid]) + b1[:, local_eid])
+            m2_y_list.append(torch.matmul(x2_e, W2[local_eid]) + b2[:, local_eid])
 
-        # Weighted sum: [N*topk, dim] → [N, topk, dim] * w → sum → [N, dim]
-        m1_out = _weighted_sum_topk(m1_orig, flat_weights, N, topk)
-        m2_out = _weighted_sum_topk(m2_orig, flat_weights, N, topk)
+        # Vectorized cat + activation
+        all_m1_y = self.node_self_experts.activate(torch.cat(m1_y_list, dim=0))
+        all_m2_y = self.node_sym_experts.activate(torch.cat(m2_y_list, dim=0))
+
+        # Direct scatter to [N, O, topk] (matches old code's out[token_idx, :, slot_idx] = all_y)
+        m1_out_3d = torch.zeros(N, m1_out_dim, topk, device=device, dtype=dtype)
+        m2_out_3d = torch.zeros(N, m2_out_dim, topk, device=device, dtype=dtype)
+        m1_out_3d[token_idx_sorted, :, slot_idx_sorted] = all_m1_y
+        m2_out_3d[token_idx_sorted, :, slot_idx_sorted] = all_m2_y
+
+        # Weighted sum via einsum: [N, O, topk] x [N, topk] -> [N, O]
+        m1_out = torch.einsum('ijk,ik->ij', m1_out_3d, weights)
+        m2_out = torch.einsum('ijk,ik->ij', m2_out_3d, weights)
         return m1_out, m2_out
 
     def _sort_split_forward_feature(
@@ -457,39 +475,59 @@ class MoEDispatchCombine(nn.Module):
         topk: int,
         expert_collection: MoEExpertCollection,
     ) -> torch.Tensor:
-        """Sort-split-forward for edge or angle features."""
+        """Sort-split-forward for edge or angle features.
+
+        Matches old code's experts_regroup_dynamic pattern:
+        - No repeat_interleave (uses index_select per expert)
+        - Direct scatter to [N, O, topk] output tensor
+        - Efficient einsum weighted sum
+        """
         device = features.device
-        out_dim = expert_collection.routing_experts[0].num_out
+        dtype = features.dtype
+        out_dim = expert_collection.num_out
 
         if N == 0:
             return features.new_zeros(0, out_dim)
 
-        flat_eids = indices.reshape(-1)
-        flat_weights = weights.reshape(-1)
-        feat_exp = features.repeat_interleave(topk, dim=0)  # [N*topk, feat_dim]
+        # Build token_idx, slot_idx, expert_idx.
+        token_idx = torch.arange(N, device=device).unsqueeze(1).expand(N, topk).reshape(-1)
+        slot_idx = torch.arange(topk, device=device).unsqueeze(0).expand(N, topk).reshape(-1)
+        expert_idx = indices.reshape(-1)
 
-        sort_idx = torch.argsort(flat_eids, stable=True)
-        feat_sorted = feat_exp[sort_idx]
-        eids_sorted = flat_eids[sort_idx]
+        # Sort by expert.
+        order = torch.argsort(expert_idx, stable=True)
+        token_idx_sorted = token_idx[order]
+        slot_idx_sorted = slot_idx[order]
+        expert_idx_sorted = expert_idx[order]
 
-        counts = torch.bincount(eids_sorted, minlength=self.n_routing_experts)
-        split_sizes = counts.tolist()
-        chunks = torch.split(feat_sorted, split_sizes)
+        counts = torch.bincount(expert_idx_sorted, minlength=self.n_routing_experts)
+        offsets = torch.zeros(self.n_routing_experts + 1, device=device, dtype=counts.dtype)
+        offsets[1:] = counts.cumsum(0)
+        offsets_cpu = offsets.tolist()
 
-        out_parts: list[torch.Tensor] = []
-        for eid, chunk in enumerate(chunks):
-            if chunk.shape[0] > 0:
-                out_parts.append(expert_collection.forward_expert(chunk, eid))
-            else:
-                out_parts.append(chunk.new_zeros(0, out_dim))
+        # Per-expert matmul using shared 3D tensor.
+        W = expert_collection.routing_matrix.permute(2, 0, 1)  # [E, I, O]
+        b = expert_collection.routing_bias  # [O, E]
 
-        sorted_out = torch.cat(out_parts, dim=0)
+        y_list: list[torch.Tensor] = []
+        for e in range(self.n_routing_experts):
+            start = offsets_cpu[e]
+            end = offsets_cpu[e + 1]
+            if start == end:
+                continue
+            local_eid = e % expert_collection.experts_per_gpu
+            tok_e = token_idx_sorted[start:end]
+            x_e = features.index_select(0, tok_e)
+            y_list.append(torch.matmul(x_e, W[local_eid]) + b[:, local_eid])
 
-        unsort_idx = torch.empty_like(sort_idx)
-        unsort_idx[sort_idx] = torch.arange(len(sort_idx), device=device)
-        orig_out = sorted_out[unsort_idx]
+        all_y = expert_collection.activate(torch.cat(y_list, dim=0))
 
-        return _weighted_sum_topk(orig_out, flat_weights, N, topk)
+        # Direct scatter to [N, O, topk].
+        out_3d = torch.zeros(N, out_dim, topk, device=device, dtype=dtype)
+        out_3d[token_idx_sorted, :, slot_idx_sorted] = all_y
+
+        # Weighted sum via einsum.
+        return torch.einsum('ijk,ik->ij', out_3d, weights)
 
     # ------------------------------------------------------------------
     # Multi-GPU path (topk expand -> sort -> Pack -> A2A -> Expert -> A2A -> Unpack -> weighted sum)
@@ -850,21 +888,14 @@ class MoEDispatchCombine(nn.Module):
         m1_gathered = node_m1_input[gather_idx]
         m2_gathered = node_m2_input[gather_idx]
 
-        # Split + forward each expert.
-        m1_chunks = torch.split(m1_gathered, split_sizes)
-        m2_chunks = torch.split(m2_gathered, split_sizes)
-        m1_out_parts: list[torch.Tensor] = []
-        m2_out_parts: list[torch.Tensor] = []
-        for eid, (m1c, m2c) in enumerate(zip(m1_chunks, m2_chunks)):
-            if m1c.shape[0] > 0:
-                m1_out_parts.append(self.node_self_experts.forward_expert(m1c, eid))
-                m2_out_parts.append(self.node_sym_experts.forward_expert(m2c, eid))
-            else:
-                m1_out_parts.append(m1c.new_zeros(0, self.node_out_dim))
-                m2_out_parts.append(m2c.new_zeros(0, self.node_sym_out_dim))
-
-        m1_cat = torch.cat(m1_out_parts, dim=0)
-        m2_cat = torch.cat(m2_out_parts, dim=0)
+        # Batched forward using shared 3D tensor.
+        eids_gathered = local_eids[gather_idx]
+        m1_cat = self.node_self_experts.forward_expert_batched(
+            m1_gathered, eids_gathered, split_sizes,
+        )
+        m2_cat = self.node_sym_experts.forward_expert_batched(
+            m2_gathered, eids_gathered, split_sizes,
+        )
 
         # Ungather back to recv order.
         return m1_cat[ungather_idx], m2_cat[ungather_idx]
@@ -896,7 +927,7 @@ class MoEDispatchCombine(nn.Module):
         """
         N = features.shape[0]
         device = features.device
-        out_dim = expert_collection.routing_experts[0].num_out
+        out_dim = expert_collection.num_out
 
         if N == 0:
             return features.new_zeros(0, out_dim)
@@ -909,16 +940,11 @@ class MoEDispatchCombine(nn.Module):
         # Gather into expert-contiguous layout.
         feat_gathered = features[gather_idx]
 
-        # Split + forward each expert.
-        chunks = torch.split(feat_gathered, split_sizes)
-        out_parts: list[torch.Tensor] = []
-        for eid, chunk in enumerate(chunks):
-            if chunk.shape[0] > 0:
-                out_parts.append(expert_collection.forward_expert(chunk, eid))
-            else:
-                out_parts.append(chunk.new_zeros(0, out_dim))
-
-        cat_out = torch.cat(out_parts, dim=0)
+        # Batched forward using shared 3D tensor.
+        eids_gathered = local_eids[gather_idx]
+        cat_out = expert_collection.forward_expert_batched(
+            feat_gathered, eids_gathered, split_sizes,
+        )
 
         # Ungather back to recv order.
         return cat_out[ungather_idx]

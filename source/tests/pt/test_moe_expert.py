@@ -232,9 +232,11 @@ class TestMoEExpertCollection:
         total = total + coll.forward_shared(x)
         loss = total.sum()
         loss.backward()
-        for i, e in enumerate(coll.routing_experts):
-            assert e.matrix.grad is not None, f"routing_expert[{i}].matrix no grad"
-            assert e.bias.grad is not None, f"routing_expert[{i}].bias no grad"
+        # Shared 3D tensor receives gradient (covers all routing experts).
+        assert coll.routing_matrix.grad is not None, "routing_matrix no grad"
+        assert coll.routing_bias.grad is not None, "routing_bias no grad"
+        assert coll.routing_matrix.grad.abs().sum() > 0
+        assert coll.routing_bias.grad.abs().sum() > 0
         for i, e in enumerate(coll.shared_experts):
             assert e.matrix.grad is not None, f"shared_expert[{i}].matrix no grad"
             assert e.bias.grad is not None, f"shared_expert[{i}].bias no grad"

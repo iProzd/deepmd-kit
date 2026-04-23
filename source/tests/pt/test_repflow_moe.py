@@ -446,32 +446,37 @@ def _copy_non_moe_to_moe(non_moe_layer, moe_layer):
     """
     with torch.no_grad():
         # M1: node self.
-        moe_e0_m1 = moe_layer.moe_phase1.node_self_experts.routing_experts[0].mlp
-        moe_e0_m1.matrix.copy_(non_moe_layer.node_self_mlp.matrix)
-        moe_e0_m1.bias.copy_(non_moe_layer.node_self_mlp.bias)
+        # With shared 3D tensor: routing_matrix[:, :, 0] = W, routing_bias[:, 0] = b
+        moe_e0_m1_matrix = moe_layer.moe_phase1.node_self_experts.routing_matrix
+        moe_e0_m1_bias = moe_layer.moe_phase1.node_self_experts.routing_bias
+        moe_e0_m1_matrix[:, :, 0].copy_(non_moe_layer.node_self_mlp.matrix)
+        moe_e0_m1_bias[:, 0].copy_(non_moe_layer.node_self_mlp.bias)
 
         # M2: node sym.
-        moe_e0_m2 = moe_layer.moe_phase1.node_sym_experts.routing_experts[0].mlp
-        moe_e0_m2.matrix.copy_(non_moe_layer.node_sym_linear.matrix)
-        moe_e0_m2.bias.copy_(non_moe_layer.node_sym_linear.bias)
+        moe_e0_m2_matrix = moe_layer.moe_phase1.node_sym_experts.routing_matrix
+        moe_e0_m2_bias = moe_layer.moe_phase1.node_sym_experts.routing_bias
+        moe_e0_m2_matrix[:, :, 0].copy_(non_moe_layer.node_sym_linear.matrix)
+        moe_e0_m2_bias[:, 0].copy_(non_moe_layer.node_sym_linear.bias)
 
         # M3+M4: merged edge expert. W_merged = [W_M3 | W_M4], b_merged = [b_M3 | b_M4].
-        moe_e0_edge = moe_layer.moe_phase1.edge_experts.routing_experts[0].mlp
+        moe_e0_edge_matrix = moe_layer.moe_phase1.edge_experts.routing_matrix
+        moe_e0_edge_bias = moe_layer.moe_phase1.edge_experts.routing_bias
         w_m3 = non_moe_layer.node_edge_linear.matrix  # [edge_info_dim, n_dim]
         w_m4 = non_moe_layer.edge_self_linear.matrix   # [edge_info_dim, e_dim]
-        moe_e0_edge.matrix.copy_(torch.cat([w_m3, w_m4], dim=-1))
+        moe_e0_edge_matrix[:, :, 0].copy_(torch.cat([w_m3, w_m4], dim=-1))
         b_m3 = non_moe_layer.node_edge_linear.bias  # [n_dim]
         b_m4 = non_moe_layer.edge_self_linear.bias   # [e_dim]
-        moe_e0_edge.bias.copy_(torch.cat([b_m3, b_m4], dim=-1))
+        moe_e0_edge_bias[:, 0].copy_(torch.cat([b_m3, b_m4], dim=-1))
 
         # M5+M7: merged angle expert. W_merged = [W_M5 | W_M7], b_merged = [b_M5 | b_M7].
-        moe_e0_angle = moe_layer.moe_phase1.angle_experts.routing_experts[0].mlp
+        moe_e0_angle_matrix = moe_layer.moe_phase1.angle_experts.routing_matrix
+        moe_e0_angle_bias = moe_layer.moe_phase1.angle_experts.routing_bias
         w_m5 = non_moe_layer.edge_angle_linear1.matrix  # [angle_dim, e_dim]
         w_m7 = non_moe_layer.angle_self_linear.matrix    # [angle_dim, a_dim]
-        moe_e0_angle.matrix.copy_(torch.cat([w_m5, w_m7], dim=-1))
+        moe_e0_angle_matrix[:, :, 0].copy_(torch.cat([w_m5, w_m7], dim=-1))
         b_m5 = non_moe_layer.edge_angle_linear1.bias  # [e_dim]
         b_m7 = non_moe_layer.angle_self_linear.bias    # [a_dim]
-        moe_e0_angle.bias.copy_(torch.cat([b_m5, b_m7], dim=-1))
+        moe_e0_angle_bias[:, 0].copy_(torch.cat([b_m5, b_m7], dim=-1))
 
         # M6: edge_angle_linear2 -> edge_angle_linear2_moe.
         moe_layer.edge_angle_linear2_moe.matrix.copy_(

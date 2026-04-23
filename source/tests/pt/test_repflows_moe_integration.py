@@ -318,7 +318,11 @@ class TestDescrptBlockRepflowsMoE(unittest.TestCase):
         """MoE layers should have MoE-specific parameters."""
         block = _make_repflows_block(use_moe=True)
         param_names = [n for n, _ in block.named_parameters()]
-        has_routing_expert = any(".routing_experts." in n for n in param_names)
+        # With shared 3D tensor: routing_matrix and routing_bias
+        has_routing_expert = any(
+            ".routing_matrix" in n or ".routing_bias" in n
+            for n in param_names
+        )
         has_router = any("router" in n for n in param_names)
         self.assertTrue(has_routing_expert, "No routing expert parameters found")
         self.assertTrue(has_router, "No router parameters found")

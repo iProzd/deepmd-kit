@@ -91,15 +91,25 @@ def init_ep_dp_groups(
 def _is_routing_expert_param(name: str) -> bool:
     """Check whether a parameter belongs to a routing expert.
 
-    Routing expert parameters contain ``.routing_experts.`` in their
-    fully-qualified name.  Examples::
+    Routing expert parameters are identified by the presence of
+    ``routing_matrix`` or ``routing_bias`` in their fully-qualified name
+    (for the shared 3D tensor layout), or the legacy ``.routing_experts.``
+    pattern (for backward compatibility).
 
-        moe_phase1.node_self_experts.routing_experts.0.mlp.matrix  → True
-        moe_phase1.edge_experts.shared_experts.0.mlp.matrix        → False
-        node_router.gate.matrix                                     → False
-        n_residual.0                                                → False
+    Examples::
+
+        moe_phase1.node_self_experts.routing_matrix         → True
+        moe_phase1.node_self_experts.routing_bias            → True
+        moe_phase1.node_self_experts.routing_experts.0.mlp.matrix  → True (legacy)
+        moe_phase1.edge_experts.shared_experts.0.mlp.matrix  → False
+        node_router.gate.matrix                               → False
+        n_residual.0                                          → False
     """
-    return ".routing_experts." in name
+    return (
+        ".routing_matrix" in name
+        or ".routing_bias" in name
+        or ".routing_experts." in name
+    )
 
 
 def sync_moe_gradients(

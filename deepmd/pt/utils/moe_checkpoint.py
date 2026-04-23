@@ -6,9 +6,18 @@ Provides:
 - ``moe_load_state_dict_from_global``: load global state_dict into local model.
 
 When using Expert Parallelism (EP), each GPU only holds a subset of routing
-experts.  These functions handle the index renaming needed to save all experts
-in a single checkpoint with global indices, and to distribute the correct
-subset when loading with a different ``ep_size``.
+experts.  With the shared 3D tensor layout, each GPU's ``routing_matrix``
+has shape ``[num_in, num_out, experts_per_gpu]`` and ``routing_bias`` has
+shape ``[num_out, experts_per_gpu]``.  These functions handle gathering all
+expert slices into global tensors for saving, and distributing the correct
+slices when loading with a potentially different ``ep_size``.
+
+The ``_ExpertView`` sub-modules (``routing_experts.{idx}``) have NO
+parameters of their own — they're lightweight facades.  The checkpoint
+code operates on the actual ``routing_matrix`` / ``routing_bias`` tensors.
+
+Legacy support: the old checkpoint format with ``routing_experts.{idx}.mlp.matrix``
+keys is also handled for backward compatibility.
 """
 
 from __future__ import annotations
@@ -19,29 +28,23 @@ from collections import OrderedDict
 import torch
 import torch.distributed as dist
 
-# Regex to match `.routing_experts.{idx}.` in state_dict keys.
+# Regex to match `.routing_experts.{idx}.` in state_dict keys (legacy format).
 _ROUTING_EXPERT_RE = re.compile(r"\.routing_experts\.(\d+)\.")
+
+# Regex to match `.routing_matrix` or `.routing_bias` (new shared 3D format).
+_ROUTING_3D_RE = re.compile(r"\.(routing_matrix|routing_bias)$")
+
+
+def _is_routing_3d_param(key: str) -> bool:
+    """Check if key is a shared 3D routing tensor (routing_matrix or routing_bias)."""
+    return key.endswith(".routing_matrix") or key.endswith(".routing_bias")
 
 
 def _rename_routing_expert_key(key: str, old_idx: int, new_idx: int) -> str:
-    """Rename a routing expert index in a state_dict key.
+    """Rename a routing expert index in a state_dict key (legacy format).
 
     Replaces ``.routing_experts.{old_idx}.`` with ``.routing_experts.{new_idx}.``
     (first occurrence only).
-
-    Parameters
-    ----------
-    key : str
-        Original state_dict key.
-    old_idx : int
-        Current expert index in the key.
-    new_idx : int
-        Target expert index.
-
-    Returns
-    -------
-    str
-        Key with the expert index replaced.
     """
     return key.replace(
         f".routing_experts.{old_idx}.",
@@ -59,13 +62,13 @@ def moe_state_dict_to_global(
 ) -> OrderedDict:
     """Convert a model's local state_dict to global expert indices.
 
-    When ``ep_size == 1``, the local indices are already global (0..n_routing-1),
-    so the state_dict is returned as-is.
+    When ``ep_size == 1``, the local state_dict is already global (all experts
+    on one GPU), so it is returned as-is.
 
     When ``ep_size > 1``, this function:
-    1. Renames local expert indices to global indices on each rank.
-    2. All-gathers routing expert tensors from all EP ranks.
-    3. Returns a complete global state_dict (on all ranks).
+    1. All-gathers ``routing_matrix`` and ``routing_bias`` tensors from all
+       EP ranks, concatenating along the expert dimension.
+    2. Returns a complete global state_dict (on all ranks).
 
     Parameters
     ----------
@@ -83,87 +86,39 @@ def moe_state_dict_to_global(
     Returns
     -------
     OrderedDict
-        Global state_dict with expert indices 0..n_routing_experts-1.
+        Global state_dict with all routing expert parameters.
     """
     local_sd = model.state_dict()
 
     if ep_size <= 1:
-        # ep_size=1: local indices are already global.
         return OrderedDict(local_sd)
 
-    # ep_size > 1: rename local → global on this rank.
-    n_routing_experts = ep_size * experts_per_gpu
-
-    # Step 1: Rename local indices to global indices.
-    renamed_sd = OrderedDict()
-    for key, tensor in local_sd.items():
-        m = _ROUTING_EXPERT_RE.search(key)
-        if m:
-            local_idx = int(m.group(1))
-            global_idx = ep_rank * experts_per_gpu + local_idx
-            new_key = _rename_routing_expert_key(key, local_idx, global_idx)
-            renamed_sd[new_key] = tensor
-        else:
-            renamed_sd[key] = tensor
-
-    # Step 2: All-gather routing expert params from all EP ranks.
-    # Collect all routing expert keys and tensors.
-    # Each rank broadcasts its routing expert tensors to all other ranks.
+    # ep_size > 1: gather routing_matrix/routing_bias from all ranks.
     global_sd = OrderedDict()
-
-    # First, add non-routing params (same on all ranks).
-    for key, tensor in renamed_sd.items():
-        if not _ROUTING_EXPERT_RE.search(key):
-            global_sd[key] = tensor
-
-    # Then, gather routing expert params from all ranks.
-    # Each rank broadcasts its renamed (global-indexed) routing expert params.
-    # Compute this rank's DP rank to convert EP group ranks to global ranks.
     global_rank = dist.get_rank() if dist.is_initialized() else 0
     dp_rank = (global_rank - ep_rank) // ep_size
 
-    for r in range(ep_size):
-        # Convert EP group rank r to global rank for broadcast src.
-        # EP group layout: [dp_rank * ep_size + 0, ..., dp_rank * ep_size + (ep_size-1)]
-        src_global_rank = dp_rank * ep_size + r
+    for key, tensor in local_sd.items():
+        if _is_routing_3d_param(key):
+            # Shared 3D tensor: gather from all EP ranks.
+            # routing_matrix: [I, O, experts_per_gpu] → cat to [I, O, n_routing]
+            # routing_bias:   [O, experts_per_gpu] → cat to [O, n_routing]
+            expert_dim = tensor.dim() - 1  # last dim is expert dim
 
-        for local_idx in range(experts_per_gpu):
-            global_idx = r * experts_per_gpu + local_idx
+            # All-gather: collect tensors from all EP ranks.
+            gathered = [torch.empty_like(tensor) for _ in range(ep_size)]
+            dist.all_gather(gathered, tensor.contiguous(), group=ep_group)
 
-            # Find all keys for this global expert on the source rank.
-            # We need to broadcast each tensor from rank r to all ranks.
-            if r == ep_rank:
-                # This rank owns this expert; collect keys.
-                for key, tensor in renamed_sd.items():
-                    m = _ROUTING_EXPERT_RE.search(key)
-                    if m and int(m.group(1)) == global_idx:
-                        # Broadcast this tensor from this rank.
-                        tensor = tensor.contiguous().clone()
-                        dist.broadcast(tensor, src=src_global_rank, group=ep_group)
-                        global_sd[key] = tensor
-            else:
-                # This rank doesn't own this expert; receive via broadcast.
-                # We need to know the keys and shapes. Since all ranks have
-                # the same model structure, we can construct the expected keys.
-                # Find local keys that would match this global_idx if we owned it.
-                for key, tensor in renamed_sd.items():
-                    m = _ROUTING_EXPERT_RE.search(key)
-                    if m:
-                        local_idx_in_key = int(m.group(1))
-                        # This key has our ep_rank's global index. We need the
-                        # equivalent key with global_idx instead.
-                        our_global = ep_rank * experts_per_gpu + (
-                            local_idx_in_key - ep_rank * experts_per_gpu
-                        )
-                        # Only process if this local key maps to the same
-                        # "position" (e.g., same expert collection + suffix).
-                        if local_idx_in_key - ep_rank * experts_per_gpu == local_idx:
-                            target_key = _rename_routing_expert_key(
-                                key, local_idx_in_key, global_idx,
-                            )
-                            recv_tensor = torch.empty_like(tensor)
-                            dist.broadcast(recv_tensor, src=src_global_rank, group=ep_group)
-                            global_sd[target_key] = recv_tensor
+            # Concatenate along expert dimension.
+            global_tensor = torch.cat(gathered, dim=expert_dim)
+            global_sd[key] = global_tensor
+        elif _ROUTING_EXPERT_RE.search(key):
+            # Skip _ExpertView sub-module keys (they have no parameters,
+            # but if any slip through, ignore them).
+            pass
+        else:
+            # Non-routing params: same on all ranks.
+            global_sd[key] = tensor
 
     return global_sd
 
@@ -177,16 +132,15 @@ def moe_load_state_dict_from_global(
 ) -> None:
     """Load a global state_dict into a local model with EP resharding.
 
-    Selects the routing experts that belong to this EP rank and renames
-    their global indices to local indices.  Non-routing params are loaded
-    as-is.
+    Selects the routing expert slice that belongs to this EP rank by
+    indexing into the shared 3D tensor's expert dimension.
 
     Parameters
     ----------
     model : torch.nn.Module
         The model to load into.
     global_state_dict : dict
-        State dict with global expert indices (0..n_routing_experts-1).
+        State dict with global routing parameters.
     ep_rank : int
         This GPU's EP rank.
     ep_size : int
@@ -194,20 +148,34 @@ def moe_load_state_dict_from_global(
     experts_per_gpu : int
         Number of routing experts this GPU should hold.
     """
-    n_routing_experts = ep_size * experts_per_gpu
-
     local_sd = OrderedDict()
+
     for key, tensor in global_state_dict.items():
-        m = _ROUTING_EXPERT_RE.search(key)
-        if m:
-            global_idx = int(m.group(1))
-            # Determine which EP rank owns this expert.
-            owner_rank = global_idx // experts_per_gpu
-            if owner_rank == ep_rank:
-                local_idx = global_idx % experts_per_gpu
-                new_key = _rename_routing_expert_key(key, global_idx, local_idx)
-                local_sd[new_key] = tensor
-            # else: skip, belongs to another GPU.
+        if _is_routing_3d_param(key):
+            # Shared 3D tensor: slice out this rank's experts.
+            expert_dim = tensor.dim() - 1
+            start = ep_rank * experts_per_gpu
+            end = start + experts_per_gpu
+            if expert_dim == 2:
+                # routing_matrix: [I, O, n_routing] → [I, O, experts_per_gpu]
+                local_sd[key] = tensor[:, :, start:end].contiguous()
+            elif expert_dim == 1:
+                # routing_bias: [O, n_routing] → [O, experts_per_gpu]
+                local_sd[key] = tensor[:, start:end].contiguous()
+            else:
+                # Fallback: use narrow on last dim
+                local_sd[key] = tensor.narrow(expert_dim, start, experts_per_gpu).contiguous()
+        elif _ROUTING_EXPERT_RE.search(key):
+            # Legacy format: routing_experts.{idx}.mlp.matrix / .bias
+            # Handle by extracting the global index and mapping to local.
+            m = _ROUTING_EXPERT_RE.search(key)
+            if m:
+                global_idx = int(m.group(1))
+                owner_rank = global_idx // experts_per_gpu
+                if owner_rank == ep_rank:
+                    local_idx = global_idx % experts_per_gpu
+                    new_key = _rename_routing_expert_key(key, global_idx, local_idx)
+                    local_sd[new_key] = tensor
         else:
             local_sd[key] = tensor
 
