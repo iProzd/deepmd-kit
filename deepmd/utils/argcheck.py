@@ -4901,6 +4901,16 @@ def validating_args() -> Argument:
         "`1` disables the feature. A value larger than `1` is interpreted as the "
         "starting step after integer conversion."
     )
+    doc_compiled_infer = (
+        "Whether to route eval-time forwards (including full validation) "
+        "through the SeZM `torch.compile` path instead of eager. When `true`, "
+        "this flag is translated into `DP_COMPILE_INFER=1` at trainer "
+        "startup before any model is constructed, which is the env var SeZM "
+        "samples inside `SeZMModel.__init__`. A manually exported "
+        "`DP_COMPILE_INFER` takes precedence over this option. Only "
+        "meaningful when `model.use_compile=true`; has no effect on models "
+        "that do not implement the SeZM-style eval compile path."
+    )
     args = [
         Argument(
             "full_validation",
@@ -4968,6 +4978,13 @@ def validating_args() -> Argument:
             doc=doc_only_pt_supported + doc_full_val_start,
             extra_check=lambda x: x >= 0,
             extra_check_errmsg="must be greater than or equal to 0",
+        ),
+        Argument(
+            "compiled_infer",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_compiled_infer,
         ),
     ]
     return Argument(

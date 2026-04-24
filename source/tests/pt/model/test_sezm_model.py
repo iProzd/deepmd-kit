@@ -454,6 +454,56 @@ class TestSeZMModelCompile(unittest.TestCase):
         model_eval.eval()
         self.assertTrue(model_eval.should_use_compile())
 
+    def test_compile_cache_retains_train_and_eval_slots(self) -> None:
+        """Train and eval compile products must coexist in ``compiled_core_compute_cache``.
+
+        The training loop flips between ``model.train()`` and
+        ``model.eval()`` at every ``disp_freq`` (regular validation) and
+        at every ``validating.validation_freq`` (full / EMA full
+        validation).  A single-slot cache would recompile on every flip
+        and wipe out any gain from ``DP_COMPILE_INFER=1``; this test
+        pins down the multi-slot behavior that makes eval-time compile
+        actually pay off.
+        """
+        coord, atype, box, _, _, _ = self._load_water_frame()
+
+        # DP_COMPILE_INFER is sampled in ``SeZMModel.__init__``, so the
+        # env var must be set at construction time, not just at forward
+        # time.
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model = get_sezm_model(self._build_model_params(use_compile=True))
+        self._randomize_params(model)
+
+        # === Stage 1. Train-mode forward fills the (training=True) slot. ===
+        model.train()
+        model(coord, atype, box=box)
+        train_key = (True, False)
+        eval_key = (False, False)
+        self.assertIn(train_key, model.compiled_core_compute_cache)
+        self.assertNotIn(eval_key, model.compiled_core_compute_cache)
+        callable_train_first = model.compiled_core_compute_cache[train_key]
+
+        # === Stage 2. Eval-mode forward adds the (training=False) slot;
+        # the train slot must not be evicted. ===
+        model.eval()
+        model(coord, atype, box=box)
+        self.assertIn(train_key, model.compiled_core_compute_cache)
+        self.assertIn(eval_key, model.compiled_core_compute_cache)
+        self.assertIs(
+            model.compiled_core_compute_cache[train_key], callable_train_first
+        )
+        callable_eval_first = model.compiled_core_compute_cache[eval_key]
+        self.assertIsNot(callable_train_first, callable_eval_first)
+
+        # === Stage 3. Flip back to train; the cached train callable
+        # must be reused exactly (no retrace, no recompile). ===
+        model.train()
+        model(coord, atype, box=box)
+        self.assertIs(
+            model.compiled_core_compute_cache[train_key], callable_train_first
+        )
+        self.assertIs(model.compiled_core_compute_cache[eval_key], callable_eval_first)
+
     def test_forward_backward_double_backward_matches_compile(self) -> None:
         """
         Check forward, backward, double backward, and short training consistency.
@@ -667,9 +717,19 @@ class TestSeZMModelCompile(unittest.TestCase):
             )
 
         # === Step 3. Each compiled branch owns its own compile cache; the
-        # shared descriptor weights must not collapse them into one. ===
-        c1 = wrapper_cmp.model["water_1"].compiled_core_compute
-        c2 = wrapper_cmp.model["water_2"].compiled_core_compute
+        # shared descriptor weights must not collapse them into one.
+        # Step 2 ran every branch in training mode with the default
+        # ``do_atomic_virial=False``, so each per-branch cache dict
+        # should hold exactly that one slot, and the compiled callables
+        # at that slot must be distinct across branches. ===
+        cache1 = wrapper_cmp.model["water_1"].compiled_core_compute_cache
+        cache2 = wrapper_cmp.model["water_2"].compiled_core_compute_cache
+        self.assertIsNot(cache1, cache2)
+        train_key = (True, False)
+        self.assertIn(train_key, cache1)
+        self.assertIn(train_key, cache2)
+        c1 = cache1[train_key]
+        c2 = cache2[train_key]
         self.assertIsNotNone(c1)
         self.assertIsNotNone(c2)
         self.assertIsNot(c1, c2)

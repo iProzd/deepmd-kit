@@ -479,7 +479,7 @@ def _get_submodule_or_none(root: nn.Module, path: str) -> nn.Module | None:
 
 
 def _clear_sezm_compile_cache(model: nn.Module) -> None:
-    """Invalidate any ``compiled_core_compute`` / ``compiled_dens_compute``.
+    """Invalidate any ``compiled_core_compute_cache`` / ``compiled_dens_compute``.
 
     LoRA injection or merge replaces submodules, which changes the Python
     object graph that ``torch.compile`` had captured.  Without clearing the
@@ -488,16 +488,19 @@ def _clear_sezm_compile_cache(model: nn.Module) -> None:
     :meth:`SeZMModel.reset_head_for_mode`.
     """
     for m in model.modules():
-        if hasattr(m, "compiled_core_compute"):
-            object.__setattr__(m, "compiled_core_compute", None)
-            if hasattr(m, "_core_compute_compiled_train"):
-                m._core_compute_compiled_train = None
-            if hasattr(m, "_core_compute_compiled_atomic_virial"):
-                m._core_compute_compiled_atomic_virial = None
+        core_cache = getattr(m, "compiled_core_compute_cache", None)
+        if isinstance(core_cache, dict):
+            core_cache.clear()
+            if hasattr(m, "_core_compute_pending_compile_t0"):
+                m._core_compute_pending_compile_t0 = None
+            if hasattr(m, "_core_compute_pending_compile_key"):
+                m._core_compute_pending_compile_key = None
         if hasattr(m, "compiled_dens_compute"):
             object.__setattr__(m, "compiled_dens_compute", None)
             if hasattr(m, "_dens_compiled"):
                 m._dens_compiled = False
+            if hasattr(m, "_dens_pending_compile_t0"):
+                m._dens_pending_compile_t0 = None
 
 
 def _swap_submodule(parent: nn.Module, attr: str, new_module: nn.Module) -> None:

@@ -69,12 +69,15 @@ Pipeline for one training batch
               |     |     '-- torch.compile(backend="inductor",
               |     |                        dynamic=True,
               |     |                        options=<locked down>)   (NOTE 6)
-              |     |           stored via object.__setattr__         (NOTE 8)
-              |     '-- compiled_core_compute(...)
+              |     |           stored in compiled_core_compute_cache[key]    (NOTE 8)
+              |     '-- compiled_core_compute_cache[key](...)
               '-- communicate_extended_output
 
-Subsequent batches reuse the cached ``compiled_core_compute`` until the
-cache key ``(training, do_atomic_virial)`` changes (NOTE 7).
+Subsequent batches look up the cached callable at the same
+``(training, do_atomic_virial)`` slot of ``compiled_core_compute_cache``.  Each
+slot is retained independently, so train <-> eval toggles around every
+``disp_freq`` / full-validation checkpoint reuse the other slot's
+compile product instead of evicting it (NOTE 7).
 
 Body of the traced compute
 ==========================
@@ -260,8 +263,8 @@ configured with:
       #178080, #179494.  All three manifest only under data-dependent
       symbolic shapes -- exactly our edge count.
 
-NOTE 7 -- Compile cache keyed on ``(training, do_atomic_virial)``
------------------------------------------------------------------
+NOTE 7 -- Multi-slot compile cache keyed on ``(training, do_atomic_virial)``
+----------------------------------------------------------------------------
 
 Both flags alter the traced graph topology:
 
@@ -271,21 +274,38 @@ Both flags alter the traced graph topology:
 * ``do_atomic_virial`` adds or removes an extra per-atom virial tensor
   in the compute output.
 
-No single compiled graph can serve both variants, so the cache keeps
-the last ``(training, do_atomic_virial)`` pair and retraces +
-recompiles whenever either flag flips.
+No single compiled graph can serve both variants, so the cache is a
+``dict[tuple[bool, bool], Callable]`` named ``compiled_core_compute_cache``,
+one slot per ``(training, do_atomic_virial)`` pair.  A single-slot
+cache would have to evict on every flip, which turns the normal
+training-loop pattern -- ``train -> eval at every disp_freq -> train``
+and an occasional full validation on top of that -- into
+two-recompile-per-disp_freq thrashing (each recompile costs tens of
+seconds to minutes on SeZM).  With multi-slot caching the first
+encounter of each mode pays the compile cost once, and every later
+toggle is a dict lookup.
 
-NOTE 8 -- Storing the compiled callable outside the ``nn.Module`` tree
-----------------------------------------------------------------------
+Enabling compile for eval is an opt-in via ``DP_COMPILE_INFER=1``
+(``should_use_compile`` returns ``_env_use_compile_infer`` when
+``self.training`` is ``False``).  Once enabled, regular validation,
+full validation and EMA full validation all reuse the eval slot.
 
-The assignment goes through ``object.__setattr__(self, ...)`` rather
-than plain ``self.compiled_core_compute = ...``.
+NOTE 8 -- Storing the compile cache outside the ``nn.Module`` tree
+------------------------------------------------------------------
+
+The cache dict is installed via ``object.__setattr__(self, ...)`` at
+__init__ time rather than plain ``self.compiled_core_compute_cache = {}``, and
+every later mutation writes into that same dict in place.
 ``nn.Module.__setattr__`` would register any module-looking value as a
-submodule; the compiled wrapper holds duplicated flat views of the
-trainable parameters, and FSDP2 / DDP would then shard or synchronise
-those duplicates and silently corrupt training.  Escaping the
-``nn.Module`` machinery keeps the wrapper a plain Python attribute
-invisible to parameter discovery.
+submodule; the compiled wrappers held as *values* of this dict carry
+duplicated flat views of the trainable parameters, and FSDP2 / DDP
+would then shard or synchronise those duplicates and silently corrupt
+training.  A plain ``dict`` container escapes parameter discovery
+entirely because ``nn.Module.__setattr__`` only recognises
+``nn.Parameter`` / ``nn.Module`` values, and ``named_parameters`` /
+``named_modules`` walk ``self._parameters`` / ``self._modules``, never
+arbitrary attributes; ``object.__setattr__`` merely belt-and-braces
+this invariant for readers of the constructor.
 
 NOTE 9 -- Graph restart via ``detach().requires_grad_(True)``
 -------------------------------------------------------------
@@ -402,7 +422,7 @@ os.environ.setdefault("TORCHINDUCTOR_MAX_AUTOTUNE_REPORT_CHOICES_STATS", "0")
 os.environ.setdefault("TRITON_PRINT_AUTOTUNING", "0")
 
 # NOTE: Disable DDPOptimizer graph splitting globally.
-# ``compiled_core_compute`` / ``compiled_dens_compute`` are inner
+# ``compiled_core_compute_cache`` entries / ``compiled_dens_compute`` are inner
 # ``torch.compile`` calls sitting *inside* a DDP-wrapped model;
 # DDPOptimizer assumes it sees the *whole* model and splits the FX graph
 # at DDP bucket boundaries.  For an inner submodule that heuristic
@@ -567,11 +587,17 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # LoRA injection happens in Trainer.__init__ after pre-trained state is loaded.
         self.lora_config: dict[str, Any] | None = None if lora is None else dict(lora)
         self._dens_compiled = False
-        self._core_compute_compiled_train: bool | None = None
-        self._core_compute_compiled_atomic_virial: bool | None = None
+        self._core_compute_pending_compile_t0: float | None = None
+        self._core_compute_pending_compile_key: tuple[bool, bool] | None = None
+        self._dens_pending_compile_t0: float | None = None
         # Store compiled callables outside the nn.Module tree so that
         # FSDP2 / DDP do not shard or sync its duplicated parameters.
-        object.__setattr__(self, "compiled_core_compute", None)
+        # ``compiled_core_compute_cache`` is a dict keyed on
+        # ``(training, do_atomic_virial)`` so every (mode, output-shape)
+        # variant has its own slot; flipping between train and eval for
+        # validation -- regular, full, or EMA full -- therefore reuses
+        # cached compile products instead of evicting the other mode.
+        object.__setattr__(self, "compiled_core_compute_cache", {})
         object.__setattr__(self, "compiled_dens_compute", None)
         # Training follows `use_compile`. Evaluation/inference reads
         # `DP_COMPILE_INFER` at init time and falls back to eager when unset.
@@ -798,6 +824,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                                 fparam=fp,
                                 aparam=ap,
                             )
+                        if self._dens_pending_compile_t0 is not None:
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            log.info(
+                                "SeZM: finished compiling dens path in %.2fs",
+                                time.perf_counter() - self._dens_pending_compile_t0,
+                            )
+                            self._dens_pending_compile_t0 = None
                 else:
                     with nvtx_range("SeZM/core_compute_dens"):
                         compute_ret = self.core_compute_dens(
@@ -845,23 +879,21 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                         device=cc.device,
                     )
                     with self.tf32_precision_ctx():
-                        # NOTE: Compile cache is keyed on
+                        # NOTE: Compile cache is a dict keyed on
                         # ``(training, do_atomic_virial)``.  Both flags
                         # change the traced graph topology:
                         # ``training`` toggles ``create_graph`` in
                         # ``fit_output_to_model_output`` and therefore
                         # the entire second-derivative branch;
                         # ``do_atomic_virial`` pulls an extra per-atom
-                        # virial tensor into the outputs.  A single
-                        # compiled graph cannot serve both shapes, so we
-                        # retrace + recompile whenever either flag
-                        # flips.
-                        if (
-                            self.compiled_core_compute is None
-                            or self._core_compute_compiled_train != self.training
-                            or self._core_compute_compiled_atomic_virial
-                            != do_atomic_virial
-                        ):
+                        # virial tensor into the outputs.  Each slot is
+                        # retained independently, so the common
+                        # train->eval->train cycle around every
+                        # disp_freq / full-validation checkpoint reuses
+                        # the already-compiled callable of whichever
+                        # mode is re-entered, instead of evicting it.
+                        cache_key = (bool(self.training), bool(do_atomic_virial))
+                        if cache_key not in self.compiled_core_compute_cache:
                             self.trace_and_compile(
                                 extended_coord,
                                 extended_atype,
@@ -871,8 +903,11 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                                 ap,
                                 do_atomic_virial,
                             )
+                        compiled_core_compute = self.compiled_core_compute_cache[
+                            cache_key
+                        ]
                         with nvtx_range("SeZM/core_compute"):
-                            model_predict_lower = self.compiled_core_compute(
+                            model_predict_lower = compiled_core_compute(
                                 extended_coord,
                                 extended_atype,
                                 nlist,
@@ -880,6 +915,22 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                                 fp,
                                 ap,
                             )
+                        if (
+                            self._core_compute_pending_compile_t0 is not None
+                            and self._core_compute_pending_compile_key == cache_key
+                        ):
+                            if torch.cuda.is_available():
+                                torch.cuda.synchronize()
+                            log.info(
+                                "SeZM: finished compiling "
+                                "(mode=%s, do_atomic_virial=%s) in %.2fs",
+                                "train" if self.training else "eval",
+                                do_atomic_virial,
+                                time.perf_counter()
+                                - self._core_compute_pending_compile_t0,
+                            )
+                            self._core_compute_pending_compile_t0 = None
+                            self._core_compute_pending_compile_key = None
                 else:
                     with nvtx_range("SeZM/core_compute"):
                         model_predict_lower = self.core_compute(
@@ -1396,8 +1447,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
         mode = "train" if self.training else "eval"
         log.info(
-            "SeZM: start tracing and compiling core_compute "
-            "(mode=%s, do_atomic_virial=%s)",
+            "SeZM: start tracing and compiling (mode=%s, do_atomic_virial=%s)",
             mode,
             do_atomic_virial,
         )
@@ -1562,39 +1612,37 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             compile_options["max_fusion_size"] = 8
             compile_options["triton.persistent_reductions"] = False
 
-        # NOTE: Store the compiled callable via ``object.__setattr__``.
-        # Plain ``self.compiled_core_compute = ...`` would go through
-        # ``nn.Module.__setattr__`` and register the compile wrapper as
-        # a submodule; the wrapper carries duplicated flat views of the
-        # trainable parameters, and FSDP2/DDP would then shard or
-        # synchronise those duplicates and silently corrupt training.
-        # Escaping the ``nn.Module`` machinery keeps the wrapper a plain
-        # Python attribute invisible to parameter discovery.
-        object.__setattr__(
-            self,
-            "compiled_core_compute",
-            # NOTE: ``dynamic=True`` emits a single kernel per traced
-            # shape symbol, so changes in ``nframes``, ``nall`` or edge
-            # count do not trigger recompiles; and the option dict above
-            # disables every Inductor/Triton feature that has ever
-            # interacted badly with ``make_fx`` + double backward in
-            # this project.
-            torch.compile(
-                traced,
-                backend="inductor",
-                dynamic=True,
-                options=compile_options,
-            ),
+        # NOTE: Store the compiled callable inside the plain-``dict``
+        # cache ``compiled_core_compute_cache``.  The dict itself was installed
+        # via ``object.__setattr__`` at __init__ time so that
+        # ``nn.Module.__setattr__`` never saw any of this; mutating the
+        # dict in place afterwards keeps the compile wrappers hidden
+        # from parameter discovery (FSDP2/DDP would otherwise shard or
+        # synchronise the wrapper's duplicated flat parameter views and
+        # silently corrupt training).  The cache is keyed on
+        # ``(training, do_atomic_virial)`` so that train-mode and
+        # eval-mode compile products can coexist without evicting each
+        # other on every ``model.eval()`` / ``model.train()`` switch.
+        cache_key = (bool(self.training), bool(do_atomic_virial))
+        # NOTE: ``dynamic=True`` emits a single kernel per traced
+        # shape symbol, so changes in ``nframes``, ``nall`` or edge
+        # count do not trigger recompiles; and the option dict above
+        # disables every Inductor/Triton feature that has ever
+        # interacted badly with ``make_fx`` + double backward in
+        # this project.
+        self.compiled_core_compute_cache[cache_key] = torch.compile(
+            traced,
+            backend="inductor",
+            dynamic=True,
+            options=compile_options,
         )
-        self._core_compute_compiled_train = self.training
-        self._core_compute_compiled_atomic_virial = do_atomic_virial
-        log.info(
-            "SeZM: finished compiling core_compute "
-            "(mode=%s, do_atomic_virial=%s) in %.2fs",
-            mode,
-            do_atomic_virial,
-            time.perf_counter() - _compile_t0,
-        )
+        # torch.compile is lazy; the "finished" log is emitted after the
+        # first call triggers Inductor lowering (see forward_common).
+        # ``pending_key`` pairs with ``pending_t0`` so the log is only
+        # printed once, by the forward that actually triggers lowering
+        # for *this* cache slot -- other slots may still be pending.
+        self._core_compute_pending_compile_t0 = _compile_t0
+        self._core_compute_pending_compile_key = cache_key
 
     def compile_dens(self) -> None:
         """Compile the direct-force `dens` path."""
@@ -1623,10 +1671,9 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             ),
         )
         self._dens_compiled = True
-        log.info(
-            "SeZM: finished compiling dens path in %.2fs",
-            time.perf_counter() - _compile_t0,
-        )
+        # torch.compile is lazy; the "finished" log is emitted after the
+        # first call triggers Inductor lowering (see forward_common).
+        self._dens_pending_compile_t0 = _compile_t0
 
     def should_use_compile(self) -> bool:
         """Return whether the current forward should use the compile path."""
@@ -1992,11 +2039,14 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self.atomic_model.reset_head_for_mode(mode)
         if mode == "dens":
             self._dens_compiled = False
+            self._dens_pending_compile_t0 = None
             object.__setattr__(self, "compiled_dens_compute", None)
         else:
-            self._core_compute_compiled_train = None
-            self._core_compute_compiled_atomic_virial = None
-            object.__setattr__(self, "compiled_core_compute", None)
+            self._core_compute_pending_compile_t0 = None
+            self._core_compute_pending_compile_key = None
+            # Drop every (training, do_atomic_virial) slot so the next
+            # forward retraces against the reinitialised fitting head.
+            self.compiled_core_compute_cache.clear()
 
     def translated_output_def(self) -> dict[str, Any]:
         """

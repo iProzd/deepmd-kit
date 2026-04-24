@@ -91,6 +91,7 @@ from .sezm_nn import (
     fold_lora_state_dict_keys,
     get_promoted_dtype,
     get_so3_dim_of_lmax,
+    has_lora,
     np_safe,
     nvtx_range,
     resolve_s2_grid_resolution,
@@ -1675,9 +1676,25 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         keys are then removed so the load proceeds as if the checkpoint
         were a plain SeZM.  This enables resume, finetune, and full-train
         from any LoRA checkpoint without manual merging.
+
+        When the current descriptor is itself LoRA-injected, however, the
+        incoming ``A_*`` / ``B_*`` / ``lora_scaling`` tensors are
+        first-class parameters this descriptor already owns, *not*
+        redundant adapters to be folded away.  Folding in that case would
+        consume the LoRA keys and then ``super()._load_from_state_dict``
+        would report them as ``Missing key(s)`` against the target
+        module.  ``has_lora(self)`` gates the fold step so the
+        LoRA-to-plain merge still runs when appropriate, while
+        LoRA-to-LoRA loads (full training, ckpt resume, tests, and
+        cross-instance copies via ``model_a.load_state_dict(
+        model_b.state_dict())``) pass the adapter keys through
+        unchanged.
         """
         # === Step 1. Fold any LoRA keys into base weights ===
-        fold_lora_state_dict_keys(state_dict, prefix)
+        # Only fold when the current descriptor has no LoRA adapters
+        # (see docstring).
+        if not has_lora(self):
+            fold_lora_state_dict_keys(state_dict, prefix)
 
         # === Step 2. Drop transient descriptor state rebuilt at construction ===
         expected_keys = {prefix + key for key in self.state_dict().keys()}

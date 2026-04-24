@@ -3,6 +3,7 @@ import datetime
 import functools
 import json
 import logging
+import os
 import time
 from collections.abc import (
     Callable,
@@ -176,6 +177,19 @@ class Trainer:
         model_params = config["model"]
         training_params = config["training"]
         optimizer_params = config.get("optimizer", {})
+
+        # NOTE: Translate ``validating.compiled_infer`` (input.json opt-in)
+        # into the ``DP_COMPILE_INFER`` environment variable *before* any
+        # model is constructed below.  SeZMModel samples this env var
+        # exactly once inside its __init__ (see ``_env_use_compile_infer``
+        # in ``deepmd/pt/model/model/sezm_model.py``) and uses the cached
+        # value to decide whether eval / full-validation forwards take
+        # the compile path.  Setting it later would be silently ignored
+        # for the rest of the run.  ``setdefault`` preserves any explicit
+        # shell-level override so a user who manually exported
+        # ``DP_COMPILE_INFER`` (either direction) stays in control.
+        if bool((config.get("validating") or {}).get("compiled_infer", False)):
+            os.environ.setdefault("DP_COMPILE_INFER", "1")
         self.multi_task = "model_dict" in model_params
         self.finetune_links = finetune_links
         self.finetune_update_stat = False

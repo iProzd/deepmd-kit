@@ -139,14 +139,15 @@
     "_comment": "that's all"
   },
   "validating": {
-    "full_validation": false,
-    "ema_full_validation": false,
+    "full_validation": true,
+    "ema_full_validation": true,
     "validation_freq": 100,
     "save_best": true,
     "max_best_ckpt": 1,
     "validation_metric": "E:MAE",
     "full_val_file": "val.log",
-    "full_val_start": 0.5,
+    "full_val_start": 100,
+    "compiled_infer": true,
     "_comment": "that's all"
   }
 }
