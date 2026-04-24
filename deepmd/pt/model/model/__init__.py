@@ -318,21 +318,37 @@ def get_sezm_model(model_params: dict) -> BaseModel:
 
     fitting_net = copy.deepcopy(model_params["fitting_net"])
     fitting_net.pop("type", None)
+    fitting_net["ntypes"] = descriptor.get_ntypes()
+    fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
+    fitting_net["mixed_types"] = descriptor.mixed_types()
+    fitting_net["dim_descrpt"] = descriptor.get_dim_out()
     neuron = fitting_net.get("neuron")
     if neuron is not None:
         resolved_neuron = [int(width) for width in neuron]
         if any(width < 0 for width in resolved_neuron):
             raise ValueError("`fitting_net.neuron` entries must be >= 0")
         if 0 in resolved_neuron:
-            channels = int(descriptor.channels)
-            resolved_width = int(32 * math.ceil((8.0 * float(channels) / 3.0) / 32.0))
+            # NOTE: Heuristic GLU hidden width = round_to_32(8/3 * in_dim).
+            # ``in_dim`` mirrors ``GeneralFitting`` / ``SeZMEnergyFittingNet``
+            # forward input width: descriptor features + fparam + aparam
+            # (unless used as mask) + case embedding.  Using ``channels``
+            # alone would ignore those extras and under-size the hidden
+            # layer in multi-task runs with ``dim_case_embd > 0`` or when
+            # frame / atomic parameters are configured.
+            dim_in = (
+                int(descriptor.get_dim_out())
+                + int(fitting_net.get("numb_fparam", 0))
+                + (
+                    0
+                    if bool(fitting_net.get("use_aparam_as_mask", False))
+                    else int(fitting_net.get("numb_aparam", 0))
+                )
+                + int(fitting_net.get("dim_case_embd", 0))
+            )
+            resolved_width = int(32 * math.ceil((8.0 * float(dim_in) / 3.0) / 32.0))
             fitting_net["neuron"] = [
                 resolved_width if width == 0 else width for width in resolved_neuron
             ]
-    fitting_net["ntypes"] = descriptor.get_ntypes()
-    fitting_net["type_map"] = copy.deepcopy(model_params["type_map"])
-    fitting_net["mixed_types"] = descriptor.mixed_types()
-    fitting_net["dim_descrpt"] = descriptor.get_dim_out()
     fitting = SeZMEnergyFittingNet(**fitting_net)
     atom_exclude_types = model_params.get("atom_exclude_types", [])
     pair_exclude_types = model_params.get("pair_exclude_types", [])

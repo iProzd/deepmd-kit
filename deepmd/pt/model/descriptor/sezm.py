@@ -1413,7 +1413,58 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     def share_params(
         self, base_class: Any, shared_level: int, resume: bool = False
     ) -> None:
-        raise NotImplementedError("share_params is not supported for SeZM")
+        """
+        Share the parameters of self to the base_class with shared_level during multitask training.
+
+        SeZM does not rely on running mean/stddev statistics in ``forward``
+        (``EquivariantRMSNorm`` is used instead), so only submodules and
+        the optional FiLM strength parameters need to be linked.
+
+        Parameters
+        ----------
+        base_class
+            The base class to share parameters with. Must be the same class as self.
+
+        shared_level
+            The level of sharing.
+
+            - ``0``: share every learnable submodule and FiLM strength parameter
+              (type_embedding, env_seed_embedding, film_*_norm,
+              film_*_strength_log, radial_basis, radial_embedding,
+              edge_envelope, wigner_calc, gie, blocks, final_*_attn_res,
+              output_ffn).
+            - ``1``: share only ``type_embedding``.
+
+        resume
+            Unused for SeZM; kept for interface compatibility.
+
+        Raises
+        ------
+        NotImplementedError
+            If ``shared_level`` is not ``0`` or ``1``.
+        """
+        del resume
+        assert self.__class__ == base_class.__class__, (
+            "Only descriptors of the same type can share params!"
+        )
+        if shared_level == 0:
+            # NOTE: ``nn.Module.__setattr__`` routes plain assignment of a
+            # child ``nn.Module`` through the ``_modules`` dict, so iterating
+            # that dict covers every learnable submodule registered by
+            # ``__init__`` (type_embedding, env_seed_embedding, film norms,
+            # radial_*, edge_envelope, wigner_calc, gie, blocks, final attn
+            # residuals, output_ffn).  Raw ``nn.Parameter`` attributes
+            # (``film_*_strength_log``) live in ``_parameters`` instead and
+            # are linked explicitly below.
+            for item in self._modules:
+                self._modules[item] = base_class._modules[item]
+            for name in ("film_scale_strength_log", "film_shift_strength_log"):
+                if self._parameters.get(name) is not None:
+                    self._parameters[name] = base_class._parameters[name]
+        elif shared_level == 1:
+            self._modules["type_embedding"] = base_class._modules["type_embedding"]
+        else:
+            raise NotImplementedError
 
     def enable_compression(
         self,

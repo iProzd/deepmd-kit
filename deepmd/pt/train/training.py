@@ -925,33 +925,31 @@ class Trainer:
                 data_stat_protect=_data_stat_protect[0],
             )
 
-        # LoRA adapter injection for SeZM.
+        # LoRA injection (single-task only; argcheck rejects multi-task).
         self._lora_enabled = False
-        for _mkey in self.model_keys:
-            _branch_params = (
-                model_params["model_dict"][_mkey] if self.multi_task else model_params
-            )
-            _lora_cfg = _branch_params.get("lora")
-            if _lora_cfg is None:
-                continue
-            _branch_model = self.wrapper.model[_mkey]
-            if not isinstance(_branch_model, SeZMModel):
-                log.warning(
-                    f"[LoRA] skipping branch {_mkey}: model is not SeZMModel; "
-                    "LoRA fine-tuning is only supported for SeZM."
-                )
-                continue
-            apply_lora_to_sezm(
-                _branch_model,
-                rank=int(_lora_cfg["rank"]),
-                alpha=_lora_cfg.get("alpha"),
-            )
-            self._lora_enabled = True
-            log.info(
-                f"[LoRA] injected into branch {_mkey}: "
-                f"rank={_lora_cfg['rank']}, "
-                f"alpha={_lora_cfg.get('alpha', _lora_cfg['rank'])}"
-            )
+        if not self.multi_task:
+            _lora_cfg = model_params.get("lora")
+            if _lora_cfg is not None:
+                # "Default" is the fixed key ModelWrapper assigns to the sole
+                # single-task model (see wrapper.py); finetune `--model-branch`
+                # has already selected pretrained weights for this slot.
+                _branch_model = self.wrapper.model["Default"]
+                if not isinstance(_branch_model, SeZMModel):
+                    log.warning(
+                        "[LoRA] skipping: model is not SeZMModel; "
+                        "LoRA fine-tuning is only supported for SeZM."
+                    )
+                else:
+                    apply_lora_to_sezm(
+                        _branch_model,
+                        rank=int(_lora_cfg["rank"]),
+                        alpha=_lora_cfg.get("alpha"),
+                    )
+                    self._lora_enabled = True
+                    log.info(
+                        f"[LoRA] injected: rank={_lora_cfg['rank']}, "
+                        f"alpha={_lora_cfg.get('alpha', _lora_cfg['rank'])}"
+                    )
 
         if self.is_distributed:
             torch.cuda.set_device(LOCAL_RANK)

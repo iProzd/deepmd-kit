@@ -562,6 +562,125 @@ class TestSeZMModelCompile(unittest.TestCase):
                 grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
 
+    def test_multitask_compile_matches_eager(self) -> None:
+        """
+        Multi-task + compile: two SeZM branches sharing descriptor and
+        fitting (with per-task case embedding) should each compile correctly
+        and produce outputs matching their eager counterparts.
+        """
+        from deepmd.pt.train.training import (
+            get_model_for_wrapper,
+            prepare_model_for_loss,
+        )
+        from deepmd.pt.train.wrapper import (
+            ModelWrapper,
+        )
+        from deepmd.pt.utils.multi_task import (
+            preprocess_shared_params,
+        )
+
+        # === Step 1. Build a multi-task model config with shared descriptor
+        # + shared fitting (case_embd=2) seeded from the compile fixture. ===
+        def _make_mt_cfg(use_compile: bool) -> dict:
+            single = self._build_model_params(use_compile=use_compile)
+            fitting_shared = dict(single["fitting_net"])
+            fitting_shared["type"] = "sezm_ener"
+            fitting_shared["dim_case_embd"] = 2
+            return {
+                "use_compile": use_compile,
+                "shared_dict": {
+                    "type_map": single["type_map"],
+                    "descriptor": single["descriptor"],
+                    "shared_fit": fitting_shared,
+                },
+                "model_dict": {
+                    "water_1": {
+                        "type": "SeZM",
+                        "type_map": "type_map",
+                        "descriptor": "descriptor",
+                        "fitting_net": "shared_fit",
+                    },
+                    "water_2": {
+                        "type": "SeZM",
+                        "type_map": "type_map",
+                        "descriptor": "descriptor",
+                        "fitting_net": "shared_fit",
+                    },
+                },
+            }
+
+        def _build_wrapper(use_compile: bool) -> ModelWrapper:
+            mt_cfg = _make_mt_cfg(use_compile)
+            # ``preprocess_shared_params`` cascades the top-level
+            # ``use_compile`` into every branch before unrolling the
+            # shared_dict, mirroring the real training flow.
+            mt_cfg, shared_links = preprocess_shared_params(mt_cfg)
+            loss_params = {
+                "water_1": {"type": "ener"},
+                "water_2": {"type": "ener"},
+            }
+            models = get_model_for_wrapper(mt_cfg, _loss_params=loss_params)
+            prepare_model_for_loss(models, loss_params)
+            wrapper = ModelWrapper(models)
+            wrapper.share_params(shared_links, {"water_1": 0.5, "water_2": 0.5})
+            return wrapper
+
+        wrapper_eager = _build_wrapper(use_compile=False)
+        self._randomize_params(wrapper_eager)
+        wrapper_cmp = _build_wrapper(use_compile=True)
+        # Mirror eager weights so the only remaining difference between the
+        # two wrappers is the compile path.
+        wrapper_cmp.load_state_dict(wrapper_eager.state_dict())
+
+        # Sanity: descriptor and fitting parameters are shared across branches
+        # inside each wrapper.
+        for w in (wrapper_eager, wrapper_cmp):
+            d1 = w.model["water_1"].get_descriptor()
+            d2 = w.model["water_2"].get_descriptor()
+            self.assertEqual(
+                next(d1.parameters()).data_ptr(),
+                next(d2.parameters()).data_ptr(),
+            )
+            f1 = w.model["water_1"].atomic_model.fitting_net
+            f2 = w.model["water_2"].atomic_model.fitting_net
+            self.assertEqual(
+                next(f1.filter_layers.parameters()).data_ptr(),
+                next(f2.filter_layers.parameters()).data_ptr(),
+            )
+            # Per-task case embeddings remain distinct.
+            self.assertFalse(torch.equal(f1.case_embd, f2.case_embd))
+
+        # === Step 2. Run compile + eager forward on each branch. ===
+        coord, atype, box, _, _, _ = self._load_water_frame()
+        for branch in ("water_1", "water_2"):
+            m_eager = wrapper_eager.model[branch]
+            m_cmp = wrapper_cmp.model[branch]
+            m_eager.train()
+            m_cmp.train()
+            out_e = m_eager(coord, atype, box=box)
+            out_c = m_cmp(coord, atype, box=box)
+            torch.testing.assert_close(
+                out_e["energy"], out_c["energy"], atol=1.0e-6, rtol=1.0e-6
+            )
+            torch.testing.assert_close(
+                out_e["force"], out_c["force"], atol=1.0e-6, rtol=1.0e-6
+            )
+
+        # === Step 3. Each compiled branch owns its own compile cache; the
+        # shared descriptor weights must not collapse them into one. ===
+        c1 = wrapper_cmp.model["water_1"].compiled_core_compute
+        c2 = wrapper_cmp.model["water_2"].compiled_core_compute
+        self.assertIsNotNone(c1)
+        self.assertIsNotNone(c2)
+        self.assertIsNot(c1, c2)
+
+        # === Step 4. Per-task case embedding must differentiate outputs. ===
+        out_e1 = wrapper_eager.model["water_1"](coord, atype, box=box)
+        out_e2 = wrapper_eager.model["water_2"](coord, atype, box=box)
+        self.assertFalse(
+            torch.allclose(out_e1["energy"], out_e2["energy"], atol=1.0e-8)
+        )
+
 
 class TestInterPotential(unittest.TestCase):
     """Test InterPotential ZBL analytical pair potential."""

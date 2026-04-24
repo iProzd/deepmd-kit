@@ -2875,7 +2875,13 @@ def sezm_model_args() -> Argument:
                 optional=True,
                 default=None,
                 doc=doc_only_pt_supported
-                + "Low-rank adaptation for fine-tuning. When set, backbone SO3Linear and "
+                + "Low-rank adaptation for fine-tuning. Single-task only; "
+                "setting this in a multi-task input (top-level or per-branch) "
+                "raises an error in `preprocess_shared_params` because "
+                "`share_params` links descriptor modules across branches to "
+                "the same object, which would collapse per-branch LoRA into "
+                "one shared adapter. "
+                "When set, backbone SO3Linear and "
                 "SO2Linear weights are frozen and low-rank A/B adapters are injected "
                 "alongside them (the adapters share the base shape family so HybridMuon's "
                 "slice route applies identically). fitting_net, env_seed_embedding, "
@@ -5157,6 +5163,27 @@ def gen_json_schema(multi_task: bool = False) -> str:
     return json.dumps(generate_json_schema(arg))
 
 
+def validate_no_multitask_lora(data: dict[str, Any], multi_task: bool = False) -> None:
+    """Reject ``lora`` in multi-task configs.
+
+    In multi-task training `share_params` aliases descriptor modules across
+    branches to the same Python object, so a per-branch LoRA injection would
+    silently collapse into one global adapter. Catch this at config time
+    rather than letting a confusing shared-adapter model slip through.
+    """
+    if not multi_task:
+        return
+    model_dict = (data.get("model") or {}).get("model_dict") or {}
+    for branch_key, branch in model_dict.items():
+        if branch.get("lora") is not None:
+            raise ValueError(
+                f"`lora` is only supported in single-task training; found in "
+                f"branch '{branch_key}' (or inherited from the top-level "
+                f"`model` cascade). Remove the `lora` entry, or switch to a "
+                f"single-task input."
+            )
+
+
 def normalize(
     data: dict[str, Any], multi_task: bool = False, *, check: bool = True
 ) -> dict[str, Any]:
@@ -5166,6 +5193,7 @@ def normalize(
     if check:
         base.check_value(data, strict=True)
     validate_full_validation_config(data, multi_task=multi_task)
+    validate_no_multitask_lora(data, multi_task=multi_task)
 
     return data
 
