@@ -635,6 +635,30 @@ class SeZMAtomicModel(DPAtomicModel):
             return active_fitting.get_default_fparam()
         return super().get_default_fparam()
 
+    def has_chg_spin_ebd(self) -> bool:
+        """Return whether charge/spin condition embedding is enabled."""
+        return bool(getattr(self.descriptor, "add_chg_spin_ebd", False))
+
+    def get_dim_chg_spin(self) -> int:
+        """Return charge/spin condition width."""
+        if self.has_chg_spin_ebd() and hasattr(self.descriptor, "get_dim_chg_spin"):
+            return self.descriptor.get_dim_chg_spin()
+        return 0
+
+    def has_default_chg_spin(self) -> bool:
+        """Return whether default charge/spin conditions are configured."""
+        if self.has_chg_spin_ebd() and hasattr(self.descriptor, "has_default_chg_spin"):
+            return self.descriptor.has_default_chg_spin()
+        return False
+
+    def get_default_chg_spin(self) -> torch.Tensor | None:
+        """Return default charge/spin conditions as a tensor."""
+        if self.has_chg_spin_ebd() and hasattr(self.descriptor, "get_default_chg_spin"):
+            default_chg_spin = self.descriptor.get_default_chg_spin()
+            if default_chg_spin is not None:
+                return self.out_std.new_tensor(default_chg_spin)
+        return None
+
     def get_dim_aparam(self) -> int:
         """Return atomic-parameter width of the active SeZM branch."""
         active_fitting = self.get_active_fitting_net()

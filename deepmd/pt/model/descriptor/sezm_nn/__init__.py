@@ -37,6 +37,7 @@ from .edge_cache import (
     edge_cache_to_dtype,
 )
 from .embedding import (
+    ChargeSpinEmbedding,
     EnvironmentInitialEmbedding,
     GeometricInitialEmbedding,
     SeZMTypeEmbedding,
@@ -111,6 +112,7 @@ __all__ = [
     "BridgingSwitch",
     "C3CutoffEnvelope",
     "ChannelLinear",
+    "ChargeSpinEmbedding",
     "DepthAttnRes",
     "EdgeFeatureCache",
     "EnvironmentInitialEmbedding",

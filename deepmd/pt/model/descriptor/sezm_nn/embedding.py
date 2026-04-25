@@ -613,3 +613,87 @@ class EnvironmentInitialEmbedding(nn.Module):
         }
         obj.load_state_dict(state)
         return obj
+
+
+class ChargeSpinEmbedding(nn.Module):
+    """
+    Frame-level charge and spin embedding for scalar type features.
+
+    Parameters
+    ----------
+    embed_dim
+        Embedding dimension.
+    activation_function
+        Activation function used by the mixing layer.
+    dtype
+        Parameter dtype.
+    seed
+        Random seed for initialization.
+    trainable
+        Whether parameters are trainable.
+    """
+
+    def __init__(
+        self,
+        *,
+        embed_dim: int,
+        activation_function: str,
+        dtype: torch.dtype,
+        seed: int | list[int] | None = None,
+        trainable: bool,
+    ) -> None:
+        super().__init__()
+        self.embed_dim = int(embed_dim)
+        self.activation_function = str(activation_function)
+        self.dtype = dtype
+        self.precision = RESERVED_PRECISION_DICT[dtype]
+        if self.embed_dim <= 0:
+            raise ValueError("`embed_dim` must be positive")
+
+        self.charge_embedding = SeZMTypeEmbedding(
+            ntypes=200,
+            embed_dim=self.embed_dim,
+            dtype=self.dtype,
+            seed=child_seed(seed, 0),
+            trainable=trainable,
+            padding=False,
+        )
+        self.spin_embedding = SeZMTypeEmbedding(
+            ntypes=100,
+            embed_dim=self.embed_dim,
+            dtype=self.dtype,
+            seed=child_seed(seed, 1),
+            trainable=trainable,
+            padding=False,
+        )
+        self.mix_layer = MLPLayer(
+            2 * self.embed_dim,
+            self.embed_dim,
+            activation_function=self.activation_function,
+            precision=self.precision,
+            seed=child_seed(seed, 2),
+            trainable=trainable,
+        )
+
+        for p in self.parameters():
+            p.requires_grad = trainable
+
+    def forward(self, charge_spin: torch.Tensor) -> torch.Tensor:
+        """
+        Embed frame-level charge and spin.
+
+        Parameters
+        ----------
+        charge_spin
+            Frame charge and spin values with shape (nf, 2).
+
+        Returns
+        -------
+        torch.Tensor
+            Mixed condition embedding with shape (nf, embed_dim).
+        """
+        charge = charge_spin[:, 0].to(dtype=torch.int64) + 100
+        spin = charge_spin[:, 1].to(dtype=torch.int64)
+        charge_embed = self.charge_embedding(charge)
+        spin_embed = self.spin_embedding(spin)
+        return self.mix_layer(torch.cat((charge_embed, spin_embed), dim=-1))

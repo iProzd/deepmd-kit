@@ -74,10 +74,10 @@ Pipeline for one training batch
               '-- communicate_extended_output
 
 Subsequent batches look up the cached callable at the same
-``(training, do_atomic_virial)`` slot of ``compiled_core_compute_cache``.  Each
-slot is retained independently, so train <-> eval toggles around every
-``disp_freq`` / full-validation checkpoint reuse the other slot's
-compile product instead of evicting it (NOTE 7).
+``(training, do_atomic_virial, has_coord_corr)`` slot of
+``compiled_core_compute_cache``.  Each slot is retained independently, so
+train <-> eval toggles around every ``disp_freq`` / full-validation checkpoint
+reuse the other slot's compile product instead of evicting it (NOTE 7).
 
 Body of the traced compute
 ==========================
@@ -263,20 +263,23 @@ configured with:
       #178080, #179494.  All three manifest only under data-dependent
       symbolic shapes -- exactly our edge count.
 
-NOTE 7 -- Multi-slot compile cache keyed on ``(training, do_atomic_virial)``
-----------------------------------------------------------------------------
+NOTE 7 -- Multi-slot compile cache key
+--------------------------------------
 
-Both flags alter the traced graph topology:
+The key is ``(training, do_atomic_virial, has_coord_corr)`` because all three
+fields alter the traced graph topology:
 
 * ``self.training`` switches ``create_graph`` in
   ``fit_output_to_model_output`` -- it toggles the entire
   second-derivative branch on or off.
 * ``do_atomic_virial`` adds or removes an extra per-atom virial tensor
   in the compute output.
+* ``has_coord_corr`` selects the spin-virial correction branch, changing the
+  compiled callable arity from six tensor inputs to seven.
 
 No single compiled graph can serve both variants, so the cache is a
-``dict[tuple[bool, bool], Callable]`` named ``compiled_core_compute_cache``,
-one slot per ``(training, do_atomic_virial)`` pair.  A single-slot
+``dict[tuple[bool, bool, bool], Callable]`` named
+``compiled_core_compute_cache``.  A single-slot
 cache would have to evict on every flip, which turns the normal
 training-loop pattern -- ``train -> eval at every disp_freq -> train``
 and an occasional full validation on top of that -- into
@@ -588,15 +591,15 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         self.lora_config: dict[str, Any] | None = None if lora is None else dict(lora)
         self._dens_compiled = False
         self._core_compute_pending_compile_t0: float | None = None
-        self._core_compute_pending_compile_key: tuple[bool, bool] | None = None
+        self._core_compute_pending_compile_key: tuple[bool, bool, bool] | None = None
         self._dens_pending_compile_t0: float | None = None
         # Store compiled callables outside the nn.Module tree so that
         # FSDP2 / DDP do not shard or sync its duplicated parameters.
-        # ``compiled_core_compute_cache`` is a dict keyed on
-        # ``(training, do_atomic_virial)`` so every (mode, output-shape)
-        # variant has its own slot; flipping between train and eval for
-        # validation -- regular, full, or EMA full -- therefore reuses
-        # cached compile products instead of evicting the other mode.
+        # ``compiled_core_compute_cache`` is keyed on
+        # ``(training, do_atomic_virial, has_coord_corr)`` so every graph
+        # topology has its own slot; flipping between train and eval for
+        # validation -- regular, full, or EMA full -- therefore reuses cached
+        # compile products instead of evicting the other mode.
         object.__setattr__(self, "compiled_core_compute_cache", {})
         object.__setattr__(self, "compiled_dens_compute", None)
         # Training follows `use_compile`. Evaluation/inference reads
@@ -629,6 +632,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         do_atomic_virial: bool = False,
         force_input: Float[Tensor, "nf nloc 3"] | None = None,
         noise_mask: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Forward pass using standard neighbor list.
@@ -655,6 +659,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Optional corruption mask with shape `(nf, nloc)`. It stays optional
             at the public model boundary because validation / inference and
             clean `dens` batches may not provide corruption masks.
+        charge_spin
+            Frame-level charge and spin conditions with shape `(nf, 2)`.
 
         Returns
         -------
@@ -671,6 +677,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             do_atomic_virial=do_atomic_virial,
             force_input=force_input,
             noise_mask=noise_mask,
+            charge_spin=charge_spin,
         )
         if self.get_fitting_net() is not None:
             model_predict: dict[str, torch.Tensor] = {}
@@ -734,6 +741,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         do_atomic_virial: bool = False,
         force_input: Float[Tensor, "nf nloc 3"] | None = None,
         noise_mask: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Return model prediction using standard neighbor list.
@@ -760,6 +768,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Optional corruption mask with shape `(nf, nloc)`. It stays optional
             at the public model boundary because validation / inference and
             clean `dens` batches may not provide corruption masks.
+        charge_spin
+            Frame-level charge and spin conditions with shape `(nf, 2)`.
 
         Returns
         -------
@@ -785,56 +795,112 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                     self.build_neighbor_list(cc, atype, bb)
                 )
 
-            active_mode = self.get_active_mode()
-            if active_mode == "dens":
-                # === Step 3. `dens` path (no coordinate gradients needed) ===
-                extended_coord = extended_coord.detach()
-                force_input, noise_mask = self.canonicalize_dens_inputs(
-                    force_input,
-                    noise_mask,
+            # === Step 3. Run the shared extended-input path ===
+            return self.forward_common_after_nlist(
+                extended_coord,
+                extended_atype,
+                mapping,
+                nlist,
+                atype,
+                fp,
+                ap,
+                input_prec,
+                do_atomic_virial=do_atomic_virial,
+                force_input=force_input,
+                noise_mask=noise_mask,
+                charge_spin=charge_spin,
+            )
+
+    def forward_common_after_nlist(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        mapping: torch.Tensor,
+        nlist: torch.Tensor,
+        atype: torch.Tensor,
+        fp: torch.Tensor | None,
+        ap: torch.Tensor | None,
+        input_prec: torch.dtype,
+        *,
+        do_atomic_virial: bool = False,
+        force_input: torch.Tensor | None = None,
+        noise_mask: torch.Tensor | None = None,
+        extended_coord_corr: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Run SeZM from already-built extended inputs.
+
+        Parameters
+        ----------
+        extended_coord
+            Coordinates in extended region with shape (nf, nall, 3).
+        extended_atype
+            Atom types in extended region with shape (nf, nall).
+        mapping
+            Extended-to-local mapping with shape (nf, nall).
+        nlist
+            Neighbor list with shape (nf, nloc, nsel).
+        atype
+            Local atom types with shape (nf, nloc).
+        fp
+            Cast frame parameters with shape (nf, ndf), or None.
+        ap
+            Cast atomic parameters with shape (nf, nloc, nda), or None.
+        input_prec
+            Original input precision used for output casting.
+        do_atomic_virial
+            Whether to compute per-atom virial.
+        force_input
+            Optional atom-wise force input for the ``dens`` path with shape
+            (nf, nloc, 3).
+        noise_mask
+            Optional atom-wise corruption mask for the ``dens`` path with
+            shape (nf, nloc).
+        extended_coord_corr
+            Coordinate correction for virial with shape (nf, nall, 3), or None.
+        charge_spin
+            Frame-level charge and spin conditions with shape `(nf, 2)`.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Model predictions with the standard SeZM internal keys.
+        """
+        nf, nloc = atype.shape[:2]
+        charge_spin = self.convert_charge_spin(
+            charge_spin,
+            nf=nf,
+            dtype=extended_coord.dtype,
+            device=extended_coord.device,
+        )
+        active_mode = self.get_active_mode()
+        if active_mode == "dens":
+            # === Step 1. `dens` path (no coordinate gradients needed) ===
+            extended_coord = extended_coord.detach()
+            force_input, noise_mask = self.canonicalize_dens_inputs(
+                force_input,
+                noise_mask,
+                nf=nf,
+                nloc=nloc,
+                dtype=extended_coord.dtype,
+                device=extended_coord.device,
+            )
+
+            if self.should_use_compile():
+                fp, ap = self.convert_fp_ap(
+                    fp,
+                    ap,
                     nf=nf,
                     nloc=nloc,
-                    dtype=cc.dtype,
-                    device=cc.device,
+                    dtype=extended_coord.dtype,
+                    device=extended_coord.device,
                 )
-
-                if self.should_use_compile():
-                    fp, ap = self.convert_fp_ap(
-                        fp,
-                        ap,
-                        nf=nf,
-                        nloc=nloc,
-                        dtype=cc.dtype,
-                        device=cc.device,
-                    )
-                    with self.tf32_precision_ctx():
-                        if (
-                            self.compiled_dens_compute is None
-                            or not self._dens_compiled
-                        ):
-                            self.compile_dens()
-                        with nvtx_range("SeZM/core_compute_dens"):
-                            compute_ret = self.compiled_dens_compute(
-                                extended_coord,
-                                extended_atype,
-                                nlist,
-                                mapping,
-                                force_input=force_input,
-                                noise_mask=noise_mask,
-                                fparam=fp,
-                                aparam=ap,
-                            )
-                        if self._dens_pending_compile_t0 is not None:
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                            log.info(
-                                "SeZM: finished compiling dens path in %.2fs",
-                                time.perf_counter() - self._dens_pending_compile_t0,
-                            )
-                            self._dens_pending_compile_t0 = None
-                else:
+                with self.tf32_precision_ctx():
+                    if self.compiled_dens_compute is None or not self._dens_compiled:
+                        self.compile_dens()
                     with nvtx_range("SeZM/core_compute_dens"):
-                        compute_ret = self.core_compute_dens(
+                        compute_ret = self.compiled_dens_compute(
                             extended_coord,
                             extended_atype,
                             nlist,
@@ -843,70 +909,85 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                             noise_mask=noise_mask,
                             fparam=fp,
                             aparam=ap,
+                            charge_spin=charge_spin,
                         )
-                with nvtx_range("SeZM/post_process"):
-                    model_predict = self.post_process_output_dens(
-                        compute_ret,
-                        atype,
-                        noise_mask=noise_mask,
-                    )
+                    if self._dens_pending_compile_t0 is not None:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        log.info(
+                            "SeZM: finished compiling dens path in %.2fs",
+                            time.perf_counter() - self._dens_pending_compile_t0,
+                        )
+                        self._dens_pending_compile_t0 = None
             else:
-                # === Step 3. `ener` path (edges built inside core_compute) ===
-                # NOTE: Rebind the extended coordinates to a fresh leaf
-                # tensor before entering either ``core_compute`` or the
-                # compiled callable.  ``detach()`` breaks any upstream
-                # autograd graph carried by the batch (data pipeline
-                # artefacts, neighbor-list ops) and
-                # ``requires_grad_(True)`` reinstates a grad-endpoint
-                # owned exclusively by this forward.  The inner
-                # ``autograd.grad`` inside ``fit_output_to_model_output``
-                # will then compute ``dE/dx`` against a graph of known
-                # shape and ownership -- the essential precondition for
-                # symbolic make_fx tracing.  In eval without coordinate
-                # gradients a bare detach is enough.
-                if self.do_grad_r() or self.do_grad_c():
-                    extended_coord = extended_coord.detach().requires_grad_(True)
-                else:
-                    extended_coord = extended_coord.detach()
-
-                if self.should_use_compile():
-                    fp, ap = self.convert_fp_ap(
-                        fp,
-                        ap,
-                        nf=nf,
-                        nloc=nloc,
-                        dtype=cc.dtype,
-                        device=cc.device,
+                with nvtx_range("SeZM/core_compute_dens"):
+                    compute_ret = self.core_compute_dens(
+                        extended_coord,
+                        extended_atype,
+                        nlist,
+                        mapping,
+                        force_input=force_input,
+                        noise_mask=noise_mask,
+                        fparam=fp,
+                        aparam=ap,
+                        charge_spin=charge_spin,
                     )
-                    with self.tf32_precision_ctx():
-                        # NOTE: Compile cache is a dict keyed on
-                        # ``(training, do_atomic_virial)``.  Both flags
-                        # change the traced graph topology:
-                        # ``training`` toggles ``create_graph`` in
-                        # ``fit_output_to_model_output`` and therefore
-                        # the entire second-derivative branch;
-                        # ``do_atomic_virial`` pulls an extra per-atom
-                        # virial tensor into the outputs.  Each slot is
-                        # retained independently, so the common
-                        # train->eval->train cycle around every
-                        # disp_freq / full-validation checkpoint reuses
-                        # the already-compiled callable of whichever
-                        # mode is re-entered, instead of evicting it.
-                        cache_key = (bool(self.training), bool(do_atomic_virial))
-                        if cache_key not in self.compiled_core_compute_cache:
-                            self.trace_and_compile(
-                                extended_coord,
-                                extended_atype,
-                                nlist,
-                                mapping,
-                                fp,
-                                ap,
-                                do_atomic_virial,
-                            )
-                        compiled_core_compute = self.compiled_core_compute_cache[
-                            cache_key
-                        ]
-                        with nvtx_range("SeZM/core_compute"):
+            with nvtx_range("SeZM/post_process"):
+                model_predict = self.post_process_output_dens(
+                    compute_ret,
+                    atype,
+                    noise_mask=noise_mask,
+                )
+        else:
+            # === Step 1. `ener` path (edges built inside core_compute) ===
+            # NOTE: Rebind the extended coordinates to a fresh leaf
+            # tensor before entering either ``core_compute`` or the
+            # compiled callable.  ``detach()`` breaks any upstream
+            # autograd graph carried by the batch (data pipeline
+            # artefacts, neighbor-list ops) and
+            # ``requires_grad_(True)`` reinstates a grad-endpoint
+            # owned exclusively by this forward.  The inner
+            # ``autograd.grad`` inside ``fit_output_to_model_output``
+            # will then compute ``dE/dx`` against a graph of known
+            # shape and ownership -- the essential precondition for
+            # symbolic make_fx tracing.  In eval without coordinate
+            # gradients a bare detach is enough.
+            if self.do_grad_r() or self.do_grad_c():
+                extended_coord = extended_coord.detach().requires_grad_(True)
+            else:
+                extended_coord = extended_coord.detach()
+
+            if self.should_use_compile():
+                fp, ap = self.convert_fp_ap(
+                    fp,
+                    ap,
+                    nf=nf,
+                    nloc=nloc,
+                    dtype=extended_coord.dtype,
+                    device=extended_coord.device,
+                )
+                with self.tf32_precision_ctx():
+                    has_coord_corr = extended_coord_corr is not None
+                    cache_key = (
+                        bool(self.training),
+                        bool(do_atomic_virial),
+                        has_coord_corr,
+                    )
+                    if cache_key not in self.compiled_core_compute_cache:
+                        self.trace_and_compile(
+                            extended_coord,
+                            extended_atype,
+                            nlist,
+                            mapping,
+                            fp,
+                            ap,
+                            charge_spin,
+                            do_atomic_virial,
+                            extended_coord_corr=extended_coord_corr,
+                        )
+                    compiled_core_compute = self.compiled_core_compute_cache[cache_key]
+                    with nvtx_range("SeZM/core_compute"):
+                        if extended_coord_corr is None:
                             model_predict_lower = compiled_core_compute(
                                 extended_coord,
                                 extended_atype,
@@ -914,48 +995,63 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                                 mapping,
                                 fp,
                                 ap,
+                                charge_spin,
                             )
-                        if (
-                            self._core_compute_pending_compile_t0 is not None
-                            and self._core_compute_pending_compile_key == cache_key
-                        ):
-                            if torch.cuda.is_available():
-                                torch.cuda.synchronize()
-                            log.info(
-                                "SeZM: finished compiling "
-                                "(mode=%s, do_atomic_virial=%s) in %.2fs",
-                                "train" if self.training else "eval",
-                                do_atomic_virial,
-                                time.perf_counter()
-                                - self._core_compute_pending_compile_t0,
+                        else:
+                            model_predict_lower = compiled_core_compute(
+                                extended_coord,
+                                extended_atype,
+                                nlist,
+                                mapping,
+                                fp,
+                                ap,
+                                charge_spin,
+                                extended_coord_corr,
                             )
-                            self._core_compute_pending_compile_t0 = None
-                            self._core_compute_pending_compile_key = None
-                else:
-                    with nvtx_range("SeZM/core_compute"):
-                        model_predict_lower = self.core_compute(
-                            extended_coord,
-                            extended_atype,
-                            nlist,
-                            mapping=mapping,
-                            fparam=fp,
-                            aparam=ap,
-                            do_atomic_virial=do_atomic_virial,
-                            extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+                    if (
+                        self._core_compute_pending_compile_t0 is not None
+                        and self._core_compute_pending_compile_key == cache_key
+                    ):
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        log.info(
+                            "SeZM: finished compiling "
+                            "(mode=%s, atomic_virial=%s, coord_corr=%s) "
+                            "in %.2fs",
+                            "train" if self.training else "eval",
+                            do_atomic_virial,
+                            has_coord_corr,
+                            time.perf_counter() - self._core_compute_pending_compile_t0,
                         )
-
-                with nvtx_range("SeZM/communicate_output"):
-                    model_predict = communicate_extended_output(
-                        model_predict_lower,
-                        self.model_output_def(),
-                        mapping,
+                        self._core_compute_pending_compile_t0 = None
+                        self._core_compute_pending_compile_key = None
+            else:
+                with nvtx_range("SeZM/core_compute"):
+                    model_predict_lower = self.core_compute(
+                        extended_coord,
+                        extended_atype,
+                        nlist,
+                        mapping=mapping,
+                        fparam=fp,
+                        aparam=ap,
+                        charge_spin=charge_spin,
                         do_atomic_virial=do_atomic_virial,
+                        extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+                        extended_coord_corr=extended_coord_corr,
                     )
 
-            # === Step 4. Type cast output ===
-            with nvtx_range("SeZM/output_type_cast"):
-                model_predict = self._output_type_cast(model_predict, input_prec)
-                return model_predict
+            with nvtx_range("SeZM/communicate_output"):
+                model_predict = communicate_extended_output(
+                    model_predict_lower,
+                    self.model_output_def(),
+                    mapping,
+                    do_atomic_virial=do_atomic_virial,
+                )
+
+        # === Step 2. Type cast output ===
+        with nvtx_range("SeZM/output_type_cast"):
+            model_predict = self._output_type_cast(model_predict, input_prec)
+            return model_predict
 
     def core_compute(
         self,
@@ -965,6 +1061,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         mapping: torch.Tensor | None = None,
         fparam: torch.Tensor | None = None,
         aparam: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
         do_atomic_virial: bool = False,
         comm_dict: dict[str, torch.Tensor] | None = None,
         extra_nlist_sort: bool = False,
@@ -991,6 +1088,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Frame parameters with shape (nf, ndf), or ``None``.
         aparam
             Atomic parameters with shape (nf, nloc, nda), or ``None``.
+        charge_spin
+            Frame-level charge and spin conditions with shape `(nf, 2)`.
         do_atomic_virial
             Whether to compute per-atom virial.
         comm_dict
@@ -1028,6 +1127,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 edge_index=edge_index,
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
+                charge_spin=charge_spin,
             )
         if self.atomic_model.enable_eval_descriptor_hook:
             self.atomic_model.eval_descriptor_list.append(descriptor.detach())
@@ -1073,6 +1173,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 extended_atype,
                 nlist,
                 nloc,
+                real_type_count=self._get_inter_potential_real_type_count(),
             )
 
         # === Step 6. Force / virial via fit_output_to_model_output ===
@@ -1110,6 +1211,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         noise_mask: torch.Tensor,
         fparam: torch.Tensor | None = None,
         aparam: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Compute SeZM ``dens`` energy/direct-force tensors from extended inputs.
@@ -1132,6 +1234,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Frame parameters with shape ``(nf, ndf)``, or ``None``.
         aparam
             Atomic parameters with shape ``(nf, nloc, nda)``, or ``None``.
+        charge_spin
+            Frame-level charge and spin conditions with shape `(nf, 2)`.
 
         Returns
         -------
@@ -1177,6 +1281,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
                 force_embedding=force_embedding,
+                charge_spin=charge_spin,
             )
         if self.atomic_model.enable_eval_descriptor_hook:
             self.atomic_model.eval_descriptor_list.append(descriptor.detach())
@@ -1219,6 +1324,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         aparam: Float[Tensor, "nf nall nda"] | None = None,
         do_atomic_virial: bool = False,
         comm_dict: dict[str, torch.Tensor] | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Lower-level public forward using the DeePMD lower-interface contract.
@@ -1241,6 +1347,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             Whether to compute atomic virial.
         comm_dict
             Communication dict forwarded to `forward_common_lower()`.
+        charge_spin
+            Frame-level charge and spin conditions with shape `(nf, 2)`.
 
         Returns
         -------
@@ -1275,6 +1383,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
             extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+            charge_spin=charge_spin,
         )
         model_ret = self._output_type_cast(model_ret, input_prec)
         if self.get_fitting_net() is not None:
@@ -1322,6 +1431,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         comm_dict: dict[str, torch.Tensor] | None = None,
         extra_nlist_sort: bool = False,
         extended_coord_corr: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Public lower interface with dtype casting around ``core_compute()``."""
         cc_ext, _, fp, ap, input_prec = self._input_type_cast(
@@ -1334,6 +1444,13 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             )
         if self.do_grad_r() or self.do_grad_c():
             cc_ext = cc_ext.detach().requires_grad_(True)
+        nf = extended_atype.shape[0]
+        charge_spin = self.convert_charge_spin(
+            charge_spin,
+            nf=nf,
+            dtype=cc_ext.dtype,
+            device=cc_ext.device,
+        )
         model_predict = self.core_compute(
             cc_ext,
             extended_atype,
@@ -1341,79 +1458,13 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             mapping=mapping,
             fparam=fp,
             aparam=ap,
+            charge_spin=charge_spin,
             do_atomic_virial=do_atomic_virial,
             comm_dict=comm_dict,
             extra_nlist_sort=extra_nlist_sort,
             extended_coord_corr=extended_coord_corr,
         )
         return self._output_type_cast(model_predict, input_prec)
-
-    def forward_common_lower_exportable(
-        self,
-        extended_coord: torch.Tensor,
-        extended_atype: torch.Tensor,
-        nlist: torch.Tensor,
-        mapping: torch.Tensor | None = None,
-        fparam: torch.Tensor | None = None,
-        aparam: torch.Tensor | None = None,
-        do_atomic_virial: bool = False,
-    ) -> torch.nn.Module:
-        """Trace ``forward_common_lower`` into an exportable FX ``GraphModule``.
-
-        ``make_fx`` unfolds the inner ``autograd.grad`` that
-        ``fit_output_to_model_output`` performs for force and virial, so
-        the returned module can be handed to :func:`torch.export.export`
-        directly.  ``silu_backward`` is decomposed to primitive ops so
-        Inductor never sees an opaque higher-order derivative — the same
-        decomposition the training compile path uses.
-
-        Only the conservative ``ener`` mode is supported: ``dens``
-        emits a direct-force tensor that has no ``DeepPotPTExpt`` consumer.
-        """
-        from torch._decomp import (
-            get_decompositions,
-        )
-
-        if self.get_active_mode() == "dens":
-            raise NotImplementedError(
-                "SeZM export supports only the conservative `ener` path."
-            )
-
-        model = self
-        extra_sort = self.need_sorted_nlist_for_lower()
-
-        def fn(
-            ext_coord: torch.Tensor,
-            ext_atype: torch.Tensor,
-            nlist_: torch.Tensor,
-            mapping_: torch.Tensor | None,
-            fparam_: torch.Tensor | None,
-            aparam_: torch.Tensor | None,
-        ) -> dict[str, torch.Tensor]:
-            # detach + requires_grad_ must live INSIDE the traced closure:
-            # LAMMPS feeds a plain fp64 non-leaf tensor, and the exported
-            # graph needs its own grad endpoint for the inner autograd.grad
-            # that fit_output_to_model_output performs.
-            ext_coord = ext_coord.detach().requires_grad_(True)
-            return model.forward_common_lower(
-                ext_coord,
-                ext_atype,
-                nlist_,
-                mapping_,
-                fparam=fparam_,
-                aparam=aparam_,
-                do_atomic_virial=do_atomic_virial,
-                extra_nlist_sort=extra_sort,
-            )
-
-        return make_fx(
-            fn,
-            tracing_mode="symbolic",
-            _allow_non_fake_inputs=True,
-            decomposition_table=get_decompositions(
-                [torch.ops.aten.silu_backward.default]
-            ),
-        )(extended_coord, extended_atype, nlist, mapping, fparam, aparam)
 
     # =========================================================================
     # Compile Utilities
@@ -1427,7 +1478,9 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         mapping: torch.Tensor,
         fp: torch.Tensor,
         ap: torch.Tensor,
+        charge_spin: torch.Tensor,
         do_atomic_virial: bool,
+        extended_coord_corr: torch.Tensor | None = None,
     ) -> None:
         """Trace ``core_compute()`` with ``make_fx`` and cache the compiled callable.
 
@@ -1446,71 +1499,120 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         )
 
         mode = "train" if self.training else "eval"
+        has_coord_corr = extended_coord_corr is not None
         log.info(
-            "SeZM: start tracing and compiling (mode=%s, do_atomic_virial=%s)",
+            "SeZM: start tracing and compiling "
+            "(mode=%s, atomic_virial=%s, coord_corr=%s)",
             mode,
             do_atomic_virial,
+            has_coord_corr,
         )
         _compile_t0 = time.perf_counter()
 
         need_coord_grad = self.do_grad_r() or self.do_grad_c()
 
-        def compute_fn(
-            extended_coord: torch.Tensor,
-            extended_atype: torch.Tensor,
-            nlist: torch.Tensor,
-            mapping: torch.Tensor,
-            fp: torch.Tensor,
-            ap: torch.Tensor,
-        ) -> dict[str, torch.Tensor]:
-            # NOTE: Restart the autograd graph at the trace entry point.
-            # detach() severs any upstream graph carried by the trace
-            # inputs and requires_grad_(True) reinstates a fresh
-            # grad-endpoint owned by this compute.  The inner
-            # ``autograd.grad`` inside ``fit_output_to_model_output``
-            # then differentiates against a graph of known shape and
-            # ownership -- the essential precondition for make_fx
-            # symbolic tracing to capture dE/dx as ordinary FX nodes.
-            # In the eval-only branch we merely detach so the traced
-            # graph has no backward section at all.
-            if need_coord_grad:
-                extended_coord = extended_coord.detach().requires_grad_(True)
-            else:
-                extended_coord = extended_coord.detach()
-            return self.core_compute(
-                extended_coord,
-                extended_atype,
-                nlist,
-                mapping=mapping,
-                fparam=fp,
-                aparam=ap,
-                do_atomic_virial=do_atomic_virial,
-                extra_nlist_sort=self.need_sorted_nlist_for_lower(),
-            )
+        def _prepare_coord_for_trace(coord: torch.Tensor) -> torch.Tensor:
+            """Restart the coordinate autograd graph for the traced compute.
 
-        # NOTE: Always trace with exactly nf=2 -- the only batch size
-        # free of every known symbolic-shape collision.
+            ``detach()`` severs any upstream graph carried by the trace
+            inputs and ``requires_grad_(True)`` reinstates a fresh
+            grad-endpoint owned by this compute.  The inner
+            ``autograd.grad`` inside ``fit_output_to_model_output`` then
+            differentiates against a graph of known shape and ownership --
+            the essential precondition for make_fx symbolic tracing to
+            capture dE/dx as ordinary FX nodes.  In the eval-only branch
+            a bare detach keeps the traced graph free of backward sections.
+            """
+            if need_coord_grad:
+                return coord.detach().requires_grad_(True)
+            else:
+                return coord.detach()
+
+        if extended_coord_corr is None:
+
+            def compute_fn(
+                extended_coord: torch.Tensor,
+                extended_atype: torch.Tensor,
+                nlist: torch.Tensor,
+                mapping: torch.Tensor,
+                fp: torch.Tensor,
+                ap: torch.Tensor,
+                charge_spin: torch.Tensor,
+            ) -> dict[str, torch.Tensor]:
+                return self.core_compute(
+                    _prepare_coord_for_trace(extended_coord),
+                    extended_atype,
+                    nlist,
+                    mapping=mapping,
+                    fparam=fp,
+                    aparam=ap,
+                    charge_spin=charge_spin,
+                    do_atomic_virial=do_atomic_virial,
+                    extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+                )
+        else:
+
+            def compute_fn(
+                extended_coord: torch.Tensor,
+                extended_atype: torch.Tensor,
+                nlist: torch.Tensor,
+                mapping: torch.Tensor,
+                fp: torch.Tensor,
+                ap: torch.Tensor,
+                charge_spin: torch.Tensor,
+                extended_coord_corr: torch.Tensor,
+            ) -> dict[str, torch.Tensor]:
+                # NOTE: Spin virial uses a coordinate correction derived from the
+                # virtual-atom displacement.  Keeping it as a tensor input lets the
+                # compiled graph stay reusable across frames.
+                return self.core_compute(
+                    _prepare_coord_for_trace(extended_coord),
+                    extended_atype,
+                    nlist,
+                    mapping=mapping,
+                    fparam=fp,
+                    aparam=ap,
+                    charge_spin=charge_spin,
+                    do_atomic_virial=do_atomic_virial,
+                    extra_nlist_sort=self.need_sorted_nlist_for_lower(),
+                    extended_coord_corr=extended_coord_corr,
+                )
+
+        # NOTE: Always trace with a fixed batch size that is free of known
+        # symbolic-shape collisions.
         #
         # make_fx(tracing_mode="symbolic") replaces shapes with sympy
         # symbols, but the moment a symbolic dim ends up equal to a
         # *concrete* dim elsewhere in the same tensor it collapses into
-        # a constant and the graph specialises on that batch size.
-        # Concretely: nf=1 triggers PyTorch's 0/1 specialisation; nf=3
-        # collides with the trailing spatial ``3`` in ``extended_coord``
-        # shape ``(nf, nall, 3)``; nf=9 would collide with the virial
-        # dim.  Any of those collisions forces
+        # a constant and the graph specialises on that batch size. Known
+        # reserved dimensions include 1 (specialisation), 2 (charge/spin
+        # width), 3 (Cartesian coordinates), and 9 (virial tensor). Any
+        # of those collisions forces
         # ``torch.compile(dynamic=True)`` to reject later batches whose
-        # nf differs from the traced constant.  nf=2 sidesteps all three.
+        # nf differs from the traced constant.
         #
         # If a future code change introduces a new explicit dimension of
-        # size 2 and compile starts failing with a similar shape
+        # this size and compile starts failing with a similar shape
         # mismatch, change this constant accordingly.
-        coord_for_trace = extended_coord[:1].repeat(2, 1, 1)
-        atype_for_trace = extended_atype[:1].repeat(2, 1)
-        nlist_for_trace = nlist[:1].repeat(2, 1, 1)
-        mapping_for_trace = mapping[:1].repeat(2, 1)
-        fp_for_trace = fp[:1].repeat(2, 1)
-        ap_for_trace = ap[:1].repeat(2, 1, 1)
+        trace_nf = 5
+        coord_for_trace = extended_coord[:1].repeat(trace_nf, 1, 1)
+        atype_for_trace = extended_atype[:1].repeat(trace_nf, 1)
+        nlist_for_trace = nlist[:1].repeat(trace_nf, 1, 1)
+        mapping_for_trace = mapping[:1].repeat(trace_nf, 1)
+        fp_for_trace = fp[:1].repeat(trace_nf, 1)
+        ap_for_trace = ap[:1].repeat(trace_nf, 1, 1)
+        charge_spin_for_trace = charge_spin[:1].repeat(trace_nf, 1)
+        trace_args = [
+            coord_for_trace,
+            atype_for_trace,
+            nlist_for_trace,
+            mapping_for_trace,
+            fp_for_trace,
+            ap_for_trace,
+            charge_spin_for_trace,
+        ]
+        if extended_coord_corr is not None:
+            trace_args.append(extended_coord_corr[:1].repeat(trace_nf, 1, 1))
 
         # NOTE: Decompose ``silu_backward`` into primitive ops.
         # PyTorch ships forward and first-order backward for SiLU but no
@@ -1537,14 +1639,7 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             tracing_mode="symbolic",
             _allow_non_fake_inputs=True,
             decomposition_table=decomp_table,
-        )(
-            coord_for_trace,
-            atype_for_trace,
-            nlist_for_trace,
-            mapping_for_trace,
-            fp_for_trace,
-            ap_for_trace,
-        )
+        )(*trace_args)
 
         # NOTE: Only strip autograd-inserted detach chains in training
         # mode.  With ``create_graph=True`` make_fx wraps every saved
@@ -1620,10 +1715,10 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         # from parameter discovery (FSDP2/DDP would otherwise shard or
         # synchronise the wrapper's duplicated flat parameter views and
         # silently corrupt training).  The cache is keyed on
-        # ``(training, do_atomic_virial)`` so that train-mode and
-        # eval-mode compile products can coexist without evicting each
-        # other on every ``model.eval()`` / ``model.train()`` switch.
-        cache_key = (bool(self.training), bool(do_atomic_virial))
+        # ``(training, do_atomic_virial, has_coord_corr)`` so that distinct
+        # graph topologies coexist without evicting each other on every
+        # ``model.eval()`` / ``model.train()`` switch.
+        cache_key = (bool(self.training), bool(do_atomic_virial), has_coord_corr)
         # NOTE: ``dynamic=True`` emits a single kernel per traced
         # shape symbol, so changes in ``nframes``, ``nall`` or edge
         # count do not trigger recompiles; and the option dict above
@@ -1680,6 +1775,97 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         if self.training:
             return self.use_compile
         return bool(self._env_use_compile_infer)
+
+    # =========================================================================
+    # Export Utilities
+    # =========================================================================
+
+    def _trace_lower_exportable(
+        self,
+        fn: Any,
+        *sample_inputs: torch.Tensor | None,
+    ) -> torch.nn.Module:
+        """Trace a lower-interface closure into an exportable FX graph."""
+        from torch._decomp import (
+            get_decompositions,
+        )
+
+        return make_fx(
+            fn,
+            tracing_mode="symbolic",
+            _allow_non_fake_inputs=True,
+            decomposition_table=get_decompositions(
+                [torch.ops.aten.silu_backward.default]
+            ),
+        )(*sample_inputs)
+
+    def forward_common_lower_exportable(
+        self,
+        extended_coord: torch.Tensor,
+        extended_atype: torch.Tensor,
+        nlist: torch.Tensor,
+        mapping: torch.Tensor | None = None,
+        fparam: torch.Tensor | None = None,
+        aparam: torch.Tensor | None = None,
+        do_atomic_virial: bool = False,
+        charge_spin: torch.Tensor | None = None,
+    ) -> torch.nn.Module:
+        """Trace ``forward_common_lower`` into an exportable FX ``GraphModule``.
+
+        ``make_fx`` unfolds the inner ``autograd.grad`` that
+        ``fit_output_to_model_output`` performs for force and virial, so
+        the returned module can be handed to :func:`torch.export.export`
+        directly.  ``silu_backward`` is decomposed to primitive ops so
+        Inductor never sees an opaque higher-order derivative — the same
+        decomposition the training compile path uses.
+
+        Only the conservative ``ener`` mode is supported: ``dens``
+        emits a direct-force tensor that has no ``DeepPotPTExpt`` consumer.
+        """
+        if self.get_active_mode() == "dens":
+            raise NotImplementedError(
+                "SeZM export supports only the conservative `ener` path."
+            )
+
+        model = self
+        extra_sort = self.need_sorted_nlist_for_lower()
+
+        def fn(
+            ext_coord: torch.Tensor,
+            ext_atype: torch.Tensor,
+            nlist_: torch.Tensor,
+            mapping_: torch.Tensor | None,
+            fparam_: torch.Tensor | None,
+            aparam_: torch.Tensor | None,
+            charge_spin_: torch.Tensor | None,
+        ) -> dict[str, torch.Tensor]:
+            # detach + requires_grad_ must live INSIDE the traced closure:
+            # LAMMPS feeds a plain fp64 non-leaf tensor, and the exported
+            # graph needs its own grad endpoint for the inner autograd.grad
+            # that fit_output_to_model_output performs.
+            ext_coord = ext_coord.detach().requires_grad_(True)
+            return model.forward_common_lower(
+                ext_coord,
+                ext_atype,
+                nlist_,
+                mapping_,
+                fparam=fparam_,
+                aparam=aparam_,
+                do_atomic_virial=do_atomic_virial,
+                extra_nlist_sort=extra_sort,
+                charge_spin=charge_spin_,
+            )
+
+        return self._trace_lower_exportable(
+            fn,
+            extended_coord,
+            extended_atype,
+            nlist,
+            mapping,
+            fparam,
+            aparam,
+            charge_spin,
+        )
 
     # =========================================================================
     # Neighbor List Construction
@@ -1832,75 +2018,8 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         return edge_index, edge_vec_sel, edge_mask
 
     # =========================================================================
-    # Output Definitions
+    # Input Canonicalization
     # =========================================================================
-
-    @torch.jit.export
-    def get_observed_type_list(self) -> list[str]:
-        """
-        Get observed types (elements) of the model during data statistics.
-
-        Returns
-        -------
-        list[str]
-            A list of the observed types in this model.
-        """
-        type_map = self.get_type_map()
-        out_bias = self.atomic_model.get_out_bias()[0]
-
-        assert out_bias is not None, "No out_bias found in the model."
-        assert out_bias.dim() == 2, "The supported out_bias should be a 2D tensor."
-        assert out_bias.size(0) == len(type_map), (
-            "The out_bias shape does not match the type_map length."
-        )
-        bias_mask = (
-            torch.gt(torch.abs(out_bias), 1e-6).any(dim=-1).detach().cpu()
-        )  # 1e-6 for stability
-
-        # TorchScript does not support list comprehension with if clause
-        result: list[str] = []
-        for t, m in zip(type_map, bias_mask.tolist()):
-            if m:
-                result.append(t)
-        return result
-
-    def post_process_output_dens(
-        self,
-        compute_ret: torch.Tensor,
-        atype: torch.Tensor,
-        *,
-        noise_mask: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """
-        Convert the concatenated `dens` output to DeePMD model outputs.
-
-        Parameters
-        ----------
-        compute_ret
-            Concatenated tensor with shape `(nf, nloc, 7)` or `(1, n_node, 7)`.
-        atype
-            Local atom types with shape `(nf, nloc)`.
-        noise_mask
-            Corruption mask with shape `(nf, nloc)`.
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Standard DeePMD model predictions for `dens` mode.
-        """
-        nf, nloc = atype.shape[:2]
-        n_actual = nf * nloc
-        dens_ret = {
-            "energy": compute_ret[:, :n_actual, 0:1].view(nf, nloc, 1),
-            "clean_dforce": compute_ret[:, :n_actual, 1:4].view(nf, nloc, 3),
-            "denoising_dforce": compute_ret[:, :n_actual, 4:7].view(nf, nloc, 3),
-        }
-        return self.atomic_model.apply_out_stat_dens(
-            dens_ret,
-            atype,
-            noise_mask=noise_mask,
-            energy_redu_dtype=self.redu_prec,
-        )
 
     def convert_fp_ap(
         self,
@@ -1916,30 +2035,92 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         dim_aparam = self.get_dim_aparam()
 
         # === Step 1. Canonicalize frame parameters ===
-        if fp is None:
-            if dim_fparam > 0:
+        if dim_fparam == 0:
+            fp = torch.empty((nf, 0), dtype=dtype, device=device)
+        elif fp is None:
+            default_fparam = self.get_default_fparam()
+            if default_fparam is None:
                 raise ValueError(
                     "fparam is required because fitting net dim_fparam > 0"
                 )
-            fp = torch.empty((nf, 0), dtype=dtype, device=device)
-        elif fp.shape[-1] != dim_fparam:
-            raise ValueError(
-                f"fparam last dim ({fp.shape[-1]}) != dim_fparam ({dim_fparam})"
-            )
+            fp = default_fparam.to(device=device, dtype=dtype).view(1, dim_fparam)
+            fp = fp.expand(nf, -1)
+        else:
+            if fp.numel() != nf * dim_fparam:
+                raise ValueError(
+                    f"input fparam: cannot reshape {list(fp.shape)} "
+                    f"into ({nf}, {dim_fparam})."
+                )
+            fp = fp.to(device=device, dtype=dtype).view(nf, dim_fparam)
 
         # === Step 2. Canonicalize atomic parameters ===
-        if ap is None:
+        if dim_aparam == 0:
+            ap = torch.empty((nf, nloc, 0), dtype=dtype, device=device)
+        elif ap is None:
             if dim_aparam > 0:
                 raise ValueError(
                     "aparam is required because fitting net dim_aparam > 0"
                 )
-            ap = torch.empty((nf, nloc, 0), dtype=dtype, device=device)
-        elif ap.shape[-1] != dim_aparam:
-            raise ValueError(
-                f"aparam last dim ({ap.shape[-1]}) != dim_aparam ({dim_aparam})"
-            )
+        else:
+            if ap.numel() != nf * nloc * dim_aparam:
+                raise ValueError(
+                    f"input aparam: cannot reshape {list(ap.shape)} "
+                    f"into ({nf}, {nloc}, {dim_aparam})."
+                )
+            ap = ap.to(device=device, dtype=dtype).view(nf, nloc, dim_aparam)
 
         return fp, ap
+
+    def convert_charge_spin(
+        self,
+        charge_spin: torch.Tensor | None,
+        nf: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """
+        Canonicalize optional charge/spin conditions for internal compute paths.
+
+        Parameters
+        ----------
+        charge_spin
+            Optional frame-level charge and spin conditions.
+        nf
+            Number of frames.
+        dtype
+            Target floating-point dtype.
+        device
+            Target device.
+
+        Returns
+        -------
+        torch.Tensor
+            Tensor with shape `(nf, 2)` when enabled, otherwise `(nf, 0)`.
+        """
+        dim_chg_spin = self.atomic_model.get_dim_chg_spin()
+        if dim_chg_spin == 0:
+            return torch.empty((nf, 0), dtype=dtype, device=device)
+
+        if charge_spin is None:
+            default_chg_spin = self.atomic_model.get_default_chg_spin()
+            if default_chg_spin is None:
+                raise ValueError("charge_spin is required for this SeZM model")
+            charge_spin = default_chg_spin.to(device=device, dtype=dtype).view(1, 2)
+        else:
+            charge_spin = charge_spin.to(device=device, dtype=dtype)
+
+        if charge_spin.ndim == 1:
+            if charge_spin.numel() != dim_chg_spin:
+                raise ValueError("charge_spin must contain [charge, spin]")
+            charge_spin = charge_spin.view(1, dim_chg_spin)
+        elif charge_spin.ndim != 2 or charge_spin.shape[-1] != dim_chg_spin:
+            raise ValueError("charge_spin must have shape (nf, 2)")
+
+        if charge_spin.shape[0] == 1 and nf != 1:
+            charge_spin = charge_spin.expand(nf, -1)
+        elif charge_spin.shape[0] != nf:
+            raise ValueError("charge_spin first dimension must match nframes")
+        return charge_spin
 
     def canonicalize_dens_inputs(
         self,
@@ -1999,6 +2180,72 @@ class SeZMModel(DPModelCommon, SeZMModel_):
 
         return force_input, noise_mask
 
+    # =========================================================================
+    # Output Post-Processing
+    # =========================================================================
+
+    def post_process_output_dens(
+        self,
+        compute_ret: torch.Tensor,
+        atype: torch.Tensor,
+        *,
+        noise_mask: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """
+        Convert the concatenated `dens` output to DeePMD model outputs.
+
+        Parameters
+        ----------
+        compute_ret
+            Concatenated tensor with shape `(nf, nloc, 7)` or `(1, n_node, 7)`.
+        atype
+            Local atom types with shape `(nf, nloc)`.
+        noise_mask
+            Corruption mask with shape `(nf, nloc)`.
+
+        Returns
+        -------
+        dict[str, torch.Tensor]
+            Standard DeePMD model predictions for `dens` mode.
+        """
+        nf, nloc = atype.shape[:2]
+        n_actual = nf * nloc
+        dens_ret = {
+            "energy": compute_ret[:, :n_actual, 0:1].view(nf, nloc, 1),
+            "clean_dforce": compute_ret[:, :n_actual, 1:4].view(nf, nloc, 3),
+            "denoising_dforce": compute_ret[:, :n_actual, 4:7].view(nf, nloc, 3),
+        }
+        return self.atomic_model.apply_out_stat_dens(
+            dens_ret,
+            atype,
+            noise_mask=noise_mask,
+            energy_redu_dtype=self.redu_prec,
+        )
+
+    # =========================================================================
+    # Charge/Spin Condition Metadata
+    # =========================================================================
+
+    def has_chg_spin_ebd(self) -> bool:
+        """Return whether charge/spin condition embedding is enabled."""
+        return self.atomic_model.has_chg_spin_ebd()
+
+    def get_dim_chg_spin(self) -> int:
+        """Return charge/spin condition width."""
+        return self.atomic_model.get_dim_chg_spin()
+
+    def has_default_chg_spin(self) -> bool:
+        """Return whether default charge/spin conditions are configured."""
+        return self.atomic_model.has_default_chg_spin()
+
+    def get_default_chg_spin(self) -> torch.Tensor | None:
+        """Return default charge/spin conditions as a tensor."""
+        return self.atomic_model.get_default_chg_spin()
+
+    # =========================================================================
+    # Mode Management
+    # =========================================================================
+
     def get_active_mode(self) -> str:
         """Return the current SeZM execution mode."""
         return self.atomic_model.get_active_mode()
@@ -2044,9 +2291,21 @@ class SeZMModel(DPModelCommon, SeZMModel_):
         else:
             self._core_compute_pending_compile_t0 = None
             self._core_compute_pending_compile_key = None
-            # Drop every (training, do_atomic_virial) slot so the next
-            # forward retraces against the reinitialised fitting head.
+            # Drop every compile slot so the next forward retraces against the
+            # reinitialised fitting head.
             self.compiled_core_compute_cache.clear()
+
+    # =========================================================================
+    # Bridging Helpers
+    # =========================================================================
+
+    def _get_inter_potential_real_type_count(self) -> int:
+        """Return the real-type count used to mask analytical pair potentials."""
+        return len(self.get_type_map())
+
+    # =========================================================================
+    # Type and Output Metadata
+    # =========================================================================
 
     def translated_output_def(self) -> dict[str, Any]:
         """
@@ -2073,6 +2332,38 @@ class SeZMModel(DPModelCommon, SeZMModel_):
             output_def["mask"] = out_def_data["mask"]
 
         return output_def
+
+    def get_observed_type_list(self) -> list[str]:
+        """
+        Get observed types (elements) of the model during data statistics.
+
+        Returns
+        -------
+        list[str]
+            A list of the observed types in this model.
+        """
+        type_map = self.get_type_map()
+        out_bias = self.atomic_model.get_out_bias()[0]
+
+        assert out_bias is not None, "No out_bias found in the model."
+        assert out_bias.dim() == 2, "The supported out_bias should be a 2D tensor."
+        assert out_bias.size(0) == len(type_map), (
+            "The out_bias shape does not match the type_map length."
+        )
+        bias_mask = (
+            torch.gt(torch.abs(out_bias), 1e-6).any(dim=-1).detach().cpu()
+        )  # 1e-6 for stability
+
+        # TorchScript does not support list comprehension with if clause
+        result: list[str] = []
+        for t, m in zip(type_map, bias_mask.tolist()):
+            if m:
+                result.append(t)
+        return result
+
+    # =========================================================================
+    # Serialization
+    # =========================================================================
 
     def serialize(self) -> dict[str, Any]:
         """
@@ -2259,6 +2550,7 @@ class InterPotential(torch.nn.Module):
         extended_atype: torch.Tensor,
         nlist: torch.Tensor,
         nloc: int,
+        real_type_count: int | None = None,
     ) -> torch.Tensor:
         """
         Compute per-atom pair energy from the standard neighbor list path.
@@ -2273,15 +2565,27 @@ class InterPotential(torch.nn.Module):
             Neighbor list with shape (nf, nloc, nsel).
         nloc : int
             Number of local atoms.
+        real_type_count
+            Number of real atom types. Types with index greater than or equal to
+            this value are virtual spin types and are masked out of the
+            analytical potential. If omitted, all configured types are real.
 
         Returns
         -------
         torch.Tensor
             Per-atom pair energy with shape (nf, nloc, 1) in eV.
         """
+        if real_type_count is None:
+            real_type_count = int(self.atomic_numbers.numel())
         nf = extended_coord.shape[0]
         coord64 = extended_coord.to(dtype=torch.float64)
-        z_all = self.atomic_numbers[extended_atype.clamp(min=0)]  # (nf, nall)
+        atype_for_z = extended_atype.clamp(min=0)
+        atype_for_z = torch.where(
+            atype_for_z >= real_type_count,
+            atype_for_z - real_type_count,
+            atype_for_z,
+        )
+        z_all = self.atomic_numbers[atype_for_z]  # (nf, nall)
 
         # === Step 1. Gather neighbor coordinates and types ===
         nsel = nlist.shape[2]
@@ -2302,6 +2606,12 @@ class InterPotential(torch.nn.Module):
 
         # Mask padding entries (nlist == -1)
         valid = (nlist >= 0).to(dtype=pair_e.dtype)
+        center_is_real = (extended_atype[:, :nloc] < real_type_count).unsqueeze(2)
+        neighbor_atype = torch.gather(extended_atype, 1, nlist_clamp.view(nf, -1)).view(
+            nf, nloc, nsel
+        )
+        neighbor_is_real = neighbor_atype < real_type_count
+        valid = valid * (center_is_real & neighbor_is_real).to(dtype=pair_e.dtype)
         pair_e = pair_e * valid
 
         # Half contribution to avoid double-counting

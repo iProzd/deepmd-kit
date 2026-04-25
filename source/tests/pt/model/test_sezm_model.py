@@ -365,6 +365,55 @@ class TestSeZMModelCompile(unittest.TestCase):
             out_dyn_2["virial"], out_cmp_2["virial"], atol=1.0e-5, rtol=1.0e-5
         )
 
+    def test_charge_spin_condition_matches_compile(self) -> None:
+        """Charge/spin conditions should work through the compiled energy path."""
+        coord, atype, box, _, _, _ = self._load_water_frame()
+        params = self._build_model_params(use_compile=False)
+        params["descriptor"]["add_chg_spin_ebd"] = True
+        params["descriptor"]["default_chg_spin"] = [0.0, 1.0]
+
+        model_dyn = get_sezm_model(params)
+        self._randomize_params(model_dyn)
+        params_cmp = self._build_model_params(use_compile=True)
+        params_cmp["descriptor"]["add_chg_spin_ebd"] = True
+        params_cmp["descriptor"]["default_chg_spin"] = [0.0, 1.0]
+        with mock.patch.dict(os.environ, {"DP_COMPILE_INFER": "1"}, clear=False):
+            model_cmp = get_sezm_model(params_cmp)
+        model_cmp.load_state_dict(model_dyn.state_dict())
+        model_dyn.eval()
+        model_cmp.eval()
+
+        charge_spin = torch.tensor(
+            [[0.0, 1.0]], dtype=torch.float32, device=self.device
+        )
+        out_dyn = model_dyn(coord, atype, box=box, charge_spin=charge_spin)
+        out_cmp = model_cmp(coord, atype, box=box, charge_spin=charge_spin)
+        out_default = model_cmp(coord, atype, box=box)
+        out_shifted = model_cmp(
+            coord,
+            atype,
+            box=box,
+            charge_spin=torch.tensor(
+                [[1.0, 1.0]], dtype=torch.float32, device=self.device
+            ),
+        )
+
+        torch.testing.assert_close(
+            out_dyn["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn["force"], out_cmp["force"], atol=1.0e-6, rtol=1.0e-6
+        )
+        torch.testing.assert_close(
+            out_dyn["virial"], out_cmp["virial"], atol=1.0e-5, rtol=1.0e-5
+        )
+        torch.testing.assert_close(
+            out_default["energy"], out_cmp["energy"], atol=1.0e-6, rtol=1.0e-6
+        )
+        self.assertFalse(
+            torch.allclose(out_shifted["atom_energy"], out_cmp["atom_energy"])
+        )
+
     def test_fixed_edge_geometry_matches_standard_cache(self) -> None:
         """Sparse edge geometry should match the standard descriptor cache."""
         coord, atype, box, _, _, _ = self._load_water_frame()
@@ -474,16 +523,16 @@ class TestSeZMModelCompile(unittest.TestCase):
             model = get_sezm_model(self._build_model_params(use_compile=True))
         self._randomize_params(model)
 
-        # === Stage 1. Train-mode forward fills the (training=True) slot. ===
+        # === Stage 1. Train-mode forward fills the training slot. ===
         model.train()
         model(coord, atype, box=box)
-        train_key = (True, False)
-        eval_key = (False, False)
+        train_key = (True, False, False)
+        eval_key = (False, False, False)
         self.assertIn(train_key, model.compiled_core_compute_cache)
         self.assertNotIn(eval_key, model.compiled_core_compute_cache)
         callable_train_first = model.compiled_core_compute_cache[train_key]
 
-        # === Stage 2. Eval-mode forward adds the (training=False) slot;
+        # === Stage 2. Eval-mode forward adds the eval slot;
         # the train slot must not be evicted. ===
         model.eval()
         model(coord, atype, box=box)
@@ -719,13 +768,14 @@ class TestSeZMModelCompile(unittest.TestCase):
         # === Step 3. Each compiled branch owns its own compile cache; the
         # shared descriptor weights must not collapse them into one.
         # Step 2 ran every branch in training mode with the default
-        # ``do_atomic_virial=False``, so each per-branch cache dict
+        # ``do_atomic_virial=False`` and no coordinate correction, so each
+        # per-branch cache dict
         # should hold exactly that one slot, and the compiled callables
         # at that slot must be distinct across branches. ===
         cache1 = wrapper_cmp.model["water_1"].compiled_core_compute_cache
         cache2 = wrapper_cmp.model["water_2"].compiled_core_compute_cache
         self.assertIsNot(cache1, cache2)
-        train_key = (True, False)
+        train_key = (True, False, False)
         self.assertIn(train_key, cache1)
         self.assertIn(train_key, cache2)
         c1 = cache1[train_key]

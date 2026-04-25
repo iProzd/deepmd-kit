@@ -117,7 +117,8 @@ SeZMModel main forward path (core_compute):
        └─ type features fused once after GIE; per-block slices prebuilt
 
   Node initialization:
-    ├─ l=0: Type embedding + optional EnvironmentInitialEmbedding (FiLM)
+    ├─ l=0: Type embedding + optional charge/spin condition embedding
+    ├─ optional EnvironmentInitialEmbedding (FiLM)
     └─ l>0: Zonal (m=0) initial embedding via Wigner-D + radial_feat[:, 1:, :]
 
   Interaction blocks (pyramid schedule):
@@ -151,8 +152,8 @@ SeZMModel main forward path (core_compute):
 
 Two `forward` entry points exist in `DescrptSeZM`:
 
-- **`forward(...)`** — the standard DeePMD descriptor interface. Accepts `extended_coord`, `extended_atype`, `nlist`, `mapping`. Builds a padded edge cache from the neighbor list. Zone bridging (InnerClamp + SFPG) is excluded because ZBL energy injection is handled only by `SeZMModel` on the sparse-edge path.
-- **`forward_with_edges(...)`** — the sparse-edge interface used by `SeZMModel`. Accepts pre-built `(edge_index, edge_vec, edge_mask)`. Supports zone bridging and returns both the scalar descriptor and the full equivariant latent for downstream heads.
+- **`forward(...)`** — the standard DeePMD descriptor interface. Accepts `extended_coord`, `extended_atype`, `nlist`, `mapping`, and optional frame-level `charge_spin`. Builds a padded edge cache from the neighbor list. Zone bridging is handled only by `SeZMModel` on the sparse-edge path.
+- **`forward_with_edges(...)`** — the sparse-edge interface used by `SeZMModel`. Accepts pre-built `(edge_index, edge_vec, edge_mask)` and optional frame-level `charge_spin`. Supports zone bridging and returns both the scalar descriptor and the full equivariant latent for downstream heads.
 
 Both paths share `_forward_blocks(...)` for the actual interaction-block loop.
 
@@ -765,7 +766,27 @@ Set `model.type = "SeZM"` (alias `"sezm"`) to select the SeZM model scaffold. In
 
 The LAMMPS-style interface (`forward_lower`) supports only the `ener` path.
 
-### 12.2 torch.compile Path
+### 12.2 SeZMSpinModel
+
+SeZM spin is selected by keeping `model.type = "SeZM"` and adding the standard DeePMD `model.spin` block. The PyTorch factory builds `SeZMSpinModel`, a subclass of `SeZMModel`, rather than wrapping SeZM in the generic `SpinEnergyModel`. This keeps SeZM's `core_compute`, sparse-edge construction, ZBL injection, LoRA state, serialization, and compile cache in one model object.
+
+The model follows DeePMD's virtual-atom spin convention:
+
+- For every real atom, a virtual spin atom is placed at `coord + spin * virtual_scale`.
+- Virtual atom types are stored internally as `atype + ntypes_real`.
+- Public metadata (`get_type_map`, `get_sel`, `get_nsel`) reports the real system, while the internal descriptor uses an expanded neighbor capacity of `2 * real_nsel + 1`.
+- The standard forward path first builds the real-atom neighbor list, then expands it to include the self spin atom plus real and virtual neighbors. The lower interface follows the same contract: callers provide the real-atom extended inputs and real neighbor list; `SeZMSpinModel.forward_lower` performs the spin expansion internally.
+- Energy is retained only on real local atoms. Coordinate derivatives are split into real force and magnetic force (`force_mag`) by combining real and virtual derivatives with the spin mask.
+
+Only the conservative `ener` / `ener_spin` path is supported. `dens + spin` is intentionally unsupported and fails during mode selection. This is a model invariant, not a temporary implementation gap: the direct-force denoising head has a different output semantics from the virtual-atom magnetic force decomposition.
+
+ZBL bridging remains available under spin, but the analytical pair potential is masked to real-real pairs only. Virtual spin atoms still participate in the learned descriptor as neighbours, but they are not treated as nuclei by `InterPotential`; this avoids assigning `_spin` placeholder types an atomic number and keeps the ZBL term physically real-atom-only.
+
+The compile path is shared with `SeZMModel`. For spin, the expanded lower inputs include an `extended_coord_corr` tensor that corrects virial contributions for the virtual displacement; this tensor is passed through both eager and compiled `core_compute`.
+
+The `.pt2` freeze path also supports SeZM spin checkpoints. The exporter detects `model.spin`, builds `SeZMSpinModel`, traces the spin lower signature `(extended_coord, extended_atype, extended_spin, nlist, mapping, fparam, aparam)`, and writes `is_spin`, `use_spin`, and `ntypes_spin` into `metadata.json` so `DeepSpinPTExpt` can call the C++ spin backend with the 7-input contract. Spin type masks are registered as non-persistent buffers, so CPU/GPU export moves them with the model without adding checkpoint state.
+
+### 12.3 torch.compile Path
 
 SeZM supports an end-to-end `torch.compile` path for `ener` force-loss training. The implementation lives in `sezm_model.py` and is designed to survive Inductor's compilation of second-order coordinate derivatives — the gradient of the force loss with respect to model parameters passes through both the energy-to-force `autograd.grad` and the optimizer's backward pass.
 
@@ -778,23 +799,25 @@ Because the compile cache is multi-slot (see the cache invariant below), opting 
 
 **The unified kernel** `core_compute()` handles both eager and compile paths. It builds compact sparse edges from the DeePMD neighbor list (outside the compiled graph), runs the descriptor and fitting, then calls `autograd.grad` for force/virial with `create_graph=self.training`.
 
+Frame and atomic fitting parameters are canonicalized before entering the compiled callable so the traced signature is tensor-only. The semantics match DeePMD's standard PyTorch fitting path: when `fitting_net.numb_fparam == 0`, any incidental `fparam` tensor in the batch is ignored; when `numb_fparam > 0`, the tensor is reshaped to `(nf, numb_fparam)` and participates in the fitting network; when it is missing and `default_fparam` is configured, that default is expanded across frames. `aparam` follows the same "ignored when unused, required when configured" rule with shape `(nf, nloc, numb_aparam)`.
+
 **Trace strategy for `ener`:** `make_fx(tracing_mode="symbolic", _allow_non_fake_inputs=True)` captures the inner `autograd.grad` as ordinary FX nodes. Then `torch.compile(dynamic=True, backend="inductor")` compiles the resulting graph. The `make_fx` step is essential: it turns the second-derivative `autograd.grad` into a flat FX graph that Inductor can lower without needing to re-derive the second backward at compile time.
 
 **Key compile invariants** (each maps to a `NOTE:` tag in `sezm_model.py`):
 
-| Invariant                                                            | Why                                                                                                                                                                                                                                                                                                                                                                           |
-| -------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Trace inputs use `nf=2`**                                          | `nf=1` triggers 0/1 specialization; `nf=3` collides with spatial dim 3 in `extended_coord (nf, nall, 3)`                                                                                                                                                                                                                                                                      |
-| **`silu_backward` decomposed**                                       | PyTorch has no registered higher-order derivative for SiLU; the opaque `silu_backward` would crash Inductor's double-backward                                                                                                                                                                                                                                                 |
-| **Detach chains stripped in training**                               | `make_fx` under `create_graph=True` wraps saved activations in `fwd → detach → detach → bwd` chains that sever gradient flow. The stripper uses graph topology to remove chain-inner detaches while preserving user-explicit `.detach()`                                                                                                                                      |
-| **FX graph rebuilt after stripping**                                 | `Graph.erase_node` leaves stale C-level pointers on some builds; a fresh `node_copy` pass prevents segfaults                                                                                                                                                                                                                                                                  |
-| **DDPOptimizer disabled**                                            | Set at import time. DDPOptimizer splits graphs at bucket boundaries, producing subgraphs with symbolic-integer outputs that crash AOT Autograd                                                                                                                                                                                                                                |
-| **`index_select` for edge vectors**                                  | Advanced indexing under `make_fx` has silently produced zero second-derivative gradients in this project                                                                                                                                                                                                                                                                      |
-| **Dummy edge appended**                                              | `torch.nonzero(valid_mask)` is data-dependent; an empty result cannot be traced symbolically. The dummy edge (`edge_mask=False`) keeps every tensor at length ≥ 1                                                                                                                                                                                                             |
-| **Compiled callable via `object.__setattr__`**                       | `nn.Module.__setattr__` would register the wrapper as a submodule, exposing duplicate parameter views to FSDP2/DDP                                                                                                                                                                                                                                                            |
-| **Extended coords rebound per forward**                              | `.detach().requires_grad_(True)` severs upstream autograd and provides a known-shape grad endpoint for symbolic tracing                                                                                                                                                                                                                                                       |
-| **Multi-slot compile cache keyed on `(training, do_atomic_virial)`** | Both toggle graph structure (second-derivative branch / extra output tensor). The cache is a `dict` with one slot per key (stored outside the `nn.Module` tree via `object.__setattr__`), so flipping between train and eval — at every `disp_freq` regular validation, at every full / EMA-full validation — reuses the other slot's compile product instead of evicting it. |
-| **Inference tightens Inductor fusion**                               | Inference path sets `triton.persistent_reductions=False` and drops `max_fusion_size` from 64 to 8 to avoid a Triton `make_ttgir` `PassManager::run failed` on a persistent per-reduction kernel fused around the fitting `tanh_backward` / `pow` / `exp` / `sum`; training keeps the looser options (different graph, no observed failure)                                    |
+| Invariant                                                                            | Why                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Trace inputs use `nf=2`**                                                          | `nf=1` triggers 0/1 specialization; `nf=3` collides with spatial dim 3 in `extended_coord (nf, nall, 3)`                                                                                                                                                                                                                                                                                                                   |
+| **`silu_backward` decomposed**                                                       | PyTorch has no registered higher-order derivative for SiLU; the opaque `silu_backward` would crash Inductor's double-backward                                                                                                                                                                                                                                                                                              |
+| **Detach chains stripped in training**                                               | `make_fx` under `create_graph=True` wraps saved activations in `fwd → detach → detach → bwd` chains that sever gradient flow. The stripper uses graph topology to remove chain-inner detaches while preserving user-explicit `.detach()`                                                                                                                                                                                   |
+| **FX graph rebuilt after stripping**                                                 | `Graph.erase_node` leaves stale C-level pointers on some builds; a fresh `node_copy` pass prevents segfaults                                                                                                                                                                                                                                                                                                               |
+| **DDPOptimizer disabled**                                                            | Set at import time. DDPOptimizer splits graphs at bucket boundaries, producing subgraphs with symbolic-integer outputs that crash AOT Autograd                                                                                                                                                                                                                                                                             |
+| **`index_select` for edge vectors**                                                  | Advanced indexing under `make_fx` has silently produced zero second-derivative gradients in this project                                                                                                                                                                                                                                                                                                                   |
+| **Dummy edge appended**                                                              | `torch.nonzero(valid_mask)` is data-dependent; an empty result cannot be traced symbolically. The dummy edge (`edge_mask=False`) keeps every tensor at length ≥ 1                                                                                                                                                                                                                                                          |
+| **Compiled callable via `object.__setattr__`**                                       | `nn.Module.__setattr__` would register the wrapper as a submodule, exposing duplicate parameter views to FSDP2/DDP                                                                                                                                                                                                                                                                                                         |
+| **Extended coords rebound per forward**                                              | `.detach().requires_grad_(True)` severs upstream autograd and provides a known-shape grad endpoint for symbolic tracing                                                                                                                                                                                                                                                                                                    |
+| **Multi-slot compile cache keyed on `(training, do_atomic_virial, has_coord_corr)`** | These fields toggle graph structure (second-derivative branch, extra output tensor, and the spin virial-correction input). The cache is a `dict` with one slot per key (stored outside the `nn.Module` tree via `object.__setattr__`), so flipping between train and eval — at every `disp_freq` regular validation, at every full / EMA-full validation — reuses the other slot's compile product instead of evicting it. |
+| **Inference tightens Inductor fusion**                                               | Inference path sets `triton.persistent_reductions=False` and drops `max_fusion_size` from 64 to 8 to avoid a Triton `make_ttgir` `PassManager::run failed` on a persistent per-reduction kernel fused around the fitting `tanh_backward` / `pow` / `exp` / `sum`; training keeps the looser options (different graph, no observed failure)                                                                                 |
 
 **Inductor options** locked in `trace_and_compile`. Shared across training and inference: `max_autotune=False`, `shape_padding=True`, `epilogue_fusion=False`, `triton.cudagraphs=False`, `triton.mix_order_reduction=False`. Mode-dependent fields:
 
@@ -1093,55 +1116,66 @@ ______________________________________________________________________
 
 ### 20.1 Descriptor Parameters
 
-| Parameter             | Type              | Default     | Description                                                        |
-| --------------------- | ----------------- | ----------- | ------------------------------------------------------------------ |
-| `rcut`                | float             | —           | Cutoff radius in Å                                                 |
-| `sel`                 | int \| list[int]  | —           | Max neighbors (int: total, list: per-type)                         |
-| `env_exp`             | list[int]         | `[7, 5]`    | Envelope exponents `[rbf_env_exp, edge_env_exp]`                   |
-| `channels`            | int               | 64          | Total channels per `(l,m)` coefficient                             |
-| `n_radial`            | int               | 10          | Number of radial basis functions                                   |
-| `radial_mlp`          | list[int]         | `[64]`      | Hidden sizes for radial MLP; use `0` as placeholder for `channels` |
-| `use_env_seed`        | bool              | True        | Enable FiLM conditioning from environment matrix                   |
-| `random_gamma`        | bool              | True        | Random edge roll for data augmentation                             |
-| `lmax`                | int               | 2           | Max degree (when `l_schedule` is None)                             |
-| `n_blocks`            | int               | 2           | Number of blocks (when `l_schedule` is None)                       |
-| `l_schedule`          | list[int] \| None | None        | Pyramid schedule of lmax per block (non-increasing)                |
-| `mmax`                | int \| None       | None        | Max SO(2) order (when `m_schedule` is None)                        |
-| `m_schedule`          | list[int] \| None | None        | Schedule of mmax per block                                         |
-| `n_focus`             | int               | 1           | Parallel focus streams in SO(2) convolution                        |
-| `focus_dim`           | int               | 0           | Per-focus hidden width (0 = use `channels`)                        |
-| `n_atten_head`        | int               | 1           | Attention heads in SO(2) aggregation (0 = plain scatter)           |
-| `so2_norm`            | bool              | False       | Pre-norm between SO(2) layers                                      |
-| `so2_layers`          | int               | 4           | SO2Linear layers per convolution                                   |
-| `so2_attn_res`        | str               | `"none"`    | SO(2)-internal depth attention (`none`/`independent`/`dependent`)  |
-| `ffn_neurons`         | int               | 0           | FFN hidden width (0 = auto from channels)                          |
-| `grid_mlp`            | bool              | False       | Grid-MLP FFN variant                                               |
-| `ffn_blocks`          | int               | 1           | FFN subblocks per interaction block                                |
-| `sandwich_norm`       | list[bool]        | `[T,F,T,F]` | `[so2_pre, so2_post, ffn_pre, ffn_post]`                           |
-| `mlp_bias`            | bool              | False       | Bias in equivariant layers                                         |
-| `layer_scale`         | bool              | False       | Learnable LayerScale (init 1e-3)                                   |
-| `full_attn_res`       | str               | `"none"`    | Descriptor-level full attention residual                           |
-| `block_attn_res`      | str               | `"none"`    | Descriptor-level block attention residual                          |
-| `s2_activation`       | list[bool]        | `[F, F]`    | `[so2_s2_enabled, ffn_s2_enabled]`                                 |
-| `s2_grid_resolution`  | list[int] \| None | None        | `[R_phi, R_theta]` for S2-grid activation                          |
-| `activation_function` | str               | `"silu"`    | Base activation                                                    |
-| `glu_activation`      | bool              | True        | Base GLU switch for FFN                                            |
-| `use_amp`             | bool              | True        | AMP with bf16 during training on CUDA                              |
-| `precision`           | str               | `"float32"` | Working precision for interaction blocks                           |
-| `eps`                 | float             | 1e-7        | Numerical stability epsilon                                        |
-| `exclude_types`       | list[tuple]       | `[]`        | Excluded type pairs                                                |
+| Parameter             | Type                | Default     | Description                                                                                        |
+| --------------------- | ------------------- | ----------- | -------------------------------------------------------------------------------------------------- |
+| `rcut`                | float               | —           | Cutoff radius in Å                                                                                 |
+| `sel`                 | int \| list[int]    | —           | Max neighbors (int: total, list: per-type)                                                         |
+| `env_exp`             | list[int]           | `[7, 5]`    | Envelope exponents `[rbf_env_exp, edge_env_exp]`                                                   |
+| `channels`            | int                 | 64          | Total channels per `(l,m)` coefficient                                                             |
+| `n_radial`            | int                 | 10          | Number of radial basis functions                                                                   |
+| `radial_mlp`          | list[int]           | `[64]`      | Hidden sizes for radial MLP; use `0` as placeholder for `channels`                                 |
+| `use_env_seed`        | bool                | True        | Enable FiLM conditioning from environment matrix                                                   |
+| `random_gamma`        | bool                | True        | Random edge roll for data augmentation                                                             |
+| `lmax`                | int                 | 2           | Max degree (when `l_schedule` is None)                                                             |
+| `n_blocks`            | int                 | 2           | Number of blocks (when `l_schedule` is None)                                                       |
+| `l_schedule`          | list[int] \| None   | None        | Pyramid schedule of lmax per block (non-increasing)                                                |
+| `mmax`                | int \| None         | None        | Max SO(2) order (when `m_schedule` is None)                                                        |
+| `m_schedule`          | list[int] \| None   | None        | Schedule of mmax per block                                                                         |
+| `n_focus`             | int                 | 1           | Parallel focus streams in SO(2) convolution                                                        |
+| `focus_dim`           | int                 | 0           | Per-focus hidden width (0 = use `channels`)                                                        |
+| `n_atten_head`        | int                 | 1           | Attention heads in SO(2) aggregation (0 = plain scatter)                                           |
+| `so2_norm`            | bool                | False       | Pre-norm between SO(2) layers                                                                      |
+| `so2_layers`          | int                 | 4           | SO2Linear layers per convolution                                                                   |
+| `so2_attn_res`        | str                 | `"none"`    | SO(2)-internal depth attention (`none`/`independent`/`dependent`)                                  |
+| `ffn_neurons`         | int                 | 0           | FFN hidden width (0 = auto from channels)                                                          |
+| `grid_mlp`            | bool                | False       | Grid-MLP FFN variant                                                                               |
+| `ffn_blocks`          | int                 | 1           | FFN subblocks per interaction block                                                                |
+| `sandwich_norm`       | list[bool]          | `[T,F,T,F]` | `[so2_pre, so2_post, ffn_pre, ffn_post]`                                                           |
+| `mlp_bias`            | bool                | False       | Bias in equivariant layers                                                                         |
+| `layer_scale`         | bool                | False       | Learnable LayerScale (init 1e-3)                                                                   |
+| `full_attn_res`       | str                 | `"none"`    | Descriptor-level full attention residual                                                           |
+| `block_attn_res`      | str                 | `"none"`    | Descriptor-level block attention residual                                                          |
+| `s2_activation`       | list[bool]          | `[F, F]`    | `[so2_s2_enabled, ffn_s2_enabled]`                                                                 |
+| `s2_grid_resolution`  | list[int] \| None   | None        | `[R_phi, R_theta]` for S2-grid activation                                                          |
+| `activation_function` | str                 | `"silu"`    | Base activation                                                                                    |
+| `glu_activation`      | bool                | True        | Base GLU switch for FFN                                                                            |
+| `use_amp`             | bool                | True        | AMP with bf16 during training on CUDA                                                              |
+| `add_chg_spin_ebd`    | bool                | False       | Add frame-level charge/spin condition embedding to scalar type features                            |
+| `default_chg_spin`    | list[float] \| None | None        | Default `[charge, spin]` condition used when `charge_spin` is not provided                         |
+| `precision`           | str                 | `"float32"` | Working precision for interaction blocks                                                           |
+| `eps`                 | float               | 1e-7        | Numerical stability epsilon                                                                        |
+| `exclude_types`       | list[tuple]         | `[]`        | Excluded pairs for standalone descriptor use; full models should prefer `model.pair_exclude_types` |
+
+When `add_chg_spin_ebd` is enabled, `charge_spin` is a frame-level tensor with
+shape `(nf, 2)`. The first column is charge and the second column is spin. The
+SeZM model canonicalizes this tensor before sparse-edge descriptor execution;
+the standard descriptor `forward()` canonicalizes it at the descriptor boundary.
+The condition embedding is added once to the scalar type embedding of every
+local atom in the frame, before the edge cache is built. The fitting `fparam`
+remains independent and is not used for descriptor condition embedding.
 
 ### 20.2 Model Parameters
 
-| Parameter                | Type  | Default  | Description                                                 |
-| ------------------------ | ----- | -------- | ----------------------------------------------------------- |
-| `model.type`             | str   | —        | `"SeZM"` / `"sezm"`                                         |
-| `model.use_compile`      | bool  | False    | Enable torch.compile path                                   |
-| `model.bridging_method`  | str   | `"none"` | `"none"` or `"ZBL"`                                         |
-| `model.bridging_r_inner` | float | 0.8      | Inner radius in Å                                           |
-| `model.bridging_r_outer` | float | 1.2      | Outer radius in Å                                           |
-| `model.lora.rank`        | int   | —        | LoRA rank (enables LoRA fine-tune; see §22)                 |
-| `model.lora.alpha`       | float | `rank`   | LoRA scaling numerator; effective scaling is `alpha / rank` |
+| Parameter                  | Type  | Default  | Description                                                                                                         |
+| -------------------------- | ----- | -------- | ------------------------------------------------------------------------------------------------------------------- |
+| `model.type`               | str   | —        | `"SeZM"` / `"sezm"`                                                                                                 |
+| `model.use_compile`        | bool  | False    | Enable torch.compile path                                                                                           |
+| `model.pair_exclude_types` | list  | `[]`     | Excluded type pairs; copied into the descriptor edge mask and must match descriptor `exclude_types` if both are set |
+| `model.bridging_method`    | str   | `"none"` | `"none"` or `"ZBL"`                                                                                                 |
+| `model.bridging_r_inner`   | float | 0.8      | Inner radius in Å                                                                                                   |
+| `model.bridging_r_outer`   | float | 1.2      | Outer radius in Å                                                                                                   |
+| `model.lora.rank`          | int   | —        | LoRA rank (enables LoRA fine-tune; see §22)                                                                         |
+| `model.lora.alpha`         | float | `rank`   | LoRA scaling numerator; effective scaling is `alpha / rank`                                                         |
 
 ### 20.3 Environment Variables
 
@@ -1310,7 +1344,7 @@ frozen_model.pt2  (ZIP archive)
 `extra/metadata.json` matches the reader contract at `source/api_cc/src/DeepPotPTExpt.cc` lines ~88-137 **and** the metadata-only load path of `deepmd.pt_expt.infer.deep_eval.DeepEval._init_from_metadata`. Emitted fields:
 
 - `type_map`, `rcut`, `sel`: descriptor geometry.
-- `dim_fparam`, `dim_aparam`, `has_default_fparam`, `default_fparam`: fitting parameter wiring (SeZM v1 ships `0 / 0 / False / null`).
+- `dim_fparam`, `dim_aparam`, `has_default_fparam`, `default_fparam`: fitting parameter wiring, including optional frame parameters used by the SeZM fitting head.
 - `mixed_types`, `is_spin`: SeZM is `True` / `False`.
 - `output_keys`: insertion-order names of the tensors returned by the traced graph (currently `energy`, `mask`, `energy_redu`, `energy_derv_r`, `energy_derv_c`, `energy_derv_c_redu`). `DeepPotPTExpt::extract_outputs` zips this list with the flat output vector of `AOTIModelPackageLoader::run`.
 - `fitting_output_defs`: serialised `OutputVariableDef` entries so the C++ side can rebuild `ModelOutputDef` without importing any Python class; the Python `DeepEval._init_from_metadata` consumes the same list.

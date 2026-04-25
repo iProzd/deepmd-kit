@@ -488,8 +488,22 @@ def descrpt_se_zm_args() -> list[Argument]:
         "This does not provide accelerations under fp32 precision but will decrease "
         "the memory usage, while preserving model accuracy."
     )
+    doc_add_chg_spin_ebd = (
+        "Whether to add frame-level charge and spin conditions to the descriptor "
+        "type embedding."
+    )
+    doc_default_chg_spin = (
+        "Default frame-level charge and spin conditions `[charge, spin]`. "
+        "If set, this value is used when charge_spin data are not provided."
+    )
 
-    doc_exclude_types = "The excluded pairs of types which have no interaction with each other. For example, `[[0, 1]]` means no interaction between type 0 and type 1."
+    doc_exclude_types = (
+        "The excluded pairs of types which have no interaction with each other. "
+        "For example, `[[0, 1]]` means no interaction between type 0 and type 1. "
+        "When the SeZM descriptor is used inside a full SeZM model config, prefer "
+        "the model-level `pair_exclude_types`; if both fields are provided, they "
+        "must match."
+    )
     doc_precision = f"The precision of the descriptor parameters, supported options are {list_to_doc(PRECISION_DICT.keys())}."
     doc_eps = "Small epsilon for numerical stability in division and normalization."
     doc_trainable = "If the parameters in the descriptor are trainable."
@@ -661,6 +675,20 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_glu_activation,
         ),
         Argument("use_amp", bool, optional=True, default=True, doc=doc_use_amp),
+        Argument(
+            "add_chg_spin_ebd",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_add_chg_spin_ebd,
+        ),
+        Argument(
+            "default_chg_spin",
+            list[float],
+            optional=True,
+            default=None,
+            doc=doc_only_pt_supported + doc_default_chg_spin,
+        ),
         Argument(
             "exclude_types",
             list[list[int]],

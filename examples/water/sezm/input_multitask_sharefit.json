@@ -55,6 +55,7 @@
         "activation_function": "silu",
         "glu_activation": true,
         "use_amp": true,
+        "add_chg_spin_ebd": false,
         "precision": "float32",
         "seed": 42,
         "_comment": "that's all"

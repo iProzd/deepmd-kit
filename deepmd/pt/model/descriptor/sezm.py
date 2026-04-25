@@ -73,6 +73,7 @@ from .sezm_nn import (
     ATTN_RES_MODES,
     BridgingSwitch,
     C3CutoffEnvelope,
+    ChargeSpinEmbedding,
     DepthAttnRes,
     EdgeFeatureCache,
     EnvironmentInitialEmbedding,
@@ -266,7 +267,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
     use_amp
         If True, use automatic mixed precision (AMP) with bfloat16 on CUDA.
         This does not provide accelerations under fp32 precision but will decrease
-        the memory usage, while persevering model accuracy.
+        the memory usage, while preserving model accuracy.
     exclude_types
         List of excluded type pairs.
     precision
@@ -282,6 +283,19 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         Random seed(s).
     type_map
         Type names.
+    inner_clamp_r_inner
+        Inner radius for distance saturation in Å. If both inner and outer radii
+        are set, the descriptor freezes short-range descriptor geometry inside
+        the zone-bridging window.
+    inner_clamp_r_outer
+        Outer radius for distance saturation in Å.
+    add_chg_spin_ebd
+        If True, add frame-level charge/spin condition embedding to scalar type
+        features before edge features are built.
+    default_chg_spin
+        Default frame-level charge/spin condition `[charge, spin]`. This value is
+        used when `add_chg_spin_ebd=True` and no explicit `charge_spin` tensor is
+        provided at the descriptor or SeZM model boundary.
 
     Notes
     -----
@@ -336,6 +350,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         type_map: list[str] | None = None,
         inner_clamp_r_inner: float | None = None,
         inner_clamp_r_outer: float | None = None,
+        add_chg_spin_ebd: bool = False,
+        default_chg_spin: list[float] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__()
@@ -424,6 +440,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         )
         self.seed = seed
         self.random_gamma = bool(random_gamma)
+        self.add_chg_spin_ebd = bool(add_chg_spin_ebd)
+        if default_chg_spin is not None and len(default_chg_spin) != 2:
+            raise ValueError("`default_chg_spin` must contain [charge, spin].")
+        self.default_chg_spin = (
+            None if default_chg_spin is None else [float(x) for x in default_chg_spin]
+        )
 
         # === Zone bridging: InnerClamp + Source Freeze Propagation Gate ===
         # Both the geometry clamp (``InnerClamp``) and the message-passing
@@ -474,6 +496,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         seed_env_seed = child_seed(self.seed, 4)
         seed_full_attn = child_seed(self.seed, 5)
         seed_block_attn = child_seed(self.seed, 6)
+        seed_charge_spin = child_seed(self.seed, 7)
 
         # === L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
@@ -539,6 +562,18 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             seed=seed_type_embedding,
             trainable=self.trainable,
         )
+        if self.add_chg_spin_ebd:
+            self.charge_spin_embedding: ChargeSpinEmbedding | None = (
+                ChargeSpinEmbedding(
+                    embed_dim=self.channels,
+                    activation_function=self.activation_function,
+                    dtype=self.compute_dtype,
+                    seed=seed_charge_spin,
+                    trainable=self.trainable,
+                )
+            )
+        else:
+            self.charge_spin_embedding = None
 
         # === Env FiLM embedding (optional) ===
         if self.use_env_seed:
@@ -756,6 +791,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         comm_dict: dict[str, torch.Tensor] | None = None,
         fparam: torch.Tensor | None = None,
         force_embedding: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -795,6 +831,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             ``(nf * nloc, D, 1, channels)``, where
             ``D = (l_schedule[0] + 1) ** 2``. This tensor is added to the
             initial SO(3) backbone state before the interaction blocks.
+        charge_spin
+            Frame-level charge and spin conditions with shape (nf, 2).
 
         Returns
         -------
@@ -817,6 +855,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             )
 
         if edge_index is not None:
+            nf_edge = extended_atype.shape[0]
+            charge_spin = self._canonicalize_charge_spin(
+                charge_spin,
+                nf=nf_edge,
+                dtype=extended_coord.dtype,
+                device=extended_coord.device,
+            )
             descriptor, _ = self.forward_with_edges(
                 extended_coord=extended_coord,
                 extended_atype=extended_atype,
@@ -824,6 +869,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 edge_vec=edge_vec,
                 edge_mask=edge_mask,
                 force_embedding=force_embedding,
+                charge_spin=charge_spin,
             )
             return (
                 descriptor,
@@ -838,6 +884,12 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         nf, nloc, nnei = nlist.shape
         nall = extended_coord.shape[1]
         n_nodes = int(nf * nloc)
+        charge_spin = self._canonicalize_charge_spin(
+            charge_spin,
+            nf=nf,
+            dtype=extended_coord.dtype,
+            device=extended_coord.device,
+        )
 
         # === Step 2. Excluded type pairs ===
         if self.exclude_types:
@@ -854,6 +906,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             type_ebed = self.type_embedding(atype_loc).reshape(
                 n_nodes, self.channels
             )  # (N, C)
+            if self.charge_spin_embedding is not None:
+                type_ebed = self._apply_charge_spin_embedding(
+                    type_ebed,
+                    charge_spin,
+                    nf=nf,
+                    nloc=nloc,
+                )
 
         # === Step 4. Build edge cache once (geometry + RBF + Wigner-D) ===
         # Zone bridging (InnerClamp + SFPG + ZBL) is not routed through the
@@ -982,6 +1041,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         edge_vec: torch.Tensor,
         edge_mask: torch.Tensor,
         force_embedding: torch.Tensor | None = None,
+        charge_spin: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Compute the descriptor from a sparse edge list.
@@ -1003,6 +1063,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             ``(nf * nloc, D, 1, channels)``, where
             ``D = (l_schedule[0] + 1) ** 2``. This tensor is added to the
             initial SO(3) backbone state before the interaction blocks.
+        charge_spin
+            Frame-level charge and spin conditions with shape (nf, 2).
 
         Returns
         -------
@@ -1020,6 +1082,13 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             type_ebed = self.type_embedding(atype_loc).reshape(
                 -1, self.channels
             )  # (N, C)
+            if self.charge_spin_embedding is not None:
+                type_ebed = self._apply_charge_spin_embedding(
+                    type_ebed,
+                    charge_spin,
+                    nf=nf,
+                    nloc=nloc,
+                )
             n_nodes = type_ebed.shape[0]
 
         # === Step 3. Build edge cache once (sparse edges) ===
@@ -1220,6 +1289,37 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         ).to(dtype=self.dtype)
         return x
 
+    def _apply_charge_spin_embedding(
+        self,
+        type_ebed: torch.Tensor,
+        charge_spin: torch.Tensor,
+        *,
+        nf: int,
+        nloc: int,
+    ) -> torch.Tensor:
+        """
+        Add frame-level charge and spin conditions to scalar type features.
+
+        Parameters
+        ----------
+        type_ebed
+            Flattened type embeddings with shape (nf * nloc, channels).
+        charge_spin
+            Frame-level charge and spin conditions with shape (nf, 2).
+        nf
+            Number of frames.
+        nloc
+            Number of local atoms.
+
+        Returns
+        -------
+        torch.Tensor
+            Conditioned type embeddings with shape (nf * nloc, channels).
+        """
+        condition = self.charge_spin_embedding(charge_spin.to(dtype=type_ebed.dtype))
+        condition = condition[:, None, :].expand(nf, nloc, self.channels)
+        return type_ebed + condition.reshape_as(type_ebed)
+
     def _edge_type_keep_mask(
         self,
         atype_flat: torch.Tensor,
@@ -1324,6 +1424,59 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         self.mmax = int(self.m_schedule[0])
 
+    def _canonicalize_charge_spin(
+        self,
+        charge_spin: torch.Tensor | None,
+        *,
+        nf: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        """
+        Canonicalize charge/spin conditions for the public descriptor path.
+
+        Parameters
+        ----------
+        charge_spin
+            Optional frame-level charge and spin conditions.
+        nf
+            Number of frames.
+        dtype
+            Target floating-point dtype.
+        device
+            Target device.
+
+        Returns
+        -------
+        torch.Tensor or None
+            Tensor with shape (nf, 2) when condition embedding is enabled.
+        """
+        if self.charge_spin_embedding is None:
+            return None
+        if charge_spin is None:
+            if self.default_chg_spin is None:
+                raise ValueError("`charge_spin` is required for this SeZM descriptor.")
+            charge_spin = torch.tensor(
+                self.default_chg_spin,
+                dtype=dtype,
+                device=device,
+            ).view(1, 2)
+        else:
+            charge_spin = charge_spin.to(dtype=dtype, device=device)
+
+        if charge_spin.ndim == 1:
+            if charge_spin.numel() != 2:
+                raise ValueError("`charge_spin` must contain [charge, spin].")
+            charge_spin = charge_spin.view(1, 2)
+        elif charge_spin.ndim != 2 or charge_spin.shape[-1] != 2:
+            raise ValueError("`charge_spin` must have shape (nf, 2).")
+
+        if charge_spin.shape[0] == 1 and nf != 1:
+            charge_spin = charge_spin.expand(nf, -1)
+        elif charge_spin.shape[0] != nf:
+            raise ValueError("`charge_spin` first dimension must match nframes.")
+        return charge_spin
+
     @contextmanager
     def _compute_mode_ctx(self, device: torch.device) -> Generator[None, None, None]:
         """
@@ -1372,6 +1525,18 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
     def get_type_map(self) -> list[str]:
         return self.type_map if self.type_map is not None else []
+
+    def get_dim_chg_spin(self) -> int:
+        """Return the charge/spin condition width."""
+        return 2 if self.add_chg_spin_ebd else 0
+
+    def has_default_chg_spin(self) -> bool:
+        """Return whether default charge/spin conditions are configured."""
+        return self.default_chg_spin is not None
+
+    def get_default_chg_spin(self) -> list[float] | None:
+        """Return default charge/spin conditions."""
+        return self.default_chg_spin
 
     def get_dim_out(self) -> int:
         return self.channels
@@ -1434,7 +1599,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
               film_*_strength_log, radial_basis, radial_embedding,
               edge_envelope, wigner_calc, gie, blocks, final_*_attn_res,
               output_ffn).
-            - ``1``: share only ``type_embedding``.
+            - ``1``: share ``type_embedding`` and optional condition embedding.
 
         resume
             Unused for SeZM; kept for interface compatibility.
@@ -1464,6 +1629,10 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     self._parameters[name] = base_class._parameters[name]
         elif shared_level == 1:
             self._modules["type_embedding"] = base_class._modules["type_embedding"]
+            if self.charge_spin_embedding is not None:
+                self._modules["charge_spin_embedding"] = base_class._modules[
+                    "charge_spin_embedding"
+                ]
         else:
             raise NotImplementedError
 
@@ -1588,6 +1757,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "seed": self.seed,
                 "inner_clamp_r_inner": self.inner_clamp_r_inner,
                 "inner_clamp_r_outer": self.inner_clamp_r_outer,
+                "add_chg_spin_ebd": self.add_chg_spin_ebd,
+                "default_chg_spin": self.default_chg_spin,
             },
             "@variables": {key: np_safe(value) for key, value in state.items()},
             "env_mat": DPEnvMat(self.rcut, self.rcut, self.eps).serialize(),

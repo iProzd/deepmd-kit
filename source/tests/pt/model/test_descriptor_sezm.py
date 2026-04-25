@@ -404,6 +404,88 @@ class TestDescrptSeZM(_SeZMTestCase):
                     msg="Smooth weight mismatch after deserialization",
                 )
 
+    def test_charge_spin_sparse_edge_conditioning(self) -> None:
+        """Charge/spin conditions should affect the sparse-edge descriptor path."""
+        coord, atype, nlist = _tiny_two_atom_system(self.device, dtype=torch.float32)
+        extended_coord = coord.reshape(1, -1)
+        edge_index = torch.tensor(
+            [[1, 0], [0, 1]], dtype=torch.long, device=self.device
+        )
+        edge_vec = torch.tensor(
+            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        edge_mask = torch.ones(2, dtype=torch.bool, device=self.device)
+        model = DescrptSeZM(
+            **_descriptor_kwargs(
+                add_chg_spin_ebd=True,
+                default_chg_spin=[0.0, 1.0],
+                seed=123,
+            )
+        )
+
+        desc_default, *_ = model(extended_coord, atype, nlist)
+        desc_explicit, *_ = model(
+            extended_coord,
+            atype,
+            nlist,
+            charge_spin=torch.tensor([[0.0, 1.0]], device=self.device),
+        )
+        desc_ref, _ = model.forward_with_edges(
+            extended_coord=coord,
+            extended_atype=atype,
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            edge_mask=edge_mask,
+            charge_spin=torch.tensor([[0.0, 1.0]], device=self.device),
+        )
+        desc_shifted, _ = model.forward_with_edges(
+            extended_coord=coord,
+            extended_atype=atype,
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            edge_mask=edge_mask,
+            charge_spin=torch.tensor([[1.0, 1.0]], device=self.device),
+        )
+        restored = DescrptSeZM.deserialize(model.serialize())
+        desc_restored, _ = restored.forward_with_edges(
+            extended_coord=coord,
+            extended_atype=atype,
+            edge_index=edge_index,
+            edge_vec=edge_vec,
+            edge_mask=edge_mask,
+            charge_spin=torch.tensor([[0.0, 1.0]], device=self.device),
+        )
+
+        self.assertTrue(restored.add_chg_spin_ebd)
+        self.assertEqual(restored.get_default_chg_spin(), [0.0, 1.0])
+        torch.testing.assert_close(desc_default, desc_explicit, atol=1e-6, rtol=1e-6)
+        self.assertFalse(torch.allclose(desc_ref, desc_shifted))
+        torch.testing.assert_close(desc_ref, desc_restored, atol=1e-6, rtol=1e-6)
+
+    def test_plain_descriptor_deserializes_without_condition_config(self) -> None:
+        """Plain descriptors should not depend on charge/spin condition fields."""
+        coord, atype, nlist = _tiny_two_atom_system(self.device, dtype=torch.float32)
+        extended_coord = coord.reshape(1, -1)
+        model = DescrptSeZM(**_descriptor_kwargs(seed=123))
+        self.assertTrue(
+            all("charge_spin_embedding" not in key for key in model.state_dict())
+        )
+        data = model.serialize()
+        data["config"].pop("add_chg_spin_ebd", None)
+        data["config"].pop("default_chg_spin", None)
+
+        restored = DescrptSeZM.deserialize(data)
+        desc_ref, *_ = model(extended_coord, atype, nlist)
+        desc_new, *_ = restored(extended_coord, atype, nlist)
+
+        self.assertFalse(restored.add_chg_spin_ebd)
+        self.assertTrue(
+            all("charge_spin_embedding" not in key for key in restored.state_dict())
+        )
+        torch.testing.assert_close(desc_ref, desc_new, atol=1e-6, rtol=1e-6)
+
     def test_seed_reproducibility(self) -> None:
         """Test that fixed seed produces identical model initialization."""
         for prec in ["float64", "float32", "bfloat16"]:

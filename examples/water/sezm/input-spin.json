@@ -2,10 +2,18 @@
   "model": {
     "type": "SeZM",
     "type_map": [
-      "O",
-      "H"
+      "Ni",
+      "O"
     ],
-    "pair_exclude_types": [],
+    "spin": {
+      "use_spin": [
+        true,
+        false
+      ],
+      "virtual_scale": [
+        0.314
+      ]
+    },
     "descriptor": {
       "type": "SeZM",
       "sel": 120,
@@ -53,7 +61,6 @@
       "activation_function": "silu",
       "glu_activation": true,
       "use_amp": true,
-      "add_chg_spin_ebd": false,
       "precision": "float32",
       "seed": 42,
       "_comment": "that's all"
@@ -81,37 +88,36 @@
     "decay_type": "cosine"
   },
   "loss": {
-    "type": "ener",
-    "loss_func": "mae",
-    "f_use_norm": true,
-    "start_pref_e": 20,
-    "limit_pref_e": 20,
-    "start_pref_f": 20,
-    "limit_pref_f": 20,
-    "start_pref_v": 5,
-    "limit_pref_v": 5
+    "type": "ener_spin",
+    "start_pref_e": 0.02,
+    "limit_pref_e": 1,
+    "start_pref_fr": 1000,
+    "limit_pref_fr": 1,
+    "start_pref_fm": 1000,
+    "limit_pref_fm": 1,
+    "_comment": " that's all"
   },
   "optimizer": {
     "type": "HybridMuon",
     "muon_mode": "slice",
+    "enable_gram": true,
     "magma_muon": true,
     "lr_adjust": 0.0,
     "weight_decay": 0.001
   },
   "training": {
-    "stat_file": "./se_zm.hdf5",
+    "stat_file": "./se_zm_spin.hdf5",
     "training_data": {
       "systems": [
-        "../data/data_0",
-        "../data/data_1",
-        "../data/data_2"
+        "../../spin/data_reformat/data_0",
+        "../../spin/data_reformat/data_1"
       ],
       "batch_size": 1,
       "_comment": "that's all"
     },
     "validation_data": {
       "systems": [
-        "../data/data_3"
+        "../../spin/data_reformat/data_2"
       ],
       "batch_size": 1,
       "numb_btch": 1,
@@ -140,15 +146,13 @@
     "_comment": "that's all"
   },
   "validating": {
-    "full_validation": true,
-    "ema_full_validation": true,
+    "full_validation": false,
+    "ema_full_validation": false,
     "validation_freq": 100,
-    "save_best": true,
+    "save_best": false,
     "max_best_ckpt": 1,
     "validation_metric": "E:MAE",
-    "full_val_file": "val.log",
-    "full_val_start": 100,
-    "compiled_infer": true,
-    "_comment": "that's all"
+    "compiled_infer": false,
+    "_comment": "full validation currently rejects spin-energy training"
   }
 }
