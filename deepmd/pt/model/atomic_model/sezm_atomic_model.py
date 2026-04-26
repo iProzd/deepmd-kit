@@ -705,6 +705,7 @@ class SeZMAtomicModel(DPAtomicModel):
             "numb_fparam": int(fitting.numb_fparam),
             "numb_aparam": int(fitting.numb_aparam),
             "dim_case_embd": int(fitting.dim_case_embd),
+            "case_film_embd": bool(getattr(fitting, "case_film_embd", False)),
             "activation_function": str(fitting.activation_function),
             "bias_out": bool(getattr(fitting, "bias_out", False)),
             "precision": str(fitting.precision),

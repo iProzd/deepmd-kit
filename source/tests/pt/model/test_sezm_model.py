@@ -661,7 +661,11 @@ class TestSeZMModelCompile(unittest.TestCase):
                 grads_dyn[name], grads_cmp[name], atol=grad_atol, rtol=grad_rtol
             )
 
-    def test_multitask_compile_matches_eager(self) -> None:
+    def _assert_multitask_compile_matches_eager(
+        self,
+        *,
+        case_film_embd: bool,
+    ) -> None:
         """
         Multi-task + compile: two SeZM branches sharing descriptor and
         fitting (with per-task case embedding) should each compile correctly
@@ -685,6 +689,7 @@ class TestSeZMModelCompile(unittest.TestCase):
             fitting_shared = dict(single["fitting_net"])
             fitting_shared["type"] = "sezm_ener"
             fitting_shared["dim_case_embd"] = 2
+            fitting_shared["case_film_embd"] = case_film_embd
             return {
                 "use_compile": use_compile,
                 "shared_dict": {
@@ -748,6 +753,9 @@ class TestSeZMModelCompile(unittest.TestCase):
             )
             # Per-task case embeddings remain distinct.
             self.assertFalse(torch.equal(f1.case_embd, f2.case_embd))
+            expected_in_dim = f1.dim_descrpt + (0 if case_film_embd else 2)
+            self.assertEqual(f1.filter_layers.networks[0].in_dim, expected_in_dim)
+            self.assertEqual(f1.case_film_embd, case_film_embd)
 
         # === Step 2. Run compile + eager forward on each branch. ===
         coord, atype, box, _, _, _ = self._load_water_frame()
@@ -790,6 +798,14 @@ class TestSeZMModelCompile(unittest.TestCase):
         self.assertFalse(
             torch.allclose(out_e1["energy"], out_e2["energy"], atol=1.0e-8)
         )
+
+    def test_multitask_compile_matches_eager(self) -> None:
+        """Legacy case embedding concatenation should match through compile."""
+        self._assert_multitask_compile_matches_eager(case_film_embd=False)
+
+    def test_multitask_case_film_compile_matches_eager(self) -> None:
+        """Case FiLM sharefit should match eager and compile paths."""
+        self._assert_multitask_compile_matches_eager(case_film_embd=True)
 
 
 class TestInterPotential(unittest.TestCase):

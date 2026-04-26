@@ -2128,6 +2128,7 @@ def fitting_ener() -> list[Argument]:
     doc_numb_aparam = "The dimension of the atomic parameter. If set to >0, file `aparam.npy` should be included to provided the input aparams."
     doc_default_fparam = "The default frame parameter. If set, when `fparam.npy` files are not included in the data system, this value will be used as the default value for the frame parameter in the fitting net."
     doc_dim_case_embd = "The dimension of the case embedding embedding. When training or fine-tuning a multitask model with case embedding embeddings, this number should be set to the number of model branches."
+    doc_case_film_embd = "Whether to use case FiLM conditioning for SeZM shared fitting. When enabled, the case embedding is used to modulate fitting features instead of being concatenated to the fitting input."
     doc_neuron = "The number of neurons in each hidden layer of the fitting net. When two hidden layers are of the same size, a skip connection is built."
     doc_activation_function = f'The activation function in the fitting net. Supported activation functions are {list_to_doc(ACTIVATION_FN_DICT.keys())} Note that "gelu" denotes the custom operator version, and "gelu_tf" denotes the TF standard version. If you set "None" or "none" here, no activation function will be used.'
     doc_precision = f"The precision of the fitting net parameters, supported options are {list_to_doc(PRECISION_DICT.keys())} Default follows the interface precision."
@@ -2167,6 +2168,13 @@ def fitting_ener() -> list[Argument]:
             optional=True,
             default=0,
             doc=doc_only_pt_supported + doc_dim_case_embd,
+        ),
+        Argument(
+            "case_film_embd",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_case_film_embd,
         ),
         Argument(
             "neuron",

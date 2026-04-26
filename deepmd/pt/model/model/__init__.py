@@ -271,12 +271,16 @@ def _resolve_sezm_fitting_neuron(fitting_net: dict, descriptor: BaseDescriptor) 
     if 0 not in resolved_neuron:
         return
     # NOTE: Heuristic GLU hidden width = round_to_32(8/3 * in_dim).
-    # ``in_dim`` mirrors ``GeneralFitting`` / ``SeZMEnergyFittingNet``
-    # forward input width: descriptor features + fparam + aparam
-    # (unless used as mask) + case embedding.  Using ``channels``
-    # alone would ignore those extras and under-size the hidden
-    # layer in multi-task runs with ``dim_case_embd > 0`` or when
-    # frame / atomic parameters are configured.
+    # ``in_dim`` mirrors ``SeZMEnergyFittingNet`` forward input width:
+    # descriptor features + fparam + aparam (unless used as mask), plus
+    # the legacy concatenated case embedding only when case FiLM is disabled.
+    # Using ``channels`` alone would ignore those extras and under-size the
+    # hidden layer when frame / atomic parameters are configured.
+    case_dim = (
+        0
+        if bool(fitting_net.get("case_film_embd", False))
+        else int(fitting_net.get("dim_case_embd", 0))
+    )
     dim_in = (
         int(descriptor.get_dim_out())
         + int(fitting_net.get("numb_fparam", 0))
@@ -285,7 +289,7 @@ def _resolve_sezm_fitting_neuron(fitting_net: dict, descriptor: BaseDescriptor) 
             if bool(fitting_net.get("use_aparam_as_mask", False))
             else int(fitting_net.get("numb_aparam", 0))
         )
-        + int(fitting_net.get("dim_case_embd", 0))
+        + case_dim
     )
     resolved_width = int(32 * math.ceil((8.0 * float(dim_in) / 3.0) / 32.0))
     fitting_net["neuron"] = [

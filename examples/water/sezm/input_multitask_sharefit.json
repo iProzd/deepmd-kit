@@ -68,6 +68,7 @@
         "activation_function": "silu",
         "precision": "float32",
         "dim_case_embd": 2,
+        "case_film_embd": true,
         "seed": 42,
         "_comment": "that's all"
       },

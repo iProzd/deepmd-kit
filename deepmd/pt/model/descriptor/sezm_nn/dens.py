@@ -391,6 +391,8 @@ class SeZMDeNSFittingNet(torch.nn.Module):
         Number of atomic parameters.
     dim_case_embd
         Case embedding width for the scalar energy branch.
+    case_film_embd
+        Whether the scalar energy branch uses case FiLM conditioning.
     activation_function
         Activation function of the scalar energy branch.
     bias_out
@@ -431,6 +433,7 @@ class SeZMDeNSFittingNet(torch.nn.Module):
         numb_fparam: int = 0,
         numb_aparam: int = 0,
         dim_case_embd: int = 0,
+        case_film_embd: bool = False,
         activation_function: str = "silu",
         bias_out: bool = False,
         precision: str = DEFAULT_PRECISION,
@@ -459,6 +462,7 @@ class SeZMDeNSFittingNet(torch.nn.Module):
         self.numb_fparam = int(numb_fparam)
         self.numb_aparam = int(numb_aparam)
         self.dim_case_embd = int(dim_case_embd)
+        self.case_film_embd = bool(case_film_embd and self.dim_case_embd > 0)
         self.bias_out = bool(bias_out)
         self.resnet_dt = bool(resnet_dt)
         self.type_map = None if type_map is None else list(type_map)
@@ -487,6 +491,7 @@ class SeZMDeNSFittingNet(torch.nn.Module):
             numb_fparam=self.numb_fparam,
             numb_aparam=self.numb_aparam,
             dim_case_embd=self.dim_case_embd,
+            case_film_embd=self.case_film_embd,
             activation_function=self.activation_function,
             bias_out=self.bias_out,
             precision=self.precision,
@@ -719,6 +724,7 @@ class SeZMDeNSFittingNet(torch.nn.Module):
                 "numb_fparam": self.numb_fparam,
                 "numb_aparam": self.numb_aparam,
                 "dim_case_embd": self.dim_case_embd,
+                "case_film_embd": self.case_film_embd,
                 "activation_function": self.activation_function,
                 "bias_out": self.bias_out,
                 "precision": self.precision,
