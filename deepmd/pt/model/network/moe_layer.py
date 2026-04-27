@@ -41,10 +41,14 @@ from deepmd.pt.model.network.moe_packer import (
     exchange_metadata,
     validate_dim_ratio,
 )
+from deepmd.pt.model.network.moe_topk_sort_cuda import (
+    fused_topk_expand_sort,
+)
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
 USE_ULTRA_OPTIMIZED = True  # Enable ultra optimizations (embed expert IDs, overlap compute)
+USE_FUSED_TOPK_SORT = True  # Use fused CUDA kernel for topk-expand-sort
 
 
 def _topk_expand_sort(
@@ -573,20 +577,35 @@ class MoEDispatchCombine(nn.Module):
             # Concatenate node M1 and M2 inputs for packing: [N_node, nd + n_sym_dim] = [N_node, 28a]
             node_combined = torch.cat([node_m1_input, node_m2_input], dim=-1)  # [N_node, 28a]
 
+            if USE_FUSED_TOPK_SORT and node_combined.is_cuda:
+                _expand_sort = fused_topk_expand_sort
+                _expand_sort_kwargs = dict(
+                    n_routing_experts=self.n_routing_experts,
+                    ep_size=self.ep_size,
+                )
+            else:
+                _expand_sort = _topk_expand_sort
+                _expand_sort_kwargs = {}
+
             (node_sorted, node_expert_ids_sorted, node_weights_sorted,
-            node_unsort_idx, node_counts, _) = _topk_expand_sort(
+            node_unsort_idx, node_counts, _) = _expand_sort(
                 node_combined, node_indices, node_weights, self.experts_per_gpu,
+                **_expand_sort_kwargs,
             )
             (edge_sorted, edge_expert_ids_sorted, edge_weights_sorted,
-            edge_unsort_idx, edge_counts, _) = _topk_expand_sort(
+            edge_unsort_idx, edge_counts, _) = _expand_sort(
                 edge_input, edge_indices, edge_weights, self.experts_per_gpu,
+                **_expand_sort_kwargs,
             )
             (angle_sorted, angle_expert_ids_sorted, angle_weights_sorted,
-            angle_unsort_idx, angle_counts, _) = _topk_expand_sort(
+            angle_unsort_idx, angle_counts, _) = _expand_sort(
                 angle_input, angle_indices, angle_weights, self.experts_per_gpu,
+                **_expand_sort_kwargs,
             )
 
             # Pad counts to ep_size if needed (some GPUs may get 0 tokens).
+            # The fused kernel already returns length-ep_size; this loop
+            # is a no-op there but kept for the PyTorch fallback path.
             while len(node_counts) < self.ep_size:
                 node_counts.append(0)
             while len(edge_counts) < self.ep_size:
