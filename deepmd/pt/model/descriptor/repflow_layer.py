@@ -41,6 +41,8 @@ from deepmd.utils.version import (
     check_version_compatibility,
 )
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 
 class RepFlowLayer(torch.nn.Module):
     def __init__(
@@ -797,11 +799,12 @@ class RepFlowLayer(torch.nn.Module):
                 assert type_embedding is not None, (
                     "type_embedding is required for MoE forward"
                 )
-                return self.forward_moe(
-                    node_ebd_ext, edge_ebd, h2, angle_ebd,
-                    nlist, nlist_mask, sw, a_nlist, a_nlist_mask, a_sw,
-                    edge_index, angle_index, type_embedding,
-                )
+                with record_function("forward_moe"):
+                    return self.forward_moe(
+                        node_ebd_ext, edge_ebd, h2, angle_ebd,
+                        nlist, nlist_mask, sw, a_nlist, a_nlist_mask, a_sw,
+                        edge_index, angle_index, type_embedding,
+                    )
         """
         Parameters
         ----------
@@ -1335,19 +1338,20 @@ class RepFlowLayer(torch.nn.Module):
         angle_router_out = self.angle_router(type_embedding)
 
         # ---- Step 3: MoE Phase 1 ----
-        node_m1_out, node_m2_out, edge_merged_out, angle_merged_out = (
-            self.moe_phase1(
-                node_m1_input=node_m1_input,
-                node_m2_input=node_m2_input,
-                edge_input=edge_info,
-                angle_input=angle_info,
-                node_router_out=node_router_out,
-                edge_router_out=edge_router_out,
-                angle_router_out=angle_router_out,
-                n2e_index=n2e_index,
-                n2a_index=n2a_index,
+        with record_function("moe_phase1"):
+            node_m1_out, node_m2_out, edge_merged_out, angle_merged_out = (
+                self.moe_phase1(
+                    node_m1_input=node_m1_input,
+                    node_m2_input=node_m2_input,
+                    edge_input=edge_info,
+                    angle_input=angle_info,
+                    node_router_out=node_router_out,
+                    edge_router_out=edge_router_out,
+                    angle_router_out=angle_router_out,
+                    n2e_index=n2e_index,
+                    n2a_index=n2a_index,
+                )
             )
-        )
 
         # ---- Step 4: Split merged outputs ----
         # edge_merged_out: [N_edge, n_dim + e_dim] → M3 part (node update) + M4 part (edge self).

@@ -114,6 +114,8 @@ from deepmd.utils.path import (
     DPH5Path,
 )
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
 log = logging.getLogger(__name__)
 
 
@@ -480,19 +482,19 @@ class Trainer:
                 self.validation_data,
                 self.valid_numb_batch,
             ) = get_data_loader(training_data, validation_data, training_params)
-            training_data.print_summary(
-                "training",
-                to_numpy_array(self.training_dataloader.sampler.weights)
-                if not isinstance(training_data, LmdbDataset)
-                else [1.0],
-            )
-            if validation_data is not None:
-                validation_data.print_summary(
-                    "validation",
-                    to_numpy_array(self.validation_dataloader.sampler.weights)
-                    if not isinstance(validation_data, LmdbDataset)
-                    else [1.0],
-                )
+            # training_data.print_summary(
+            #     "training",
+            #     to_numpy_array(self.training_dataloader.sampler.weights)
+            #     if not isinstance(training_data, LmdbDataset)
+            #     else [1.0],
+            # )
+            # if validation_data is not None:
+            #     validation_data.print_summary(
+            #         "validation",
+            #         to_numpy_array(self.validation_dataloader.sampler.weights)
+            #         if not isinstance(validation_data, LmdbDataset)
+            #         else [1.0],
+            #     )
         else:
             (
                 self.training_dataloader,
@@ -555,24 +557,24 @@ class Trainer:
                     training_params["data_dict"][model_key],
                 )
 
-                training_data[model_key].print_summary(
-                    f"training in {model_key}",
-                    to_numpy_array(self.training_dataloader[model_key].sampler.weights)
-                    if not isinstance(training_data[model_key], LmdbDataset)
-                    else [1.0],
-                )
-                if (
-                    validation_data is not None
-                    and validation_data[model_key] is not None
-                ):
-                    validation_data[model_key].print_summary(
-                        f"validation in {model_key}",
-                        to_numpy_array(
-                            self.validation_dataloader[model_key].sampler.weights
-                        )
-                        if not isinstance(validation_data[model_key], LmdbDataset)
-                        else [1.0],
-                    )
+                # training_data[model_key].print_summary(
+                #     f"training in {model_key}",
+                #     to_numpy_array(self.training_dataloader[model_key].sampler.weights)
+                #     if not isinstance(training_data[model_key], LmdbDataset)
+                #     else [1.0],
+                # )
+                # if (
+                #     validation_data is not None
+                #     and validation_data[model_key] is not None
+                # ):
+                #     validation_data[model_key].print_summary(
+                #         f"validation in {model_key}",
+                #         to_numpy_array(
+                #             self.validation_dataloader[model_key].sampler.weights
+                #         )
+                #         if not isinstance(validation_data[model_key], LmdbDataset)
+                #         else [1.0],
+                #     )
 
         # Resolve training steps
         per_task_total = []
@@ -1094,14 +1096,16 @@ class Trainer:
 
             writer = SummaryWriter(log_dir=self.tensorboard_log_dir)
         if self.enable_profiler or self.profiling:
-            prof = torch.profiler.profile(
-                schedule=torch.profiler.schedule(wait=1, warmup=15, active=3, repeat=1),
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=2, warmup=12, active=6, repeat=1),
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     self.tensorboard_log_dir
                 )
                 if self.enable_profiler
                 else None,
                 record_shapes=True,
+                profile_memory=True,
                 with_stack=True,
             )
             prof.start()
@@ -1114,9 +1118,6 @@ class Trainer:
                     p=self.model_prob,
                 )
                 task_key = self.model_keys[model_index]
-            # PyTorch Profiler
-            if self.enable_profiler or self.profiling:
-                prof.step()
             cur_lr = self.lr_schedule.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
@@ -1130,75 +1131,78 @@ class Trainer:
             if self.opt_type in ["Adam", "AdamW", "AdaMuon", "HybridMuon"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
+                with record_function("forward+backward"):
+                    model_pred, loss, more_loss = self.wrapper(
+                        **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
+                    )
                 # MoE EP+DP: manual gradient sync with correct groups (clean separation).
                 # Standard DDP all-reduces ALL gradients across world_size, which is incorrect
                 # for routing experts (should only sync within DP group). Use no_sync() to
                 # disable DDP's automatic sync, then manually sync with correct groups.
-                if self.use_moe_ep:
-                    with self.wrapper.no_sync():
+                with record_function("loss_backward"):
+                    if self.use_moe_ep:
+                        with self.wrapper.no_sync():
+                            loss.backward()
+                        # Manual sync: routing experts → DP group, others → world group.
+                        from deepmd.pt.utils.moe_ep_dp import sync_moe_gradients
+                        sync_moe_gradients(
+                            self._get_inner_module(),
+                            self.dp_group,
+                            None,  # world_group (use default)
+                            self.dp_size,
+                            self.world_size,
+                        )
+                    else:
+                        # Standard DDP: automatic gradient sync during backward.
                         loss.backward()
-                    # Manual sync: routing experts → DP group, others → world group.
-                    from deepmd.pt.utils.moe_ep_dp import sync_moe_gradients
-                    sync_moe_gradients(
-                        self._get_inner_module(),
-                        self.dp_group,
-                        None,  # world_group (use default)
-                        self.dp_size,
-                        self.world_size,
-                    )
-                else:
-                    # Standard DDP: automatic gradient sync during backward.
-                    loss.backward()
                 # === Initialize gradient diagnostics variables ===
                 total_norm: torch.Tensor | None = None
                 pre_clip_named_norms: list[tuple[str, float]] = []
-                if self.gradient_max_norm > 0.0:
-                    # Collect per-parameter gradient norms before clipping.
-                    # NOTE: Under FSDP2 with ZeRO stage >= 2, p.grad is a sharded DTensor,
-                    # so p.grad.norm() computes the shard-local L2 norm, not the full-parameter
-                    # norm. Skip per-param collection in this case to avoid misleading values.
-                    if (
-                        self.enable_tensorboard
-                        and self.zero_stage < 2
-                        and (
-                            display_step_id % self.tensorboard_freq == 0
-                            or display_step_id == 1
+                with record_function("optimizer_step"):
+                    if self.gradient_max_norm > 0.0:
+                        # Collect per-parameter gradient norms before clipping.
+                        # NOTE: Under FSDP2 with ZeRO stage >= 2, p.grad is a sharded DTensor,
+                        # so p.grad.norm() computes the shard-local L2 norm, not the full-parameter
+                        # norm. Skip per-param collection in this case to avoid misleading values.
+                        if (
+                            self.enable_tensorboard
+                            and self.zero_stage < 2
+                            and (
+                                display_step_id % self.tensorboard_freq == 0
+                                or display_step_id == 1
+                            )
+                        ):
+                            pre_clip_named_norms = [
+                                (name, p.grad.detach().norm().item())
+                                for name, p in self.wrapper.named_parameters()
+                                if p.grad is not None
+                            ]
+                        # FSDP2 sharded DTensor gradients don't support error_if_nonfinite; use manual isfinite check instead.
+                        total_norm = torch.nn.utils.clip_grad_norm_(
+                            self.wrapper.parameters(),
+                            self.gradient_max_norm,
                         )
-                    ):
-                        pre_clip_named_norms = [
-                            (name, p.grad.detach().norm().item())
-                            for name, p in self.wrapper.named_parameters()
-                            if p.grad is not None
-                        ]
-                    # FSDP2 sharded DTensor gradients don't support error_if_nonfinite; use manual isfinite check instead.
-                    total_norm = torch.nn.utils.clip_grad_norm_(
-                        self.wrapper.parameters(),
-                        self.gradient_max_norm,
-                    )
-                    if not torch.isfinite(total_norm):
-                        bad_params = []
-                        for name, p in self.wrapper.named_parameters():
-                            if p.grad is not None:
-                                grad_norm = p.grad.data.norm()
-                                if not torch.isfinite(grad_norm):
-                                    bad_params.append(
-                                        f"  {name}: grad_norm={grad_norm}, shape={list(p.shape)}"
-                                    )
-                        detail = (
-                            "\n".join(bad_params)
-                            if bad_params
-                            else "  (all individual grads finite, overflow in norm reduction)"
-                        )
-                        raise RuntimeError(
-                            f"Non-finite gradient norm: {total_norm}\n"
-                            f"Parameters with non-finite gradients:\n{detail}"
-                        )
-                with torch.device(DEVICE):
-                    self.optimizer.step()
-                self.scheduler.step()
+                        if not torch.isfinite(total_norm):
+                            bad_params = []
+                            for name, p in self.wrapper.named_parameters():
+                                if p.grad is not None:
+                                    grad_norm = p.grad.data.norm()
+                                    if not torch.isfinite(grad_norm):
+                                        bad_params.append(
+                                            f"  {name}: grad_norm={grad_norm}, shape={list(p.shape)}"
+                                        )
+                            detail = (
+                                "\n".join(bad_params)
+                                if bad_params
+                                else "  (all individual grads finite, overflow in norm reduction)"
+                            )
+                            raise RuntimeError(
+                                f"Non-finite gradient norm: {total_norm}\n"
+                                f"Parameters with non-finite gradients:\n{detail}"
+                            )
+                    with torch.device(DEVICE):
+                        self.optimizer.step()
+                    self.scheduler.step()
             elif self.opt_type == "LKF":
                 if isinstance(self.loss, EnergyStdLoss):
                     KFOptWrapper = KFOptimizerWrapper(
@@ -1571,7 +1575,13 @@ class Trainer:
             self.last_display_step = 0
 
         for step_id in range(self.start_step, self.num_steps):
+            if self.enable_profiler or self.profiling:
+                if step_id >= 20:
+                    break
             step(step_id)
+            # PyTorch Profiler
+            if self.enable_profiler or self.profiling:
+                prof.step()
             if JIT:
                 break
 
@@ -1645,10 +1655,12 @@ class Trainer:
                     f"The profiling trace has been saved under {self.tensorboard_log_dir}"
                 )
             if not self.enable_profiler and self.profiling:
-                prof.export_chrome_trace(self.profiling_file)
+                prof.export_chrome_trace(self.profiling_file.split('.')[0]+f'_{self.rank}.json')
                 log.info(
-                    f"The profiling trace has been saved to: {self.profiling_file}"
+                    f"The profiling trace has been saved to: {self.profiling_file.split('.')[0]+f'_{self.rank}.json'}"
                 )
+                if self.rank == 0:
+                    print(prof.key_averages().table( sort_by="cuda_time_total", row_limit=20))
 
     def save_model(self, save_path: str, lr: float = 0.0, step: int = 0) -> None:
         module = self._get_inner_module()

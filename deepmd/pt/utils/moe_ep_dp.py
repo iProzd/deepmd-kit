@@ -138,6 +138,29 @@ def sync_moe_gradients(
     world_size : int
         Total number of ranks.
     """
+    # Early return: if world_size == 1, no synchronization needed
+    if world_size == 1:
+        return
+
+    # Early return: if dp_size == 1 and world_size == ep_size,
+    # only routing experts need sync (already done by A2A backward)
+    # and other params are replicated (no DP), so skip
+    if dp_size == 1:
+        # With DP=1, all non-routing params are replicated across EP ranks
+        # and need world-group all-reduce. Routing expert grads are already
+        # synced via A2A backward across EP group.
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if not _is_routing_expert_param(name):
+                # Non-routing params: all-reduce across world
+                dist.all_reduce(
+                    param.grad, op=dist.ReduceOp.SUM, group=world_group
+                )
+                param.grad.div_(world_size)
+        return
+
+    # General case: both EP and DP are active
     for name, param in model.named_parameters():
         if param.grad is None:
             continue

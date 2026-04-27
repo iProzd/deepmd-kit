@@ -509,14 +509,10 @@ def exchange_metadata(
         return send_info
 
     ep_size = dist.get_world_size(group=ep_group)
-    n_fields = send_info.shape[1]
 
-    # Each rank sends one row (n_fields ints) to every other rank.
-    # Use all_to_all on the flattened tensor.
     recv_info = torch.empty_like(send_info)
-    # dist.all_to_all requires a list of tensors.
-    send_list = list(send_info.chunk(ep_size, dim=0))  # each [1, n_fields]
-    recv_list = list(recv_info.chunk(ep_size, dim=0))   # each [1, n_fields]
+    send_list = list(send_info.chunk(ep_size, dim=0))
+    recv_list = list(recv_info.chunk(ep_size, dim=0))
     dist.all_to_all(recv_list, send_list, group=ep_group)
 
     return torch.cat(recv_list, dim=0)

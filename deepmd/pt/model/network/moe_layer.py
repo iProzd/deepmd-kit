@@ -42,6 +42,10 @@ from deepmd.pt.model.network.moe_packer import (
     validate_dim_ratio,
 )
 
+from torch.profiler import profile, record_function, ProfilerActivity
+
+USE_ULTRA_OPTIMIZED = True  # Enable ultra optimizations (embed expert IDs, overlap compute)
+
 
 def _topk_expand_sort(
     features: torch.Tensor,
@@ -306,18 +310,19 @@ class MoEDispatchCombine(nn.Module):
         edge_out : Tensor ``[N_edge, nd+ne]``
         angle_out : Tensor ``[N_angle, ne+na]``
         """
-        if self.ep_group is None:
-            return self._forward_single_gpu(
-                node_m1_input, node_m2_input, edge_input, angle_input,
-                node_router_out, edge_router_out, angle_router_out,
-                n2e_index, n2a_index,
-            )
-        else:
-            return self._forward_multi_gpu(
-                node_m1_input, node_m2_input, edge_input, angle_input,
-                node_router_out, edge_router_out, angle_router_out,
-                n2e_index, n2a_index,
-            )
+        with record_function("moe_combine"):
+            if self.ep_group is None:
+                return self._forward_single_gpu(
+                    node_m1_input, node_m2_input, edge_input, angle_input,
+                    node_router_out, edge_router_out, angle_router_out,
+                    n2e_index, n2a_index,
+                )
+            else:
+                return self._forward_multi_gpu(
+                    node_m1_input, node_m2_input, edge_input, angle_input,
+                    node_router_out, edge_router_out, angle_router_out,
+                    n2e_index, n2a_index,
+                )
 
     # ------------------------------------------------------------------
     # Single-GPU path (no A2A, simple for-loop)
@@ -546,156 +551,211 @@ class MoEDispatchCombine(nn.Module):
         n2a_index: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Multi-GPU path with All-to-All dispatch and combine."""
-        N_node = node_m1_input.shape[0]
-        N_edge = edge_input.shape[0]
-        N_angle = angle_input.shape[0]
-        device = node_m1_input.device
-        dtype = node_m1_input.dtype
-        topk = self.topk
+        with record_function("sort_and_expand"):
+            N_node = node_m1_input.shape[0]
+            N_edge = edge_input.shape[0]
+            N_angle = angle_input.shape[0]
+            device = node_m1_input.device
+            dtype = node_m1_input.dtype
+            topk = self.topk
 
-        node_weights, node_indices = node_router_out
-        edge_weights_node, edge_indices_node = edge_router_out
-        angle_weights_node, angle_indices_node = angle_router_out
+            node_weights, node_indices = node_router_out
+            edge_weights_node, edge_indices_node = edge_router_out
+            angle_weights_node, angle_indices_node = angle_router_out
 
-        # Broadcast node-level routing to edge/angle.
-        edge_weights = edge_weights_node[n2e_index]   # [N_edge, topk]
-        edge_indices = edge_indices_node[n2e_index]   # [N_edge, topk]
-        angle_weights = angle_weights_node[n2a_index]  # [N_angle, topk]
-        angle_indices = angle_indices_node[n2a_index]  # [N_angle, topk]
+            # Broadcast node-level routing to edge/angle.
+            edge_weights = edge_weights_node[n2e_index]   # [N_edge, topk]
+            edge_indices = edge_indices_node[n2e_index]   # [N_edge, topk]
+            angle_weights = angle_weights_node[n2a_index]  # [N_angle, topk]
+            angle_indices = angle_indices_node[n2a_index]  # [N_angle, topk]
 
-        # ── Step 3a: topk expand + sort ──
-        # Concatenate node M1 and M2 inputs for packing: [N_node, nd + n_sym_dim] = [N_node, 28a]
-        node_combined = torch.cat([node_m1_input, node_m2_input], dim=-1)  # [N_node, 28a]
+            # ── Step 3a: topk expand + sort ──
+            # Concatenate node M1 and M2 inputs for packing: [N_node, nd + n_sym_dim] = [N_node, 28a]
+            node_combined = torch.cat([node_m1_input, node_m2_input], dim=-1)  # [N_node, 28a]
 
-        (node_sorted, node_expert_ids_sorted, node_weights_sorted,
-         node_unsort_idx, node_counts, _) = _topk_expand_sort(
-            node_combined, node_indices, node_weights, self.experts_per_gpu,
-        )
-        (edge_sorted, edge_expert_ids_sorted, edge_weights_sorted,
-         edge_unsort_idx, edge_counts, _) = _topk_expand_sort(
-            edge_input, edge_indices, edge_weights, self.experts_per_gpu,
-        )
-        (angle_sorted, angle_expert_ids_sorted, angle_weights_sorted,
-         angle_unsort_idx, angle_counts, _) = _topk_expand_sort(
-            angle_input, angle_indices, angle_weights, self.experts_per_gpu,
-        )
+            (node_sorted, node_expert_ids_sorted, node_weights_sorted,
+            node_unsort_idx, node_counts, _) = _topk_expand_sort(
+                node_combined, node_indices, node_weights, self.experts_per_gpu,
+            )
+            (edge_sorted, edge_expert_ids_sorted, edge_weights_sorted,
+            edge_unsort_idx, edge_counts, _) = _topk_expand_sort(
+                edge_input, edge_indices, edge_weights, self.experts_per_gpu,
+            )
+            (angle_sorted, angle_expert_ids_sorted, angle_weights_sorted,
+            angle_unsort_idx, angle_counts, _) = _topk_expand_sort(
+                angle_input, angle_indices, angle_weights, self.experts_per_gpu,
+            )
 
-        # Pad counts to ep_size if needed (some GPUs may get 0 tokens).
-        while len(node_counts) < self.ep_size:
-            node_counts.append(0)
-        while len(edge_counts) < self.ep_size:
-            edge_counts.append(0)
-        while len(angle_counts) < self.ep_size:
-            angle_counts.append(0)
+            # Pad counts to ep_size if needed (some GPUs may get 0 tokens).
+            while len(node_counts) < self.ep_size:
+                node_counts.append(0)
+            while len(edge_counts) < self.ep_size:
+                edge_counts.append(0)
+            while len(angle_counts) < self.ep_size:
+                angle_counts.append(0)
 
         # ── Step 3b: Pack for dispatch ──
-        packed, send_splits = self.packer.pack_for_dispatch(
-            node_sorted, edge_sorted, angle_sorted,
-            node_counts, edge_counts, angle_counts,
-        )
+        with record_function("Pack_for_dispatch"):
+            packed, send_splits = self.packer.pack_for_dispatch(
+                node_sorted, edge_sorted, angle_sorted,
+                node_counts, edge_counts, angle_counts,
+            )
 
         # ── Step 3c: Exchange metadata ──
         # Build send_info: [ep_size, 3] with (node_count, edge_count, angle_count).
-        send_info = torch.tensor(
-            [[node_counts[g], edge_counts[g], angle_counts[g]]
-             for g in range(self.ep_size)],
-            dtype=torch.int64, device=device,
-        )
-        recv_info = exchange_metadata(send_info, self.ep_group)
-        recv_node_counts = recv_info[:, 0].tolist()
-        recv_edge_counts = recv_info[:, 1].tolist()
-        recv_angle_counts = recv_info[:, 2].tolist()
+        with record_function("Exchange_metadata"):
+            send_info = torch.empty(self.ep_size, 3, dtype=torch.int64, device=device)
+            for g in range(self.ep_size):
+                send_info[g, 0] = node_counts[g]
+                send_info[g, 1] = edge_counts[g]
+                send_info[g, 2] = angle_counts[g]
+            recv_info = exchange_metadata(send_info, self.ep_group)
+            recv_node_counts = recv_info[:, 0].tolist()
+            recv_edge_counts = recv_info[:, 1].tolist()
+            recv_angle_counts = recv_info[:, 2].tolist()
 
-        recv_splits = counts_to_packed_rows(
-            recv_node_counts, recv_edge_counts, recv_angle_counts,
-            edge_group_size=self.packer.edge_concat_in,
-            angle_group_size=self.packer.angle_concat_in,
-        )
+            recv_splits = counts_to_packed_rows(
+                recv_node_counts, recv_edge_counts, recv_angle_counts,
+                edge_group_size=self.packer.edge_concat_in,
+                angle_group_size=self.packer.angle_concat_in,
+            )
 
         # ── Step 3d: Dispatch A2A ──
-        recv_tensor = all_to_all_differentiable(
-            packed, send_splits, recv_splits, self.ep_group,
-        )
+        with record_function("Dispatch_A2A"):
+            recv_tensor = all_to_all_differentiable(
+                packed, send_splits, recv_splits, self.ep_group,
+            )
+
+        # Ultra-optimized: Start shared expert computation on separate stream
+        # to overlap with expert ID exchange and expert computation.
+        if USE_ULTRA_OPTIMIZED and torch.cuda.is_available():
+            with record_function("overlap_shared_experts"):
+                # Create stream if not exists
+                if not hasattr(self, '_shared_stream'):
+                    self._shared_stream = torch.cuda.Stream()
+
+                # Launch shared expert computation on separate stream
+                with torch.cuda.stream(self._shared_stream):
+                    self._shared_results = {
+                        'node_m1': self.node_self_experts.forward_shared(node_m1_input),
+                        'node_m2': self.node_sym_experts.forward_shared(node_m2_input),
+                        'edge': self.edge_experts.forward_shared(edge_input),
+                        'angle': self.angle_experts.forward_shared(angle_input),
+                    }
+                # Don't synchronize yet - let it run in parallel
 
         # ── Step 3e: Unpack + Expert Compute ──
-        node_recv, edge_recv, angle_recv = self.packer.unpack_from_dispatch(
-            recv_tensor, recv_node_counts, recv_edge_counts, recv_angle_counts,
-        )
+        with record_function("unpack_from_dispatch"):
+            node_recv, edge_recv, angle_recv = self.packer.unpack_from_dispatch(
+                recv_tensor, recv_node_counts, recv_edge_counts, recv_angle_counts,
+            )
 
-        # Exchange expert IDs via separate A2A (non-differentiable, int).
-        node_eid_recv = self._exchange_expert_ids(
-            node_expert_ids_sorted, node_counts,
-            recv_node_counts, device,
-        )
-        edge_eid_recv = self._exchange_expert_ids(
-            edge_expert_ids_sorted, edge_counts,
-            recv_edge_counts, device,
-        )
-        angle_eid_recv = self._exchange_expert_ids(
-            angle_expert_ids_sorted, angle_counts,
-            recv_angle_counts, device,
-        )
+        # Exchange expert IDs via A2A (non-differentiable, int).
+        # Ultra-optimized: merge 3 separate A2A calls into 1 batched call.
+        if USE_ULTRA_OPTIMIZED:
+            with record_function("batched_expert_id_A2A"):
+                node_eid_recv, edge_eid_recv, angle_eid_recv = self._exchange_expert_ids_batched(
+                    node_expert_ids_sorted, edge_expert_ids_sorted, angle_expert_ids_sorted,
+                    node_counts, edge_counts, angle_counts,
+                    recv_node_counts, recv_edge_counts, recv_angle_counts,
+                    device,
+                )
+        else:
+            with record_function("non-diff_A2A"):
+                node_eid_recv = self._exchange_expert_ids(
+                    node_expert_ids_sorted, node_counts,
+                    recv_node_counts, device,
+                )
+                edge_eid_recv = self._exchange_expert_ids(
+                    edge_expert_ids_sorted, edge_counts,
+                    recv_edge_counts, device,
+                )
+                angle_eid_recv = self._exchange_expert_ids(
+                    angle_expert_ids_sorted, angle_counts,
+                    recv_angle_counts, device,
+                )
+        
+        with record_function("split_and_compute"):
+            # Split node_recv into M1 and M2 inputs.
+            node_m1_recv = node_recv[:, :self.n_dim]       # [N_node_recv, nd]
+            node_m2_recv = node_recv[:, self.n_dim:]        # [N_node_recv, n_sym_dim]
 
-        # Split node_recv into M1 and M2 inputs.
-        node_m1_recv = node_recv[:, :self.n_dim]       # [N_node_recv, nd]
-        node_m2_recv = node_recv[:, self.n_dim:]        # [N_node_recv, n_sym_dim]
+            # Compute experts: for each local expert, process its tokens.
+            node_m1_output, node_m2_output = self._compute_node_experts(
+                node_m1_recv, node_m2_recv, node_eid_recv, recv_node_counts,
+            )
+            edge_output = self._compute_feature_experts(
+                edge_recv, edge_eid_recv, self.edge_experts, recv_edge_counts,
+            )
+            angle_output = self._compute_feature_experts(
+                angle_recv, angle_eid_recv, self.angle_experts, recv_angle_counts,
+            )
 
-        # Compute experts: for each local expert, process its tokens.
-        node_m1_output, node_m2_output = self._compute_node_experts(
-            node_m1_recv, node_m2_recv, node_eid_recv, recv_node_counts,
-        )
-        edge_output = self._compute_feature_experts(
-            edge_recv, edge_eid_recv, self.edge_experts, recv_edge_counts,
-        )
-        angle_output = self._compute_feature_experts(
-            angle_recv, angle_eid_recv, self.angle_experts, recv_angle_counts,
-        )
+        with record_function("pack_for_combine"):
+            # ── Step 3f: Repack output ──
+            # Combine node M1 and M2 outputs: [N_node_recv, nd + nd] = [N_node_recv, 8a]
+            node_output_combined = torch.cat([node_m1_output, node_m2_output], dim=-1)
 
-        # ── Step 3f: Repack output ──
-        # Combine node M1 and M2 outputs: [N_node_recv, nd + nd] = [N_node_recv, 8a]
-        node_output_combined = torch.cat([node_m1_output, node_m2_output], dim=-1)
+            packed_out = self.packer.pack_for_combine(
+                node_output_combined, edge_output, angle_output,
+                recv_node_counts, recv_edge_counts, recv_angle_counts,
+            )
 
-        packed_out = self.packer.pack_for_combine(
-            node_output_combined, edge_output, angle_output,
-            recv_node_counts, recv_edge_counts, recv_angle_counts,
-        )
+        with record_function("combine_A2A"):
+            # ── Step 3g: Combine A2A (reverse direction) ──
+            returned = all_to_all_differentiable(
+                packed_out, recv_splits, send_splits, self.ep_group,
+            )
 
-        # ── Step 3g: Combine A2A (reverse direction) ──
-        returned = all_to_all_differentiable(
-            packed_out, recv_splits, send_splits, self.ep_group,
-        )
+        with record_function("unpack_from_combine"):
+            # ── Step 3h: Unpack + Unsort + Weighted Sum ──
+            node_ret, edge_ret, angle_ret = self.packer.unpack_from_combine(
+                returned, node_counts, edge_counts, angle_counts,
+            )
 
-        # ── Step 3h: Unpack + Unsort + Weighted Sum ──
-        node_ret, edge_ret, angle_ret = self.packer.unpack_from_combine(
-            returned, node_counts, edge_counts, angle_counts,
-        )
+        with record_function("process_output"):
+            # Split node output back into M1 and M2.
+            node_m1_ret = node_ret[:, :self.n_dim]   # [N_node_exp, nd]
+            node_m2_ret = node_ret[:, self.n_dim:]   # [N_node_exp, nd]
 
-        # Split node output back into M1 and M2.
-        node_m1_ret = node_ret[:, :self.n_dim]   # [N_node_exp, nd]
-        node_m2_ret = node_ret[:, self.n_dim:]   # [N_node_exp, nd]
+            # Unsort to restore original token order.
+            with record_function("unsort_tokens"):
+                node_m1_ret = node_m1_ret[node_unsort_idx]
+                node_m2_ret = node_m2_ret[node_unsort_idx]
+                node_weights_orig = node_weights_sorted[node_unsort_idx]
 
-        # Unsort to restore original token order.
-        node_m1_ret = node_m1_ret[node_unsort_idx]
-        node_m2_ret = node_m2_ret[node_unsort_idx]
-        node_weights_orig = node_weights_sorted[node_unsort_idx]
+                edge_ret = edge_ret[edge_unsort_idx]
+                edge_weights_orig = edge_weights_sorted[edge_unsort_idx]
 
-        edge_ret = edge_ret[edge_unsort_idx]
-        edge_weights_orig = edge_weights_sorted[edge_unsort_idx]
+                angle_ret = angle_ret[angle_unsort_idx]
+                angle_weights_orig = angle_weights_sorted[angle_unsort_idx]
 
-        angle_ret = angle_ret[angle_unsort_idx]
-        angle_weights_orig = angle_weights_sorted[angle_unsort_idx]
+            # Weighted sum: [N_orig*topk, dim] -> [N_orig, topk, dim] -> sum.
+            with record_function("weighted_sum_all"):
+                node_m1_out = _weighted_sum_topk(node_m1_ret, node_weights_orig, N_node, topk)
+                node_m2_out = _weighted_sum_topk(node_m2_ret, node_weights_orig, N_node, topk)
+                edge_out = _weighted_sum_topk(edge_ret, edge_weights_orig, N_edge, topk)
+                angle_out = _weighted_sum_topk(angle_ret, angle_weights_orig, N_angle, topk)
 
-        # Weighted sum: [N_orig*topk, dim] -> [N_orig, topk, dim] -> sum.
-        node_m1_out = _weighted_sum_topk(node_m1_ret, node_weights_orig, N_node, topk)
-        node_m2_out = _weighted_sum_topk(node_m2_ret, node_weights_orig, N_node, topk)
-        edge_out = _weighted_sum_topk(edge_ret, edge_weights_orig, N_edge, topk)
-        angle_out = _weighted_sum_topk(angle_ret, angle_weights_orig, N_angle, topk)
-
-        # Add shared expert contribution (on original inputs, no A2A).
-        node_m1_out = node_m1_out + self.node_self_experts.forward_shared(node_m1_input)
-        node_m2_out = node_m2_out + self.node_sym_experts.forward_shared(node_m2_input)
-        edge_out = edge_out + self.edge_experts.forward_shared(edge_input)
-        angle_out = angle_out + self.angle_experts.forward_shared(angle_input)
+            # Add shared expert contribution (on original inputs).
+            # Ultra-optimized: This was computed in parallel with A2A, just add the results.
+            with record_function("add_shared_experts"):
+                if USE_ULTRA_OPTIMIZED and hasattr(self, '_shared_results'):
+                    # Synchronize shared stream before using results
+                    if hasattr(self, '_shared_stream'):
+                        self._shared_stream.synchronize()
+                    # Use pre-computed results from overlap
+                    node_m1_out = node_m1_out + self._shared_results['node_m1']
+                    node_m2_out = node_m2_out + self._shared_results['node_m2']
+                    edge_out = edge_out + self._shared_results['edge']
+                    angle_out = angle_out + self._shared_results['angle']
+                    delattr(self, '_shared_results')  # Clean up
+                else:
+                    # Baseline: compute shared experts now
+                    node_m1_out = node_m1_out + self.node_self_experts.forward_shared(node_m1_input)
+                    node_m2_out = node_m2_out + self.node_sym_experts.forward_shared(node_m2_input)
+                    edge_out = edge_out + self.edge_experts.forward_shared(edge_input)
+                    angle_out = angle_out + self.angle_experts.forward_shared(angle_input)
 
         return node_m1_out, node_m2_out, edge_out, angle_out
 
@@ -748,6 +808,113 @@ class MoEDispatchCombine(nn.Module):
             group=self.ep_group,
         )
         return recv_tensor
+
+    def _exchange_expert_ids_batched(
+        self,
+        node_eids: torch.Tensor,
+        edge_eids: torch.Tensor,
+        angle_eids: torch.Tensor,
+        node_send_counts: list[int],
+        edge_send_counts: list[int],
+        angle_send_counts: list[int],
+        node_recv_counts: list[int],
+        edge_recv_counts: list[int],
+        angle_recv_counts: list[int],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Exchange all expert IDs in a single A2A call.
+
+        Concatenates node/edge/angle expert IDs per GPU, does one A2A,
+        then splits the received tensor back.  Saves 2 NCCL calls per
+        MoE forward (3 -> 1).
+
+        Parameters
+        ----------
+        node_eids, edge_eids, angle_eids : Tensor
+            Sorted expert IDs for each feature type.
+        node_send_counts, edge_send_counts, angle_send_counts : list[int]
+            Per-GPU send counts for each type.
+        node_recv_counts, edge_recv_counts, angle_recv_counts : list[int]
+            Per-GPU recv counts for each type.
+        device : torch.device
+
+        Returns
+        -------
+        node_eid_recv, edge_eid_recv, angle_eid_recv : Tensor
+        """
+        if self.ep_group is None:
+            return node_eids, edge_eids, angle_eids
+
+        ep_size = len(node_send_counts)
+
+        # Concatenate per-GPU: for each GPU g, cat(node_eids_g, edge_eids_g, angle_eids_g)
+        send_parts: list[torch.Tensor] = []
+        send_splits: list[int] = []
+        node_off = edge_off = angle_off = 0
+
+        for g in range(ep_size):
+            nc, ec, ac = node_send_counts[g], edge_send_counts[g], angle_send_counts[g]
+            parts = []
+            if nc > 0:
+                parts.append(node_eids[node_off:node_off + nc])
+            if ec > 0:
+                parts.append(edge_eids[edge_off:edge_off + ec])
+            if ac > 0:
+                parts.append(angle_eids[angle_off:angle_off + ac])
+            node_off += nc
+            edge_off += ec
+            angle_off += ac
+            send_splits.append(nc + ec + ac)
+            if parts:
+                send_parts.append(torch.cat(parts))
+
+        total_send = sum(send_splits)
+        if total_send > 0:
+            send_tensor = torch.cat(send_parts).long().contiguous()
+        else:
+            send_tensor = torch.empty(0, dtype=torch.long, device=device)
+
+        recv_splits: list[int] = []
+        for g in range(ep_size):
+            recv_splits.append(
+                node_recv_counts[g] + edge_recv_counts[g] + angle_recv_counts[g]
+            )
+
+        total_recv = sum(recv_splits)
+        recv_tensor = torch.empty(total_recv, dtype=torch.long, device=device)
+
+        if total_send > 0 or total_recv > 0:
+            dist.all_to_all_single(
+                recv_tensor, send_tensor,
+                output_split_sizes=recv_splits,
+                input_split_sizes=send_splits,
+                group=self.ep_group,
+            )
+
+        # Split received tensor back into node/edge/angle per GPU
+        node_parts: list[torch.Tensor] = []
+        edge_parts: list[torch.Tensor] = []
+        angle_parts: list[torch.Tensor] = []
+        recv_off = 0
+        for g in range(ep_size):
+            nc = node_recv_counts[g]
+            ec = edge_recv_counts[g]
+            ac = angle_recv_counts[g]
+            if nc > 0:
+                node_parts.append(recv_tensor[recv_off:recv_off + nc])
+            recv_off += nc
+            if ec > 0:
+                edge_parts.append(recv_tensor[recv_off:recv_off + ec])
+            recv_off += ec
+            if ac > 0:
+                angle_parts.append(recv_tensor[recv_off:recv_off + ac])
+            recv_off += ac
+
+        node_eid_recv = torch.cat(node_parts) if node_parts else torch.empty(0, dtype=torch.long, device=device)
+        edge_eid_recv = torch.cat(edge_parts) if edge_parts else torch.empty(0, dtype=torch.long, device=device)
+        angle_eid_recv = torch.cat(angle_parts) if angle_parts else torch.empty(0, dtype=torch.long, device=device)
+
+        return node_eid_recv, edge_eid_recv, angle_eid_recv
 
     # ------------------------------------------------------------------
     # Expert computation helpers (multi-GPU recv side, no sort needed)

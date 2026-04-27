@@ -263,6 +263,8 @@ class MoEExpertCollection(nn.Module):
         the shared ``routing_matrix``.  Activation is applied ONCE at
         the end (not inside each expert), matching old code behavior.
 
+        Ultra-optimized version uses torch.bmm for balanced loads.
+
         Parameters
         ----------
         sorted_features : Tensor ``[N_expanded, num_in]``
@@ -286,7 +288,20 @@ class MoEExpertCollection(nn.Module):
         W = self.routing_matrix.permute(2, 0, 1)  # [E, I, O]
         b = self.routing_bias                       # [O, E]
 
-        # Split into per-expert chunks (already sorted, so contiguous)
+        # Try ultra-optimized batched matmul if enabled
+        try:
+            from deepmd.pt.model.network.moe_layer import USE_ULTRA_OPTIMIZED
+            if USE_ULTRA_OPTIMIZED:
+                from deepmd.pt.model.network.moe_ultra_optimized import (
+                    batched_expert_forward_optimized,
+                )
+                return batched_expert_forward_optimized(
+                    sorted_features, split_sizes, W, b, self.activate, use_bmm=True
+                )
+        except (ImportError, AttributeError):
+            pass
+
+        # Baseline: Split into per-expert chunks (already sorted, so contiguous)
         chunks = torch.split(sorted_features, split_sizes)
 
         out_parts: list[torch.Tensor] = []
