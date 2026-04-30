@@ -1375,8 +1375,6 @@ class Trainer:
             # All frames filtered by min_pair_dist (single-GPU only;
             # DDP path in get_data() always keeps at least one frame)
             if not input_dict:
-                if self.opt_type in ["Adam", "AdamW", "AdaMuon", "HybridMuon"]:
-                    self.scheduler.step()
                 return
             if SAMPLER_RECORD:
                 print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
