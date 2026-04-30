@@ -637,6 +637,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
             box: torch.Tensor | None,
             fparam: torch.Tensor | None = None,
             aparam: torch.Tensor | None = None,
+            charge_spin: torch.Tensor | None = None,
         ) -> dict[str, torch.Tensor]:
             with (
                 torch.no_grad()
@@ -661,6 +662,7 @@ class BaseAtomicModel(torch.nn.Module, BaseAtomicModel_):
                     mapping=mapping,
                     fparam=fparam,
                     aparam=aparam,
+                    charge_spin=charge_spin,
                 )
                 return {kk: vv.detach() for kk, vv in atomic_ret.items()}
 
