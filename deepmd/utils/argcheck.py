@@ -3386,6 +3386,7 @@ def training_args(
         if not multi_task
         else [
             Argument("model_prob", dict, optional=True, default={}, doc=doc_model_prob),
+            Argument("use_pcgrad", bool, optional=True, default=False, doc="Apply PCGrad gradient surgery on the shared descriptor parameters in multi-task training."),
             Argument("data_dict", dict, data_args, repeat=True, doc=doc_data_dict),
         ]
     )

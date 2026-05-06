@@ -626,6 +626,10 @@ class Trainer:
             assert sum_prob > 0.0, "Sum of model prob must be larger than 0!"
             self.model_prob = self.model_prob / sum_prob
 
+        self.use_pcgrad = self.multi_task and training_params.get("use_pcgrad", False)
+        if self.use_pcgrad:
+            log.info("PCGrad enabled: descriptor gradients will be projected each step.")
+
         # Multi-task share params
         if shared_links is not None:
             _data_stat_protect = np.array(
@@ -764,10 +768,87 @@ class Trainer:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
-                loss.backward()
+                if self.use_pcgrad:
+                    module = (
+                        self.wrapper.module
+                        if hasattr(self.wrapper, "module")
+                        else self.wrapper
+                    )
+                    descriptor = module.model[self.model_keys[0]].get_descriptor()
+                    desc_params = list(descriptor.parameters())
+                    desc_param_ids = {id(p) for p in desc_params}
+                    all_params = list(self.wrapper.parameters())
+
+                    task_grads = {}
+                    more_loss_per_task = {}
+                    for tk in self.model_keys:
+                        self.optimizer.zero_grad(set_to_none=True)
+                        in_d, lbl_d, _ = self.get_data(is_train=True, task_key=tk)
+                        _, loss, more_loss = self.wrapper(
+                            **in_d, cur_lr=pref_lr, label=lbl_d, task_key=tk
+                        )
+                        loss.backward()
+                        task_grads[tk] = {
+                            id(p): p.grad.clone() if p.grad is not None else None
+                            for p in all_params
+                        }
+                        more_loss_per_task[tk] = more_loss
+
+                    k0, k1 = self.model_keys[0], self.model_keys[1]
+
+                    # PCGrad projection: only on descriptor params
+                    desc_pids = [
+                        pid for pid in desc_param_ids
+                        if task_grads[k0].get(pid) is not None
+                        and task_grads[k1].get(pid) is not None
+                    ]
+                    if desc_pids:
+                        g0 = torch.cat([task_grads[k0][pid].flatten() for pid in desc_pids])
+                        g1 = torch.cat([task_grads[k1][pid].flatten() for pid in desc_pids])
+                        dot = (g0 * g1).sum()
+                        projected = dot < 0
+                        if projected:
+                            g0_proj = g0 - dot / (g1 * g1).sum().clamp(min=1e-12) * g1
+                            g1_proj = g1 - dot / (g0 * g0).sum().clamp(min=1e-12) * g0
+                            offset = 0
+                            for pid in desc_pids:
+                                numel = task_grads[k0][pid].numel()
+                                shape = task_grads[k0][pid].shape
+                                task_grads[k0][pid] = g0_proj[offset:offset + numel].reshape(shape)
+                                task_grads[k1][pid] = g1_proj[offset:offset + numel].reshape(shape)
+                                offset += numel
+                        if self.rank == 0 and (_step_id + 1) % self.disp_freq == 0:
+                            cos_sim = dot / (
+                                g0.norm() * g1.norm()
+                            ).clamp(min=1e-12)
+                            log.info(
+                                "PCGrad step %d: desc dot=%.4e, cos_sim=%.4f, projected=%s",
+                                _step_id + 1,
+                                dot.item(),
+                                cos_sim.item(),
+                                projected,
+                            )
+
+                    # Set final grads:
+                    # - descriptor: projected sum (from above)
+                    # - all other params: plain sum of two tasks' grads
+                    self.optimizer.zero_grad(set_to_none=True)
+                    for p in all_params:
+                        pid = id(p)
+                        g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
+                        if g0p is not None and g1p is not None:
+                            p.grad = g0p + g1p
+                        elif g0p is not None:
+                            p.grad = g0p
+                        elif g1p is not None:
+                            p.grad = g1p
+
+                    more_loss = more_loss_per_task[task_key]
+                else:
+                    _, loss, more_loss = self.wrapper(
+                        **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
+                    )
+                    loss.backward()
                 if self.gradient_max_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(
                         self.wrapper.parameters(),
