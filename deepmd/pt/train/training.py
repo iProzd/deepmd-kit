@@ -627,8 +627,13 @@ class Trainer:
             self.model_prob = self.model_prob / sum_prob
 
         self.use_pcgrad = self.multi_task and training_params.get("use_pcgrad", False)
+        self.use_dual_batch = self.multi_task and (
+            self.use_pcgrad or training_params.get("use_dual_batch", False)
+        )
         if self.use_pcgrad:
             log.info("PCGrad enabled: descriptor gradients will be projected each step.")
+        elif self.use_dual_batch:
+            log.info("Dual-batch enabled: all tasks sampled per step, gradients summed without projection.")
 
         # Multi-task share params
         if shared_links is not None:
@@ -768,17 +773,8 @@ class Trainer:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                if self.use_pcgrad:
-                    module = (
-                        self.wrapper.module
-                        if hasattr(self.wrapper, "module")
-                        else self.wrapper
-                    )
-                    descriptor = module.model[self.model_keys[0]].get_descriptor()
-                    desc_params = list(descriptor.parameters())
-                    desc_param_ids = {id(p) for p in desc_params}
+                if self.use_dual_batch:
                     all_params = list(self.wrapper.parameters())
-
                     task_grads = {}
                     more_loss_per_task = {}
                     for tk in self.model_keys:
@@ -796,42 +792,42 @@ class Trainer:
 
                     k0, k1 = self.model_keys[0], self.model_keys[1]
 
-                    # PCGrad projection: only on descriptor params
-                    desc_pids = [
-                        pid for pid in desc_param_ids
-                        if task_grads[k0].get(pid) is not None
-                        and task_grads[k1].get(pid) is not None
-                    ]
-                    if desc_pids:
-                        g0 = torch.cat([task_grads[k0][pid].flatten() for pid in desc_pids])
-                        g1 = torch.cat([task_grads[k1][pid].flatten() for pid in desc_pids])
-                        dot = (g0 * g1).sum()
-                        projected = dot < 0
-                        if projected:
-                            g0_proj = g0 - dot / (g1 * g1).sum().clamp(min=1e-12) * g1
-                            g1_proj = g1 - dot / (g0 * g0).sum().clamp(min=1e-12) * g0
-                            offset = 0
-                            for pid in desc_pids:
-                                numel = task_grads[k0][pid].numel()
-                                shape = task_grads[k0][pid].shape
-                                task_grads[k0][pid] = g0_proj[offset:offset + numel].reshape(shape)
-                                task_grads[k1][pid] = g1_proj[offset:offset + numel].reshape(shape)
-                                offset += numel
-                        if self.rank == 0 and (_step_id + 1) % self.disp_freq == 0:
-                            cos_sim = dot / (
-                                g0.norm() * g1.norm()
-                            ).clamp(min=1e-12)
-                            log.info(
-                                "PCGrad step %d: desc dot=%.4e, cos_sim=%.4f, projected=%s",
-                                _step_id + 1,
-                                dot.item(),
-                                cos_sim.item(),
-                                projected,
-                            )
+                    if self.use_pcgrad:
+                        module = (
+                            self.wrapper.module
+                            if hasattr(self.wrapper, "module")
+                            else self.wrapper
+                        )
+                        descriptor = module.model[k0].get_descriptor()
+                        desc_param_ids = {id(p) for p in descriptor.parameters()}
+                        desc_pids = [
+                            pid for pid in desc_param_ids
+                            if task_grads[k0].get(pid) is not None
+                            and task_grads[k1].get(pid) is not None
+                        ]
+                        if desc_pids:
+                            g0 = torch.cat([task_grads[k0][pid].flatten() for pid in desc_pids])
+                            g1 = torch.cat([task_grads[k1][pid].flatten() for pid in desc_pids])
+                            dot = (g0 * g1).sum()
+                            projected = dot < 0
+                            if projected:
+                                g0_proj = g0 - dot / (g1 * g1).sum().clamp(min=1e-12) * g1
+                                g1_proj = g1 - dot / (g0 * g0).sum().clamp(min=1e-12) * g0
+                                offset = 0
+                                for pid in desc_pids:
+                                    numel = task_grads[k0][pid].numel()
+                                    shape = task_grads[k0][pid].shape
+                                    task_grads[k0][pid] = g0_proj[offset:offset + numel].reshape(shape)
+                                    task_grads[k1][pid] = g1_proj[offset:offset + numel].reshape(shape)
+                                    offset += numel
+                            if self.rank == 0 and (_step_id + 1) % self.disp_freq == 0:
+                                cos_sim = dot / (g0.norm() * g1.norm()).clamp(min=1e-12)
+                                log.info(
+                                    "PCGrad step %d: desc dot=%.4e, cos_sim=%.4f, projected=%s",
+                                    _step_id + 1, dot.item(), cos_sim.item(), projected,
+                                )
 
-                    # Set final grads:
-                    # - descriptor: projected sum (from above)
-                    # - all other params: plain sum of two tasks' grads
+                    # Set final grads: sum of (projected) per-task grads
                     self.optimizer.zero_grad(set_to_none=True)
                     for p in all_params:
                         pid = id(p)
