@@ -888,6 +888,13 @@ def main_parser() -> argparse.ArgumentParser:
         "Total batches collected = nbatches; number of dot product samples = nbatches // k. "
         "Larger K reduces norm variance and improves SNR of mean/std.",
     )
+    parser_grad_probe.add_argument(
+        "--pcgrad",
+        action="store_true",
+        default=False,
+        help="Apply PCGrad projection to descriptor gradients before analysis. "
+        "Reports similarity of the projected vectors instead of raw gradients.",
+    )
     return parser
 
 

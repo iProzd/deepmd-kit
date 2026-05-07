@@ -549,6 +549,9 @@ def grad_probe(FLAGS) -> None:
 
     accumulate_k = getattr(FLAGS, "accumulate_k", 1)
     total_batches = FLAGS.nbatches
+    use_pcgrad = getattr(FLAGS, "pcgrad", False)
+    if use_pcgrad:
+        log.info("grad_probe: PCGrad projection enabled — analysing projected descriptor gradients.")
 
     # Initialize trackers
     task_batch_norms = {k: [] for k in trainer.model_keys}
@@ -566,6 +569,8 @@ def grad_probe(FLAGS) -> None:
     cur_lr = config["learning_rate"]["start_lr"]
 
     for b in range(total_batches):
+        # Collect raw descriptor grad vectors for all tasks this batch
+        batch_grad_vecs = {}
         for task_key in trainer.model_keys:
             trainer.optimizer.zero_grad(set_to_none=True)
             input_dict, label_dict, _ = trainer.get_data(
@@ -587,16 +592,7 @@ def grad_probe(FLAGS) -> None:
                     )
 
             if current_grads:
-                grad_vec = np.concatenate(current_grads)
-                if task_accum_grads[task_key] is None:
-                    task_accum_grads[task_key] = grad_vec.copy()
-                else:
-                    task_accum_grads[task_key] += grad_vec
-
-                if group_grads[task_key] is None:
-                    group_grads[task_key] = grad_vec.copy()
-                else:
-                    group_grads[task_key] += grad_vec
+                batch_grad_vecs[task_key] = np.concatenate(current_grads)
 
                 if param_names is None:
                     param_names = [
@@ -607,6 +603,29 @@ def grad_probe(FLAGS) -> None:
                         for n, p in descriptor.named_parameters()
                         if p.requires_grad
                     ]
+
+        # Apply PCGrad projection to descriptor grad vectors if requested
+        if use_pcgrad and len(batch_grad_vecs) == 2:
+            keys = list(batch_grad_vecs.keys())
+            k0, k1 = keys[0], keys[1]
+            g0, g1 = batch_grad_vecs[k0], batch_grad_vecs[k1]
+            dot = float(np.dot(g0, g1))
+            if dot < 0:
+                g0_orig = g0.copy()
+                batch_grad_vecs[k0] = g0 - dot / max(np.dot(g1, g1), 1e-12) * g1
+                batch_grad_vecs[k1] = g1 - dot / max(np.dot(g0_orig, g0_orig), 1e-12) * g0_orig
+
+        # Accumulate (projected) grad vectors
+        for task_key, grad_vec in batch_grad_vecs.items():
+            if task_accum_grads[task_key] is None:
+                task_accum_grads[task_key] = grad_vec.copy()
+            else:
+                task_accum_grads[task_key] += grad_vec
+
+            if group_grads[task_key] is None:
+                group_grads[task_key] = grad_vec.copy()
+            else:
+                group_grads[task_key] += grad_vec
 
         # At the end of each group of K batches, record norms and dot products then reset
         if (b + 1) % accumulate_k == 0:
