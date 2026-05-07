@@ -44,11 +44,15 @@ from deepmd.pt.model.network.moe_packer import (
 from deepmd.pt.model.network.moe_topk_sort_cuda import (
     fused_topk_expand_sort,
 )
+from deepmd.pt.model.network.moe_pack_dispatch_cuda import (
+    fused_pack_for_dispatch,
+)
 
 from torch.profiler import profile, record_function, ProfilerActivity
 
 USE_ULTRA_OPTIMIZED = True  # Enable ultra optimizations (embed expert IDs, overlap compute)
 USE_FUSED_TOPK_SORT = True  # Use fused CUDA kernel for topk-expand-sort
+USE_FUSED_PACK = True  # Use fused CUDA kernel for pack-for-dispatch
 
 
 def _topk_expand_sort(
@@ -586,22 +590,25 @@ class MoEDispatchCombine(nn.Module):
             else:
                 _expand_sort = _topk_expand_sort
                 _expand_sort_kwargs = {}
-
-            (node_sorted, node_expert_ids_sorted, node_weights_sorted,
-            node_unsort_idx, node_counts, _) = _expand_sort(
-                node_combined, node_indices, node_weights, self.experts_per_gpu,
-                **_expand_sort_kwargs,
-            )
-            (edge_sorted, edge_expert_ids_sorted, edge_weights_sorted,
-            edge_unsort_idx, edge_counts, _) = _expand_sort(
-                edge_input, edge_indices, edge_weights, self.experts_per_gpu,
-                **_expand_sort_kwargs,
-            )
-            (angle_sorted, angle_expert_ids_sorted, angle_weights_sorted,
-            angle_unsort_idx, angle_counts, _) = _expand_sort(
-                angle_input, angle_indices, angle_weights, self.experts_per_gpu,
-                **_expand_sort_kwargs,
-            )
+            
+            with record_function("sort_and_expand_node"):
+                (node_sorted, node_expert_ids_sorted, node_weights_sorted,
+                node_unsort_idx, node_counts, _) = _expand_sort(
+                    node_combined, node_indices, node_weights, self.experts_per_gpu,
+                    **_expand_sort_kwargs,
+                )
+            with record_function("sort_and_expand_edge"):
+                (edge_sorted, edge_expert_ids_sorted, edge_weights_sorted,
+                edge_unsort_idx, edge_counts, _) = _expand_sort(
+                    edge_input, edge_indices, edge_weights, self.experts_per_gpu,
+                    **_expand_sort_kwargs,
+                )
+            with record_function("sort_and_expand_angle"):
+                (angle_sorted, angle_expert_ids_sorted, angle_weights_sorted,
+                angle_unsort_idx, angle_counts, _) = _expand_sort(
+                    angle_input, angle_indices, angle_weights, self.experts_per_gpu,
+                    **_expand_sort_kwargs,
+                )
 
             # Pad counts to ep_size if needed (some GPUs may get 0 tokens).
             # The fused kernel already returns length-ep_size; this loop
@@ -615,10 +622,18 @@ class MoEDispatchCombine(nn.Module):
 
         # ── Step 3b: Pack for dispatch ──
         with record_function("Pack_for_dispatch"):
-            packed, send_splits = self.packer.pack_for_dispatch(
-                node_sorted, edge_sorted, angle_sorted,
-                node_counts, edge_counts, angle_counts,
-            )
+            if USE_FUSED_PACK and node_sorted.is_cuda:
+                packed, send_splits = fused_pack_for_dispatch(
+                    node_sorted, edge_sorted, angle_sorted,
+                    node_counts, edge_counts, angle_counts,
+                    self.packer.edge_concat_in, self.packer.angle_concat_in,
+                    self.packer.D_packed_in,
+                )
+            else:
+                packed, send_splits = self.packer.pack_for_dispatch(
+                    node_sorted, edge_sorted, angle_sorted,
+                    node_counts, edge_counts, angle_counts,
+                )
 
         # ── Step 3c: Exchange metadata ──
         # Build send_info: [ep_size, 3] with (node_count, edge_count, angle_count).

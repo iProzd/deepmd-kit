@@ -1,5 +1,5 @@
 file(GLOB OP_SRC print_summary.cc comm.cc tabulate_multi_device.cc
-     moe_topk_expand_sort.cc)
+     moe_topk_expand_sort.cc moe_pack_for_dispatch.cc)
 
 add_library(deepmd_op_pt MODULE ${OP_SRC})
 # link: libdeepmd libtorch
