@@ -33,7 +33,6 @@ def compute_min_pair_dist_single(
         real atoms exist.
     """
     coord = coord.reshape(-1, 3)
-    natoms = coord.shape[0]
 
     # === Step 1. Filter out virtual atoms ===
     real_mask = atype.ravel() >= 0
@@ -43,21 +42,18 @@ def compute_min_pair_dist_single(
         return float("inf")
 
     # === Step 2. Compute pairwise displacement vectors ===
-    # diff[i, j] = coord[j] - coord[i], shape (n_real, n_real, 3)
     diff = real_coord[np.newaxis, :, :] - real_coord[:, np.newaxis, :]
 
     # === Step 3. Apply minimum image convention for PBC ===
     if box is not None:
         cell = box.reshape(3, 3)
         inv_cell = np.linalg.inv(cell)
-        # Convert to fractional coordinates
         frac_diff = diff @ inv_cell
         frac_diff -= np.round(frac_diff)
-        # Convert back to Cartesian
         diff = frac_diff @ cell
 
     # === Step 4. Compute distances and exclude self-pairs ===
-    dist_sq = np.sum(diff * diff, axis=-1)  # (n_real, n_real)
+    dist_sq = np.sum(diff * diff, axis=-1)
     np.fill_diagonal(dist_sq, np.inf)
 
     return float(np.sqrt(dist_sq.min()))

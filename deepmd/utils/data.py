@@ -504,7 +504,7 @@ class DeepmdData:
 
         # === Compute min_pair_dist on-the-fly in DataLoader worker ===
         if "min_pair_dist" in self.data_dict:
-            from deepmd.pt.utils.dist_check import (
+            from deepmd.dpmodel.utils.dist_check import (
                 compute_min_pair_dist_single,
             )
 
