@@ -838,11 +838,12 @@ class Trainer:
 
                     # Set final grads: sum of (projected) per-task grads
                     self.optimizer.zero_grad(set_to_none=True)
+                    num_tasks = len(self.model_keys)
                     for p in all_params:
                         pid = id(p)
                         g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
                         if g0p is not None and g1p is not None:
-                            p.grad = g0p + g1p
+                            p.grad = (g0p + g1p) / num_tasks
                         elif g0p is not None:
                             p.grad = g0p
                         elif g1p is not None:
