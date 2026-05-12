@@ -630,10 +630,16 @@ class Trainer:
         self.use_dual_batch = self.multi_task and (
             self.use_pcgrad or training_params.get("use_dual_batch", False)
         )
+        self.use_alternating = self.multi_task and (
+            not self.use_dual_batch
+            and training_params.get("alternating_tasks", False)
+        )
         if self.use_pcgrad:
             log.info("PCGrad enabled: descriptor gradients will be projected each step.")
         elif self.use_dual_batch:
             log.info("Dual-batch enabled: all tasks sampled per step, gradients summed without projection.")
+        elif self.use_alternating:
+            log.info("Alternating-tasks enabled: tasks cycled deterministically A→B→A→B each step.")
 
         # Multi-task share params
         if shared_links is not None:
@@ -745,11 +751,14 @@ class Trainer:
 
         def step(_step_id, task_key="Default") -> None:
             if self.multi_task:
-                model_index = dp_random.choice(
-                    np.arange(self.num_model, dtype=np.int_),
-                    p=self.model_prob,
-                )
-                task_key = self.model_keys[model_index]
+                if self.use_alternating:
+                    task_key = self.model_keys[_step_id % self.num_model]
+                else:
+                    model_index = dp_random.choice(
+                        np.arange(self.num_model, dtype=np.int_),
+                        p=self.model_prob,
+                    )
+                    task_key = self.model_keys[model_index]
             # PyTorch Profiler
             if self.enable_profiler or self.profiling:
                 prof.step()

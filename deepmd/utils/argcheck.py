@@ -3388,6 +3388,7 @@ def training_args(
             Argument("model_prob", dict, optional=True, default={}, doc=doc_model_prob),
             Argument("use_pcgrad", bool, optional=True, default=False, doc="Apply PCGrad gradient surgery on the shared descriptor parameters in multi-task training."),
             Argument("use_dual_batch", bool, optional=True, default=False, doc="Sample all tasks every step and sum gradients without projection. Use as control group to isolate PCGrad effect from dual-batch effect."),
+            Argument("alternating_tasks", bool, optional=True, default=False, doc="Cycle through tasks deterministically (A→B→A→B) each step instead of random sampling. Ablation control to isolate balanced-sampling effect from combined-gradient effect."),
             Argument("data_dict", dict, data_args, repeat=True, doc=doc_data_dict),
         ]
     )
