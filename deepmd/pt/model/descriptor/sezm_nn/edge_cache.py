@@ -322,7 +322,11 @@ def build_edge_cache(
     # caller explicitly allows it (descriptor eval/inference path). Bridging
     # primitives never enter here; they are owned by the sparse-edge path.
     coord_flat = coord.reshape(nf * nall, 3)
-    if use_geometry_rbf_triton:
+    use_bessel_triton = (
+        use_geometry_rbf_triton
+        and getattr(radial_basis, "basis_type", "bessel") == "bessel"
+    )
+    if use_bessel_triton:
         with nvtx_range("edge_geometry_rbf_triton"):
             edge_vec, edge_len, edge_env, edge_rbf = edge_geometry_rbf_triton(
                 coord_flat=coord_flat,

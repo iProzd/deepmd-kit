@@ -183,6 +183,10 @@ class TestDescrptSeZM(_SeZMTestCase):
                 s2_activation=[False, True],
                 s2_grid_resolution=[8, 12],
             ),
+            "gaussian_basis": _descriptor_kwargs(
+                channels=4,
+                basis_type="gaussian",
+            ),
         }
         for name, model_kwargs in cases.items():
             with self.subTest(mode=name):

@@ -143,6 +143,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         Larger values give weaker suppression (values stay near 1.0 longer).
     channels
         Total channels per (l,m) coefficient.
+    basis_type
+        Radial basis type. Supported values are ``"bessel"`` and ``"gaussian"``.
     n_radial
         Number of radial basis functions.
     radial_mlp
@@ -314,6 +316,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         rcut: float,
         env_exp: list[int] | None = None,
         channels: int = 64,
+        basis_type: str = "bessel",
         n_radial: int = 10,
         radial_mlp: list[int] | None = None,
         use_env_seed: bool = True,
@@ -381,6 +384,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         self.focus_dim = int(focus_dim)
         if self.focus_dim < 0:
             raise ValueError("`focus_dim` must be >= 0")
+        self.basis_type = str(basis_type).lower()
         self.n_radial = int(n_radial)
         if radial_mlp is None:
             radial_mlp = [64]
@@ -636,8 +640,9 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
             self.film_shift_strength_log = None
 
         self.radial_basis = RadialBasis(
-            self.rcut,
-            self.n_radial,
+            rcut=self.rcut,
+            basis_type=self.basis_type,
+            n_radial=self.n_radial,
             dtype=self.compute_dtype,  # force fp32+
             exponent=self.env_exp[0],
         )
@@ -1728,6 +1733,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "mmax": self.mmax,
                 "m_schedule": self.m_schedule,
                 "channels": self.channels,
+                "basis_type": self.basis_type,
                 "n_radial": self.n_radial,
                 "radial_mlp": self.radial_mlp,
                 "use_env_seed": self.use_env_seed,

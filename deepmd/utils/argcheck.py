@@ -360,6 +360,7 @@ def descrpt_se_zm_args() -> list[Argument]:
         "Larger values give weaker suppression."
     )
     doc_channels = "Total channels per (l,m) coefficient."
+    doc_basis_type = "Radial basis type. Supported values are `bessel` and `gaussian`."
     doc_n_radial = "Number of radial basis functions."
     doc_radial_mlp = "Hidden layer sizes for radial networks. An output layer of size (l_schedule[0]+1)*channels will be automatically appended. Use 0 as a placeholder to be replaced by channels."
     doc_use_env_seed = (
@@ -521,6 +522,9 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_env_exp,
         ),
         Argument("channels", int, optional=True, default=64, doc=doc_channels),
+        Argument(
+            "basis_type", str, optional=True, default="bessel", doc=doc_basis_type
+        ),
         Argument("n_radial", int, optional=True, default=10, doc=doc_n_radial),
         Argument(
             "radial_mlp",

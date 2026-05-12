@@ -32,7 +32,7 @@ The descriptor and model are both registered as `SeZM` (alias `sezm`). The model
 
 - **Multi-focus SO(2) convolution.** Multiple parallel focus streams process the same geometric context inside the SO(2) operator. A cross-focus softmax competition (driven by `l=0` scalar invariants, with label smoothing to prevent dead focuses) re-weights the streams before rotate-back. Unlike MHA, which attends across sequence positions, multi-focus attends across parallel equivariant sub-channels on the same edge. Unlike sparse MoE, all focuses are computed and then soft-weighted, preserving SO(3) equivariance.
 
-- **Trainable-frequency radial basis.** Radial basis frequencies, initialized as integer harmonics `nπ/rcut`, are learnable parameters that adapt to the data distribution during training, improving expressiveness over a fixed grid.
+- **Configurable trainable radial basis.** The default Bessel basis uses trainable frequencies initialized as integer harmonics `nπ/rcut`; the optional Gaussian basis uses trainable centers over `[0, rcut]`. Both share the same `adam_freqs` parameter shape and downstream `n_radial` interface.
 
 **Training methodology:**
 
@@ -106,7 +106,7 @@ SeZMModel main forward path (core_compute):
   EdgeFeatureCache (built once per forward via build_edge_cache_from_edges):
     ├─ edges: (src, dst) global indices, edge_vec
     ├─ edge_type_feat: per-edge type embedding (src + dst)
-    ├─ edge_rbf: Bessel radial basis × C² envelope (trainable frequencies)
+    ├─ edge_rbf: configured radial basis × C³ envelope
     ├─ edge_env: C³ cutoff envelope (flattened to valid edges)
     ├─ D_full, Dt_full: block-diagonal Wigner-D matrices
     ├─ inv_sqrt_deg: inverse sqrt smooth degree for normalization
@@ -172,7 +172,7 @@ Edge geometry computation — coordinate gathering, distance calculation, quater
 | `src`, `dst`      | `(E,)`             | Flattened node indices in `[0, N)`                |
 | `edge_type_feat`  | `(E, C)`           | Per-edge type embedding (src + dst lookup)        |
 | `edge_vec`        | `(E, 3)`           | Displacement vectors in Å                         |
-| `edge_rbf`        | `(E, n_radial)`    | Bessel radial basis × C² envelope                 |
+| `edge_rbf`        | `(E, n_radial)`    | Configured radial basis × C³ envelope             |
 | `edge_env`        | `(E, 1)`           | C³ cutoff envelope weights                        |
 | `deg`             | `(N, 1)`           | Smooth degree: `Σ_e edge_env²` per destination    |
 | `inv_sqrt_deg`    | `(N, 1, 1)`        | `rsqrt(deg + eps)` for normalization              |
@@ -203,7 +203,7 @@ The squared envelope ensures the degree is a smooth function of atomic positions
 
 Geometry computations always run in fp32+ (`compute_dtype = get_promoted_dtype(dtype)`) regardless of the model's working precision. This ensures accurate distances, quaternions, and Wigner-D matrices for stable training convergence.
 
-When the descriptor is in eval mode and the device supports it, `build_edge_cache` replaces the eager geometry chain with a fused Triton kernel (`kernels_edge_geometry_rbf.py`). Training always uses the eager chain to preserve the full PyTorch autograd graph for force/virial higher-order derivatives. The `edge_cache_to_dtype` helper converts float fields to the working dtype when entering the interaction blocks, and clears the rotation projection caches to prevent dtype mismatches.
+When the descriptor is in eval mode, uses `basis_type="bessel"`, and the device supports it, `build_edge_cache` replaces the eager geometry chain with a fused Triton kernel (`kernels_edge_geometry_rbf.py`). Training always uses the eager chain to preserve the full PyTorch autograd graph for force/virial higher-order derivatives. The Gaussian basis uses the vectorized eager RBF path. The `edge_cache_to_dtype` helper converts float fields to the working dtype when entering the interaction blocks, and clears the rotation projection caches to prevent dtype mismatches.
 
 ______________________________________________________________________
 
@@ -235,15 +235,25 @@ This double application ensures that a message, its first derivative, its second
 
 ### 5.2 Trainable Radial Basis
 
-`RadialBasis` (in `radial.py`) produces `n_radial` basis functions evaluated at each edge distance. The basis uses a sinc form:
+`RadialBasis` (in `radial.py`) produces `n_radial` basis functions evaluated at each edge distance. The `basis_type` setting selects the basis family.
+
+For `basis_type="bessel"` (default), the basis uses a sinc form:
 
 ```
 φ_n(r) = w_n · sinc(w_n · r / π) = sin(w_n · r) / r
 ```
 
-where `w_n = n · π / rcut` for `n = 1, ..., n_radial`. The sinc form is chosen for numerical stability near `r → 0`: unlike `sin(w·r)/r`, `sinc` is well-defined at zero and produces stable gradients. Each basis function is multiplied by the C² envelope (with `exponent` typically 7) before output.
+where `w_n = n · π / rcut` for `n = 1, ..., n_radial`. The sinc form is chosen for numerical stability near `r → 0`: unlike `sin(w·r)/r`, `sinc` is well-defined at zero and produces stable gradients.
 
-The frequencies `w_n` are stored as trainable parameters (`adam_freqs`) with the `adam_` prefix so that HybridMuon routes them to the Adam optimizer without weight decay. During training, the frequencies can shift away from their integer-harmonic initialization to better fit the data distribution.
+For `basis_type="gaussian"`, the basis uses trainable centers `c_n` initialized uniformly on `[0, rcut]`:
+
+```
+φ_n(r) = exp(-0.5 · ((r - c_n) / σ)²),   σ = rcut / max(n_radial - 1, 1)
+```
+
+Both basis families are multiplied by the C³ envelope (with `exponent` typically 7) before output.
+
+The trainable radial parameters are stored as `adam_freqs` with the `adam_` prefix so that HybridMuon routes them to the Adam optimizer without weight decay. In Bessel mode they are frequencies; in Gaussian mode they are centers. The parameter name and shape are unchanged across the two modes, so existing Bessel checkpoints continue to load with the default `basis_type="bessel"`.
 
 ### 5.3 RadialMLP
 
@@ -860,7 +870,7 @@ HybridMuon uses name-based routing to separate optimizer paths (case-insensitive
 | 2D tensor (default)  | Muon      | —            |
 | Other shape          | AdamW     | decoupled    |
 
-SeZM parameters use `adam_` prefixes for norm scales, layer scales, radial frequencies, and type embeddings (`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adam_freqs`, `adam_type_embedding`) so they route to Adam without weight decay.
+SeZM parameters use `adam_` prefixes for norm scales, layer scales, trainable radial basis parameters, and type embeddings (`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adam_freqs`, `adam_type_embedding`) so they route to Adam without weight decay.
 
 **Recommended mode:** `muon_mode = "slice"`:
 
@@ -1125,6 +1135,7 @@ ______________________________________________________________________
 | `sel`                 | int \| list[int]    | —           | Max neighbors (int: total, list: per-type)                                                         |
 | `env_exp`             | list[int]           | `[7, 5]`    | Envelope exponents `[rbf_env_exp, edge_env_exp]`                                                   |
 | `channels`            | int                 | 64          | Total channels per `(l,m)` coefficient                                                             |
+| `basis_type`          | str                 | `"bessel"`  | Radial basis family: `"bessel"` or `"gaussian"`                                                    |
 | `n_radial`            | int                 | 10          | Number of radial basis functions                                                                   |
 | `radial_mlp`          | list[int]           | `[64]`      | Hidden sizes for radial MLP; use `0` as placeholder for `channels`                                 |
 | `use_env_seed`        | bool                | True        | Enable FiLM conditioning from environment matrix                                                   |
@@ -1269,7 +1280,7 @@ LoRA low-rank adapters let you fine-tune a pre-trained SeZM checkpoint on a down
 | leaf name ∈ {`adam_scale`, `adam_so2_layer_scales`, `adam_ffn_layer_scales`, `adamw_attn_logit_w`, `adamw_attn_z_bias_raw`, `adamw_attn_gate_w`, `adamw_focus_compete_w`, `adamw_pseudo_query`, `focus_compete_bias`}                                         | Fully unfrozen        | Small routed params, zero-cost. Matching is model-wide: every RMSNorm scale named `adam_scale` (per-block `pre/post_so2_norm`, `pre/post_ffn_norms`, `so2_inter_norms`, `key_norm` in every `DepthAttnRes`, radial-MLP norms, etc.) becomes trainable |
 | any leaf name containing `bias`                                                                                                                                                                                                                               | Fully unfrozen        | Constant offsets absorb domain mean shift. Includes the LoRA-preserved `SO3Linear.bias` / `SO2Linear.bias0` and every norm bias (`EquivariantRMSNorm.bias`, `ReducedEquivariantRMSNorm.bias0`) across the model                                       |
 | `type_embedding.adam_type_embedding`                                                                                                                                                                                                                          | **Frozen** (override) | Already converged on all elements                                                                                                                                                                                                                     |
-| `radial_basis.adam_freqs`                                                                                                                                                                                                                                     | **Frozen** (override) | Radial frequencies already converged                                                                                                                                                                                                                  |
+| `radial_basis.adam_freqs`                                                                                                                                                                                                                                     | **Frozen** (override) | Trainable radial basis parameters already converged                                                                                                                                                                                                   |
 | anything inside a `GatedActivation` submodule                                                                                                                                                                                                                 | **Frozen** (override) | Downstream gate patterns are stable; also shields `gate_linear.bias` from the generic "any bias unfrozen" rule                                                                                                                                        |
 | `GIE`, `InnerClamp`, `BridgingSwitch`, `C3CutoffEnvelope`, `WignerDCalculator`, `InterPotential`                                                                                                                                                              | No trainable params   | —                                                                                                                                                                                                                                                     |
 

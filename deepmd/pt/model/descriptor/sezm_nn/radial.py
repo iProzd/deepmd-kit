@@ -434,15 +434,14 @@ class BridgingSwitch(nn.Module):
 
 class RadialBasis(nn.Module):
     """
-    Spherical Bessel radial basis with C^3 cutoff envelope.
+    Radial basis with C^3 cutoff envelope.
 
-    Frequencies are trainable nn.Parameter, allowing the model
-    to learn optimal radial basis spacing during training.
+    The trainable radial parameters are stored in ``adam_freqs`` so HybridMuon
+    routes them to Adam without weight decay.
 
     Notes
     -----
-    This implementation computes the spherical Bessel radial basis
-    using PyTorch's sinc function for numerical stability::
+    The Bessel basis uses PyTorch's sinc function for numerical stability::
 
         phi_n(r) = w_n * sinc(w_n * r / π)
 
@@ -455,7 +454,7 @@ class RadialBasis(nn.Module):
 
         lim_{r->0} w_n * sinc(w_n * r / π) = w_n
 
-    The initial frequencies follow a common "Bessel" spacing::
+    The initial Bessel frequencies follow a common spacing::
 
         w_n = n * π / rcut, for n = 1..n_radial (in 1/Å)
 
@@ -468,6 +467,8 @@ class RadialBasis(nn.Module):
         Cutoff radius in Å.
     n_radial : int
         Number of basis functions.
+    basis_type : str, optional
+        Radial basis type. Supported values are ``"bessel"`` and ``"gaussian"``.
     dtype : torch.dtype
         Floating-point dtype for the radial basis frequencies and outputs.
     exponent : int, optional
@@ -477,9 +478,9 @@ class RadialBasis(nn.Module):
     def __init__(
         self,
         rcut: float,
-        n_radial: int,
-        *,
-        dtype: torch.dtype,
+        basis_type: str = "bessel",
+        n_radial: int = 10,
+        dtype: torch.dtype = torch.float32,
         exponent: int = 7,
     ) -> None:
         super().__init__()
@@ -487,6 +488,9 @@ class RadialBasis(nn.Module):
         self.n_radial = int(n_radial)
         if self.n_radial <= 0:
             raise ValueError("`n_radial` must be positive")
+        self.basis_type = str(basis_type).lower()
+        if self.basis_type not in ("bessel", "gaussian"):
+            raise ValueError("`basis_type` must be either 'bessel' or 'gaussian'")
         self.dtype = dtype
         self.device = env.DEVICE
         self.precision = RESERVED_PRECISION_DICT[self.dtype]
@@ -497,16 +501,35 @@ class RadialBasis(nn.Module):
             persistent=False,
         )
 
-        # === Frequencies: n*π/rcut, n=1..n_radial ===
-        # Shape: (1, n_radial), stored as trainable nn.Parameter
-        freqs = torch.arange(
-            1,
-            self.n_radial + 1,
-            device=self.device,
-            dtype=self.dtype,
-        ) * (math.pi / self.rcut)
+        # Frequencies: n*π/rcut, n=1..n_radial
+        # Shape: (1, n_radial), stored as trainable nn.Parameter.
+        if self.basis_type == "bessel":
+            freqs = torch.arange(
+                1,
+                self.n_radial + 1,
+                device=self.device,
+                dtype=self.dtype,
+            ) * (math.pi / self.rcut)
+        else:
+            freqs = torch.linspace(
+                0.0,
+                self.rcut,
+                self.n_radial,
+                device=self.device,
+                dtype=self.dtype,
+            )
         self.adam_freqs = nn.Parameter(
             rearrange(freqs, "n_radial -> 1 n_radial"), requires_grad=True
+        )
+        gaussian_width = self.rcut / max(self.n_radial - 1, 1)
+        self.register_buffer(
+            "gaussian_coeff",
+            torch.tensor(
+                -0.5 / (gaussian_width * gaussian_width),
+                dtype=self.dtype,
+                device=self.device,
+            ),
+            persistent=False,
         )
 
         self.envelope = C3CutoffEnvelope(
@@ -530,11 +553,15 @@ class RadialBasis(nn.Module):
             Radial basis multiplied by C^3 cutoff envelope with shape (N, n_rbf).
             The output is smoothly truncated to zero at r = rcut.
         """
-        # === Step 1. Bessel Basis via Sinc ===
-        # phi_n(r) = w_n * sinc(w_n * r / π)
+        # === Step 1. Radial basis ===
         # Shape: (N, 1) * (1, n_radial) -> (N, n_radial)
-        x = r * self.adam_freqs  # (N, n_rbf)
-        raw = self.adam_freqs * torch.sinc(x / self.pi_tensor)  # (N, n_rbf)
+        if self.basis_type == "bessel":
+            # phi_n(r) = w_n * sinc(w_n * r / π)
+            x = r * self.adam_freqs  # (N, n_rbf)
+            raw = self.adam_freqs * torch.sinc(x / self.pi_tensor)  # (N, n_rbf)
+        else:
+            dr = r - self.adam_freqs  # (N, n_rbf)
+            raw = torch.exp(dr * dr * self.gaussian_coeff)  # (N, n_rbf)
 
         # === Step 2. Apply C^3 envelope for smooth cutoff ===
         envelope = self.envelope(r)  # (N, 1)
@@ -548,6 +575,7 @@ class RadialBasis(nn.Module):
             "@version": 1,
             "config": {
                 "rcut": self.rcut,
+                "basis_type": self.basis_type,
                 "n_radial": self.n_radial,
                 "exponent": self.exponent,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
@@ -572,6 +600,7 @@ class RadialBasis(nn.Module):
         obj = cls(
             rcut=float(config["rcut"]),
             n_radial=int(config["n_radial"]),
+            basis_type=str(config.get("basis_type", "bessel")),
             exponent=int(config.get("exponent", 7)),
             dtype=dtype,
         )

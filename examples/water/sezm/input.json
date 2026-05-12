@@ -15,6 +15,7 @@
         5
       ],
       "channels": 64,
+      "basis_type": "bessel",
       "n_radial": 16,
       "radial_mlp": [
         0
