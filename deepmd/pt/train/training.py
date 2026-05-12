@@ -73,6 +73,9 @@ from deepmd.pt.train.ema import (
     get_ema_checkpoint_prefix,
     get_ema_validation_log_path,
 )
+from deepmd.pt.train.utils import (
+    clip_grad_norm_with_stable_fallback,
+)
 from deepmd.pt.train.validation import (
     FullValidator,
     resolve_full_validation_start_step,
@@ -1408,29 +1411,12 @@ class Trainer:
                             for name, p in self.wrapper.named_parameters()
                             if p.grad is not None
                         ]
-                    # FSDP2 sharded DTensor gradients don't support error_if_nonfinite; use manual isfinite check instead.
-                    total_norm = torch.nn.utils.clip_grad_norm_(
+                    total_norm = clip_grad_norm_with_stable_fallback(
                         self.wrapper.parameters(),
                         self.gradient_max_norm,
+                        use_stable_fallback=self.zero_stage < 2,
+                        named_parameters=self.wrapper.named_parameters,
                     )
-                    if not torch.isfinite(total_norm):
-                        bad_params = []
-                        for name, p in self.wrapper.named_parameters():
-                            if p.grad is not None:
-                                grad_norm = p.grad.data.norm()
-                                if not torch.isfinite(grad_norm):
-                                    bad_params.append(
-                                        f"  {name}: grad_norm={grad_norm}, shape={list(p.shape)}"
-                                    )
-                        detail = (
-                            "\n".join(bad_params)
-                            if bad_params
-                            else "  (all individual grads finite, overflow in norm reduction)"
-                        )
-                        raise RuntimeError(
-                            f"Non-finite gradient norm: {total_norm}\n"
-                            f"Parameters with non-finite gradients:\n{detail}"
-                        )
                 with torch.device(DEVICE):
                     self.optimizer.step()
                 self.scheduler.step()
