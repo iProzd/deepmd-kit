@@ -410,11 +410,22 @@ def descrpt_se_zm_args() -> list[Argument]:
     doc_n_atten_head = (
         "Number of attention heads when aggregating messages in SO(2) "
         "convolution. 0 applies a plain envelope-weighted scatter-sum. When >0, "
-        "the effective per-focus hidden width `focus_dim` (or `channels` when "
-        "`focus_dim=0`) must be divisible by `n_atten_head`, and envelope-gated "
+        "the attention width must be divisible by `n_atten_head`, and envelope-gated "
         "grouped softmax attention with output-side head gate is applied. Attention uses "
         "`w**2 * exp(logit)` in the numerator and "
         "`zeta + sum(w**2 * exp(logit))` in the denominator."
+    )
+    doc_mixed_attention = (
+        "If True, merge all SO(2) focus streams into one attention stream after "
+        "rotate-back. Attention heads split `n_focus * focus_dim` (or "
+        "`n_focus * channels` when `focus_dim=0`) instead of each focus stream "
+        "independently. The default False preserves per-focus attention."
+    )
+    doc_legacy_attention = (
+        "If True, preserve the legacy single-head attention value path without "
+        "explicit value/output projections. If False, all attention modes use "
+        "explicit value/output projections. Keep True to load old single-head "
+        "attention checkpoints without new attention projection parameters."
     )
     doc_ffn_neurons = (
         "Hidden width for block FFNs and the final scalar output FFN. "
@@ -584,6 +595,20 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_focus_dim,
         ),
         Argument("n_atten_head", int, optional=True, default=1, doc=doc_n_atten_head),
+        Argument(
+            "mixed_attention",
+            bool,
+            optional=True,
+            default=False,
+            doc=doc_only_pt_supported + doc_mixed_attention,
+        ),
+        Argument(
+            "legacy_attention",
+            bool,
+            optional=True,
+            default=True,
+            doc=doc_only_pt_supported + doc_legacy_attention,
+        ),
         Argument(
             "ffn_neurons",
             int,

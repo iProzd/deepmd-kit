@@ -510,6 +510,13 @@ k = attn_k_proj(ScalarRMSNorm(x_l0[src]))     # (E, F, H, Dh)
 logits = dot(q, k) / sqrt(head_dim) + attn_radial_logit_proj(radial_l0)
 ```
 
+By default, attention is independent for each SO(2) focus stream. When
+`mixed_attention=true`, all focus streams are viewed as one attention stream
+after rotate-back: `F_attn=1` and `C_attn=n_focus * focus_dim`. A degree-aware
+`SO3Linear` first mixes the full hidden width after rotate-back, then the same
+attention code path is used. Each head splits the mixed multi-focus hidden
+width instead of a single focus stream.
+
 **Destination-wise softmax with envelope gating:**
 
 ```
@@ -521,14 +528,17 @@ alpha = numerator / denominator[dst]
 
 The `z_bias` term (learnable, initialized to `softplus⁻¹(1)`) prevents the denominator from reaching zero when all edges have small envelope weights, which would produce division-by-zero at the cutoff boundary. Zero-weight edges (from padding or envelope) have their logits set to `−∞` before the grouped max, excluding them from the normalization entirely.
 
-**Output-side head gate:** After scatter-summing the attention-weighted messages, an output gate is applied per head:
+**Output-side head gate:** After scatter-summing the attention-weighted messages, an output gate is applied per head. In the standard path (`legacy_attention=false`), the value path also uses value and output projections:
 
 ```
+value = attn_v_proj(message)
+output = scatter_sum(alpha × value, dst)
 gate = sigmoid(attn_output_gate_proj(ScalarRMSNorm(x_l0)))
 output = output × gate
+output = attn_o_proj(output)
 ```
 
-This query-dependent gate (analogous to the G1 gate in AlphaFold) allows the model to selectively suppress or amplify each attention head's contribution based on the destination atom's scalar features.
+This query-dependent gate allows the model to suppress or amplify each attention head based on the destination atom's scalar features. The two projections are degree-aware, per-attention-focus `SO3Linear` maps: each degree `l` has its own channel projection, while all `m` components within the same degree share the same weights. The default `legacy_attention=true` preserves the older single-head, non-mixed value path without these projections, so existing single-head attention checkpoints keep the same state layout. Multi-head attention and `mixed_attention=true` still use the projections.
 
 When attention is active, `inv_sqrt_deg` is not applied — the softmax normalization replaces degree-based normalization.
 

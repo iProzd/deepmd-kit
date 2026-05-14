@@ -34,6 +34,8 @@
       "n_focus": 1,
       "focus_dim": 0,
       "n_atten_head": 1,
+      "mixed_attention": false,
+      "legacy_attention": true,
       "ffn_neurons": 0,
       "grid_mlp": false,
       "ffn_blocks": 1,

@@ -516,8 +516,15 @@ class SO2Convolution(nn.Module):
         - >0: envelope-gated grouped softmax attention with output-side head
           gates. Attention uses ``w**2 * exp(logit)`` in the numerator and
           ``zeta + sum(w**2 * exp(logit))`` in the denominator.
-        Requires the effective per-focus width to satisfy
-        ``focus_dim % n_atten_head == 0``.
+    mixed_attention
+        If True, merge the internal focus streams into one attention stream
+        after rotate-back. Attention heads then split the full hidden width
+        ``n_focus * focus_dim`` instead of each focus stream independently.
+    legacy_attention
+        If True, keep the legacy attention value path: single-head,
+        non-mixed attention uses the raw rotated message as value and skips
+        value/output projections. If False, all attention modes use explicit
+        value and output projections.
     s2_activation
         If True, replace each intermediate reduced-layout gate with S2-grid
         SwiGLU. Intermediate ``SO2Linear`` layers then output ``2 * focus_dim``
@@ -557,6 +564,8 @@ class SO2Convolution(nn.Module):
         so2_attn_res: str = "none",
         layer_scale: bool = False,
         n_atten_head: int = 1,
+        mixed_attention: bool = False,
+        legacy_attention: bool = True,
         s2_activation: bool = False,
         s2_grid_resolution: list[int] | None = None,
         activation_function: str = "silu",
@@ -599,6 +608,8 @@ class SO2Convolution(nn.Module):
         self.use_so2_attn_res = self.so2_attn_res_mode != "none"
         self.layer_scale = bool(layer_scale)
         self.n_atten_head = int(n_atten_head)
+        self.mixed_attention = bool(mixed_attention)
+        self.legacy_attention = bool(legacy_attention)
         self.s2_activation = bool(s2_activation)
         self.s2_grid_resolution = resolve_s2_grid_resolution(
             self.lmax, self.mmax, s2_grid_resolution
@@ -606,14 +617,23 @@ class SO2Convolution(nn.Module):
         self.activation_function = str(activation_function)
         if self.n_atten_head < 0:
             raise ValueError("`n_atten_head` must be non-negative")
-        if self.n_atten_head > 0 and self.so2_focus_dim % self.n_atten_head != 0:
+        self.attn_n_focus = (
+            1 if self.mixed_attention and self.n_atten_head > 0 else self.n_focus
+        )
+        self.attn_focus_dim = (
+            self.hidden_channels
+            if self.mixed_attention and self.n_atten_head > 0
+            else self.so2_focus_dim
+        )
+        if self.n_atten_head > 0 and self.attn_focus_dim % self.n_atten_head != 0:
             raise ValueError(
-                "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
+                "`n_atten_head` must divide the attention width "
+                "(`focus_dim` or `n_focus * focus_dim` when `mixed_attention=True`)"
             )
         self.head_dim = (
             None
             if self.n_atten_head == 0
-            else int(self.so2_focus_dim // self.n_atten_head)
+            else int(self.attn_focus_dim // self.n_atten_head)
         )
         self.mlp_bias = bool(mlp_bias)
         self.use_triton = bool(use_triton)
@@ -782,40 +802,79 @@ class SO2Convolution(nn.Module):
         self.attn_qk_norm: ScalarRMSNorm | None = None
         self.attn_q_proj: FocusLinear | None = None
         self.attn_k_proj: FocusLinear | None = None
+        self.attn_focus_mix: SO3Linear | None = None
+        self.attn_v_proj: SO3Linear | None = None
+        self.attn_o_proj: SO3Linear | None = None
         self.adamw_attn_logit_w: nn.Parameter | None = None
         self.adamw_attn_z_bias_raw: nn.Parameter | None = None
         self.attn_output_gate_norm: ScalarRMSNorm | None = None
         self.adamw_attn_gate_w: nn.Parameter | None = None
         if self.n_atten_head > 0:
             self.attn_qk_norm = ScalarRMSNorm(
-                channels=self.so2_focus_dim,
-                n_focus=self.n_focus,
+                channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
                 eps=self.eps,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
             self.attn_q_proj = FocusLinear(
-                in_channels=self.so2_focus_dim,
-                out_channels=self.so2_focus_dim,
-                n_focus=self.n_focus,
+                in_channels=self.attn_focus_dim,
+                out_channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
                 dtype=self.compute_dtype,
                 bias=False,
                 seed=child_seed(seed_gate, 0),
                 trainable=trainable,
             )
             self.attn_k_proj = FocusLinear(
-                in_channels=self.so2_focus_dim,
-                out_channels=self.so2_focus_dim,
-                n_focus=self.n_focus,
+                in_channels=self.attn_focus_dim,
+                out_channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
                 dtype=self.compute_dtype,
                 bias=False,
                 seed=child_seed(seed_gate, 1),
                 trainable=trainable,
             )
+            if self.mixed_attention:
+                self.attn_focus_mix = SO3Linear(
+                    lmax=self.lmax,
+                    in_channels=self.hidden_channels,
+                    out_channels=self.hidden_channels,
+                    n_focus=1,
+                    dtype=self.compute_dtype,
+                    mlp_bias=False,
+                    seed=child_seed(seed_gate, 19),
+                    trainable=trainable,
+                )
+            if (
+                not self.legacy_attention
+                or self.n_atten_head > 1
+                or self.mixed_attention
+            ):
+                self.attn_v_proj = SO3Linear(
+                    lmax=self.lmax,
+                    in_channels=self.attn_focus_dim,
+                    out_channels=self.attn_focus_dim,
+                    n_focus=self.attn_n_focus,
+                    dtype=self.compute_dtype,
+                    mlp_bias=False,
+                    seed=child_seed(seed_gate, 20),
+                    trainable=trainable,
+                )
+                self.attn_o_proj = SO3Linear(
+                    lmax=self.lmax,
+                    in_channels=self.attn_focus_dim,
+                    out_channels=self.attn_focus_dim,
+                    n_focus=self.attn_n_focus,
+                    dtype=self.compute_dtype,
+                    mlp_bias=False,
+                    seed=child_seed(seed_gate, 21),
+                    trainable=trainable,
+                )
             self.adamw_attn_logit_w = nn.Parameter(
                 torch.empty(
-                    self.so2_focus_dim,
-                    self.n_focus,
+                    self.attn_focus_dim,
+                    self.attn_n_focus,
                     self.n_atten_head,
                     dtype=self.compute_dtype,
                     device=self.device,
@@ -831,7 +890,7 @@ class SO2Convolution(nn.Module):
             # softplus(0.5413) ~= 1.0 provides balanced initial competition.
             self.adamw_attn_z_bias_raw = nn.Parameter(
                 torch.full(
-                    (self.n_focus, self.n_atten_head),
+                    (self.attn_n_focus, self.n_atten_head),
                     0.5413,
                     dtype=self.compute_dtype,
                     device=self.device,
@@ -839,16 +898,16 @@ class SO2Convolution(nn.Module):
                 requires_grad=trainable,
             )
             self.attn_output_gate_norm = ScalarRMSNorm(
-                channels=self.so2_focus_dim,
-                n_focus=self.n_focus,
+                channels=self.attn_focus_dim,
+                n_focus=self.attn_n_focus,
                 eps=self.eps,
                 dtype=self.compute_dtype,
                 trainable=trainable,
             )
             self.adamw_attn_gate_w = nn.Parameter(
                 torch.empty(
-                    self.so2_focus_dim,
-                    self.n_focus,
+                    self.attn_focus_dim,
+                    self.attn_n_focus,
                     self.n_atten_head,
                     dtype=self.compute_dtype,
                     device=self.device,
@@ -1010,7 +1069,7 @@ class SO2Convolution(nn.Module):
             if self.focus_compete and self.n_focus > 1:
                 focus_gate_src = x_local[:, :, 0, :]
 
-        # === Step 5. Multi-layer SO(2) mixing (pre-norm + residual + LayerScale) ===
+        # === Step 5. Multi-layer SO(2) mixing (pre-norm + residual) ===
         with nvtx_range("SO2Conv/so2_layers"):
 
             def so2_l0_extractor(v: torch.Tensor) -> torch.Tensor:
@@ -1086,7 +1145,7 @@ class SO2Convolution(nn.Module):
                     else:
                         x_local = residual + x_local
 
-        # === Step 5.5. Cross-focus softmax competition ===
+        # === Step 6. Cross-focus softmax competition ===
         if self.focus_compete and self.n_focus > 1:
             focus_gate_src = focus_gate_src.to(dtype=self.compute_dtype)
             focus_logits = torch.einsum(
@@ -1104,12 +1163,11 @@ class SO2Convolution(nn.Module):
             )
             x_local = x_local * alpha.unsqueeze(-1).unsqueeze(-1)
 
-        # === Step 6. Restore reduced global layout for inverse rotation ===
-        with nvtx_range("SO2Conv/reshape_for_rotate_back"):
-            x_local = x_local.transpose(1, 2).contiguous()  # (E, D_m, F, Cf)
-            x_local = x_local.reshape(
-                n_edge, self.reduced_dim, self.hidden_channels
-            )  # (E, D_m, H)
+        # Restore reduced global layout for inverse rotation
+        x_local = x_local.transpose(1, 2).contiguous()  # (E, D_m, F, Cf)
+        x_local = x_local.reshape(
+            n_edge, self.reduced_dim, self.hidden_channels
+        )  # (E, D_m, C_wide), C_wide = F * Cf
 
         # === Step 7. Rotate back to global frame ===
         with nvtx_range("SO2Conv/rotate_back"):
@@ -1121,7 +1179,7 @@ class SO2Convolution(nn.Module):
                     coeff_index=self.coeff_index_m,
                     dim_full=self.ebed_dim_full,
                     rotation_mode=self.triton_rotation_mode,
-                )  # (E, D, H)
+                )  # (E, D, C_wide)
             else:
                 Dt_from_m = project_Dt_from_m(
                     Dt_full=Dt_full,
@@ -1131,11 +1189,13 @@ class SO2Convolution(nn.Module):
                     key_lmax=self.lmax,
                     key_mmax=self.mmax,
                 )
-                x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, H)
+                x_message = torch.bmm(Dt_from_m, x_local)  # (E, D, C_wide)
             # Reduced layouts keep only 2*mmax+1 orders for l>mmax. Applying the
             # inverse-rotation degree rescale after the global lift restores the
             # full-basis amplitude expected by the block output contract.
             x_message = x_message * self.rotate_inv_rescale_full.view(1, -1, 1)
+            if self.attn_focus_mix is not None:
+                x_message = self.attn_focus_mix(x_message.unsqueeze(2)).squeeze(2)
 
         # === Step 8. Aggregate with optional head-wise gating ===
         with nvtx_range("SO2Conv/aggregate"):
@@ -1158,31 +1218,33 @@ class SO2Convolution(nn.Module):
                 out = x.new_zeros(x.shape, dtype=self.compute_dtype)
                 out.index_add_(0, dst, x_message.to(dtype=self.compute_dtype))
                 out.mul_(edge_cache.inv_sqrt_deg.to(dtype=self.compute_dtype))
-                out = out.to(dtype=self.dtype)  # (N, D, H)
+                out = out.to(dtype=self.dtype)  # (N, D, C_wide)
             else:
                 # === Step 8.1. Build attention logits from scalar channels ===
                 compute_dtype = self.compute_dtype
                 x_l0_node = x[:, 0, :].reshape(
-                    n_node, self.n_focus, self.so2_focus_dim
-                )  # (N, F, Cf)
+                    n_node, self.attn_n_focus, self.attn_focus_dim
+                )  # (N, Fa, Ca)
                 qk_input = self.attn_qk_norm(x_l0_node.to(dtype=compute_dtype))
-                q_node = self.attn_q_proj(qk_input)  # (N, F, Cf)
-                k_node = self.attn_k_proj(qk_input)  # (N, F, Cf)
+                q_node = self.attn_q_proj(qk_input)  # (N, Fa, Ca)
+                k_node = self.attn_k_proj(qk_input)  # (N, Fa, Ca)
                 q_edge = q_node.index_select(0, dst).reshape(
-                    n_edge, self.n_focus, self.n_atten_head, self.head_dim
-                )  # (E, F, H, Dh)
+                    n_edge, self.attn_n_focus, self.n_atten_head, self.head_dim
+                )  # (E, Fa, H, Ch), Ca = H * Ch
                 k_edge = k_node.index_select(0, src).reshape(
-                    n_edge, self.n_focus, self.n_atten_head, self.head_dim
-                )  # (E, F, H, Dh)
+                    n_edge, self.attn_n_focus, self.n_atten_head, self.head_dim
+                )  # (E, Fa, H, Ch)
                 radial_l0 = rad_feat[:, 0, :].reshape(
-                    n_edge, self.n_focus, self.so2_focus_dim
-                )  # (E, F, Cf)
+                    n_edge, self.attn_n_focus, self.attn_focus_dim
+                )  # (E, Fa, Ca)
                 radial_bias = torch.einsum(
                     "efi,ifo->efo",
                     radial_l0.to(dtype=compute_dtype),
                     self.adamw_attn_logit_w,
                 )  # (E, F, H)
-                attn_logits = (q_edge * k_edge).sum(-1) * (self.head_dim**-0.5)
+                attn_logits: torch.Tensor = (q_edge * k_edge).sum(-1) * (
+                    self.head_dim**-0.5
+                )
                 attn_logits = attn_logits + radial_bias
 
                 # === Step 8.2. Destination-wise stable envelope-gated softmax ===
@@ -1208,29 +1270,37 @@ class SO2Convolution(nn.Module):
                     ),
                 )  # (E, F, H)
 
-                # === Step 8.3. Head-wise value aggregation ===
-                value_heads = x_message.reshape(
+                # === Step 8.3. Value projection and head-wise aggregation ===
+                value_focus = x_message.reshape(
                     n_edge,
                     self.ebed_dim_full,
-                    self.n_focus,
+                    self.attn_n_focus,
+                    self.attn_focus_dim,
+                ).to(dtype=compute_dtype)  # (E, D, Fa, Ca)
+                if self.attn_v_proj is not None:
+                    value_focus = self.attn_v_proj(value_focus)
+                value_heads = value_focus.reshape(
+                    n_edge,
+                    self.ebed_dim_full,
+                    self.attn_n_focus,
                     self.n_atten_head,
                     self.head_dim,
-                ).to(dtype=compute_dtype)  # (E, D, F, H, Dh)
+                )  # (E, D, Fa, H, Ch)
                 weighted_value = value_heads * attn_alpha.reshape(
-                    n_edge, 1, self.n_focus, self.n_atten_head, 1
+                    n_edge, 1, self.attn_n_focus, self.n_atten_head, 1
                 )
                 out_heads = torch.zeros(
                     n_node,
                     self.ebed_dim_full,
-                    self.n_focus,
+                    self.attn_n_focus,
                     self.n_atten_head,
                     self.head_dim,
                     device=x.device,
                     dtype=compute_dtype,
-                )  # (N, D, F, H, Dh)
+                )  # (N, D, Fa, H, Ch)
                 out_heads.index_add_(0, dst, weighted_value)
 
-                # === Step 8.4. Output-side head gate (G1 style) ===
+                # === Step 8.4. Output-side head gate ===
                 attn_output_gate = torch.sigmoid(
                     torch.einsum(
                         "nfi,ifo->nfo",
@@ -1239,13 +1309,21 @@ class SO2Convolution(nn.Module):
                     )
                 )  # (N, F, H)
                 out_heads = out_heads * attn_output_gate.reshape(
-                    n_node, 1, self.n_focus, self.n_atten_head, 1
-                )  # (N, D, F, H, Dh)
+                    n_node, 1, self.attn_n_focus, self.n_atten_head, 1
+                )  # (N, D, Fa, H, Ch)
 
-                # === Step 8.5. Merge heads (softmax path has no degree norm) ===
-                out = out_heads.reshape(
+                # === Step 8.5. Output projection and merge heads ===
+                out_focus = out_heads.reshape(
+                    n_node,
+                    self.ebed_dim_full,
+                    self.attn_n_focus,
+                    self.attn_focus_dim,
+                )  # (N, D, Fa, Ca)
+                if self.attn_o_proj is not None:
+                    out_focus = self.attn_o_proj(out_focus)
+                out = out_focus.reshape(
                     n_node, self.ebed_dim_full, self.hidden_channels
-                ).to(dtype=self.dtype)  # (N, D, H)
+                ).to(dtype=self.dtype)  # (N, D, C_wide)
 
         # === Step 9. Final channel mixing ===
         with nvtx_range("SO2Conv/post_focus_mix"):
@@ -1270,6 +1348,8 @@ class SO2Convolution(nn.Module):
                 "so2_attn_res": self.so2_attn_res_mode,
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
+                "mixed_attention": self.mixed_attention,
+                "legacy_attention": self.legacy_attention,
                 "s2_activation": self.s2_activation,
                 "s2_grid_resolution": self.s2_grid_resolution,
                 "activation_function": self.activation_function,

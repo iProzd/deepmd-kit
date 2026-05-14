@@ -198,8 +198,14 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         envelope-gated grouped softmax attention with output-side head gate.
         Attention uses ``w**2 * exp(logit)`` in the numerator and
         ``zeta + sum(w**2 * exp(logit))`` in the denominator.
-        When enabled, the SO(2)-internal per-focus width ``focus_dim`` must be
-        divisible by ``n_atten_head``.
+    mixed_attention
+        If True, merge all SO(2) focus streams into one attention stream after
+        rotate-back. Attention heads split ``n_focus * focus_dim`` instead of
+        each focus stream independently.
+    legacy_attention
+        If True, keep the legacy single-head attention value path without
+        explicit value/output projections. If False, all attention modes use
+        explicit value/output projections.
     ffn_neurons
         Hidden width for block FFNs and the final scalar output FFN.
         If ``>0``, both paths use this width.
@@ -332,6 +338,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         n_focus: int = 1,
         focus_dim: int = 0,
         n_atten_head: int = 1,
+        mixed_attention: bool = False,
+        legacy_attention: bool = True,
         ffn_neurons: int = 0,
         grid_mlp: bool = False,
         ffn_blocks: int = 1,
@@ -549,10 +557,16 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "`full_attn_res` and `block_attn_res` cannot both be enabled"
             )
         self.n_atten_head = int(n_atten_head)
+        self.mixed_attention = bool(mixed_attention)
+        self.legacy_attention = bool(legacy_attention)
         so2_focus_dim = self.channels if self.focus_dim == 0 else self.focus_dim
-        if self.n_atten_head > 0 and so2_focus_dim % self.n_atten_head != 0:
+        attn_focus_dim = (
+            self.n_focus * so2_focus_dim if self.mixed_attention else so2_focus_dim
+        )
+        if self.n_atten_head > 0 and attn_focus_dim % self.n_atten_head != 0:
             raise ValueError(
-                "`focus_dim` must be divisible by `n_atten_head` when attention is enabled"
+                "`n_atten_head` must divide the attention width "
+                "(`focus_dim` or `n_focus * focus_dim` when `mixed_attention=True`)"
             )
 
         # === Excluded type pairs ===
@@ -704,6 +718,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     ffn_s2_activation=self.ffn_s2_activation,
                     s2_grid_resolution=self.s2_grid_resolution,
                     n_atten_head=self.n_atten_head,
+                    mixed_attention=self.mixed_attention,
+                    legacy_attention=self.legacy_attention,
                     so2_pre_norm=self.so2_pre_norm,
                     so2_post_norm=self.so2_post_norm,
                     so2_activation_function=self.so2_activation_function,
@@ -1748,6 +1764,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "ffn_blocks": self.ffn_blocks,
                 "layer_scale": self.layer_scale,
                 "n_atten_head": self.n_atten_head,
+                "mixed_attention": self.mixed_attention,
+                "legacy_attention": self.legacy_attention,
                 "sandwich_norm": self.sandwich_norm,
                 "full_attn_res": self.full_attn_res_mode,
                 "block_attn_res": self.block_attn_res_mode,

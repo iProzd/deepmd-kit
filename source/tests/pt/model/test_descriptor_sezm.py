@@ -211,6 +211,18 @@ class TestDescrptSeZM(_SeZMTestCase):
                 s2_activation=[False, True],
                 s2_grid_resolution=[8, 12],
             ),
+            "mixed_so2_attention": _attention_descriptor_kwargs(
+                precision="float32",
+                seed=123,
+                n_atten_head=4,
+                mixed_attention=True,
+            ),
+            "standard_single_head_attention": _attention_descriptor_kwargs(
+                precision="float32",
+                seed=123,
+                n_atten_head=1,
+                legacy_attention=False,
+            ),
         }
         for name, model_kwargs in cases.items():
             with self.subTest(mode=name):
@@ -1364,7 +1376,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
     ) -> None:
         """Check the non-bridged near-cutoff PES shape across attention and AMP modes."""
         for use_amp in (False, True):
-            for n_atten_head in (0, 2):
+            for n_atten_head in (0, 1, 2):
                 for n_focus in (1, 2):
                     with self.subTest(
                         n_atten_head=n_atten_head, use_amp=use_amp, n_focus=n_focus
@@ -1380,7 +1392,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
     ) -> None:
         """Check the bridged near-r_inner PES shape across attention and AMP modes."""
         for use_amp in (False, True):
-            for n_atten_head in (0, 2):
+            for n_atten_head in (0, 1, 2):
                 for n_focus in (1, 2):
                     with self.subTest(
                         n_atten_head=n_atten_head, use_amp=use_amp, n_focus=n_focus
@@ -1398,7 +1410,7 @@ class TestDescriptorEnergyCurveSmoothness(_SeZMTestCase):
     ) -> None:
         """Check the bridged near-r_outer PES shape across attention and AMP modes."""
         for use_amp in (False, True):
-            for n_atten_head in (0, 2):
+            for n_atten_head in (0, 1, 2):
                 for n_focus in (1, 2):
                     with self.subTest(
                         n_atten_head=n_atten_head, use_amp=use_amp, n_focus=n_focus

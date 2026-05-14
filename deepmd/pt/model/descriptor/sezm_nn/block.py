@@ -103,6 +103,14 @@ class SeZMInteractionBlock(nn.Module):
         Number of attention heads when aggregating messages in SO(2) convolution.
         0 means no attention is used; >0 enables envelope-gated grouped softmax
         attention with output-side head gate.
+    mixed_attention
+        If True, merge SO(2) focus streams into one attention stream after
+        rotate-back. This gives each attention head access to the full
+        multi-focus hidden width.
+    legacy_attention
+        If True, keep the legacy single-head attention value path without
+        explicit value/output projections. If False, all attention modes use
+        explicit value/output projections.
     so2_pre_norm
         If True, apply pre-norm before SO(2) convolution.
     so2_post_norm
@@ -179,6 +187,8 @@ class SeZMInteractionBlock(nn.Module):
         so2_layers: int = 4,
         so2_attn_res: str = "none",
         n_atten_head: int = 1,
+        mixed_attention: bool = False,
+        legacy_attention: bool = True,
         so2_pre_norm: bool = True,
         so2_post_norm: bool = False,
         ffn_pre_norm: bool = True,
@@ -225,6 +235,8 @@ class SeZMInteractionBlock(nn.Module):
                 "`so2_attn_res` must be one of 'none', 'independent', or 'dependent'"
             )
         self.n_atten_head = int(n_atten_head)
+        self.mixed_attention = bool(mixed_attention)
+        self.legacy_attention = bool(legacy_attention)
         self.so2_pre_norm = bool(so2_pre_norm)
         self.so2_post_norm = bool(so2_post_norm)
         self.ffn_pre_norm = bool(ffn_pre_norm)
@@ -308,6 +320,8 @@ class SeZMInteractionBlock(nn.Module):
             so2_attn_res=self.so2_attn_res_mode,
             layer_scale=self.layer_scale,
             n_atten_head=n_atten_head,
+            mixed_attention=self.mixed_attention,
+            legacy_attention=self.legacy_attention,
             s2_activation=self.so2_s2_activation,
             s2_grid_resolution=self.s2_grid_resolution,
             activation_function=self.so2_activation_function,
@@ -750,6 +764,8 @@ class SeZMInteractionBlock(nn.Module):
                 "so2_layers": self.so2_layers,
                 "so2_attn_res": self.so2_attn_res_mode,
                 "n_atten_head": self.n_atten_head,
+                "mixed_attention": self.mixed_attention,
+                "legacy_attention": self.legacy_attention,
                 "so2_pre_norm": self.so2_pre_norm,
                 "so2_post_norm": self.so2_post_norm,
                 "ffn_pre_norm": self.ffn_pre_norm,
