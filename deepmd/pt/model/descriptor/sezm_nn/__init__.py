@@ -56,6 +56,10 @@ from .indexing import (
     project_Dt_from_m,
     so3_packed_index,
 )
+from .lebedev import (
+    LEBEDEV_PRECISION_TO_NPOINTS,
+    load_lebedev_rule,
+)
 from .lora import (
     LoRASO2,
     LoRASO3,
@@ -109,6 +113,7 @@ from .wignerd import (
 
 __all__ = [
     "ATTN_RES_MODES",
+    "LEBEDEV_PRECISION_TO_NPOINTS",
     "BridgingSwitch",
     "C3CutoffEnvelope",
     "ChannelLinear",
@@ -159,6 +164,7 @@ __all__ = [
     "get_so3_dim_of_lmax",
     "has_lora",
     "init_trunc_normal_fan_in_out",
+    "load_lebedev_rule",
     "map_degree_idx",
     "merge_lora_into_base",
     "np_safe",

@@ -95,7 +95,6 @@ from .sezm_nn import (
     has_lora,
     np_safe,
     nvtx_range,
-    resolve_s2_grid_resolution,
     safe_numpy_to_tensor,
 )
 
@@ -257,12 +256,16 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         ``activation_function="silu"``.
         ``ffn_enabled=True`` makes the block-internal FFN path use
         ``activation_function="silu"`` and ``glu_activation=True``.
+        S2-grid resolutions are resolved automatically per block. The e3nn
+        product grid uses ``[2 * mmax + 4, ceil_even(3 * lmax + 2)]`` in the
+        SO(2) branch, and the FFN branch lifts it to a square
+        ``[max(R_phi, R_theta), max(R_phi, R_theta)]`` grid. Lebedev branches
+        use the smallest packaged rule with precision at least ``3 * lmax``.
         The final ``l=0`` output FFN is unchanged.
-    s2_grid_resolution
-        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
-        If omitted, it is resolved from the first block ``(lmax, mmax)`` after
-        schedule parsing as
-        ``[2 * mmax + 4, ceil_even(3 * lmax + 2)]``.
+    lebedev_quadrature
+        Two booleans ``[so2_enabled, ffn_enabled]`` aligned with
+        ``s2_activation``. If enabled for a branch, that branch uses Lebedev
+        quadrature instead of the e3nn product grid in its S2 projector.
     activation_function
         Base activation function for helper MLPs, the SO(2) gated activation
         path, and the final ``l=0`` output FFN.
@@ -349,7 +352,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         full_attn_res: str = "none",
         block_attn_res: str = "none",
         s2_activation: list[bool] | None = None,
-        s2_grid_resolution: list[int] | None = None,
+        lebedev_quadrature: list[bool] | None = None,
         activation_function: str = "silu",
         glu_activation: bool = True,
         use_amp: bool = True,
@@ -419,12 +422,25 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "`s2_activation` must be a list[bool] of length 2: [so2_activation, ffn_activation]"
             )
         self.s2_activation = list(s2_activation)
+        if lebedev_quadrature is None:
+            lebedev_quadrature = [False, False]
+        if not isinstance(lebedev_quadrature, list) or len(lebedev_quadrature) != 2:
+            raise ValueError(
+                "`lebedev_quadrature` must be a list[bool] of length 2: [so2_quadrature, ffn_quadrature]"
+            )
+        if any(not isinstance(flag, bool) for flag in lebedev_quadrature):
+            raise ValueError(
+                "`lebedev_quadrature` must be a list[bool] of length 2: [so2_quadrature, ffn_quadrature]"
+            )
+        self.lebedev_quadrature = list(lebedev_quadrature)
         self.activation_function = str(activation_function)
         self.glu_activation = bool(glu_activation)
 
         # === Split effective activation config by branch ===
         self.so2_s2_activation = self.s2_activation[0]
         self.ffn_s2_activation = self.s2_activation[1]
+        self.so2_lebedev_quadrature = self.lebedev_quadrature[0]
+        self.ffn_lebedev_quadrature = self.lebedev_quadrature[1]
         self.so2_activation_function = (
             "silu" if self.so2_s2_activation else self.activation_function
         )
@@ -512,11 +528,6 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
 
         # === L/M schedules ===
         self._init_lm_schedules(lmax, n_blocks, l_schedule, mmax, m_schedule)
-        self.s2_grid_resolution = resolve_s2_grid_resolution(
-            self.lmax,
-            self.mmax,
-            s2_grid_resolution,
-        )
         self.ebed_dims = [get_so3_dim_of_lmax(l) for l in self.l_schedule]
         self.rad_sizes_per_block = [l + 1 for l in self.l_schedule]
 
@@ -716,7 +727,8 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                     block_attn_res=self.block_attn_res_mode,
                     so2_s2_activation=self.so2_s2_activation,
                     ffn_s2_activation=self.ffn_s2_activation,
-                    s2_grid_resolution=self.s2_grid_resolution,
+                    so2_lebedev_quadrature=self.so2_lebedev_quadrature,
+                    ffn_lebedev_quadrature=self.ffn_lebedev_quadrature,
                     n_atten_head=self.n_atten_head,
                     mixed_attention=self.mixed_attention,
                     legacy_attention=self.legacy_attention,
@@ -1770,7 +1782,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
                 "full_attn_res": self.full_attn_res_mode,
                 "block_attn_res": self.block_attn_res_mode,
                 "s2_activation": self.s2_activation,
-                "s2_grid_resolution": self.s2_grid_resolution,
+                "lebedev_quadrature": self.lebedev_quadrature,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
@@ -1803,6 +1815,7 @@ class DescrptSeZM(BaseDescriptor, nn.Module):
         config = data.pop("config")
         variables = data.pop("@variables")
         data.pop("env_mat", None)
+        config.pop("s2_grid_resolution", None)
         obj = cls(**config)
         template = obj.state_dict()
         state = {

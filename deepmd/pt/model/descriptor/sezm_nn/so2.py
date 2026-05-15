@@ -529,8 +529,8 @@ class SO2Convolution(nn.Module):
         If True, replace each intermediate reduced-layout gate with S2-grid
         SwiGLU. Intermediate ``SO2Linear`` layers then output ``2 * focus_dim``
         channels before the activation folds them back to ``focus_dim``.
-    s2_grid_resolution
-        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
+    lebedev_quadrature
+        If True, use Lebedev quadrature for the S2 projector.
     activation_function
         Activation function for the gated activation path when
         ``s2_activation=False``.
@@ -567,7 +567,7 @@ class SO2Convolution(nn.Module):
         mixed_attention: bool = False,
         legacy_attention: bool = True,
         s2_activation: bool = False,
-        s2_grid_resolution: list[int] | None = None,
+        lebedev_quadrature: bool = False,
         activation_function: str = "silu",
         mlp_bias: bool = False,
         use_triton: bool = False,
@@ -611,8 +611,12 @@ class SO2Convolution(nn.Module):
         self.mixed_attention = bool(mixed_attention)
         self.legacy_attention = bool(legacy_attention)
         self.s2_activation = bool(s2_activation)
+        self.lebedev_quadrature = bool(lebedev_quadrature)
+        self.s2_grid_method = "lebedev" if self.lebedev_quadrature else "e3nn"
         self.s2_grid_resolution = resolve_s2_grid_resolution(
-            self.lmax, self.mmax, s2_grid_resolution
+            self.lmax,
+            self.mmax,
+            method=self.s2_grid_method,
         )
         self.activation_function = str(activation_function)
         if self.n_atten_head < 0:
@@ -736,6 +740,7 @@ class SO2Convolution(nn.Module):
                         layout="nfdc",
                         grid_resolution_list=self.s2_grid_resolution,
                         coefficient_layout="m_major",
+                        grid_method=self.s2_grid_method,
                         mlp_bias=self.mlp_bias,
                         trainable=trainable,
                         seed=child_seed(seed_non_linearities, i),
@@ -1351,7 +1356,7 @@ class SO2Convolution(nn.Module):
                 "mixed_attention": self.mixed_attention,
                 "legacy_attention": self.legacy_attention,
                 "s2_activation": self.s2_activation,
-                "s2_grid_resolution": self.s2_grid_resolution,
+                "lebedev_quadrature": self.lebedev_quadrature,
                 "activation_function": self.activation_function,
                 "mlp_bias": self.mlp_bias,
                 "eps": self.eps,

@@ -61,6 +61,7 @@ deepmd/pt/model/descriptor/
 │   │                           #   RadialBasis, RadialMLP
 │   ├── activation.py          # GatedActivation, SwiGLU, S2GridProjector,
 │   │                           #   SwiGLUS2Activation
+│   ├── lebedev.py             # Packaged Lebedev-rule loader for S2 quadrature
 │   ├── embedding.py           # SeZMTypeEmbedding, GeometricInitialEmbedding,
 │   │                           #   EnvironmentInitialEmbedding
 │   ├── norm.py                # EquivariantRMSNorm, ReducedEquivariantRMSNorm,
@@ -568,6 +569,11 @@ The first SO3Linear projects to `2 × hidden` channels. `SwiGLUS2Activation` the
 1. Applies point-wise multiplication on the grid (one half gates the other)
 1. Projects grid features back to SO(3) coefficients
 1. Applies the sigmoid gate and merges the scalar branch back to `l = 0`
+
+The S2 projector has two quadrature backends:
+
+- **e3nn product grid** (default): the SO(2) path uses the automatic product grid `[2*mmax + 4, ceil_even(3*lmax + 2)]`. In the FFN path this is lifted to a square grid `[max(R_phi, R_theta), max(R_phi, R_theta)]`, matching the EquiformerV3 sampling rule.
+- **Lebedev quadrature** (`lebedev_quadrature=[so2, ffn]`): uses packaged Lebedev rules stored as Cartesian unit points and normalized weights. The Burkardt source files use physics convention (`theta` is azimuth, `phi` is polar); the packaged `.npz` stores only Cartesian points to avoid runtime convention ambiguity. SeZM selects the smallest packaged rule with algebraic precision at least `3*lmax`, which is sufficient for the low-degree projection of the bilinear S2 product.
 
 **Grid-MLP path** (`grid_mlp=True`):
 
@@ -1169,8 +1175,8 @@ ______________________________________________________________________
 | `layer_scale`         | bool                | False       | Learnable LayerScale (init 1e-3)                                                                   |
 | `full_attn_res`       | str                 | `"none"`    | Descriptor-level full attention residual                                                           |
 | `block_attn_res`      | str                 | `"none"`    | Descriptor-level block attention residual                                                          |
-| `s2_activation`       | list[bool]          | `[F, F]`    | `[so2_s2_enabled, ffn_s2_enabled]`                                                                 |
-| `s2_grid_resolution`  | list[int] \| None   | None        | `[R_phi, R_theta]` for S2-grid activation                                                          |
+| `s2_activation`       | list[bool]          | `[F, F]`    | `[so2_s2_enabled, ffn_s2_enabled]`; S2 grids are resolved automatically                            |
+| `lebedev_quadrature`  | list[bool]          | `[F, F]`    | `[so2_lebedev, ffn_lebedev]` for S2 projector quadrature                                           |
 | `activation_function` | str                 | `"silu"`    | Base activation                                                                                    |
 | `glu_activation`      | bool                | True        | Base GLU switch for FFN                                                                            |
 | `use_amp`             | bool                | True        | AMP with bf16 during training on CUDA                                                              |

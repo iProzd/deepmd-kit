@@ -53,6 +53,10 @@
         false,
         true
       ],
+      "lebedev_quadrature": [
+        false,
+        true
+      ],
       "activation_function": "silu",
       "glu_activation": true,
       "use_amp": true,

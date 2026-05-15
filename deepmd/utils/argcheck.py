@@ -471,17 +471,22 @@ def descrpt_se_zm_args() -> list[Argument]:
         '`activation_function="silu"`. '
         "`ffn_enabled=true` makes the block-internal FFN path use "
         '`activation_function="silu"` and `glu_activation=true`. '
+        "S2-grid resolutions are resolved automatically per block. The e3nn "
+        "SO(2) grid is `[2 * mmax + 4, ceil_even(3 * lmax + 2)]`, and the "
+        "e3nn FFN grid is lifted to `[max(R_phi, R_theta), max(R_phi, R_theta)]`. "
+        "Lebedev branches use the smallest packaged rule with precision at "
+        "least `3 * lmax`. "
         "The final scalar output FFN is unchanged."
+    )
+    doc_lebedev_quadrature = (
+        "Two booleans `[so2_enabled, ffn_enabled]`, aligned with `s2_activation`. "
+        "If a branch is enabled here, its S2 projector uses packaged Lebedev "
+        "quadrature rules instead of the e3nn product grid. The default keeps "
+        "the existing e3nn behavior."
     )
     doc_grid_ffn = (
         "If True, use the optional grid-MLP structure for the block-internal "
         "equivariant FFN. This does not change the final `l=0` output head."
-    )
-    doc_s2_grid_resolution = (
-        "Two positive integers `[R_phi, R_theta]` used by the S2-grid "
-        "activation. If omitted, the resolution is resolved automatically from "
-        "the first block `(lmax, mmax)` after schedule parsing as "
-        "`[2 * mmax + 4, ceil_even(3 * lmax + 2)]`."
     )
     doc_activation_function = (
         f"Base activation function for helper MLPs, the SO(2) gated activation "
@@ -681,13 +686,13 @@ def descrpt_se_zm_args() -> list[Argument]:
             doc=doc_only_pt_supported + doc_s2_activation,
         ),
         Argument(
-            "s2_grid_resolution",
-            list[int],
+            "lebedev_quadrature",
+            list[bool],
             optional=True,
-            default=None,
-            extra_check=lambda x: x is None or (len(x) == 2 and all(v > 0 for v in x)),
-            extra_check_errmsg="must be a list of two positive integers",
-            doc=doc_only_pt_supported + doc_s2_grid_resolution,
+            default=[False, False],
+            extra_check=lambda x: len(x) == 2,
+            extra_check_errmsg="must be a list of two booleans: [so2_quadrature, ffn_quadrature]",
+            doc=doc_only_pt_supported + doc_lebedev_quadrature,
         ),
         Argument(
             "activation_function",

@@ -30,9 +30,6 @@ from deepmd.pt.utils.env import (
     RESERVED_PRECISION_DICT,
 )
 
-from .activation import (
-    resolve_s2_grid_resolution,
-)
 from .attn_res import (
     DepthAttnRes,
 )
@@ -145,9 +142,10 @@ class SeZMInteractionBlock(nn.Module):
     ffn_s2_activation
         If True, enable the merged scalar/grid SwiGLU-S2 activation in the
         default FFN activation path.
-    s2_grid_resolution
-        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation
-        modules.
+    so2_lebedev_quadrature
+        If True, use Lebedev quadrature for the SO(2) S2 activation projector.
+    ffn_lebedev_quadrature
+        If True, use Lebedev quadrature for the FFN S2 activation projector.
     so2_activation_function
         Activation function for the block-internal SO(2) l=0 gated activation
         path when ``so2_s2_activation=False``.
@@ -201,7 +199,8 @@ class SeZMInteractionBlock(nn.Module):
         block_attn_res: str = "none",
         so2_s2_activation: bool = False,
         ffn_s2_activation: bool = False,
-        s2_grid_resolution: list[int] | None = None,
+        so2_lebedev_quadrature: bool = False,
+        ffn_lebedev_quadrature: bool = False,
         so2_activation_function: str = "silu",
         ffn_activation_function: str,
         ffn_glu_activation: bool = True,
@@ -265,9 +264,8 @@ class SeZMInteractionBlock(nn.Module):
             )
         self.so2_s2_activation = bool(so2_s2_activation)
         self.ffn_s2_activation = bool(ffn_s2_activation)
-        self.s2_grid_resolution = resolve_s2_grid_resolution(
-            self.lmax, self.mmax, s2_grid_resolution
-        )
+        self.so2_lebedev_quadrature = bool(so2_lebedev_quadrature)
+        self.ffn_lebedev_quadrature = bool(ffn_lebedev_quadrature)
         self.so2_activation_function = str(so2_activation_function)
         self.ffn_activation_function = str(ffn_activation_function)
         self.ffn_glu_activation = bool(ffn_glu_activation)
@@ -323,7 +321,7 @@ class SeZMInteractionBlock(nn.Module):
             mixed_attention=self.mixed_attention,
             legacy_attention=self.legacy_attention,
             s2_activation=self.so2_s2_activation,
-            s2_grid_resolution=self.s2_grid_resolution,
+            lebedev_quadrature=self.so2_lebedev_quadrature,
             activation_function=self.so2_activation_function,
             mlp_bias=self.mlp_bias,
             use_triton=self.use_triton,
@@ -375,10 +373,7 @@ class SeZMInteractionBlock(nn.Module):
                     grid_mlp=self.grid_mlp,
                     dtype=dtype,
                     s2_activation=self.ffn_s2_activation,
-                    s2_grid_resolution=[
-                        max(self.s2_grid_resolution),
-                        max(self.s2_grid_resolution),
-                    ],
+                    lebedev_quadrature=self.ffn_lebedev_quadrature,
                     activation_function=self.ffn_activation_function,
                     glu_activation=self.ffn_glu_activation,
                     mlp_bias=self.mlp_bias,
@@ -777,7 +772,8 @@ class SeZMInteractionBlock(nn.Module):
                 "block_attn_res": self.block_attn_res_mode,
                 "so2_s2_activation": self.so2_s2_activation,
                 "ffn_s2_activation": self.ffn_s2_activation,
-                "s2_grid_resolution": self.s2_grid_resolution,
+                "so2_lebedev_quadrature": self.so2_lebedev_quadrature,
+                "ffn_lebedev_quadrature": self.ffn_lebedev_quadrature,
                 "so2_activation_function": self.so2_activation_function,
                 "ffn_activation_function": self.ffn_activation_function,
                 "ffn_glu_activation": self.ffn_glu_activation,

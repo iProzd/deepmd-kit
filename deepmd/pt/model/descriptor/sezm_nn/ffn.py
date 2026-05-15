@@ -90,8 +90,8 @@ class EquivariantFFN(nn.Module):
     s2_activation
         If True and ``grid_mlp=False``, replace the default GatedActivation path
         with the merged scalar/grid SwiGLU-S2 activation.
-    s2_grid_resolution
-        Two-element list ``[R_phi, R_theta]`` used by the S2-grid activation.
+    lebedev_quadrature
+        If True, use Lebedev quadrature for the S2 projector in this FFN.
     activation_function
         Activation function for l=0 components (e.g., "silu", "tanh", "gelu").
     glu_activation
@@ -115,7 +115,7 @@ class EquivariantFFN(nn.Module):
         grid_mlp: bool = False,
         dtype: torch.dtype,
         s2_activation: bool = False,
-        s2_grid_resolution: list[int] | None = None,
+        lebedev_quadrature: bool = False,
         activation_function: str = "silu",
         glu_activation: bool = True,
         mlp_bias: bool = False,
@@ -128,8 +128,17 @@ class EquivariantFFN(nn.Module):
         self.hidden_channels = int(hidden_channels)
         self.use_grid_mlp = bool(grid_mlp)
         self.s2_activation = bool(s2_activation)
-        self.s2_grid_resolution = resolve_s2_grid_resolution(
-            self.lmax, self.lmax, s2_grid_resolution
+        self.lebedev_quadrature = bool(lebedev_quadrature)
+        self.s2_grid_method = "lebedev" if self.lebedev_quadrature else "e3nn"
+        base_grid = resolve_s2_grid_resolution(
+            self.lmax,
+            self.lmax,
+            method=self.s2_grid_method,
+        )
+        self.s2_grid_resolution = (
+            [max(base_grid), max(base_grid)]
+            if self.s2_grid_method == "e3nn"
+            else base_grid
         )
         self.activation_function = activation_function
         self.glu_activation = bool(glu_activation)
@@ -187,6 +196,7 @@ class EquivariantFFN(nn.Module):
                 dtype=dtype,
                 grid_resolution_list=self.s2_grid_resolution,
                 coefficient_layout="packed",
+                grid_method=self.s2_grid_method,
             )
             self.pointwise_grid_mlp = PointwiseGridMLP(
                 channels=self.hidden_channels,
@@ -204,6 +214,7 @@ class EquivariantFFN(nn.Module):
                 layout="ndfc",
                 grid_resolution_list=self.s2_grid_resolution,
                 coefficient_layout="packed",
+                grid_method=self.s2_grid_method,
                 mlp_bias=self.mlp_bias,
                 trainable=trainable,
                 seed=seed_act,
@@ -308,7 +319,7 @@ class EquivariantFFN(nn.Module):
                 "grid_mlp": self.use_grid_mlp,
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "s2_activation": self.s2_activation,
-                "s2_grid_resolution": self.s2_grid_resolution,
+                "lebedev_quadrature": self.lebedev_quadrature,
                 "activation_function": self.activation_function,
                 "glu_activation": self.glu_activation,
                 "mlp_bias": self.mlp_bias,

@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from e3nn.o3 import (
     FromS2Grid,
     ToS2Grid,
+    spherical_harmonics,
 )
 
 from deepmd.dpmodel.utils.seed import (
@@ -44,6 +45,10 @@ from .indexing import (
     build_m_major_index,
     build_m_major_l_index,
     map_degree_idx,
+)
+from .lebedev import (
+    LEBEDEV_PRECISION_TO_NPOINTS,
+    load_lebedev_rule,
 )
 from .so3 import (
     FocusLinear,
@@ -289,12 +294,16 @@ class S2GridProjector(nn.Module):
     dtype
         Buffer dtype used by the projection matrices.
     grid_resolution_list
-        Two-element list ``[R_phi, R_theta]``. Internally this is converted to
-        the ``e3nn`` ``(lat, long) = (R_theta, R_phi)`` ordering.
+        Two-element resolution list. For ``grid_method='e3nn'`` it is
+        ``[R_phi, R_theta]`` and is converted to the ``e3nn``
+        ``(lat, long) = (R_theta, R_phi)`` ordering. For
+        ``grid_method='lebedev'`` it is ``[precision, n_points]``.
     coefficient_layout
         Coefficient ordering expected by the caller:
         - ``"packed"``: packed ``(l, m)`` order, optionally truncated by ``mmax``.
         - ``"m_major"``: reduced m-major order used inside ``SO2Convolution``.
+    grid_method
+        S2 quadrature backend. Must be ``"e3nn"`` or ``"lebedev"``.
     """
 
     def __init__(
@@ -305,6 +314,7 @@ class S2GridProjector(nn.Module):
         dtype: torch.dtype,
         grid_resolution_list: list[int] | None = None,
         coefficient_layout: str = "packed",
+        grid_method: str = "e3nn",
     ) -> None:
         super().__init__()
         self.lmax = int(lmax)
@@ -320,11 +330,24 @@ class S2GridProjector(nn.Module):
             raise ValueError(
                 "`coefficient_layout` must be either 'packed' or 'm_major'"
             )
+        self.grid_method = str(grid_method).lower()
+        if self.grid_method not in {"e3nn", "lebedev"}:
+            raise ValueError("`grid_method` must be either 'e3nn' or 'lebedev'")
 
-        self.grid_resolution_list = resolve_s2_grid_resolution(
-            self.lmax, self.mmax, grid_resolution_list
+        self.grid_resolution_list = _normalize_s2_grid_resolution(
+            self.lmax,
+            self.mmax,
+            grid_resolution_list,
+            method=self.grid_method,
         )
-        self.phi_resolution, self.theta_resolution = self.grid_resolution_list
+        if self.grid_method == "e3nn":
+            self.phi_resolution, self.theta_resolution = self.grid_resolution_list
+            self.lebedev_precision = 0
+            self.lebedev_npoints = 0
+        else:
+            self.phi_resolution = 0
+            self.theta_resolution = 0
+            self.lebedev_precision, self.lebedev_npoints = self.grid_resolution_list
 
         coeff_index = self._build_coefficient_index(device=torch.device("cpu"))
         self.coeff_dim = int(coeff_index.numel())
@@ -352,7 +375,25 @@ class S2GridProjector(nn.Module):
             rescale = math.sqrt(length / float(2 * self.mmax + 1))
             mat[:, :, start_idx : start_idx + length].mul_(rescale)
 
+    def _rescale_truncated_matrix(self, mat: torch.Tensor) -> None:
+        if self.lmax == self.mmax:
+            return
+        for l in range(self.lmax + 1):
+            if l <= self.mmax:
+                continue
+            start_idx = l * l
+            length = 2 * l + 1
+            rescale = math.sqrt(length / float(2 * self.mmax + 1))
+            mat[:, start_idx : start_idx + length].mul_(rescale)
+
     def _build_projection_mats(
+        self, coeff_index: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.grid_method == "lebedev":
+            return self._build_lebedev_projection_mats(coeff_index)
+        return self._build_e3nn_projection_mats(coeff_index)
+
+    def _build_e3nn_projection_mats(
         self, coeff_index: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         with torch.device("cpu"):
@@ -382,6 +423,47 @@ class S2GridProjector(nn.Module):
         )
         return to_grid_mat, from_grid_mat
 
+    def _build_lebedev_projection_mats(
+        self, coeff_index: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        with torch.device("cpu"):
+            points, weights = load_lebedev_rule(
+                self.lebedev_precision,
+                dtype=torch.float64,
+                device=torch.device("cpu"),
+            )
+            harmonics = spherical_harmonics(
+                list(range(self.lmax + 1)),
+                points,
+                normalize=True,
+                normalization="norm",
+            )
+            # e3nn's ``norm`` harmonics are ``component / sqrt(2*l+1)``.
+            # ``ToS2Grid(..., normalization="component")`` additionally divides
+            # every degree block by ``sqrt(lmax+1)``; keep the same convention so
+            # the Lebedev backend can replace the e3nn product-grid backend.
+            scale = math.sqrt(float(self.lmax + 1))
+            degree_factors = harmonics.new_tensor(
+                [
+                    float(2 * l + 1)
+                    for l in range(self.lmax + 1)
+                    for _ in range(2 * l + 1)
+                ]
+            )
+            to_grid_mat = harmonics / scale
+            # The packaged Lebedev weights sum to one. For ``norm`` harmonics,
+            # ``sum_a w_a Y_j(a) Y_k(a) = delta_jk / (2*l+1)``; the
+            # degree_factors and ``scale`` invert this normalization.
+            from_grid_mat = harmonics * (
+                weights[:, None] * scale * degree_factors[None, :]
+            )
+            self._rescale_truncated_matrix(to_grid_mat)
+            self._rescale_truncated_matrix(from_grid_mat)
+
+        to_grid_mat = to_grid_mat.index_select(1, coeff_index)
+        from_grid_mat = from_grid_mat.index_select(1, coeff_index).transpose(0, 1)
+        return to_grid_mat, from_grid_mat
+
     def to_grid(self, embedding: torch.Tensor) -> torch.Tensor:
         """Project coefficients ``(N, D, C)`` to a flattened grid ``(N, A, C)``."""
         return torch.einsum("aj,njc->nac", self.to_grid_mat, embedding)
@@ -400,6 +482,7 @@ class S2GridProjector(nn.Module):
                 "precision": RESERVED_PRECISION_DICT[self.dtype],
                 "grid_resolution_list": self.grid_resolution_list,
                 "coefficient_layout": self.coefficient_layout,
+                "grid_method": self.grid_method,
             },
             "@variables": {},
         }
@@ -455,6 +538,8 @@ class SwiGLUS2Activation(nn.Module):
         Two-element list ``[R_phi, R_theta]``.
     coefficient_layout
         Coefficient ordering: ``"packed"`` or ``"m_major"``.
+    grid_method
+        S2 quadrature backend. Must be ``"e3nn"`` or ``"lebedev"``.
     mlp_bias
         Whether the scalar sigmoid projection uses bias.
     trainable
@@ -474,6 +559,7 @@ class SwiGLUS2Activation(nn.Module):
         layout: str = "ndfc",
         grid_resolution_list: list[int] | None = None,
         coefficient_layout: str = "packed",
+        grid_method: str = "e3nn",
         mlp_bias: bool = False,
         trainable: bool,
         seed: int | list[int] | None = None,
@@ -489,8 +575,12 @@ class SwiGLUS2Activation(nn.Module):
         if self.layout not in {"ndfc", "nfdc"}:
             raise ValueError("`layout` must be either 'ndfc' or 'nfdc'")
         self.coefficient_layout = str(coefficient_layout).lower()
-        self.grid_resolution_list = resolve_s2_grid_resolution(
-            self.lmax, self.mmax, grid_resolution_list
+        self.grid_method = str(grid_method).lower()
+        self.grid_resolution_list = _normalize_s2_grid_resolution(
+            self.lmax,
+            self.mmax,
+            grid_resolution_list,
+            method=self.grid_method,
         )
         self.scalar_act = SwiGLU()
         self.scalar_gate = FocusLinear(
@@ -514,6 +604,7 @@ class SwiGLUS2Activation(nn.Module):
                 dtype=self.dtype,
                 grid_resolution_list=self.grid_resolution_list,
                 coefficient_layout=self.coefficient_layout,
+                grid_method=self.grid_method,
             )
             self.coeff_dim = self.projector.coeff_dim
 
@@ -614,6 +705,7 @@ class SwiGLUS2Activation(nn.Module):
                 "layout": self.layout,
                 "grid_resolution_list": self.grid_resolution_list,
                 "coefficient_layout": self.coefficient_layout,
+                "grid_method": self.grid_method,
                 "mlp_bias": self.mlp_bias,
                 "trainable": trainable,
                 "seed": None,
@@ -649,24 +741,67 @@ class SwiGLUS2Activation(nn.Module):
 def resolve_s2_grid_resolution(
     lmax: int,
     mmax: int,
-    grid_resolution_list: list[int] | None,
+    *,
+    method: str = "e3nn",
 ) -> list[int]:
     """
-    Resolve the user-facing S2 grid resolution ``(R_phi, R_theta)``.
+    Resolve the default S2 grid resolution.
 
-    The automatic default uses even azimuthal sampling
+    For ``method='e3nn'``, the automatic default uses even azimuthal sampling
     ``R_phi = 2 * mmax + 4`` and even polar sampling
     ``R_theta = ceil_even(3 * lmax + 2)``.
+
+    For ``method='lebedev'``, the automatic default picks the smallest packaged
+    Lebedev rule whose algebraic precision is at least ``3 * lmax`` and returns
+    ``[precision, n_points]``.
     """
+    method = str(method).lower()
+    if method not in {"e3nn", "lebedev"}:
+        raise ValueError("`method` must be either 'e3nn' or 'lebedev'")
+    if method == "lebedev":
+        required_precision = 3 * int(lmax)
+        for precision, n_points in LEBEDEV_PRECISION_TO_NPOINTS.items():
+            if precision >= required_precision:
+                return [precision, n_points]
+        raise ValueError(
+            f"No packaged Lebedev rule has precision >= {required_precision}"
+        )
+
+    phi_resolution = 2 * mmax + 4
+    theta_resolution = 3 * lmax + 2
+    theta_resolution += theta_resolution % 2
+    return [phi_resolution, theta_resolution]
+
+
+def _normalize_s2_grid_resolution(
+    lmax: int,
+    mmax: int,
+    grid_resolution_list: list[int] | None,
+    *,
+    method: str,
+) -> list[int]:
+    """Resolve default grids or validate already-resolved low-level grids."""
+    method = str(method).lower()
     if grid_resolution_list is None:
-        phi_resolution = 2 * mmax + 4
-        theta_resolution = 3 * lmax + 2
-        theta_resolution += theta_resolution % 2
-        resolution = [phi_resolution, theta_resolution]
-    else:
+        return resolve_s2_grid_resolution(lmax, mmax, method=method)
+    if method == "lebedev":
         if len(grid_resolution_list) != 2:
-            raise ValueError("`grid_resolution_list` must contain two integers")
-        resolution = [int(grid_resolution_list[0]), int(grid_resolution_list[1])]
+            raise ValueError(
+                "Lebedev `grid_resolution_list` must be [precision, n_points]"
+            )
+        precision = int(grid_resolution_list[0])
+        n_points = int(grid_resolution_list[1])
+        expected_n_points = LEBEDEV_PRECISION_TO_NPOINTS.get(precision)
+        if expected_n_points != n_points:
+            raise ValueError(
+                "Lebedev `grid_resolution_list` must match a packaged "
+                f"[precision, n_points] pair; got [{precision}, {n_points}]"
+            )
+        return [precision, n_points]
+
+    if len(grid_resolution_list) != 2:
+        raise ValueError("`grid_resolution_list` must contain two integers")
+    resolution = [int(grid_resolution_list[0]), int(grid_resolution_list[1])]
     if resolution[0] < 1 or resolution[1] < 1:
         raise ValueError("grid resolutions must be positive")
     return resolution

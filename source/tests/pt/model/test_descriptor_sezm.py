@@ -181,7 +181,14 @@ class TestDescrptSeZM(_SeZMTestCase):
                 focus_dim=0,
                 so2_layers=2,
                 s2_activation=[False, True],
-                s2_grid_resolution=[8, 12],
+            ),
+            "focus_dim_zero_s2_lebedev": _descriptor_kwargs(
+                channels=4,
+                n_focus=2,
+                focus_dim=0,
+                so2_layers=2,
+                s2_activation=[False, True],
+                lebedev_quadrature=[False, True],
             ),
             "gaussian_basis": _descriptor_kwargs(
                 channels=4,
@@ -209,7 +216,6 @@ class TestDescrptSeZM(_SeZMTestCase):
                 precision="float32",
                 seed=123,
                 s2_activation=[False, True],
-                s2_grid_resolution=[8, 12],
             ),
             "mixed_so2_attention": _attention_descriptor_kwargs(
                 precision="float32",
@@ -389,7 +395,18 @@ class TestDescrptSeZM(_SeZMTestCase):
                 radial_mlp=[6],
                 ffn_neurons=8,
                 s2_activation=[False, True],
-                s2_grid_resolution=[8, 12],
+            ),
+            "focus_dim_zero_s2_lebedev": _descriptor_kwargs(
+                precision="float32",
+                channels=4,
+                n_focus=2,
+                focus_dim=0,
+                so2_layers=2,
+                n_radial=3,
+                radial_mlp=[6],
+                ffn_neurons=8,
+                s2_activation=[False, True],
+                lebedev_quadrature=[False, True],
             ),
         }
         dtype = PRECISION_DICT["float32"]
