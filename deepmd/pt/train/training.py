@@ -642,8 +642,12 @@ class Trainer:
         )
         self.reweight_ema_decay = training_params.get("reweight_ema_decay", 0.99)
         if self.use_grad_norm_reweight or self.use_loss_ratio_reweight:
-            self.grad_norm_ema = {k: None for k in self.model_keys}
-            self.loss_val_ema = {k: None for k in self.model_keys}
+            # Per-component EMA norms: descriptor and shared fitting_net tracked separately
+            self.grad_norm_ema_desc = {k: None for k in self.model_keys}
+            self.grad_norm_ema_fit = {k: None for k in self.model_keys}
+            # Two-speed EMA for loss: relative rate = fast/slow, scale-invariant
+            self.loss_val_ema_fast = {k: None for k in self.model_keys}
+            self.loss_val_ema_slow = {k: None for k in self.model_keys}
         if self.use_pcgrad:
             log.info("PCGrad enabled: descriptor gradients will be projected each step.")
         elif self.use_dual_batch:
@@ -865,68 +869,113 @@ class Trainer:
                                     _step_id + 1, dot.item(), cos_sim.item(), projected,
                                 )
 
-                    # Compute per-task weights for gradient combination
-                    task_weights = {k: 1.0 for k in self.model_keys}
-                    d = self.reweight_ema_decay
-
-                    if self.use_grad_norm_reweight:
-                        for k in self.model_keys:
-                            grads = [
-                                task_grads[k][id(p)]
-                                for p in all_params
-                                if task_grads[k][id(p)] is not None
-                            ]
-                            if grads:
-                                cur_norm = torch.stack(
-                                    [g.norm() for g in grads]
-                                ).norm().item()
-                                if self.grad_norm_ema[k] is None:
-                                    self.grad_norm_ema[k] = cur_norm
-                                else:
-                                    self.grad_norm_ema[k] = (
-                                        d * self.grad_norm_ema[k]
-                                        + (1 - d) * cur_norm
-                                    )
-                                task_weights[k] /= self.grad_norm_ema[k] + 1e-8
-
-                    if self.use_loss_ratio_reweight:
-                        for k in self.model_keys:
-                            cur_loss_val = task_loss_val[k]
-                            if self.loss_val_ema[k] is None:
-                                self.loss_val_ema[k] = cur_loss_val
-                            else:
-                                self.loss_val_ema[k] = (
-                                    d * self.loss_val_ema[k]
-                                    + (1 - d) * cur_loss_val
-                                )
-                            task_weights[k] *= self.loss_val_ema[k]
-
-                    # Normalize weights to sum to 1 (keeps gradient scale on par with baseline)
-                    w_sum = sum(task_weights.values())
-                    for k in task_weights:
-                        task_weights[k] /= w_sum
-
-                    if self.rank == 0 and (
-                        self.use_grad_norm_reweight or self.use_loss_ratio_reweight
-                    ) and (_step_id + 1) % self.disp_freq == 0:
-                        weight_str = ", ".join(
-                            f"{k}={task_weights[k]:.4f}" for k in self.model_keys
-                        )
-                        log.info(
-                            "Reweight step %d: [%s]", _step_id + 1, weight_str
-                        )
-
-                    # Set final grads: weighted average for shared params, full grad for exclusive params
+                    # Gradient combination: per-component reweighting when active,
+                    # otherwise simple equal average for shared params
                     self.optimizer.zero_grad(set_to_none=True)
-                    for p in all_params:
-                        pid = id(p)
-                        g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
-                        if g0p is not None and g1p is not None:
-                            p.grad = task_weights[k0] * g0p + task_weights[k1] * g1p
-                        elif g0p is not None:
-                            p.grad = g0p
-                        elif g1p is not None:
-                            p.grad = g1p
+                    num_tasks = len(self.model_keys)
+
+                    if self.use_grad_norm_reweight or self.use_loss_ratio_reweight:
+                        d = self.reweight_ema_decay
+                        d_slow = 1.0 - (1.0 - d) / 10.0
+
+                        _module = (
+                            self.wrapper.module
+                            if hasattr(self.wrapper, "module")
+                            else self.wrapper
+                        )
+                        _desc_param_ids = {
+                            id(p) for p in _module.model[k0].get_descriptor().parameters()
+                        }
+                        _shared_pids = {
+                            id(p) for p in all_params
+                            if task_grads[k0].get(id(p)) is not None
+                            and task_grads[k1].get(id(p)) is not None
+                        }
+                        _fit_shared_pids = _shared_pids - _desc_param_ids
+
+                        if self.use_grad_norm_reweight:
+                            for k in self.model_keys:
+                                desc_g = [
+                                    task_grads[k][pid]
+                                    for pid in (_shared_pids & _desc_param_ids)
+                                    if task_grads[k].get(pid) is not None
+                                ]
+                                if desc_g:
+                                    cur = torch.stack([g.norm() for g in desc_g]).norm().item()
+                                    if self.grad_norm_ema_desc[k] is None:
+                                        self.grad_norm_ema_desc[k] = cur
+                                    else:
+                                        self.grad_norm_ema_desc[k] = d * self.grad_norm_ema_desc[k] + (1 - d) * cur
+                                fit_g = [
+                                    task_grads[k][pid]
+                                    for pid in _fit_shared_pids
+                                    if task_grads[k].get(pid) is not None
+                                ]
+                                if fit_g:
+                                    cur = torch.stack([g.norm() for g in fit_g]).norm().item()
+                                    if self.grad_norm_ema_fit[k] is None:
+                                        self.grad_norm_ema_fit[k] = cur
+                                    else:
+                                        self.grad_norm_ema_fit[k] = d * self.grad_norm_ema_fit[k] + (1 - d) * cur
+
+                        if self.use_loss_ratio_reweight:
+                            for k in self.model_keys:
+                                v = task_loss_val[k]
+                                if self.loss_val_ema_fast[k] is None:
+                                    self.loss_val_ema_fast[k] = v
+                                    self.loss_val_ema_slow[k] = v
+                                else:
+                                    self.loss_val_ema_fast[k] = d * self.loss_val_ema_fast[k] + (1 - d) * v
+                                    self.loss_val_ema_slow[k] = d_slow * self.loss_val_ema_slow[k] + (1 - d_slow) * v
+
+                        # Build per-component normalized weights
+                        def _w(norm_ema):
+                            return {k: 1.0 / (norm_ema[k] + 1e-8) if norm_ema[k] is not None else 1.0
+                                    for k in self.model_keys}
+
+                        dw = _w(self.grad_norm_ema_desc) if self.use_grad_norm_reweight else {k: 1.0 for k in self.model_keys}
+                        fw = _w(self.grad_norm_ema_fit)  if self.use_grad_norm_reweight else {k: 1.0 for k in self.model_keys}
+
+                        if self.use_loss_ratio_reweight:
+                            for k in self.model_keys:
+                                rel = (self.loss_val_ema_fast[k] / (self.loss_val_ema_slow[k] + 1e-8)
+                                       if self.loss_val_ema_fast[k] is not None else 1.0)
+                                dw[k] *= rel
+                                fw[k] *= rel
+
+                        dw_sum = sum(dw.values())
+                        fw_sum = sum(fw.values())
+                        desc_w = {k: dw[k] / dw_sum for k in self.model_keys}
+                        fit_w  = {k: fw[k] / fw_sum for k in self.model_keys}
+
+                        if self.rank == 0 and (_step_id + 1) % self.disp_freq == 0:
+                            log.info(
+                                "Reweight step %d: desc=[%s]  fit=[%s]",
+                                _step_id + 1,
+                                ", ".join(f"{k}={desc_w[k]:.4f}" for k in self.model_keys),
+                                ", ".join(f"{k}={fit_w[k]:.4f}" for k in self.model_keys),
+                            )
+
+                        for p in all_params:
+                            pid = id(p)
+                            g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
+                            if g0p is not None and g1p is not None:
+                                w0, w1 = (desc_w[k0], desc_w[k1]) if pid in _desc_param_ids else (fit_w[k0], fit_w[k1])
+                                p.grad = w0 * g0p + w1 * g1p
+                            elif g0p is not None:
+                                p.grad = g0p
+                            elif g1p is not None:
+                                p.grad = g1p
+                    else:
+                        for p in all_params:
+                            pid = id(p)
+                            g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
+                            if g0p is not None and g1p is not None:
+                                p.grad = (g0p + g1p) / num_tasks
+                            elif g0p is not None:
+                                p.grad = g0p
+                            elif g1p is not None:
+                                p.grad = g1p
 
                     more_loss = more_loss_per_task[task_key]
                 else:
