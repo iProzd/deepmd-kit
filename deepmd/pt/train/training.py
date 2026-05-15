@@ -634,10 +634,32 @@ class Trainer:
             not self.use_dual_batch
             and training_params.get("alternating_tasks", False)
         )
+        self.use_grad_norm_reweight = self.use_dual_batch and training_params.get(
+            "grad_norm_reweight", False
+        )
+        self.use_loss_ratio_reweight = self.use_dual_batch and training_params.get(
+            "loss_ratio_reweight", False
+        )
+        self.reweight_ema_decay = training_params.get("reweight_ema_decay", 0.99)
+        if self.use_grad_norm_reweight or self.use_loss_ratio_reweight:
+            self.grad_norm_ema = {k: None for k in self.model_keys}
+            self.loss_val_ema = {k: None for k in self.model_keys}
         if self.use_pcgrad:
             log.info("PCGrad enabled: descriptor gradients will be projected each step.")
         elif self.use_dual_batch:
-            log.info("Dual-batch enabled: all tasks sampled per step, gradients summed without projection.")
+            reweight_modes = []
+            if self.use_grad_norm_reweight:
+                reweight_modes.append("grad-norm-EMA")
+            if self.use_loss_ratio_reweight:
+                reweight_modes.append("loss-ratio")
+            if reweight_modes:
+                log.info(
+                    "Dual-batch enabled with reweighting: %s (ema_decay=%.3f).",
+                    "+".join(reweight_modes),
+                    self.reweight_ema_decay,
+                )
+            else:
+                log.info("Dual-batch enabled: all tasks sampled per step, gradients averaged.")
         elif self.use_alternating:
             log.info("Alternating-tasks enabled: tasks cycled deterministically A→B→A→B each step.")
 
@@ -769,13 +791,14 @@ class Trainer:
             cur_lr = _lr.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
-            input_dict, label_dict, log_dict = self.get_data(
-                is_train=True, task_key=task_key
-            )
-            if SAMPLER_RECORD:
-                print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
-                fout1.write(print_str)
-                fout1.flush()
+            if not self.use_dual_batch:
+                input_dict, label_dict, log_dict = self.get_data(
+                    is_train=True, task_key=task_key
+                )
+                if SAMPLER_RECORD:
+                    print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
+                    fout1.write(print_str)
+                    fout1.flush()
             if self.opt_type in ["Adam", "AdamW"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
@@ -786,9 +809,14 @@ class Trainer:
                     all_params = list(self.wrapper.parameters())
                     task_grads = {}
                     more_loss_per_task = {}
+                    task_loss_val = {}
                     for tk in self.model_keys:
                         self.optimizer.zero_grad(set_to_none=True)
-                        in_d, lbl_d, _ = self.get_data(is_train=True, task_key=tk)
+                        in_d, lbl_d, log_d = self.get_data(is_train=True, task_key=tk)
+                        if SAMPLER_RECORD and tk == self.model_keys[0]:
+                            print_str = f"Step {_step_id}: sample system{log_d['sid']}  frame{log_d['fid']}\n"
+                            fout1.write(print_str)
+                            fout1.flush()
                         _, loss, more_loss = self.wrapper(
                             **in_d, cur_lr=pref_lr, label=lbl_d, task_key=tk
                         )
@@ -798,6 +826,7 @@ class Trainer:
                             for p in all_params
                         }
                         more_loss_per_task[tk] = more_loss
+                        task_loss_val[tk] = loss.item()
 
                     k0, k1 = self.model_keys[0], self.model_keys[1]
 
@@ -836,14 +865,64 @@ class Trainer:
                                     _step_id + 1, dot.item(), cos_sim.item(), projected,
                                 )
 
-                    # Set final grads: sum of (projected) per-task grads
+                    # Compute per-task weights for gradient combination
+                    task_weights = {k: 1.0 for k in self.model_keys}
+                    d = self.reweight_ema_decay
+
+                    if self.use_grad_norm_reweight:
+                        for k in self.model_keys:
+                            grads = [
+                                task_grads[k][id(p)]
+                                for p in all_params
+                                if task_grads[k][id(p)] is not None
+                            ]
+                            if grads:
+                                cur_norm = torch.stack(
+                                    [g.norm() for g in grads]
+                                ).norm().item()
+                                if self.grad_norm_ema[k] is None:
+                                    self.grad_norm_ema[k] = cur_norm
+                                else:
+                                    self.grad_norm_ema[k] = (
+                                        d * self.grad_norm_ema[k]
+                                        + (1 - d) * cur_norm
+                                    )
+                                task_weights[k] /= self.grad_norm_ema[k] + 1e-8
+
+                    if self.use_loss_ratio_reweight:
+                        for k in self.model_keys:
+                            cur_loss_val = task_loss_val[k]
+                            if self.loss_val_ema[k] is None:
+                                self.loss_val_ema[k] = cur_loss_val
+                            else:
+                                self.loss_val_ema[k] = (
+                                    d * self.loss_val_ema[k]
+                                    + (1 - d) * cur_loss_val
+                                )
+                            task_weights[k] *= self.loss_val_ema[k]
+
+                    # Normalize weights to sum to 1 (keeps gradient scale on par with baseline)
+                    w_sum = sum(task_weights.values())
+                    for k in task_weights:
+                        task_weights[k] /= w_sum
+
+                    if self.rank == 0 and (
+                        self.use_grad_norm_reweight or self.use_loss_ratio_reweight
+                    ) and (_step_id + 1) % self.disp_freq == 0:
+                        weight_str = ", ".join(
+                            f"{k}={task_weights[k]:.4f}" for k in self.model_keys
+                        )
+                        log.info(
+                            "Reweight step %d: [%s]", _step_id + 1, weight_str
+                        )
+
+                    # Set final grads: weighted average for shared params, full grad for exclusive params
                     self.optimizer.zero_grad(set_to_none=True)
-                    num_tasks = len(self.model_keys)
                     for p in all_params:
                         pid = id(p)
                         g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
                         if g0p is not None and g1p is not None:
-                            p.grad = (g0p + g1p) / num_tasks
+                            p.grad = task_weights[k0] * g0p + task_weights[k1] * g1p
                         elif g0p is not None:
                             p.grad = g0p
                         elif g1p is not None:
