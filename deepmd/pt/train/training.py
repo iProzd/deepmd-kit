@@ -136,6 +136,10 @@ from torch.distributed.optim import (
     ZeroRedundancyOptimizer,
 )
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.profiler import (
+    ProfilerActivity,
+    profile,
+)
 from torch.utils.data import (
     DataLoader,
 )
@@ -1346,14 +1350,27 @@ class Trainer:
 
             writer = SummaryWriter(log_dir=self.tensorboard_log_dir)
         if self.enable_profiler or self.profiling:
-            prof = torch.profiler.profile(
-                schedule=torch.profiler.schedule(wait=1, warmup=15, active=3, repeat=1),
+            # prof = torch.profiler.profile(
+            #     schedule=torch.profiler.schedule(wait=1, warmup=15, active=3, repeat=1),
+            #     on_trace_ready=torch.profiler.tensorboard_trace_handler(
+            #         self.tensorboard_log_dir
+            #     )
+            #     if self.enable_profiler
+            #     else None,
+            #     record_shapes=True,
+            #     with_stack=True,
+            # )
+            # prof.start()
+            prof = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(wait=2, warmup=12, active=6, repeat=1),
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
                     self.tensorboard_log_dir
                 )
                 if self.enable_profiler
                 else None,
                 record_shapes=True,
+                profile_memory=True,
                 with_stack=True,
             )
             prof.start()
@@ -1366,9 +1383,9 @@ class Trainer:
                     p=self.model_prob,
                 )
                 task_key = self.model_keys[model_index]
-            # PyTorch Profiler
-            if self.enable_profiler or self.profiling:
-                prof.step()
+            # # PyTorch Profiler
+            # if self.enable_profiler or self.profiling:
+            #     prof.step()
             cur_lr = self.lr_schedule.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
@@ -1829,7 +1846,13 @@ class Trainer:
             self.last_display_step = 0
 
         for step_id in range(self.start_step, self.num_steps):
+            if self.enable_profiler or self.profiling:
+                if step_id >= 20:
+                    break
             step(step_id)
+            # PyTorch Profiler
+            if self.enable_profiler or self.profiling:
+                prof.step()
             if JIT:
                 break
 
