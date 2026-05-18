@@ -3386,6 +3386,12 @@ def training_args(
         if not multi_task
         else [
             Argument("model_prob", dict, optional=True, default={}, doc=doc_model_prob),
+            Argument("use_pcgrad", bool, optional=True, default=False, doc="Apply PCGrad gradient surgery on the shared descriptor parameters in multi-task training."),
+            Argument("use_dual_batch", bool, optional=True, default=False, doc="Sample all tasks every step and sum gradients without projection. Use as control group to isolate PCGrad effect from dual-batch effect."),
+            Argument("alternating_tasks", bool, optional=True, default=False, doc="Cycle through tasks deterministically (A→B→A→B) each step instead of random sampling. Ablation control to isolate balanced-sampling effect from combined-gradient effect."),
+            Argument("grad_norm_reweight", bool, optional=True, default=False, doc="(dual-batch only) Reweight per-task gradients inversely proportional to their EMA gradient norm before combining, equalizing each task's directional contribution to shared parameters."),
+            Argument("loss_ratio_reweight", bool, optional=True, default=False, doc="(dual-batch only) Reweight per-task gradients proportional to their EMA loss value, giving more weight to the higher-loss task to prevent it from being sacrificed."),
+            Argument("reweight_ema_decay", float, optional=True, default=0.99, doc="EMA decay factor for grad_norm_reweight and loss_ratio_reweight tracking. Higher values give smoother but slower-adapting estimates."),
             Argument("data_dict", dict, data_args, repeat=True, doc=doc_data_dict),
         ]
     )

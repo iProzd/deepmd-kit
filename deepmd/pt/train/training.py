@@ -559,12 +559,13 @@ class Trainer:
                     for kk in rm_list:
                         state_dict.pop(kk)
                     state_dict["_extra_state"]["model_params"] = old_model_params
-                    out_shape_list = [
-                        "model.Default.atomic_model.out_bias",
-                        "model.Default.atomic_model.out_std",
-                    ]
+                    out_shape_list = []
+                    for model_key in self.model_keys:
+                        out_shape_list.append(f"model.{model_key}.atomic_model.out_bias")
+                        out_shape_list.append(f"model.{model_key}.atomic_model.out_std")
                     for kk in out_shape_list:
-                        state_dict[kk] = state_dict[kk][:1, :, :1]
+                        if kk in state_dict:
+                            state_dict[kk] = state_dict[kk][:1, :, :1]
                     self.wrapper.load_state_dict(state_dict)
 
                 # change bias for fine-tuning
@@ -624,6 +625,47 @@ class Trainer:
             sum_prob = np.sum(self.model_prob)
             assert sum_prob > 0.0, "Sum of model prob must be larger than 0!"
             self.model_prob = self.model_prob / sum_prob
+
+        self.use_pcgrad = self.multi_task and training_params.get("use_pcgrad", False)
+        self.use_dual_batch = self.multi_task and (
+            self.use_pcgrad or training_params.get("use_dual_batch", False)
+        )
+        self.use_alternating = self.multi_task and (
+            not self.use_dual_batch
+            and training_params.get("alternating_tasks", False)
+        )
+        self.use_grad_norm_reweight = self.use_dual_batch and training_params.get(
+            "grad_norm_reweight", False
+        )
+        self.use_loss_ratio_reweight = self.use_dual_batch and training_params.get(
+            "loss_ratio_reweight", False
+        )
+        self.reweight_ema_decay = training_params.get("reweight_ema_decay", 0.99)
+        if self.use_grad_norm_reweight or self.use_loss_ratio_reweight:
+            # Per-component EMA norms: descriptor and shared fitting_net tracked separately
+            self.grad_norm_ema_desc = {k: None for k in self.model_keys}
+            self.grad_norm_ema_fit = {k: None for k in self.model_keys}
+            # Two-speed EMA for loss: relative rate = fast/slow, scale-invariant
+            self.loss_val_ema_fast = {k: None for k in self.model_keys}
+            self.loss_val_ema_slow = {k: None for k in self.model_keys}
+        if self.use_pcgrad:
+            log.info("PCGrad enabled: descriptor gradients will be projected each step.")
+        elif self.use_dual_batch:
+            reweight_modes = []
+            if self.use_grad_norm_reweight:
+                reweight_modes.append("grad-norm-EMA")
+            if self.use_loss_ratio_reweight:
+                reweight_modes.append("loss-ratio")
+            if reweight_modes:
+                log.info(
+                    "Dual-batch enabled with reweighting: %s (ema_decay=%.3f).",
+                    "+".join(reweight_modes),
+                    self.reweight_ema_decay,
+                )
+            else:
+                log.info("Dual-batch enabled: all tasks sampled per step, gradients averaged.")
+        elif self.use_alternating:
+            log.info("Alternating-tasks enabled: tasks cycled deterministically A→B→A→B each step.")
 
         # Multi-task share params
         if shared_links is not None:
@@ -735,11 +777,14 @@ class Trainer:
 
         def step(_step_id, task_key="Default") -> None:
             if self.multi_task:
-                model_index = dp_random.choice(
-                    np.arange(self.num_model, dtype=np.int_),
-                    p=self.model_prob,
-                )
-                task_key = self.model_keys[model_index]
+                if self.use_alternating:
+                    task_key = self.model_keys[_step_id % self.num_model]
+                else:
+                    model_index = dp_random.choice(
+                        np.arange(self.num_model, dtype=np.int_),
+                        p=self.model_prob,
+                    )
+                    task_key = self.model_keys[model_index]
             # PyTorch Profiler
             if self.enable_profiler or self.profiling:
                 prof.step()
@@ -750,23 +795,194 @@ class Trainer:
             cur_lr = _lr.value(_step_id)
             pref_lr = cur_lr
             self.optimizer.zero_grad(set_to_none=True)
-            input_dict, label_dict, log_dict = self.get_data(
-                is_train=True, task_key=task_key
-            )
-            if SAMPLER_RECORD:
-                print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
-                fout1.write(print_str)
-                fout1.flush()
+            if not self.use_dual_batch:
+                input_dict, label_dict, log_dict = self.get_data(
+                    is_train=True, task_key=task_key
+                )
+                if SAMPLER_RECORD:
+                    print_str = f"Step {_step_id}: sample system{log_dict['sid']}  frame{log_dict['fid']}\n"
+                    fout1.write(print_str)
+                    fout1.flush()
             if self.opt_type in ["Adam", "AdamW"]:
                 cur_lr = self.scheduler.get_last_lr()[0]
                 if _step_id < self.warmup_steps:
                     pref_lr = _lr.start_lr
                 else:
                     pref_lr = cur_lr
-                model_pred, loss, more_loss = self.wrapper(
-                    **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
-                )
-                loss.backward()
+                if self.use_dual_batch:
+                    all_params = list(self.wrapper.parameters())
+                    task_grads = {}
+                    more_loss_per_task = {}
+                    task_loss_val = {}
+                    for tk in self.model_keys:
+                        self.optimizer.zero_grad(set_to_none=True)
+                        in_d, lbl_d, log_d = self.get_data(is_train=True, task_key=tk)
+                        if SAMPLER_RECORD and tk == self.model_keys[0]:
+                            print_str = f"Step {_step_id}: sample system{log_d['sid']}  frame{log_d['fid']}\n"
+                            fout1.write(print_str)
+                            fout1.flush()
+                        _, loss, more_loss = self.wrapper(
+                            **in_d, cur_lr=pref_lr, label=lbl_d, task_key=tk
+                        )
+                        loss.backward()
+                        task_grads[tk] = {
+                            id(p): p.grad.clone() if p.grad is not None else None
+                            for p in all_params
+                        }
+                        more_loss_per_task[tk] = more_loss
+                        task_loss_val[tk] = loss.item()
+
+                    k0, k1 = self.model_keys[0], self.model_keys[1]
+
+                    if self.use_pcgrad:
+                        module = (
+                            self.wrapper.module
+                            if hasattr(self.wrapper, "module")
+                            else self.wrapper
+                        )
+                        descriptor = module.model[k0].get_descriptor()
+                        desc_param_ids = {id(p) for p in descriptor.parameters()}
+                        desc_pids = [
+                            pid for pid in desc_param_ids
+                            if task_grads[k0].get(pid) is not None
+                            and task_grads[k1].get(pid) is not None
+                        ]
+                        if desc_pids:
+                            g0 = torch.cat([task_grads[k0][pid].flatten() for pid in desc_pids])
+                            g1 = torch.cat([task_grads[k1][pid].flatten() for pid in desc_pids])
+                            dot = (g0 * g1).sum()
+                            projected = dot < 0
+                            if projected:
+                                g0_proj = g0 - dot / (g1 * g1).sum().clamp(min=1e-12) * g1
+                                g1_proj = g1 - dot / (g0 * g0).sum().clamp(min=1e-12) * g0
+                                offset = 0
+                                for pid in desc_pids:
+                                    numel = task_grads[k0][pid].numel()
+                                    shape = task_grads[k0][pid].shape
+                                    task_grads[k0][pid] = g0_proj[offset:offset + numel].reshape(shape)
+                                    task_grads[k1][pid] = g1_proj[offset:offset + numel].reshape(shape)
+                                    offset += numel
+                            if self.rank == 0 and (_step_id + 1) % self.disp_freq == 0:
+                                cos_sim = dot / (g0.norm() * g1.norm()).clamp(min=1e-12)
+                                log.info(
+                                    "PCGrad step %d: desc dot=%.4e, cos_sim=%.4f, projected=%s",
+                                    _step_id + 1, dot.item(), cos_sim.item(), projected,
+                                )
+
+                    # Gradient combination: per-component reweighting when active,
+                    # otherwise simple equal average for shared params
+                    self.optimizer.zero_grad(set_to_none=True)
+                    num_tasks = len(self.model_keys)
+
+                    if self.use_grad_norm_reweight or self.use_loss_ratio_reweight:
+                        d = self.reweight_ema_decay
+                        d_slow = 1.0 - (1.0 - d) / 10.0
+
+                        _module = (
+                            self.wrapper.module
+                            if hasattr(self.wrapper, "module")
+                            else self.wrapper
+                        )
+                        _desc_param_ids = {
+                            id(p) for p in _module.model[k0].get_descriptor().parameters()
+                        }
+                        _shared_pids = {
+                            id(p) for p in all_params
+                            if task_grads[k0].get(id(p)) is not None
+                            and task_grads[k1].get(id(p)) is not None
+                        }
+                        _fit_shared_pids = _shared_pids - _desc_param_ids
+
+                        if self.use_grad_norm_reweight:
+                            for k in self.model_keys:
+                                desc_g = [
+                                    task_grads[k][pid]
+                                    for pid in (_shared_pids & _desc_param_ids)
+                                    if task_grads[k].get(pid) is not None
+                                ]
+                                if desc_g:
+                                    cur = torch.stack([g.norm() for g in desc_g]).norm().item()
+                                    if self.grad_norm_ema_desc[k] is None:
+                                        self.grad_norm_ema_desc[k] = cur
+                                    else:
+                                        self.grad_norm_ema_desc[k] = d * self.grad_norm_ema_desc[k] + (1 - d) * cur
+                                fit_g = [
+                                    task_grads[k][pid]
+                                    for pid in _fit_shared_pids
+                                    if task_grads[k].get(pid) is not None
+                                ]
+                                if fit_g:
+                                    cur = torch.stack([g.norm() for g in fit_g]).norm().item()
+                                    if self.grad_norm_ema_fit[k] is None:
+                                        self.grad_norm_ema_fit[k] = cur
+                                    else:
+                                        self.grad_norm_ema_fit[k] = d * self.grad_norm_ema_fit[k] + (1 - d) * cur
+
+                        if self.use_loss_ratio_reweight:
+                            for k in self.model_keys:
+                                v = task_loss_val[k]
+                                if self.loss_val_ema_fast[k] is None:
+                                    self.loss_val_ema_fast[k] = v
+                                    self.loss_val_ema_slow[k] = v
+                                else:
+                                    self.loss_val_ema_fast[k] = d * self.loss_val_ema_fast[k] + (1 - d) * v
+                                    self.loss_val_ema_slow[k] = d_slow * self.loss_val_ema_slow[k] + (1 - d_slow) * v
+
+                        # Build per-component normalized weights
+                        def _w(norm_ema):
+                            return {k: 1.0 / (norm_ema[k] + 1e-8) if norm_ema[k] is not None else 1.0
+                                    for k in self.model_keys}
+
+                        dw = _w(self.grad_norm_ema_desc) if self.use_grad_norm_reweight else {k: 1.0 for k in self.model_keys}
+                        fw = _w(self.grad_norm_ema_fit)  if self.use_grad_norm_reweight else {k: 1.0 for k in self.model_keys}
+
+                        if self.use_loss_ratio_reweight:
+                            for k in self.model_keys:
+                                rel = (self.loss_val_ema_fast[k] / (self.loss_val_ema_slow[k] + 1e-8)
+                                       if self.loss_val_ema_fast[k] is not None else 1.0)
+                                dw[k] *= rel
+                                fw[k] *= rel
+
+                        dw_sum = sum(dw.values())
+                        fw_sum = sum(fw.values())
+                        desc_w = {k: dw[k] / dw_sum for k in self.model_keys}
+                        fit_w  = {k: fw[k] / fw_sum for k in self.model_keys}
+
+                        if self.rank == 0 and (_step_id + 1) % self.disp_freq == 0:
+                            log.info(
+                                "Reweight step %d: desc=[%s]  fit=[%s]",
+                                _step_id + 1,
+                                ", ".join(f"{k}={desc_w[k]:.4f}" for k in self.model_keys),
+                                ", ".join(f"{k}={fit_w[k]:.4f}" for k in self.model_keys),
+                            )
+
+                        for p in all_params:
+                            pid = id(p)
+                            g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
+                            if g0p is not None and g1p is not None:
+                                w0, w1 = (desc_w[k0], desc_w[k1]) if pid in _desc_param_ids else (fit_w[k0], fit_w[k1])
+                                p.grad = w0 * g0p + w1 * g1p
+                            elif g0p is not None:
+                                p.grad = g0p
+                            elif g1p is not None:
+                                p.grad = g1p
+                    else:
+                        for p in all_params:
+                            pid = id(p)
+                            g0p, g1p = task_grads[k0][pid], task_grads[k1][pid]
+                            if g0p is not None and g1p is not None:
+                                p.grad = (g0p + g1p) / num_tasks
+                            elif g0p is not None:
+                                p.grad = g0p
+                            elif g1p is not None:
+                                p.grad = g1p
+
+                    more_loss = more_loss_per_task[task_key]
+                else:
+                    _, loss, more_loss = self.wrapper(
+                        **input_dict, cur_lr=pref_lr, label=label_dict, task_key=task_key
+                    )
+                    loss.backward()
                 if self.gradient_max_norm > 0.0:
                     torch.nn.utils.clip_grad_norm_(
                         self.wrapper.parameters(),

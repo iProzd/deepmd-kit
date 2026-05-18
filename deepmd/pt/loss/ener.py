@@ -151,13 +151,7 @@ class EnergyStdLoss(TaskLoss):
             assert self.use_huber or self.use_l1_all, (
                 "f_use_norm can only be True when use_huber or use_l1_all is True."
             )
-        if self.use_huber and (
-            self.has_pf or self.has_gf or self.relative_f is not None
-        ):
-            raise RuntimeError(
-                "Huber loss is not implemented for force with atom_pref, generalized force and relative force. "
-            )
-
+            
     def forward(self, input_dict, model, label, natoms, learning_rate, mae=False):
         """Return loss on energy and force.
 
@@ -220,7 +214,7 @@ class EnergyStdLoss(TaskLoss):
                         l2_ener_loss.detach(), find_energy
                     )
                 if not self.use_huber:
-                    loss += atom_norm * (pref_e * l2_ener_loss)
+                    loss += atom_norm**2 * (pref_e * l2_ener_loss)
                 else:
                     l_huber_loss = custom_huber_loss(
                         atom_norm * model_pred["energy"],
@@ -405,7 +399,7 @@ class EnergyStdLoss(TaskLoss):
                         l2_virial_loss.detach(), find_virial
                     )
                 if not self.use_huber:
-                    loss += atom_norm * (pref_v * l2_virial_loss)
+                    loss += atom_norm**2 * (pref_v * l2_virial_loss)
                 else:
                     l_huber_loss = custom_huber_loss(
                         atom_norm * model_pred["virial"].reshape(-1),
