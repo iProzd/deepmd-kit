@@ -10,6 +10,24 @@ ______________________________________________________________________
 
 完整工程规范见 `SPEC.md`。**在动手任何代码之前必须先读完 `SPEC.md` 全文**。
 
+当前实现/测试进度见 `PROGRESS.md`。`SPEC.md` 只记录设计契约和验收标准，不记录日常进度。
+
+______________________________________________________________________
+
+## 0.5 Cursor 使用说明
+
+本 harness 最初为 Claude Code 编写；在 Cursor 中工作时按以下映射理解旧说明：
+
+| Claude Code 说法  | Cursor 中使用                                                                           |
+| ----------------- | --------------------------------------------------------------------------------------- |
+| `Task` / 子 agent | `Subagent` tool，对应 `sezm-moe-implementer` / `multi-gpu-tester` / `dpa3-ref-searcher` |
+| `Read`            | `ReadFile`                                                                              |
+| `Grep`            | `rg`                                                                                    |
+| `Bash`            | `Shell`                                                                                 |
+| `Write` / `Edit`  | `ApplyPatch` 或 Cursor 文件编辑工具                                                     |
+
+Cursor 原生规则在 `.cursor/rules/sezm-moe.mdc`。新会话先读：`CLAUDE.md` → `SPEC.md` → `PROGRESS.md` → 相关 skill。
+
 ______________________________________________________________________
 
 ## 1. 环境
@@ -30,7 +48,7 @@ ______________________________________________________________________
 
 ## 2. 顶层规则
 
-1. **禁止 git**：工作目录是一份代码 copy，**任何 git 命令（status / diff / add / commit / log）都不允许**。需要看历史改动直接用 `ls` / `find` / 文件内容对比。
+1. **禁止 git**：工作目录是一份代码 copy，**任何 git 命令（status / diff / add / commit / log）都不允许**。需要看历史改动直接用 `ls` / `rg` / Glob / 文件内容对比。
 1. **不支持的配置必须报错**：所有 MoE 配置组合的合法性都在初始化时检查，凡是不符合 `SPEC.md` §3 列出的"支持配置"全部 `raise ValueError(...)`，**禁止任何 fallback**。
 1. **不修改 `use_moe=False` 路径**：所有现有 SeZM 行为在 `use_moe=False` 时必须**完全不变**。MoE 走一条独立的 `if self.use_moe: ...` 分支。
 1. **二阶导不能丢**：力损失训练需要 `∂²E/∂x∂θ`。每个 A2A 调用必须用 `_AllToAllDouble.apply()`（递归可微）；**禁止**在 backward 中直接调原始 `dist.all_to_all_single`。详见 skill `a2a-double-backward`。
@@ -140,6 +158,8 @@ ______________________________________________________________________
 
 > 如果某个 Step 的 UT 不能全绿，**禁止进入下一个 Step**。先 debug。
 
+每个 Step 完成或验证失败后更新 `PROGRESS.md`，记录已改文件、测试命令、结果和 blocker。
+
 在 Phase B 之前不要碰 SeZM 任何描述符代码；Phase B 开始才允许改 `so2.py` 等。
 
 ______________________________________________________________________
@@ -210,6 +230,7 @@ ______________________________________________________________________
 
 1. **本文件 `CLAUDE.md`**（你现在在读）
 1. **`SPEC.md`**（必读，含完整设计与维度推导）
+1. **`PROGRESS.md`**（当前实现/验证状态）
 1. `.claude/skills/sezm-moe-design/SKILL.md`
 1. `.claude/skills/a2a-double-backward/SKILL.md`
 1. `.claude/skills/gradient-sync-arith/SKILL.md`

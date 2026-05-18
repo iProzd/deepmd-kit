@@ -1,0 +1,17 @@
+---
+description: SeZM MoE project workflow and safety rules
+alwaysApply: true
+---
+
+# SeZM MoE Workflow
+
+- Respond to the user in Simplified Chinese. Write code, comments, docstrings, test output, and error messages in English.
+- Do not run any git command in this workspace.
+- Before editing implementation code, read `SPEC.md` completely. Also read `PROGRESS.md` to know the current step status.
+- Treat `SPEC.md` as the design contract and `PROGRESS.md` as the progress log. Do not use `SPEC.md` for day-to-day status.
+- Follow the phase order in `SPEC.md`: do not proceed to the next Step until the current Step's unit tests and ruff checks pass.
+- Keep MoE code under `deepmd/pt/model/descriptor/sezm_nn/moe/` unless `SPEC.md` explicitly names another file.
+- Preserve `use_moe=False` behavior exactly. Unsupported MoE configurations must raise `ValueError`; do not add fallback paths.
+- All A2A code must use recursive `_AllToAllDouble.apply()` for backward paths so second-order derivatives survive.
+- For gradient sync, routing expert gradients divide by `world_size`, not `dp_size`.
+- Cursor subagents available for this project: `sezm-moe-implementer`, `multi-gpu-tester`, and `dpa3-ref-searcher`.

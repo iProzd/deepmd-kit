@@ -50,7 +50,6 @@ uv.lock
 buildcxx/
 node_modules/
 *.bib.original
-.claude
 
 # Coverage files
 .coverage

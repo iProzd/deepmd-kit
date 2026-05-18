@@ -1,0 +1,41 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source:*)",
+      "Bash(conda activate:*)",
+      "Bash(pip install:*)",
+      "Bash(conda info:*)",
+      "Bash(/mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pip install:*)",
+      "Bash(PYTHONPATH=/aisi/zhangd/claude_space/deepmd-kit-new-training:$PYTHONPATH DP_ENABLE_PYTORCH=1 DP_ENABLE_TENSORFLOW=0 /mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pip install:*)",
+      "Bash(/mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/python:*)",
+      "Bash(/mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/dp --version:*)",
+      "Bash(/mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pytest source/tests/pt/test_new_training.py -v --tb=short)",
+      "Bash(CUDA_VISIBLE_DEVICES=\"\" /mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pytest:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=\"\" /mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pytest source/tests/pt/test_new_training.py::TestEndToEndCLI -v --tb=short)",
+      "Bash(for:*)",
+      "Bash(do if [ ! -d \"source/tests/pt/$dir\" ])",
+      "Bash(then echo \"Missing: $dir\")",
+      "Bash(fi)",
+      "Bash(done)",
+      "Bash(nvidia-smi:*)",
+      "Bash(/mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pytest source/tests/pt/test_training.py::TestEnergyModelSeA::test_dp_train -v --tb=short)",
+      "Bash(echo:*)",
+      "Bash(python -c:*)",
+      "Bash(CUDA_LAUNCH_BLOCKING=1 /mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pytest:*)",
+      "Bash(python3:*)",
+      "Bash(unset:*)",
+      "Bash(env)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 /mnt/data_nas/zhangd/conda_env/claude-training-refactor/bin/pytest:*)",
+      "Bash(ls:*)",
+      "Bash(find:*)",
+      "Edit",
+      "Write",
+      "Bash(*)",
+      "Read",
+      "WebFetch",
+      "Sed",
+      "WebSearch",
+      "Bash(gh pr *)"
+    ]
+  }
+}
