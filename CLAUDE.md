@@ -44,7 +44,6 @@ ______________________________________________________________________
 1. **复用 DPA3 代码的方式**：**copy 一份过来改**，不要 `from deepmd-kit-moe.xxx import ...`。需要参考时去 `/mnt/data_nas/zhangd/claude_space/deepmd-kit-moe` 找。详见子 agent `dpa3-ref-searcher`。
 1. **每个 Step 必须配套 UT**：不写 UT 不能进下一个 Step。UT 通过 → 才能集成。详见 `SPEC.md` §6 的测试矩阵。
 1. **多卡 UT 用 torchrun 跑**：模板见 skill `multi-gpu-test-template`。
-1. **代码风格检查**：每个 Step 完成后必须运行 `ruff check` 并修复所有问题，然后重新验证测试通过。Ruff 路径：`/root/miniconda3/bin/ruff`。
 
 ______________________________________________________________________
 
