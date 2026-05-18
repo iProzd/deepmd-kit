@@ -659,13 +659,21 @@ def grad_probe(FLAGS) -> None:
             norm_mean = 0.0
             norm_std = 0.0
 
+        G_sq_norm = float(np.dot(avg_grad_vec, avg_grad_vec))
+        norms_arr = np.array(norms)
+        mean_sq_norm = float(np.mean(norms_arr ** 2))
+        tr_sigma = mean_sq_norm - G_sq_norm
+        noise_scale = tr_sigma / G_sq_norm if G_sq_norm > 1e-30 else float("nan")
+
         grads_per_task[task_key] = avg_grad_vec
         grads_per_task[f"{task_key}_norm_mean"] = norm_mean
         grads_per_task[f"{task_key}_norm_std"] = norm_std
+        grads_per_task[f"{task_key}_noise_scale"] = noise_scale
 
         log.info(
             "Task '%s': collected %d batches (groups=%d, k=%d). "
-            "Avg Grad Norm=%.4e, Mean(Group Norms)=%.4e, Std(Group Norms)=%.4e",
+            "Avg Grad Norm=%.4e, Mean(Group Norms)=%.4e, Std(Group Norms)=%.4e, "
+            "Noise Scale(group)=%.4e",
             task_key,
             total_batches,
             total_batches // accumulate_k,
@@ -673,6 +681,7 @@ def grad_probe(FLAGS) -> None:
             float(np.linalg.norm(avg_grad_vec)),
             float(norm_mean),
             float(norm_std),
+            noise_scale,
         )
 
     # Compute pairwise dot product and cosine similarity statistics
