@@ -98,9 +98,10 @@ class TestAllToAllSingleGPU(unittest.TestCase):
             "Second-order gradient should contain non-zero values",
         )
 
-    def test_gradgradcheck_fp64(self):
-        """torch.autograd.gradgradcheck should pass in fp64."""
-        # Use smaller tensors for gradgradcheck (it's expensive)
+    def test_short_circuit_gradgradcheck_fp64(self):
+        """group=None short-circuit should pass gradgradcheck in fp64."""
+        # This verifies the single-process passthrough path only.  The real
+        # _AllToAllDouble gradgradcheck lives in the multi-GPU test file.
         x = torch.randn(6, 4, dtype=torch.float64, requires_grad=True, device="cpu")
         send_splits = [2, 2, 2]
         recv_splits = [1, 3, 2]

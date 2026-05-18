@@ -673,6 +673,13 @@ ______________________________________________________________________
 
 每个测试都对应一个 pytest 文件。命名：`test_sezm_moe_<topic>.py` 和 `test_sezm_moe_<topic>_multigpu.py`。
 
+### 多卡 UT 的 GPU 数量规则
+
+- 多卡 UT 必须与单卡 UT 分开写成独立文件：`test_sezm_moe_<topic>.py` 与 `test_sezm_moe_<topic>_multigpu.py`。
+- 除非测试目标明确只是 2 GPU smoke test，否则多卡 UT 至少覆盖 4 GPU。
+- 当前开发环境有 8 张 GPU 时，Step 验收必须优先跑 8 GPU，并在报告中写明 `torchrun --nproc_per_node`、backend（NCCL/Gloo）和通过的 rank 数。
+- 对 A2A、梯度同步、checkpoint resharding、二阶导不死锁等跨 rank 行为，2 GPU 结果只能作为 smoke test，不能替代 4/8 GPU 验收。
+
 ______________________________________________________________________
 
 ## 8. 配置 schema

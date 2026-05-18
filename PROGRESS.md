@@ -29,13 +29,9 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - Single-process Step 1 tests: PASS
   - Command used: `pytest source/tests/pt/test_sezm_moe_a2a.py -q`
   - Result: 5 tests passed, 3 subtests passed
-- Multi-process Step 1 smoke test: PASS
-  - Runner: Cursor `multi-gpu-tester` subagent
-  - Command shape: `torchrun --nproc_per_node=2 ... source/tests/pt/test_sezm_moe_a2a_multigpu.py`
-  - Result: 4 tests passed, no hang
-- Multi-process Step 1 4-process test: PASS
-  - Command shape: `torchrun --nproc_per_node=4 ... source/tests/pt/test_sezm_moe_a2a_multigpu.py`
-  - Result: 4 tests passed on all ranks, no hang
+- Multi-process Step 1 8-rank CUDA/NCCL test: PASS
+  - Command shape: `torchrun --nproc_per_node=8 ... source/tests/pt/test_sezm_moe_a2a_multigpu.py`
+  - Result: 6 tests passed on all 8 ranks, no hang
 - Step 1 ruff check: PASS
   - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/moe/a2a_ops.py source/tests/pt/test_sezm_moe_a2a.py source/tests/pt/test_sezm_moe_a2a_multigpu.py`
 - DPA3 reference subagent smoke test: PASS
@@ -48,6 +44,7 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - `pytest` 9.0.3 is installed in `/mnt/data_nas/zhangd/conda_env/torch-modern`.
 - `/root/miniconda3/bin/ruff` is available and reports `ruff 0.15.6`.
 - Existing Step 1 tests are runnable via `pytest`, `unittest`, and standalone `torchrun`.
+- Multi-rank tests use CUDA/NCCL when CUDA is available and fall back to CPU/Gloo only when CUDA is unavailable.
 
 ## Not Started
 

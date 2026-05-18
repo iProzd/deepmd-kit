@@ -63,6 +63,7 @@ ______________________________________________________________________
 1. **每个 Step 必须配套 UT**：不写 UT 不能进下一个 Step。UT 通过 → 才能集成。详见 `SPEC.md` §6 的测试矩阵。
 1. **多卡 UT 用 torchrun 跑**：模板见 skill `multi-gpu-test-template`。
 1. **代码风格检查**：每个 Step 完成后必须运行 `ruff check` 并修复所有问题，然后重新验证测试通过。Ruff 路径：`/root/miniconda3/bin/ruff`。
+1. **多卡 UT 默认 4/8 GPU**：除非测试目标明确只适合 2 GPU smoke test，否则多卡 UT 必须至少覆盖 4 GPU；当前环境有 8 张 GPU 时，Step 验收必须优先跑 8 GPU。报告测试结果时写明实际 `torchrun --nproc_per_node` 数量和 backend。
 
 ______________________________________________________________________
 
