@@ -6,17 +6,20 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 - Date: 2026-05-18
 - Current phase: Phase A
-- Current step: Step 2 (`MoESO2Router`)
-- Overall status: Steps 1-2 implementations exist and matching tests pass; Steps 3-10 are not implemented.
+- Current step: Step 3 (`MoESO2ExpertCollection`)
+- Overall status: Steps 1-3 implementations exist and matching tests pass; Steps 4-10 are not implemented.
 
 ## Implemented Files
 
 - `deepmd/pt/model/descriptor/sezm_nn/moe/a2a_ops.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/router.py`
+- `deepmd/pt/model/descriptor/sezm_nn/moe/experts.py`
+- `deepmd/pt/model/descriptor/sezm_nn/so2_math.py`
 - `deepmd/pt/model/descriptor/sezm_nn/moe/__init__.py`
 - `source/tests/pt/test_sezm_moe_a2a.py`
 - `source/tests/pt/test_sezm_moe_a2a_multigpu.py`
 - `source/tests/pt/test_sezm_moe_router.py`
+- `source/tests/pt/test_sezm_moe_experts.py`
 
 ## Validation
 
@@ -41,6 +44,17 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
   - Result: 7 tests passed, 2 deprecation warnings from `torch.jit.script`
 - Step 2 ruff check: PASS
   - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/moe/router.py source/tests/pt/test_sezm_moe_router.py`
+- Single-process Step 3 expert tests: PASS
+  - Command used: `pytest source/tests/pt/test_sezm_moe_experts.py -xvs`
+  - Result: 12 tests passed, 2 deprecation warnings from `torch.jit.script`
+- Step 3 ruff check: PASS
+  - Command used: `/root/miniconda3/bin/ruff check deepmd/pt/model/descriptor/sezm_nn/moe/experts.py source/tests/pt/test_sezm_moe_experts.py`
+- Step 3 SO(2) helper simplification regression: PASS
+  - Shared SO(2) m-major layout/block helpers added in `deepmd/pt/model/descriptor/sezm_nn/so2_math.py`
+  - Standard `SO2Linear` now uses shared helper for layout and `_build_so2_weight`
+  - MoE `_ExpertSO2LinearLayer` delegates one-expert and shared-batched SO(2) block math to the same helper
+  - `pytest source/tests/pt/model/test_sezm_model.py::TestLoRASO2Adapter -xvs`: 2 tests passed
+  - `pytest source/tests/pt/model/test_sezm_model.py::TestSeZMModelCompile::test_forward_backward_double_backward_matches_compile -xvs`: 1 test passed
 - DPA3 reference subagent smoke test: PASS
   - Cursor `dpa3-ref-searcher` can read `deepmd-kit-moe` reference files.
 - Implementer subagent smoke test: PASS
@@ -54,9 +68,12 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 - Existing Step 1 tests are runnable via `pytest`, `unittest`, and standalone `torchrun`.
 - Multi-rank tests use CUDA/NCCL when CUDA is available and fall back to CPU/Gloo only when CUDA is unavailable.
 
+## Cleanup Items
+
+- Step 3 helper extraction left `SO2Linear._m0_in`, `SO2Linear._m0_out`, and `SO2Linear._block_slices` as legacy attrs for `LoRASO2` compatibility. Future cleanup: refactor `LoRASO2` to consume `so2_math.build_m_major_layout()` directly, then remove these legacy attrs.
+
 ## Not Started
 
-- Step 3: `MoESO2ExpertCollection`
 - Step 4: `MoESO2Convolution`
 - Step 5: `SO2Convolution` MoE branch and validation
 - Step 6: EP/DP groups and gradient sync
@@ -68,5 +85,5 @@ This file tracks implementation and validation status. `SPEC.md` remains the des
 
 ## Next Recommended Actions
 
-1. Proceed to Step 3 (`MoESO2ExpertCollection`) with `sezm-moe-implementer`.
+1. Proceed to Step 4 (`MoESO2Convolution`) with `sezm-moe-implementer`.
 1. Keep updating this file after each Step's tests and ruff checks.

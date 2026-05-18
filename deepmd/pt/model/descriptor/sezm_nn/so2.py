@@ -57,6 +57,10 @@ from .norm import (
     ReducedEquivariantRMSNorm,
     ScalarRMSNorm,
 )
+from .so2_math import (
+    build_m_major_layout,
+    build_so2_weight,
+)
 from .so3 import (
     ChannelLinear,
     FocusLinear,
@@ -180,57 +184,33 @@ class SO2Linear(nn.Module):
         #   m=2-: index  [7]               (l=2   with -m)
         #   m=2+: index  [8]               (l=2   with +m)
         #   => reduced_dim = 9
-        m0_size = self.lmax + 1
-        self.register_buffer(
-            "m0_idx",
-            torch.arange(m0_size, device=self.device, dtype=torch.long),
-            persistent=True,
-        )
-
-        pos_indices_list: list[torch.Tensor] = []
-        neg_indices_list: list[torch.Tensor] = []
-        # Each entry: (neg_start, pos_start, num_l) for a fixed |m|.
-        # These ranges are contiguous in m-major layout.
-        m_ranges: list[tuple[int, int, int]] = []
-
-        offset = m0_size
-        for m in range(1, self.mmax + 1):
-            num_l = self.lmax - m + 1
-            neg_start = offset
-            pos_start = offset + num_l
-            neg_idx = torch.arange(
-                neg_start, neg_start + num_l, device=self.device, dtype=torch.long
+        layout = build_m_major_layout(self.lmax, self.mmax, device=self.device)
+        self.register_buffer("m0_idx", layout["m0_idx"], persistent=True)
+        self.register_buffer("pos_indices", layout["pos_indices"], persistent=True)
+        self.register_buffer("neg_indices", layout["neg_indices"], persistent=True)
+        self._m_ranges = layout["m_ranges"]
+        self.reduced_dim = layout["reduced_dim"]
+        # NOTE: legacy attributes retained for LoRASO2 backward compatibility.
+        # Their values must remain consistent with so2_math.build_m_major_layout().
+        # TODO: refactor LoRASO2 to use so2_math directly and remove these.
+        self._m0_in = (self.lmax + 1) * self.in_channels
+        self._m0_out = (self.lmax + 1) * self.out_channels
+        self._block_slices: list[tuple[int, int, int, int, int, int, int, int]] = []
+        for neg_start, pos_start, num_l in self._m_ranges:
+            ib = num_l * self.in_channels
+            ob = num_l * self.out_channels
+            self._block_slices.append(
+                (
+                    neg_start * self.in_channels,
+                    neg_start * self.in_channels + ib,
+                    pos_start * self.in_channels,
+                    pos_start * self.in_channels + ib,
+                    neg_start * self.out_channels,
+                    neg_start * self.out_channels + ob,
+                    pos_start * self.out_channels,
+                    pos_start * self.out_channels + ob,
+                )
             )
-            pos_idx = torch.arange(
-                pos_start, pos_start + num_l, device=self.device, dtype=torch.long
-            )
-            neg_indices_list.append(neg_idx)
-            pos_indices_list.append(pos_idx)
-            m_ranges.append((neg_start, pos_start, num_l))
-            offset += 2 * num_l
-
-        self.reduced_dim = int(offset)
-
-        if len(pos_indices_list) > 0:
-            self.register_buffer(
-                "pos_indices", torch.cat(pos_indices_list), persistent=True
-            )
-            self.register_buffer(
-                "neg_indices", torch.cat(neg_indices_list), persistent=True
-            )
-            self._m_ranges = m_ranges
-        else:
-            self.register_buffer(
-                "pos_indices",
-                torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=True,
-            )
-            self.register_buffer(
-                "neg_indices",
-                torch.empty(0, device=self.device, dtype=torch.long),
-                persistent=True,
-            )
-            self._m_ranges = []
 
         # === Step 2. Learnable weight parameters ===
         # weight_m0: folded (num_l*Cin, F*num_l*Cout) storage — (in, out) convention.
@@ -294,31 +274,6 @@ class SO2Linear(nn.Module):
         for p in self.parameters():
             p.requires_grad = trainable
 
-        # === Step 3. Precompute flattened slice ranges for _build_so2_weight ===
-        # Each |m|>0 group occupies two sub-blocks (neg, pos) in the flattened
-        # weight matrix. Pre-computing the row/col ranges avoids repeated
-        # arithmetic in the hot path.
-        # Tuple layout: (neg_i0, neg_i1, pos_i0, pos_i1,   <- input row ranges
-        #                neg_o0, neg_o1, pos_o0, pos_o1)   <- output col ranges
-        self._m0_in = (self.lmax + 1) * self.in_channels
-        self._m0_out = (self.lmax + 1) * self.out_channels
-        self._block_slices: list[tuple[int, int, int, int, int, int, int, int]] = []
-        for neg_start, pos_start, num_l in self._m_ranges:
-            ib = num_l * self.in_channels
-            ob = num_l * self.out_channels
-            self._block_slices.append(
-                (
-                    neg_start * self.in_channels,
-                    neg_start * self.in_channels + ib,
-                    pos_start * self.in_channels,
-                    pos_start * self.in_channels + ib,
-                    neg_start * self.out_channels,
-                    neg_start * self.out_channels + ob,
-                    pos_start * self.out_channels,
-                    pos_start * self.out_channels + ob,
-                )
-            )
-
         # Weight cache: only used in eval + no_grad (inference).
         # Invalidated on train() via overridden method below.
         self._cached_weight: torch.Tensor | None = None
@@ -341,35 +296,16 @@ class SO2Linear(nn.Module):
         torch.Tensor
             Weight with shape (D_m*Cin, F, D_m*Cout).
         """
-        in_total = self.reduced_dim * self.in_channels
-        out_total = self.reduced_dim * self.out_channels
-        weight = self.weight_m0.new_zeros(in_total, self.n_focus, out_total)
-        num_in_m0 = (self.lmax + 1) * self.in_channels
-        num_out_m0 = (self.lmax + 1) * self.out_channels
-        weight_m0 = self.weight_m0.view(num_in_m0, self.n_focus, num_out_m0)
-
-        # m=0 block: (Cin_blk, F, Cout_blk) — (in, out) convention.
-        weight[: self._m0_in, :, : self._m0_out] = weight_m0
-
-        # |m|>0 blocks: fill the 2x2 SO(2) coupling structure.
-        # For each |m|, the learnable param w has shape (in_blk, F, 2*out_blk)
-        # which is split into W_u and W_v along the output axis.
-        for m_idx, w in enumerate(self.weight_m):
-            ni0, ni1, pi0, pi1, no0, no1, po0, po1 = self._block_slices[m_idx]
-            ib = ni1 - ni0  # in_block size
-            ob = no1 - no0  # out_block size
-            w = w.view(ib, self.n_focus, 2 * ob)
-            w_u = w[:, :, :ob]  # (in_blk, F, out_blk)
-            w_v = w[:, :, ob:]  # (in_blk, F, out_blk)
-            # Fill the 2x2 coupling:
-            #   Row = input (neg/pos), Col = output (neg/pos).
-            #   [ W_u^T, -W_v^T ]^T  =>  row=neg_in: W_u to neg_out, W_v to pos_out
-            #   [ W_v^T,  W_u^T ]^T  =>  row=pos_in: -W_v to neg_out, W_u to pos_out
-            weight[ni0:ni1, :, no0:no1] = w_u  # neg_in -> neg_out
-            weight[ni0:ni1, :, po0:po1] = w_v  # neg_in -> pos_out
-            weight[pi0:pi1, :, no0:no1] = -w_v  # pos_in -> neg_out
-            weight[pi0:pi1, :, po0:po1] = w_u  # pos_in -> pos_out
-        return weight
+        return build_so2_weight(
+            weight_m0=self.weight_m0,
+            weight_m=list(self.weight_m),
+            reduced_dim=self.reduced_dim,
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            n_focus=self.n_focus,
+            m0_size=self.lmax + 1,
+            block_slices=self._block_slices,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
