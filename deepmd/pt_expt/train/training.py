@@ -182,6 +182,9 @@ def _trace_and_compile(
     if "backend" not in compile_opts:
         compile_opts["backend"] = "aot_eager"
     compiled_lower = torch.compile(traced_lower, dynamic=False, **compile_opts)
+    del traced_lower
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return compiled_lower
 
 
@@ -730,6 +733,14 @@ class Trainer:
             aparam,
             compile_opts,
         )
+
+        del ext_coord, ext_atype, nlist_t, mapping_t
+        if fparam is not None:
+            del fparam
+        if aparam is not None:
+            del aparam
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         self.wrapper.model = _CompiledModel(
             model, compiled_lower, max_nall, compile_opts
