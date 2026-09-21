@@ -160,6 +160,17 @@ tuning first group into four accuracy–cost levers:
   {ref}`n_atten_head <model[dpa4]/descriptor[dpa4]/n_atten_head>` (`0` falls
   back to a plain envelope-weighted scatter).
 
+The neighbor search runs through `nvalchemiops` when it is installed, and falls
+back to `vesin` when it is not. On CUDA the `vesin` kernel reserves room for a
+fixed number of neighbor pairs per atom, set by the
+`VESIN_CUDA_MAX_PAIRS_PER_POINT` environment variable. A frame denser than that
+cap -- small periodic cells at the cutoffs DPA4 uses are the usual case -- stops
+with an error naming the variable. Because whether it trips depends on the
+frame, a run can proceed for a long time before meeting one. Set the variable to
+at least `sel`, the configured maximum neighbors per atom; it raises the memory
+the search reserves, so prefer the smallest value that covers the densest frame
+rather than a large constant.
+
 The neighbor list is set by {ref}`rcut <model[dpa4]/descriptor[dpa4]/rcut>` and
 {ref}`sel <model[dpa4]/descriptor[dpa4]/sel>`, the initial node features by
 {ref}`use_env_seed <model[dpa4]/descriptor[dpa4]/use_env_seed>`, and the energy

@@ -30,6 +30,7 @@ See [How to control the parallelism of a job](./troubleshooting/howtoset_num_nod
 - If ROCm is used, [ROCm environment variables](https://rocm.docs.amd.com/en/latest/conceptual/gpu-isolation.html#environment-variables) can be used to control ROCm devices.
 - {{ tensorflow_icon }} If TensorFlow is used, TensorFlow environment variables can be used.
 - {{ pytorch_icon }} If PyTorch is used, [PyTorch environment variables](https://pytorch.org/docs/stable/torch_environment_variables.html) can be used.
+- {{ pytorch_icon }} `VESIN_CUDA_MAX_PAIRS_PER_POINT` caps how many neighbor pairs the `vesin` CUDA kernel stores per atom. The DPA-4 / SeZM descriptor uses `vesin` on CUDA when `nvalchemiops` is not installed; a frame denser than the cap then fails with a message naming this variable. Set it to at least the descriptor's `sel` (the configured maximum neighbors per atom). It raises the memory the neighbor search reserves, so prefer the smallest value that fits the densest frame in the dataset rather than a large constant.
 - {{ jax_icon }} [`JAX_PLATFORMS`](https://jax.readthedocs.io/en/latest/faq.html#controlling-data-and-computation-placement-on-devices) and [`XLA_FLAGS`](https://jax.readthedocs.io/en/latest/gpu_performance_tips.html#xla-performance-flags) are commonly used.
 
 ## Python interface only

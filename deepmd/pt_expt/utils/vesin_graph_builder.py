@@ -45,6 +45,32 @@ from deepmd.pt_expt.utils.vesin_neighbor_list import (
 )
 
 
+def _annotate_max_pairs_overflow(
+    error: RuntimeError, nloc: int, rcut: float
+) -> RuntimeError:
+    """Add the descriptor context vesin cannot know to its overflow error.
+
+    vesin caps the neighbor pairs it stores per point on CUDA, and its own
+    message already names ``VESIN_CUDA_MAX_PAIRS_PER_POINT`` and suggests
+    reducing the cutoff. What it cannot say is which value to use, because
+    the bound that matters is the descriptor's own ``sel`` -- the maximum
+    neighbors per atom the model was configured for. Dense cells at the
+    cutoffs DPA-4 uses can exceed vesin's default, and because it depends on
+    the frame, a run can proceed for hours before meeting one.
+
+    Any other RuntimeError is returned unchanged.
+    """
+    if "VESIN_CUDA_MAX_PAIRS_PER_POINT" not in str(error):
+        return error
+    return RuntimeError(
+        f"{error}\n"
+        f"This came from the neighbor-list search for a {nloc}-atom frame at rcut={rcut:g}. "
+        "Set VESIN_CUDA_MAX_PAIRS_PER_POINT to at least the descriptor's `sel` "
+        "(the configured maximum neighbors per atom); a denser frame later in the "
+        "dataset can need more than an earlier one did."
+    )
+
+
 def vesin_search_ijs(
     positions: torch.Tensor,
     cell: torch.Tensor | None,
@@ -83,13 +109,16 @@ def vesin_search_ijs(
         cell if periodic else torch.zeros((3, 3), dtype=positions.dtype, device=device)
     )
     nl = _vesin_torch.NeighborList(cutoff=float(rcut), full_list=True)
-    with torch.device(device):
-        ii, jj, ss = nl.compute(
-            points=positions,
-            box=box,
-            periodic=periodic,
-            quantities="ijS",
-        )
+    try:
+        with torch.device(device):
+            ii, jj, ss = nl.compute(
+                points=positions,
+                box=box,
+                periodic=periodic,
+                quantities="ijS",
+            )
+    except RuntimeError as e:
+        raise _annotate_max_pairs_overflow(e, positions.shape[0], float(rcut)) from e
     return ii.to(torch.int64), jj.to(torch.int64), ss.to(torch.int64).reshape(-1, 3)
 
 
