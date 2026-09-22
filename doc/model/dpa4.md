@@ -82,6 +82,13 @@ unnecessary and not recommended (see [Hardware selection](#hardware-selection)).
 > the denoising (`dens`) path and the `deepspin` spin scheme cap the list at
 > `sum(sel)`. You can also set `sel` to `auto` or `auto:factor` to size it from
 > the training data.
+>
+> One consequence is worth spelling out. If the `vesin` neighbor-list backend
+> stops with `VESIN_CUDA_MAX_PAIRS_PER_POINT` (see {envvar}`VESIN_CUDA_MAX_PAIRS_PER_POINT`),
+> `sel` is **not** the value to set it to. That search runs before any `sel`
+> truncation and keeps every neighbor within `rcut`, so what it must fit is the
+> true neighbor count of the densest frame, which `sel` is allowed to be smaller
+> than. Raise the variable until the densest frame fits.
 
 ### Presets
 
@@ -159,17 +166,6 @@ tuning first group into four accuracy–cost levers:
 - **Aggregation** — {ref}`n_focus <model[dpa4]/descriptor[dpa4]/n_focus>`,
   {ref}`n_atten_head <model[dpa4]/descriptor[dpa4]/n_atten_head>` (`0` falls
   back to a plain envelope-weighted scatter).
-
-The neighbor search runs through `nvalchemiops` when it is installed, and falls
-back to `vesin` when it is not. On CUDA the `vesin` kernel reserves room for a
-fixed number of neighbor pairs per atom, set by the
-`VESIN_CUDA_MAX_PAIRS_PER_POINT` environment variable. A frame denser than that
-cap -- small periodic cells at the cutoffs DPA4 uses are the usual case -- stops
-with an error naming the variable. Because whether it trips depends on the
-frame, a run can proceed for a long time before meeting one. Set the variable to
-at least `sel`, the configured maximum neighbors per atom; it raises the memory
-the search reserves, so prefer the smallest value that covers the densest frame
-rather than a large constant.
 
 The neighbor list is set by {ref}`rcut <model[dpa4]/descriptor[dpa4]/rcut>` and
 {ref}`sel <model[dpa4]/descriptor[dpa4]/sel>`, the initial node features by

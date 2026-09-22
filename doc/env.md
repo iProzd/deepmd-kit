@@ -30,7 +30,6 @@ See [How to control the parallelism of a job](./troubleshooting/howtoset_num_nod
 - If ROCm is used, [ROCm environment variables](https://rocm.docs.amd.com/en/latest/conceptual/gpu-isolation.html#environment-variables) can be used to control ROCm devices.
 - {{ tensorflow_icon }} If TensorFlow is used, TensorFlow environment variables can be used.
 - {{ pytorch_icon }} If PyTorch is used, [PyTorch environment variables](https://pytorch.org/docs/stable/torch_environment_variables.html) can be used.
-- {{ pytorch_icon }} `VESIN_CUDA_MAX_PAIRS_PER_POINT` caps how many neighbor pairs the `vesin` CUDA kernel stores per atom. The DPA-4 / SeZM descriptor uses `vesin` on CUDA when `nvalchemiops` is not installed; a frame denser than the cap then fails with a message naming this variable. Set it to at least the descriptor's `sel` (the configured maximum neighbors per atom). It raises the memory the neighbor search reserves, so prefer the smallest value that fits the densest frame in the dataset rather than a large constant.
 - {{ jax_icon }} [`JAX_PLATFORMS`](https://jax.readthedocs.io/en/latest/faq.html#controlling-data-and-computation-placement-on-devices) and [`XLA_FLAGS`](https://jax.readthedocs.io/en/latest/gpu_performance_tips.html#xla-performance-flags) are commonly used.
 
 ## Python interface only
@@ -84,6 +83,28 @@ Default backend.
 
 {{ pytorch_icon }} Number of subprocesses to use for data loading in the PyTorch backend.
 See [PyTorch documentation](https://pytorch.org/docs/stable/data.html) for details.
+:::
+
+:::{envvar} VESIN_CUDA_MAX_PAIRS_PER_POINT
+
+**Type**: positive integer
+
+**Default**: set by `vesin`
+
+{{ pytorch_icon }} Read by the `vesin` neighbor-list backend, not by deepmd. Its CUDA kernel
+reserves room for a fixed number of neighbor pairs per point, and a frame denser than that cap
+fails with a `RuntimeError` from `vesin` naming this variable, the current cap, and the number of
+points.
+
+The DPA-4 / SeZM descriptor uses `vesin` on CUDA when `nvalchemiops` is not installed (the `pt`
+backend, and single-frame batches in `pt_expt` inference); `pt_expt` training never selects it.
+
+Size it against the largest number of neighbors within `rcut` that any frame in the dataset
+actually has. In particular **do not size it from** `sel`: on the DPA-4 energy path `sel` is only
+an initial capacity that grows on demand and is explicitly allowed to be smaller than the true
+neighbor count (see [DPA-4](model/dpa4.md)), so it is not an upper bound on what `vesin` must fit.
+Raising the variable raises the memory the neighbor search reserves, so prefer the smallest value
+that covers the densest frame rather than a large constant.
 :::
 
 :::{envvar} DP_LMDB_NUM_WORKERS
